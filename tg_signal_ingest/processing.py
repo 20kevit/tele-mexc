@@ -14,6 +14,7 @@ a parser update can walk the corpus.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -94,11 +95,27 @@ class ProcessingEngine:
         return stats
 
     async def run(self, stop_event: asyncio.Event) -> ProcessingStats:
-        """Continuous consumer loop used by the ingest service."""
+        """Continuous consumer loop used by the ingest service.
+
+        Survives unexpected errors: a single failure neither kills the loop
+        (which would strand the backlog) nor breaks claimed items — claimed
+        work is requeued before the loop continues.
+        """
 
         total = ProcessingStats()
         while not stop_event.is_set():
-            stats = await self.run_once()
+            try:
+                stats = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - single consumer: errors must not kill the loop
+                log.error(
+                    "queue consumer error (%s); requeueing claimed items and continuing",
+                    exc.__class__.__name__,
+                )
+                with contextlib.suppress(Exception):
+                    self.repo.requeue_expired_claims()
+                stats = ProcessingStats()
             total.processed += stats.processed
             total.retried += stats.retried
             total.failed += stats.failed

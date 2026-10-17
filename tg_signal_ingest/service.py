@@ -130,6 +130,10 @@ class IngestService:
 
     async def _run_once(self) -> None:
         self.cfg.ensure_dirs()
+        # Re-entrency guard: every new connection cycle must first terminate
+        # tasks started by a previous cycle (a duplicate backfill worker or
+        # queue consumer would leak FloodWait-prone loops and double claim).
+        await self._reap_background_tasks()
         await connect_and_verify(self.cfg, self._client)
         recovered = self.repo.requeue_expired_claims()
         if recovered:
@@ -397,17 +401,21 @@ class IngestService:
 
     # ------------------------------------------------------------- cleanup
 
-    async def _shutdown_tasks(self) -> None:
-        for task in (self._backfill_task, self._queue_task):
+    async def _reap_background_tasks(self) -> None:
+        """Cancel and await tasks of a previous connection cycle (if any)."""
+
+        for attr in ("_backfill_task", "_queue_task"):
+            task = getattr(self, attr, None)
             if task is None or task.done():
+                setattr(self, attr, None)
                 continue
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # noqa: BLE001
-                pass
+            setattr(self, attr, None)
+
+    async def _shutdown_tasks(self) -> None:
+        await self._reap_background_tasks()
         with contextlib.suppress(Exception):
             await self._client.disconnect()
         log.info("ingest service stopped")

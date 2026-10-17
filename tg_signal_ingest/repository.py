@@ -6,6 +6,7 @@ All writes are transactional. The logical message identity is
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,8 @@ from typing import Any
 
 from .db import Database
 from .normalize import StoredMessage
+
+log = logging.getLogger("ingest.repository")
 
 UTC_NOW = lambda: datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")  # noqa: E731
 
@@ -202,6 +205,24 @@ class Repository:
                 record.datetime,
             )
             if content_fields == new_fields:
+                return UpsertResult(UpsertOutcome.UNCHANGED, old_version, old_version)
+
+            # Staleness guard (race between live stream and history import):
+            # never overwrite a row that already reflects an edit with an
+            # OLDER snapshot fetched by backfill. A snapshot lacking an edit
+            # date is by Telegram semantics pre-edit, i.e. older than any
+            # stored row that already carries an edit date.
+            existing_edit_dt = row["edit_datetime"]
+            incoming_edit_dt = record.edit_datetime
+            stale = (
+                existing_edit_dt is not None
+                and (incoming_edit_dt is None or str(incoming_edit_dt) < str(existing_edit_dt))
+            )
+            if stale:
+                log.debug(
+                    "stale history version ignored for %s/%s (fetched %s, stored %s)",
+                    record.channel_id, record.message_id, incoming_edit_dt, existing_edit_dt,
+                )
                 return UpsertResult(UpsertOutcome.UNCHANGED, old_version, old_version)
 
             new_version = old_version + 1
