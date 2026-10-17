@@ -75,16 +75,12 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
 def _describe_photo(photo: Any) -> dict[str, Any]:
     sizes = _attr(photo, "sizes", []) or []
     dims: dict[str, Any] = {}
-    largest_klass = None
     for size in sizes:
         w, h = _attr(size, "w"), _attr(size, "h")
         if w and h and (not dims or w * h > dims.get("width", 0) * dims.get("height", 1)):
             dims = {"width": w, "height": h}
-        if size.__class__.__name__ == "PhotoSize" and (largest_klass is None or w and h):
-            largest_klass = size.__class__.__name__
-    photo_id = _attr(photo, "id")
     return {
-        "id": photo_id,
+        "id": _attr(photo, "id"),
         "width": dims.get("width"),
         "height": dims.get("height"),
         "requires_ocr": True,  # the future parser must treat photos as image content, not text
