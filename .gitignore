@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Private configuration (contains or references credentials)
+config/*
+!config/.gitkeep
+*.local.toml
+*.private.*
+
+# Telegram session / auth data
+*.session
+*.session-journal
+auth/
+telethon/
+
+# Databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+data/
+var/
+
+# Logs
+*.log
+logs/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
