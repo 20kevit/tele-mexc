@@ -7,24 +7,53 @@ and offline).
 Owner of the Telegram account performs the interactive steps; the operator
 records the outcomes.
 
+## Already completed without owner credentials (2026 audit)
+
+| Check | Result |
+| --- | --- |
+| 1. `tg-ingest diagnostics proxy` | OK — CONNECT tunnel to Telegram DC 149.154.167.51:443; direct egress blocked (expected) |
+| 2. Wrong-port failure path (`TELEGRAM_PROXY_PORT=30999`) | clear `PROXY FAILURE`, exit 1, no silent direct fallback |
+| 3. `systemd-analyze verify deploy/tg-ingest.service` | exit 0 |
+| 4. Session path consistency (CLI vs systemd, arbitrary CWD) | `/opt/projects/akha1/config/tg_session.session` in all cases |
+| 5. **Real MTProto handshake through the proxy** (Telethon `connect()` with throwaway session, no sign-in) | `connected=True, signed-in=False` — transport path fully verified, auth-key exchange with the DC succeeded through `127.0.0.1:1081` |
+| 6. Automated suite | 68 tests passed, ruff + mypy clean |
+
+## Owner-interactive steps (start here)
+
 | # | Step | Expected | Recorded |
 | --- | --- | --- | --- |
-| 1 | `tg-ingest diagnostics proxy` | `proxy diagnostics: OK` + CONNECT tunnel to a Telegram DC + `direct egress blocked (expected)` | |
-| 2 | `TELEGRAM_PROXY_PORT=30999 tg-ingest diagnostics proxy` | clear `PROXY FAILURE`, exit 1 | |
-| 3 | `tg-ingest config check` (after filling `.env`) | `configuration OK` | |
-| 4 | `tg-ingest auth login` (owner enters phone, code, optional 2FA) | `Login succeeded for ... Session persisted` | |
-| 5 | `ls -l config/tg_session.session` | permissions `-rw-------` | |
-| 6 | `tg-ingest auth check` | `Session status: valid` | |
-| 7 | `tg-ingest channels list` | displays channels incl. target | |
-| 8 | `tg-ingest channel select <id>` | `selected channel: ...` | |
-| 9 | `tg-ingest backfill run` | progress counts and `history import complete` | |
-| 10 | `tg-ingest backfill status` | `backfill: status=done` | |
-| 11 | `tg-ingest serve` starts; owner posts a test message | `live message ... stored (media=text-only)` in logs | |
-| 12 | owner edits the message | `live edit of ... stored (version 0 -> 1)` | |
-| 13 | owner deletes the message (while service online) | `deletion event: 1 message(s) newly marked deleted` | |
-| 14 | restart `tg-ingest serve` after 2+ min of downtime | `recovery sweep complete: N gap message(s) fetched` | |
-| 15 | stop proxy listener briefly (with owner's ProxyHub admin) — see note | service logs proxy failure and keeps retrying; never falls back to direct connection | |
-| 16 | `git status --short` (from repo root) | no `.env`, no `*.session`, no `*.sqlite3` | |
+| A | `tg-ingest config check` (after filling `.env`) | `configuration OK`, credentials `set` | |
+| B | `tg-ingest auth login` (owner enters phone, code, optional 2FA) | `Login succeeded for ... Session persisted` | |
+| C | `ls -l config/tg_session.session` | permissions `-rw-------` | |
+| D | `tg-ingest auth check` | `Session status: valid` | |
+| E | `tg-ingest channels list` | displays channels incl. target | |
+| F | `tg-ingest channel select <id>` | `selected channel: ...` | |
+| G | `tg-ingest backfill run` | progress counts and `history import complete` | |
+| H | `tg-ingest backfill run` (re-run) | no duplicates (unchanged counts)  | |
+| I | `tg-ingest backfill status` | `backfill: status=done` | |
+| J | `cp deploy/tg-ingest.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now tg-ingest` if a test channel exists — see note | `systemctl status tg-ingest` active; live test message stored | |
+| K | owner posts a test message in the channel | `live message ... stored` in `journalctl -fu tg-ingest` | |
+| L | owner edits the message | `live edit of ... stored (version 0 -> 1)`; `tg-ingest messages show <id>` lists edit history | |
+| M | owner deletes that message (service online) | `deletion event: 1 message(s) newly marked deleted` | |
+| N | stop daemon; wait 2+ min; restart; owner posts 1-2 messages while offline | `recovery sweep complete: N gap message(s) fetched` on the next start | |
+| O | queue snapshot | `tg-ingest queue list` shows pending/processed counts matching captured messages | |
+| P | stop proxy listener briefly (only with explicit ProxyHub admin authorization) — see note | service logs proxy failure and keeps retrying; never falls back to direct connection | |
+| Q | `git status --short` (from repo root) | no `.env`, no `*.session`, no `*.sqlite3` | |
+
+Ready-to-paste owner command block (steps A through F):
+
+```bash
+cd /opt/projects/akha1
+.venv/bin/tg-ingest config check
+.venv/bin/tg-ingest auth login
+ls -l config/tg_session.session
+.venv/bin/tg-ingest auth check
+.venv/bin/tg-ingest channels list
+.venv/bin/tg-ingest channel select <ID-OR-@USERNAME>
+```
+
+Note (step J): enable the systemd unit only after the channel is selected and a
+short-lived foreground `serve` run has been observed without errors.
 
 Notes:
 
