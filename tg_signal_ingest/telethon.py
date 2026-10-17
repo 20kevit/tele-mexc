@@ -13,6 +13,7 @@ from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.errors import (
+    FloodWaitError,
     PhoneCodeEmptyError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -133,6 +134,10 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
             await client.send_code_request(phone)
         except UserDeactivatedError as exc:
             raise AuthRequired("Telegram reported this account as deactivated.") from exc
+        except FloodWaitError as exc:
+            raise AuthRequired(
+                f"Telegram rate-limited login requests; wait {exc.seconds} seconds and try again."
+            ) from exc
         print("A login code was sent to the account owner via Telegram.")
 
         for _attempt in range(MAX_CODE_ATTEMPTS):

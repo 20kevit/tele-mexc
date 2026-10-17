@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import random
 import signal
 from typing import Any
@@ -187,14 +188,14 @@ class IngestService:
             chat_id = getattr(event, "chat_id", None)
             if not _is_target(chat_id):
                 return  # unrelated chat: never touched, message dropped
-            self._store_event_message(event.message, "live")
+            await self._store_event_message(event.message, "live")
 
         @self._client.on(events.MessageEdited())
         async def _on_edited(event: events.MessageEdited.Event) -> None:
             chat_id = getattr(event, "chat_id", None)
             if not _is_target(chat_id):
                 return
-            self._store_event_message(event.message, "live")
+            await self._store_event_message(event.message, "live")
 
         @self._client.on(events.Raw(UpdateDeleteChannelMessages))
         async def _on_deleted(update: UpdateDeleteChannelMessages) -> None:
@@ -204,7 +205,7 @@ class IngestService:
             changed = self.repo.mark_deleted(self._selected_channel_id or 0, update.messages)
             log.info("deletion event: %s message(s) newly marked deleted", changed)
 
-    def _store_event_message(self, message: Any, source: str) -> None:
+    async def _store_event_message(self, message: Any, source: str) -> None:
         assert self._selected_channel_id is not None
         try:
             rec = message_to_record(self._selected_channel_id, message, source)
@@ -219,10 +220,28 @@ class IngestService:
                     "live edit of %s stored (version %s -> %s)",
                     message.id, result.old_version, result.new_version,
                 )
+            await self._download_media_if_requested(message)
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "failed to store live message %s: %s", getattr(message, "id", "?"), exc.__class__.__name__
             )
+
+    async def _download_media_if_requested(self, message: Any) -> None:
+        """Optional, default-off media download (only when explicitly configured)."""
+
+        if not self.cfg.download_media or getattr(message, "media", None) is None:
+            return
+        try:
+            path = await self._client.download_media(message, file=str(self.cfg.media_dir))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "media download failed for message %s: %s", getattr(message, "id", "?"),
+                exc.__class__.__name__,
+            )
+            return
+        if path:
+            with contextlib.suppress(OSError):  # pragma: no cover
+                os.chmod(path, 0o600)
 
     # ------------------------------------------------------------ recovery
 

@@ -185,7 +185,7 @@ class TestServiceLifecycle:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(client.running_event.wait(), timeout=3)
         msg = FakeMsg(2000, "breaking signal", media=None)
-        svc._store_event_message(msg, "live")
+        await svc._store_event_message(msg, "live")
         stored = svc.repo.get_message_raw(100, 2000)
         assert stored is not None
         assert stored["source"] == "live"
