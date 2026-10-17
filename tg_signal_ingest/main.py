@@ -114,10 +114,12 @@ def cmd_config_check(_args) -> int:
         print(f"proxy config invalid: {exc}", file=sys.stderr)
         return 2
     print("configuration OK")
-    print("  api id / api hash: <present and redacted>")
+    id_state = 'set' if cfg.api_id else 'MISSING'
+    hash_state = 'set' if cfg.api_hash else 'MISSING'
+    print(f"  credentials: api_id={id_state}, api_hash={hash_state}")
     print(f"  proxy:  {cfg.proxy.type}://{cfg.proxy.host}:{cfg.proxy.port} enabled={cfg.proxy.enabled}")
     print(f"  database: {cfg.db_path}")
-    print(f"  session:  {cfg.session_path} .session")
+    print(f"  session:  {cfg.session_path}.session")
     print(f"  backfill: scope={cfg.backfill_scope} since={cfg.backfill_since}")
     return 0
 
