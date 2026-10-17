@@ -14,3 +14,17 @@ exposes a durable downstream processing queue for a future signal parser.
 
 See `docs/OPERATIONS.md` for the full operator guide and
 `docs/LIVE_VERIFICATION.md` for the manual Telegram verification procedure.
+
+## Known limitations (platform-imposed)
+
+- **Deletions during downtime** are not recoverable: Telegram only pushes
+  delete events to connected clients. What we can do (and do): mark deletions
+  received live, and re-fetch edited messages in the recovery window.
+- **Old edits outside the recovery window**: edits made while the service was
+  offline and older than `recovery_sweep_size` messages may not be re-fetched.
+- **Media contents** (photos/documents) are stored as references and metadata
+  only; a photo carrying a signal is marked `requires_ocr` in its media meta
+  and is never treated as parsed text. Downloading media is optional and
+  disabled by default.
+- Delete notifications bound to a channel are used only for that channel;
+  the service never accesses unrelated private conversations.
