@@ -13,6 +13,7 @@ from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.errors import (
+    ApiIdInvalidError,
     FloodWaitError,
     PhoneCodeEmptyError,
     PhoneCodeExpiredError,
@@ -134,6 +135,15 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
             await client.send_code_request(phone)
         except UserDeactivatedError as exc:
             raise AuthRequired("Telegram reported this account as deactivated.") from exc
+        except ApiIdInvalidError as exc:
+            raise AuthRequired(
+                "Telegram rejected the API credentials (api_id/api_hash pair invalid).\n"
+                "  1. Compare with https://my.telegram.org -> API development tools:\n"
+                "     run 'tg-ingest config check' and match api_id and api_hash first/last characters.\n"
+                "  2. Copy the values again (no quotes, no spaces) into .env, then retry.\n"
+                "  3. Apps created minutes ago may need a few minutes to propagate - retry later.\n"
+                "  4. If it persists, recreate the app and copy the new pair."
+            ) from exc
         except FloodWaitError as exc:
             raise AuthRequired(
                 f"Telegram rate-limited login requests; wait {exc.seconds} seconds and try again."

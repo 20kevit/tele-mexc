@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -104,6 +105,47 @@ def cmd_config_init(args) -> int:
     return 0
 
 
+def _credential_fingerprint(cfg) -> str:
+    """Safe, log-only description of the loaded credentials.
+
+    Never exposes the api_hash; only its length and outer characters so the
+    account owner can visually compare against my.telegram.org.
+    """
+
+    from .config import _read_kv_file  # local import: expose only what exists
+
+    root = Path(__file__).resolve().parents[1]
+    env_sources: list[str] = []
+    hash_value: str | None = cfg.api_hash
+    id_value: int | None = cfg.api_id
+
+    # determine where each value came from (process env can silently win over .env)
+    process_env_id = os.environ.get("TELEGRAM_API_ID")
+    process_env_hash = os.environ.get("TELEGRAM_API_HASH")
+    file_kv = _read_kv_file(root / ".env")
+    file_id = file_kv.get("TELEGRAM_API_ID")
+
+    if process_env_id:
+        env_sources.append("api_id taken from PROCESS ENVIRONMENT (overrides .env value!)")
+    if process_env_hash:
+        env_sources.append("api_hash taken from PROCESS ENVIRONMENT (overrides .env value!)")
+    if file_id and process_env_id and file_id != process_env_id:
+        env_sources.append("WARNING: process env api_id DIFFERS from the value inside .env")
+
+    parts = [f"api_id={id_value if id_value is not None else 'MISSING'}"]
+    if hash_value:
+        parts.append(f"api_hash={hash_value[:2]}...{hash_value[-2:]} (len={len(hash_value)})")
+    else:
+        parts.append("api_hash=MISSING")
+    if hash_value and len(hash_value) != 32:
+        parts.append(
+            "WARNING: api_hash length is not 32 (my.telegram.org hashes are exactly 32 hex chars)"
+        )
+    if env_sources:
+        parts.extend(env_sources)
+    return "; ".join(parts)
+
+
 def cmd_config_check(_args) -> int:
     cfg = _load_or_exit(require_credentials=False)
     from .proxy import telethon_proxy_arg
@@ -114,9 +156,7 @@ def cmd_config_check(_args) -> int:
         print(f"proxy config invalid: {exc}", file=sys.stderr)
         return 2
     print("configuration OK")
-    id_state = 'set' if cfg.api_id else 'MISSING'
-    hash_state = 'set' if cfg.api_hash else 'MISSING'
-    print(f"  credentials: api_id={id_state}, api_hash={hash_state}")
+    print(f"  credentials: {_credential_fingerprint(cfg)}")
     print(f"  proxy:  {cfg.proxy.type}://{cfg.proxy.host}:{cfg.proxy.port} enabled={cfg.proxy.enabled}")
     print(f"  database: {cfg.db_path}")
     print(f"  session:  {cfg.session_path}.session")
