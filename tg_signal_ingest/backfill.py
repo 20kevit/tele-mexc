@@ -18,7 +18,7 @@ import asyncio
 import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from telethon.errors import FloodWaitError
@@ -60,8 +60,7 @@ class _Page:
 async def _fetch_page(
     client: Any, entity_ref: int, offset_id: int, limit: int, min_bound: int
 ) -> list[Any]:
-    msgs: list[Any] = []
-    for attempt in range(MAX_FLOOD_RETRIES):
+    for _attempt in range(MAX_FLOOD_RETRIES):
         try:
             raw = await client.get_messages(entity_ref, limit=limit, offset_id=offset_id, min_id=min_bound)
             return [m for m in raw if m is not None]
@@ -76,7 +75,7 @@ def _resolve_since_dt(since: str | None) -> datetime | None:
     if not since:
         return None
     try:
-        return datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(since).replace(tzinfo=UTC)
     except ValueError as exc:
         raise BackfillError(f"invalid backfill_since value {since!r}") from exc
 
@@ -210,8 +209,8 @@ async def run_backfill(
         now = _utcnow()
         with repo.db.transaction() as conn:
             conn.execute(
-                "UPDATE sync_state SET backfill_status = 'done', backfill_completed_at = COALESCE(backfill_completed_at, ?), "
-                "backfill_next_max_id = NULL, updated_at = ? WHERE channel_id = ?",
+                "UPDATE sync_state SET backfill_status = 'done', backfill_completed_at = "
+                " COALESCE(backfill_completed_at, ?), backfill_next_max_id = NULL, updated_at = ? WHERE channel_id = ?",
                 (now, now, channel_id),
             )
         report.completed = True
@@ -231,4 +230,4 @@ def oldest_available_bottom(min_bound: int, oldest_id_seen: int | None, since_dt
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")

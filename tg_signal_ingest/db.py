@@ -83,7 +83,8 @@ MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE TABLE IF NOT EXISTS sync_state (
             channel_id                 INTEGER PRIMARY KEY,
-            backfill_target_mode       TEXT CHECK (backfill_target_mode IN ('full', 'since') OR backfill_target_mode IS NULL),
+            backfill_target_mode       TEXT CHECK (backfill_target_mode IN ('full', 'since')
+                                      OR backfill_target_mode IS NULL),
             backfill_since             TEXT,
             backfill_status            TEXT NOT NULL DEFAULT 'not_started'
                 CHECK (backfill_status IN ('not_started', 'in_progress', 'done')),
@@ -134,7 +135,10 @@ class Database:
                 if version in done:
                     continue
                 with self.transaction():
-                    self.conn.executescript(sql)
+                    # executescript would implicitly COMMIT; run statements one by one
+                    for statement in sql.split(";"):
+                        if statement.strip():
+                            self.conn.execute(statement)
                     self.conn.execute(
                         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
                         (version,),

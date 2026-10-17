@@ -45,8 +45,10 @@ def file_size_human(path: str) -> str:
         size = os.path.getsize(path)
     except OSError:
         return "?"
+    size_f = float(size)
     for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
-        size /= 1024
+        if size_f < 1024 or unit == "GB":
+            return f"{size_f:.1f} {unit}" if unit != "B" else f"{size_f} B"
+        size_f /= 1024
+    return f"{size_f} GB"
     return f"{size} GB"

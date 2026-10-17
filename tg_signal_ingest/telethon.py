@@ -7,6 +7,7 @@ proxy is misconfigured the client fails clearly.
 
 from __future__ import annotations
 
+import contextlib
 from getpass import getpass
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from telethon.errors import (
 )
 from telethon.errors.rpcerrorlist import UserDeactivatedError  # noqa: F401 (listed for docs)
 
-from .config import AppConfig, ConfigError, PROJECT_ROOT
+from .config import PROJECT_ROOT, AppConfig, ConfigError
 from .proxy import ProxyError, telethon_proxy_arg
 
 _AUTH_CODE_ERROR_TYPES = (PhoneCodeInvalidError, PhoneCodeExpiredError, PhoneCodeEmptyError)
@@ -35,10 +36,8 @@ def resolve_session_file(cfg: AppConfig) -> tuple[str, Path]:
         session = session.with_suffix(".session")
     parent = session.parent
     parent.mkdir(parents=True, exist_ok=True)
-    try:
+    with contextlib.suppress(OSError):  # pragma: no cover
         parent.chmod(0o700)
-    except OSError:  # pragma: no cover
-        pass
     return str(session.with_suffix("")), session
 
 
@@ -174,16 +173,13 @@ async def logout_and_delete_session(cfg: AppConfig, client: TelegramClient | Non
     outcome = "local session files removed (server revocation not confirmed)"
     try:
         await client.connect()
-        if client.is_user_authorized():
-            if await client.log_out():
-                outcome = "session revoked on Telegram servers (log_out) and local files removed"
+        if client.is_user_authorized() and await client.log_out():
+            outcome = "session revoked on Telegram servers (log_out) and local files removed"
     except (ProxyError, ConnectionError):
         pass  # still delete local files below
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
     _, session_file = resolve_session_file(cfg)
     for suffix in ("", "-journal"):
         candidate = Path(str(session_file) + suffix)

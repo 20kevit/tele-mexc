@@ -17,20 +17,22 @@ Operational model (per connection cycle inside ``run``):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import signal
 from typing import Any
 
-from telethon import TelegramClient, events, utils as tg_utils
+from telethon import TelegramClient, events
+from telethon import utils as tg_utils
 from telethon.errors import ChannelPrivateError, FloodWaitError, RPCError
 from telethon.tl.types import PeerChannel, UpdateDeleteChannelMessages
 
 from .backfill import BackfillError, BackfillReport, run_backfill
 from .config import AppConfig
 from .normalize import message_to_record
-from .proxy import ProxyError
 from .processing import ProcessingEngine
+from .proxy import ProxyError
 from .repository import Repository
 from .telethon import AuthRequired, build_client, connect_and_verify
 from .utils import marked_channel_id
@@ -73,10 +75,8 @@ class IngestService:
         for sig_name in ("SIGINT", "SIGTERM"):
             sig = getattr(signal, sig_name, None)
             if sig is not None:
-                try:
+                with contextlib.suppress(NotImplementedError, RuntimeError):  # pragma: no cover
                     loop.add_signal_handler(sig, self.request_stop)
-                except (NotImplementedError, RuntimeError):  # pragma: no cover
-                    pass
 
     # ------------------------------------------------------------ loop run
 
@@ -115,10 +115,8 @@ class IngestService:
                     log.error("unexpected service error (%s): %s", exc.__class__.__name__, str(exc)[:200])
                 if self._stop.is_set():
                     break
-                try:
+                with contextlib.suppress(Exception):
                     await self._client.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
                 self._build_fresh_client()
                 delay = min(backoff, self.cfg.reconnect_backoff_max_s) + random.uniform(0, backoff / 4)
                 backoff = min(backoff * 2, self.cfg.reconnect_backoff_max_s)
@@ -132,6 +130,9 @@ class IngestService:
     async def _run_once(self) -> None:
         self.cfg.ensure_dirs()
         await connect_and_verify(self.cfg, self._client)
+        recovered = self.repo.requeue_expired_claims()
+        if recovered:
+            log.info("re-queued %s item(s) left in 'processing' state by a previous crashed run", recovered)
         log.info("telegram session verified; transport=%s", self._describe_proxy())
         await self._resolve_channel_entity()
         self._register_handlers()
@@ -182,21 +183,21 @@ class IngestService:
                 return peer is not None and marked_channel_id(int(peer)) == marked
 
         @self._client.on(events.NewMessage())
-        async def _on_new(event: events.NewMessage.Event) -> None:  # type: ignore[name-defined]
+        async def _on_new(event: events.NewMessage.Event) -> None:
             chat_id = getattr(event, "chat_id", None)
             if not _is_target(chat_id):
                 return  # unrelated chat: never touched, message dropped
             self._store_event_message(event.message, "live")
 
         @self._client.on(events.MessageEdited())
-        async def _on_edited(event: events.MessageEdited.Event) -> None:  # type: ignore[name-defined]
+        async def _on_edited(event: events.MessageEdited.Event) -> None:
             chat_id = getattr(event, "chat_id", None)
             if not _is_target(chat_id):
                 return
             self._store_event_message(event.message, "live")
 
         @self._client.on(events.Raw(UpdateDeleteChannelMessages))
-        async def _on_deleted(update: UpdateDeleteChannelMessages) -> None:  # type: ignore[name-defined]
+        async def _on_deleted(update: UpdateDeleteChannelMessages) -> None:
             marked = tg_utils.get_peer_id(PeerChannel(update.channel_id))
             if not _is_target(marked):
                 return
@@ -291,7 +292,7 @@ class IngestService:
         return count
 
     def _store_message_direct(self, msg: Any, source: str) -> None:
-        upsert_result = self.repo.upsert_message(message_to_record(self._selected_channel_id or 0, msg, source))
+        self.repo.upsert_message(message_to_record(self._selected_channel_id or 0, msg, source))
 
     # ---------------------------------------------------------- background
 
@@ -355,10 +356,8 @@ class IngestService:
                 {stop_task, disconnect_done}, return_when=asyncio.FIRST_COMPLETED
             )
             if stop_task in done and self._stop.is_set():
-                try:
+                with contextlib.suppress(Exception):
                     await self._client.disconnect()
-                except Exception:  # noqa: BLE001
-                    pass
             elif disconnect_done in done:
                 log.info("telegram connection dropped (will reconnect with backoff)")
         finally:
@@ -374,10 +373,8 @@ class IngestService:
                 log.debug("telegram runner ended with %s", type(exc).__name__)
 
     async def _sleep_with_stop(self, seconds: float) -> None:
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            pass
 
     # ------------------------------------------------------------- cleanup
 
@@ -392,8 +389,6 @@ class IngestService:
                 pass
             except Exception:  # noqa: BLE001
                 pass
-        try:
+        with contextlib.suppress(Exception):
             await self._client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
         log.info("ingest service stopped")

@@ -14,7 +14,6 @@ Diagnostics never expose proxy credentials.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import socket
 import struct

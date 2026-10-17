@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .repository import QueueItem, Repository
 
@@ -105,7 +106,7 @@ class ProcessingEngine:
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.poll_interval)
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         log.info(
             "processing loop finished: processed=%s retried=%s failed=%s superseded=%s",

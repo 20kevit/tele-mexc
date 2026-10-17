@@ -19,16 +19,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import sys
 from pathlib import Path
 
 from .backfill import BackfillError, run_backfill
-from .config import ConfigError, PROJECT_ROOT, load_config
+from .config import PROJECT_ROOT, ConfigError, load_config
 from .db import Database
 from .proxy import ProxyError, run_proxy_diagnostics
 from .repository import Repository
-from .telethon import AuthRequired, build_client, connect_and_verify, interactive_login, logout_and_delete_session
+from .telethon import (
+    AuthRequired,
+    connect_and_verify,
+    interactive_login,
+    logout_and_delete_session,
+)
 from .utils import configure_logging, marked_channel_id
 
 ENV_TEMPLATE = """\
@@ -38,9 +42,9 @@ TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 
 # Proxy for ALL Telegram traffic (verified listener on this VPS):
-TELEGRAM_PROXY_TYPE={proxy_type}
-TELEGRAM_PROXY_HOST={proxy_host}
-TELEGRAM_PROXY_PORT={proxy_port}
+TELEGRAM_PROXY_TYPE={type}
+TELEGRAM_PROXY_HOST={host}
+TELEGRAM_PROXY_PORT={port}
 """
 
 CONFIG_TEMPLATE = """\
@@ -63,16 +67,17 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 DEFAULT_PROXY = {"type": "http", "host": "127.0.0.1", "port": 1081}
 
 
-def _load_or_exit():
+def _load_or_exit(require_credentials: bool = True):
     try:
-        return load_config()
+        return load_config(require_credentials=require_credentials)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2)  # noqa: B904 - deliberate non-traceable exit at CLI boundary
 
 
 def _new_repo(cfg):
     db = Database(cfg.db_path)
+    db.migrate()
     repo = Repository(db, processing_max_attempts=cfg.processing_max_attempts)
     return db, repo
 
@@ -100,7 +105,7 @@ def cmd_config_init(args) -> int:
 
 
 def cmd_config_check(_args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     from .proxy import telethon_proxy_arg
 
     try:
@@ -262,7 +267,7 @@ async def cmd_backfill_run(args) -> int:
 
 
 def cmd_backfill_status(_args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     sync = repo.sync_status()
     if sync.channel_id is None:
@@ -287,7 +292,7 @@ async def cmd_serve(_args) -> int:
 
 
 def cmd_status(_args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     sync = repo.sync_status()
     counts = repo.message_counts(sync.channel_id or 0)
@@ -311,13 +316,15 @@ def cmd_status(_args) -> int:
         print("  quiet channels show as silence; this is normal, not a failure")
     else:
         print("  no live messages recorded yet")
-    print(f"  queue: pending={queue['pending']} processing={queue['processing']} processed={queue['processed']} failed={queue['failed']}")
+    print("  queue: pending={p} processing={r} processed={d} failed={f}".format(
+        p=queue["pending"], r=queue["processing"], d=queue["processed"], f=queue["failed"]
+    ))
     db.close()
     return 0
 
 
 async def cmd_diag_proxy(_args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     try:
         diag = run_proxy_diagnostics(cfg)
     except ProxyError as exc:
@@ -369,7 +376,7 @@ async def cmd_diag_telegram(_args) -> int:
 
 
 def cmd_messages_list(args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     selected = repo.selected_channel()
     rows = repo.list_messages(selected.channel_id if selected else None, limit=args.limit, newest_first=not args.oldest)
@@ -377,13 +384,14 @@ def cmd_messages_list(args) -> int:
         deleted = " [DELETED]" if r["deleted"] else ""
         media = f" media={r['media_type']}" if r["media_type"] else ""
         text_preview = (r["text_preview"] or "").replace("\n", " ")
-        print(f"id={r['message_id']:<8} {r['datetime']:<20} v{r['processing_version']}{media}{deleted} {text_preview!r}")
+        print(f"id={r['message_id']:<8} {r['datetime']:<20} v{r['processing_version']}"
+              f"{media}{deleted} {text_preview!r}")
     db.close()
     return 0
 
 
 def cmd_messages_show(args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     selected = repo.selected_channel()
     if selected is None:
@@ -403,13 +411,14 @@ def cmd_messages_show(args) -> int:
         print(f"edit history ({len(edits)} previous version(s)):")
         for e in edits:
             prev = (e["text"] or e["caption"] or "").replace("\n", " ")
-            print(f"  seq={e['edit_seq']} edit_date={e['edit_datetime']} captured={e['captured_at']} text={prev[:80]!r}")
+            print(f"  seq={e['edit_seq']} edit_date={e['edit_datetime']}"
+                  f" captured={e['captured_at']} text={prev[:80]!r}")
     db.close()
     return 0
 
 
 def cmd_queue_list(args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     counts = repo.queue_counts()
     print(
@@ -426,7 +435,7 @@ def cmd_queue_list(args) -> int:
 
 
 def cmd_queue_retry(args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     changed = repo.retry_failed()
     print(f"re-queued {changed} failed item(s)")
@@ -435,7 +444,7 @@ def cmd_queue_retry(args) -> int:
 
 
 def cmd_queue_reprocess(args) -> int:
-    cfg = _load_or_exit()
+    cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
     selected = repo.selected_channel()
     if selected is None:

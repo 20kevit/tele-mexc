@@ -119,7 +119,9 @@ def _read_toml(path: Path) -> dict[str, object]:
         raise ConfigError(f"Cannot read {path.name}: {exc.__class__.__name__}") from exc
 
 
-def load_config(root: Path = PROJECT_ROOT, environ: dict[str, str] | None = None) -> AppConfig:
+def load_config(
+    root: Path = PROJECT_ROOT, environ: dict[str, str] | None = None, require_credentials: bool = True
+) -> AppConfig:
     """Build a validated configuration from toml + .env + environment."""
 
     env = dict(os.environ if environ is None else environ)
@@ -204,9 +206,9 @@ def load_config(root: Path = PROJECT_ROOT, environ: dict[str, str] | None = None
     if isinstance(host, str) and host:
         cfg.proxy.host = host
     port = proxy_cfg.get("port")
-    if port is not None:
+    if isinstance(port, (int, str)) and not isinstance(port, bool):
         try:
-            cfg.proxy.port = int(port) if isinstance(port, str) else port
+            cfg.proxy.port = int(port)
         except ValueError as exc:
             raise ConfigError("proxy.port must be an integer.") from exc
     username = proxy_cfg.get("username")
@@ -224,7 +226,8 @@ def load_config(root: Path = PROJECT_ROOT, environ: dict[str, str] | None = None
     since = _get(toml, "backfill_since")
     if isinstance(since, str) and since:
         cfg.backfill_since = since
-    opts: dict[str, object] = toml.get("options", {}) if isinstance(toml.get("options"), dict) else {}
+    raw_opts = toml.get("options", {})
+    opts: dict[str, object] = dict(raw_opts) if isinstance(raw_opts, dict) else {}
     sweep = opts.get("recovery_sweep_size")
     if isinstance(sweep, int) and sweep > 0:
         cfg.recovery_sweep_size = sweep
@@ -238,12 +241,12 @@ def load_config(root: Path = PROJECT_ROOT, environ: dict[str, str] | None = None
     if isinstance(lvl, str) and lvl.upper() in ("DEBUG", "INFO", "WARNING", "ERROR"):
         cfg.log_level = lvl.upper()
 
-    _validate(cfg)
+    _validate(cfg, require_credentials=require_credentials)
     return cfg
 
 
-def _validate(cfg: AppConfig) -> None:
-    if cfg.api_id is None or cfg.api_hash is None:
+def _validate(cfg: AppConfig, require_credentials: bool = True) -> None:
+    if require_credentials and (cfg.api_id is None or cfg.api_hash is None):
         raise ConfigError(
             "Telegram API credentials are missing. "
             f"Set {API_ID_ENV} and {API_HASH_ENV} in a private .env file "

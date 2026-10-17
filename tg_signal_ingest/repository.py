@@ -6,22 +6,21 @@ All writes are transactional. The logical message identity is
 
 from __future__ import annotations
 
-import json
-import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Any, Iterable, Sequence
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Any
 
 from .db import Database
 from .normalize import StoredMessage
 
-UTC_NOW = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")  # noqa: E731
+UTC_NOW = lambda: datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")  # noqa: E731
 
 MAX_QUEUE_ERROR_LEN = 400
 
 
-class UpsertOutcome(str, Enum):
+class UpsertOutcome(StrEnum):
     INSERTED = "inserted"
     UPDATED = "updated"
     UNCHANGED = "unchanged"
@@ -89,6 +88,7 @@ class Repository:
     def __init__(self, db: Database, processing_max_attempts: int = 8):
         self.db = db
         self.processing_max_attempts = processing_max_attempts
+        self.retry_backoff_scale = 1.0  # tests set 0 for deterministic retries
 
     # ----------------------------------------------------------- channels
 
@@ -234,7 +234,8 @@ class Repository:
             )
             conn.execute(
                 """
-                INSERT INTO message_edits (channel_id, message_id, edit_seq, edit_datetime, captured_at, text, caption, source)
+                INSERT INTO message_edits (channel_id, message_id, edit_seq, edit_datetime,
+                    captured_at, text, caption, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (channel_id, message_id, edit_seq) DO NOTHING
                 """,
@@ -367,7 +368,9 @@ class Repository:
                 (channel_id, mode, since, start_next_max_id, None, now, now, now),
             )
 
-    def backfill_checkpoint(self, channel_id: int, next_max_id: int | None, oldest_id_seen: int | None, count_delta: int) -> None:
+    def backfill_checkpoint(
+        self, channel_id: int, next_max_id: int | None, oldest_id_seen: int | None, count_delta: int
+    ) -> None:
         now = UTC_NOW()
         with self.db.transaction() as conn:
             conn.execute(
@@ -387,7 +390,8 @@ class Repository:
         with self.db.transaction() as conn:
             conn.execute(
                 """
-                UPDATE sync_state SET backfill_status = 'done', backfill_completed_at = COALESCE(backfill_completed_at, ?),
+                UPDATE sync_state SET backfill_status = 'done',
+                    backfill_completed_at = COALESCE(backfill_completed_at, ?),
                     backfill_oldest_id_seen = COALESCE(backfill_oldest_id_seen, ?), updated_at = ?
                 WHERE channel_id = ?
                 """,
@@ -497,14 +501,13 @@ class Repository:
         return items
 
     def requeue_expired_claims(self) -> int:
-        """Recover items claimed by a worker that died; called at startup."""
+        """Recover items claimed by a dead worker; called at service startup
+        *before* the queue consumer starts (so nothing legit is re-claimed)."""
 
-        now = UTC_NOW()
         with self.db.transaction() as conn:
             res = conn.execute(
                 "UPDATE processing_queue SET status = 'pending', claimed_at = NULL "
-                "WHERE status = 'processing' AND (claimed_at IS NULL OR claimed_at < ?)",
-                (now,),
+                "WHERE status = 'processing'"
             )
             return res.rowcount
 
@@ -528,12 +531,20 @@ class Repository:
                 )
             else:
                 # bounded exponential backoff: 1s, 2s, 4s, 8s, ... capped at 60s
-                delay = min(60, 2 ** (attempts - 1))
+                delay = min(60.0, 2.0 ** (attempts - 1)) * self.retry_backoff_scale
+                if delay < 0.001:
+                    delay = 0.0
+                available_at = (
+                    (datetime.now(UTC) + timedelta(seconds=delay))
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                    if delay
+                    else UTC_NOW()
+                )
                 conn.execute(
                     "UPDATE processing_queue SET status = 'pending', attempts = ?, last_error = ?, "
                     "available_at = ? WHERE queue_id = ?",
-                    (attempts, safe_error, (datetime.now(timezone.utc) + timedelta(seconds=delay))
-                     .isoformat(timespec="seconds").replace("+00:00", "Z"), item.queue_id),
+                    (attempts, safe_error, available_at, item.queue_id),
                 )
 
     def queue_counts(self) -> dict[str, int]:
@@ -556,7 +567,11 @@ class Repository:
             return res.rowcount
 
     def reprocess_message(self, channel_id: int, message_id: int) -> int:
-        """Re-enqueue the current version of a message (e.g. after parser update)."""
+        """Re-enqueue the current version of a message (e.g. after parser update).
+
+        The version-based UNIQUE constraint prevents duplicate rows, so an
+        explicit reprocess resets the existing row for its version instead.
+        """
 
         with self.db.transaction() as conn:
             row = conn.execute(
@@ -567,7 +582,14 @@ class Repository:
                 raise KeyError(f"message {channel_id}/{message_id} not found")
             version = row["processing_version"]
             item_type = "message" if version == 0 else "edit"
-            self._enqueue_locked(conn, channel_id, message_id, item_type, version)
+            reset = conn.execute(
+                "UPDATE processing_queue SET status = 'pending', attempts = 0, "
+                "available_at = ?, processed_at = NULL, claimed_at = NULL, last_error = NULL "
+                "WHERE channel_id = ? AND message_id = ? AND item_type = ? AND targets_version = ?",
+                (UTC_NOW(), channel_id, message_id, item_type, version),
+            )
+            if reset.rowcount == 0:
+                self._enqueue_locked(conn, channel_id, message_id, item_type, version)
             return version
 
     def list_queue(self, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
