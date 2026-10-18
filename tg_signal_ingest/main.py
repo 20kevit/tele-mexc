@@ -189,10 +189,59 @@ async def cmd_auth_check(_args) -> int:
     return 0
 
 
+def _ingestion_process_running(cfg) -> str | None:
+    """Describe a process that may be using the session, or None.
+
+    Checks the deployed systemd unit and any live 'serve' process. Never
+    inspects session contents; only process/service state.
+    """
+
+    import subprocess
+
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "tg-ingest"],
+            capture_output=True,
+            timeout=10,
+        )
+        if active.returncode == 0:
+            return "systemd unit 'tg-ingest' is active"
+    except (OSError, subprocess.SubprocessError):
+        pass  # systemd unavailable; fall through to the process scan
+    try:
+        hit = subprocess.run(
+            ["pgrep", "-f", r"tg-ingest serve|tg_signal_ingest\.service"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if hit.returncode == 0 and hit.stdout.strip():
+            return f"process(es) matching 'serve' are running (pid {hit.stdout.split()[0]})"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 async def cmd_auth_logout(_args) -> int:
     cfg = _load_or_exit()
+    offender = _ingestion_process_running(cfg)
+    if offender:
+        print(
+            f"refusing logout: {offender} and may be using the session.\n"
+            "Stop ingestion first, e.g. 'systemctl stop tg-ingest' "
+            "(or stop the 'tg-ingest serve' process), then run logout again.",
+            file=sys.stderr,
+        )
+        return 1
     outcome = await logout_and_delete_session(cfg)
     print(outcome)
+    if "revoked on Telegram servers" not in outcome:
+        print(
+            "note: the session key may still be valid on Telegram's side; "
+            "it expires with 'Settings -> Devices -> Terminate session' if needed.",
+            file=sys.stderr,
+        )
+    print("Verify with: tg-ingest auth check, then a different account can log in with: tg-ingest auth login")
     return 0
 
 
