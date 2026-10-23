@@ -8,6 +8,7 @@ built here, and never mix the two kinds of assertion.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -383,6 +384,10 @@ class TestRebuildSignalIndex:
         assert sig["entry_price"] == "270"
         assert sig["stop_loss"] == "264"
         assert sig["targets_json"]
+        assert json.loads(sig["targets_json"]) == [
+            {"index": 1, "price": "275"},
+            {"index": 2, "price": "280"},
+        ]
         assert sig["origin_message_id"] == 500
         assert sig["status"] == "active"
         # execution always starts at 'none' (never traded by this pipeline)
@@ -402,6 +407,82 @@ class TestRebuildSignalIndex:
         assert stats2.links_updated == 0
         row_count = _rows(repo.db, "SELECT COUNT(*) c FROM channel_signals")[0]["c"]
         assert row_count == 1
+
+    def test_plan_from_persisted_shape_keeps_targets_and_ambiguities(self):
+        """Regression: plan built from persisted candidate rows (the apply
+        path) must carry the parsed targets/ambiguities through.
+
+        Persisted rows store them as ``targets_json``/``ambiguities_json``
+        JSON strings; before the fix the plan only read the in-memory
+        ``targets``/``ambiguities`` keys and silently stored '[]'.
+        """
+
+        candidate = {
+            "candidate_id": "cand-1",
+            "channel_id": CHANNEL,
+            "message_id": 500,
+            "edit_version": 0,
+            "source_datetime": "2026-10-23T05:15:02Z",
+            "source_text_sha256": "x",
+            "parser_version": 2,
+            "classification": "new_signal",
+            "market_type": "non_spot",
+            "symbol": "AAVEUSDT",
+            "quote_asset": "USDT",
+            "side": "buy",
+            "entry_price": "270",
+            "entry_low_price": None,
+            "entry_high_price": None,
+            "stop_loss": "264",
+            "targets_json": '[{"index": 1, "price": "275"}]',
+            "order_type": None,
+            "referenced_message_id": None,
+            "parent_candidate_id": None,
+            "relationship": "none",
+            "parse_status": "parsed",
+            "field_confidence_json": "{}",
+            "ambiguities_json": '["stop_loss_not_below_entry"]',
+            "idempotency_key": "k1",
+            "status": "current",
+            "review_status": "unreviewed",
+            "reviewed_at": None,
+            "created_at": "2026-10-23T09:13:52Z",
+            "updated_at": "2026-10-23T09:13:52Z",
+            "logical_id": 301,
+            "followed_logical_id": None,
+            "direction": "long",
+            "exchange": "TOOBIT",
+            "symbol_raw": "AAVEUSDT.P",
+            "timeframe": 15,
+            "full_target": "290",
+            "deposit_pct": "1.00",
+            "suggested_leverage": "8",
+            "leverage_pct": "-17.39",
+            "follow_up_event": None,
+            "target_index": None,
+            "profit_pct": None,
+            "event_price": None,
+            "source_date_text": "1405/08/01",
+            "source_time_text": "08:45",
+            "source_timestamp_iso": "2026-10-23T05:15:00Z",
+            # NOTE: no "targets"/"ambiguities" keys — the persisted shape.
+        }
+        message = {
+            "message_id": 500,
+            "reply_to_message_id": None,
+            "reply_resolved_logical_id": None,
+        }
+        plan, stats = build_plan(
+            channel_id=CHANNEL,
+            messages=[message],
+            candidates_by_message={500: candidate},
+        )
+        assert stats.signals_planned == 1
+        sig = plan.signals[(CHANNEL, 301)]
+        assert json.loads(sig.fields["targets_json"]) == [{"index": 1, "price": "275"}]
+        assert json.loads(sig.fields["ambiguities_json"]) == [
+            "stop_loss_not_below_entry"
+        ]
 
     def test_apply_records_candidates_with_parser_version_2(self, repo):
         _put(repo, 500, INITIAL_301)

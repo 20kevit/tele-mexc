@@ -126,6 +126,30 @@ def _decimal_text(value: Any) -> str | None:
     return format(value, "f")
 
 
+def _planned_lists(candidate: dict[str, Any]) -> tuple[list[Any], list[Any]]:
+    """Read (targets, ambiguities) from either candidate shape.
+
+    In-memory candidates carry ``targets``/``ambiguities`` lists; persisted
+    rows (the apply path) carry ``targets_json``/``ambiguities_json`` JSON
+    strings. Before this normalization only the in-memory shape passed its
+    lists into the plan, so applies built from persisted rows stored '[]'
+    even when the candidate held parsed targets/ambiguities.
+    """
+
+    def _read(value: Any, fallback: Any) -> list[Any]:
+        if value is None:
+            try:
+                value = json.loads(fallback or "[]")
+            except (TypeError, ValueError):
+                value = []
+        return value if isinstance(value, list) else []
+
+    return (
+        _read(candidate.get("targets"), candidate.get("targets_json")),
+        _read(candidate.get("ambiguities"), candidate.get("ambiguities_json")),
+    )
+
+
 def _candidate_row_shaped(
     parsed: Any, *, message_id: int, edit_version: int, parser_version: int
 ) -> dict[str, Any]:
@@ -245,6 +269,7 @@ def build_plan(
             and logical_id is not None
             and str(candidate["parse_status"]) == "parsed"
         ):
+            planned_targets, planned_ambiguities = _planned_lists(candidate)
             key = (channel_id, int(logical_id))
             existing = plan.signals.get(key)
             if existing is None:
@@ -261,7 +286,7 @@ def build_plan(
                         "entry_price": candidate.get("entry_price"),
                         "stop_loss": candidate.get("stop_loss"),
                         "targets_json": json.dumps(
-                            candidate.get("targets") or [], sort_keys=True
+                            planned_targets, sort_keys=True
                         ),
                         "full_target": candidate.get("full_target"),
                         "deposit_pct": candidate.get("deposit_pct"),
@@ -273,7 +298,7 @@ def build_plan(
                         "classification": classification,
                         "parse_status": candidate.get("parse_status"),
                         "ambiguities_json": json.dumps(
-                            candidate.get("ambiguities") or [], ensure_ascii=False
+                            planned_ambiguities, ensure_ascii=False
                         ),
                     },
                     origin_message_id=message_id,
@@ -292,6 +317,7 @@ def build_plan(
                     existing.origin_parser_version = int(
                         candidate.get("parser_version") or 0
                     )
+                    dup_targets, dup_ambiguities = _planned_lists(candidate)
                     existing.fields = {
                         "direction": candidate.get("direction"),
                         "exchange": candidate.get("exchange"),
@@ -302,7 +328,7 @@ def build_plan(
                         "entry_price": candidate.get("entry_price"),
                         "stop_loss": candidate.get("stop_loss"),
                         "targets_json": json.dumps(
-                            candidate.get("targets") or [], sort_keys=True
+                            dup_targets, sort_keys=True
                         ),
                         "full_target": candidate.get("full_target"),
                         "deposit_pct": candidate.get("deposit_pct"),
@@ -314,7 +340,7 @@ def build_plan(
                         "classification": classification,
                         "parse_status": candidate.get("parse_status"),
                         "ambiguities_json": json.dumps(
-                            candidate.get("ambiguities") or [], ensure_ascii=False
+                            dup_ambiguities, ensure_ascii=False
                         ),
                     }
                 else:
