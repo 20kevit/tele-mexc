@@ -920,6 +920,10 @@ class MexcCliAdapter:
                 _pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"
             ),
             "clientOrderId": body.get("clientOrderId"),
+            "triggerPrice": _pick(data, "triggerPrice", "trigger_price"),
+            "triggerLimitPrice": _pick(
+                data, "triggerLimitPrice", "trigger_limit_price"
+            ),
             "raw": data,
         }
 
@@ -1016,8 +1020,16 @@ class MexcCliAdapter:
             ),
             "price": _pick(data, "price"),
             "type": _normalize_order_type(_pick(data, "orderType", "order_type")),
-            "profitTriggerPrice": _pick(data, "profitTriggerPrice", "profitTriggerprice"),
-            "loseTriggerPrice": _pick(data, "loseTriggerPrice", "loseTriggerprice"),
+            # Attached-protection path echoes profitTriggerPrice/loseTriggerPrice;
+            # the native OCO path echoes triggerPrice/triggerLimitPrice.  Read
+            # both so a read-only detail query can confirm either trigger.
+            "profitTriggerPrice": _pick(
+                data, "profitTriggerPrice", "profitTriggerprice", "triggerPrice", "trigger_price"
+            ),
+            "loseTriggerPrice": _pick(
+                data, "loseTriggerPrice", "loseTriggerprice", "triggerLimitPrice",
+                "trigger_limit_price",
+            ),
             "raw": data,
         }
 

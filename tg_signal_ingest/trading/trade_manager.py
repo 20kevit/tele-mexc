@@ -99,6 +99,17 @@ def _dec(value: Any) -> Decimal | None:
         return None
 
 
+def _optional_decimal(value: Any) -> Decimal | None:
+    """Return a Decimal or None, without converting empty/invalid to zero."""
+    if value in (None, ""):
+        return None
+    try:
+        d = Decimal(str(value))
+        return d if d.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
 def _first(values: list[Decimal | str] | tuple[Decimal, ...] | None) -> Decimal | None:
     if not values:
         return None
@@ -1295,8 +1306,12 @@ class TradeManager:
             exchange_order_id=str(exchange_id),
             exchange_status=result.get("state") or result.get("status"),
             sold_qty=executed,
+            stop_trigger_price=_dec(result.get("trigger_price")),
         )
-        self._notify_trade(trade, f"OCO_SUBMITTED_{target.upper()}", f"{target} OCO {qty} @ {price} SL @ {stop_price}")
+        self._notify_trade(
+            trade, f"OCO_SUBMITTED_{target.upper()}",
+            f"{target} OCO {qty} @ {price} SL @ {stop_price} trigger @ {result.get('trigger_price')}",
+        )
         self._reconcile_trade_orders(trade)
         return {
             "exchange_order_id": str(exchange_id),
