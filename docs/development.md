@@ -46,12 +46,13 @@ contact Telegram or MEXC. Shared fakes live in `tests/conftest.py` and
 | Config precedence/caps | `test_config.py`, `test_trading_config.py` |
 | Schema/migrations | `test_db_migrations.py` |
 | Message/queue semantics | `test_repository.py`, `test_processing.py`, `test_backfill.py` |
-| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_channel_trading_boundary.py` |
+| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_channel_trading_boundary.py`, `test_service_activation_boundary.py` |
 | Parser/risk/sizing | `test_signals.py`, `test_sizing.py` |
 | Intent/budget/execution | `test_trading_engine.py`, `test_trading_budget.py`, `test_trading_live_gates.py`, `test_mexc_execution_gates.py` |
 | Reconciliation/fills | `test_trading_live_gates.py`, `test_balance.py` |
 | Trade lifecycle (simulated) | `test_trading_conditional_entry.py`, `test_trading_tp_sl.py`, `test_trading_monitor.py` |
 | MEXC contract | `test_mexc_client.py`, `test_mexc_official_contract.py`, `test_symbols.py` |
+| MEXC rate limits/hybrid | `test_mexc_client.py`, `test_mexc_hybrid.py`, `test_trading_monitor.py` |
 | MEXC CLI adapter/preflight | `test_mexc_cli_adapter.py`, `test_trading_preflight.py`, `test_trading_cli_protection.py`, `test_config_mexc_cli.py` |
 | Management/control | `test_management_*.py`, `test_control_*.py` |
 

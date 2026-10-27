@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..config import AppConfig
-from ..mexc import MexcSpotClient, SymbolRegistry
+from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..mexc.errors import MexcError
 from ..repository import Repository
 from ..trading.balance import BalanceError, parse_account
@@ -687,11 +687,23 @@ class ControlBot:
     def _make_mexc_client(self, key: str, secret: str) -> Any:
         if self._mexc_client_factory is not None:
             return self._mexc_client_factory(key, secret)
+        state_dir = self.cfg.data_dir
+        state_dir.mkdir(parents=True, exist_ok=True)
         return MexcSpotClient(
             key, secret, base_url=self.cfg.mexc.base_url,
             recv_window_ms=self.cfg.mexc.recv_window_ms,
             connect_timeout_s=self.cfg.mexc.connect_timeout_s,
             request_timeout_s=self.cfg.mexc.request_timeout_s,
+            general_gate=SharedWeightedRateGate(
+                max(1, self.cfg.mexc.max_ip_weight_per_10s),
+                10.0,
+                state_path=state_dir / "mexc-rate-limit-ip.json",
+            ),
+            uid_gate=SharedWeightedRateGate(
+                max(1, self.cfg.mexc.max_uid_weight_per_10s),
+                10.0,
+                state_path=state_dir / "mexc-rate-limit-uid.json",
+            ),
         )
 
     async def _finish_mexc_verification(self, chat_id: int, client: Any, *, store_new: bool) -> None:

@@ -171,7 +171,9 @@ with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable.
 7. Fills are idempotent by exchange trade id. `fill_sync_required` keeps terminal
    intents in the reconciliation set until fills match executed quantity.
 8. Notifications are idempotent by `(event_key, role)` and never gate execution.
-9. `app_state` activation boundary is forward-only.
+9. `app_state` activation boundary is forward-only; each `serve` cycle snapshots
+   the newest pre-handler message id, and `source='recovery'/'backfill'` remains
+   non-tradeable even above the boundary.
 
 ## Backup and integrity
 

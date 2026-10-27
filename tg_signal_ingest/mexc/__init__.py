@@ -19,7 +19,7 @@ from .cli import (
     discover_binary,
     parse_version,
 )
-from .client import MexcSpotClient, WeightedRateGate
+from .client import MexcSpotClient, SharedWeightedRateGate, WeightedRateGate
 from .credentials import (
     REQUIRED_SPOT_PERMISSIONS,
     WRITE_PERMISSION,
@@ -68,6 +68,7 @@ from .symbols import SymbolMeta, SymbolRegistry, SymbolValidationError
 
 __all__ = [
     "MexcSpotClient",
+    "SharedWeightedRateGate",
     "WeightedRateGate",
     "MexcError",
     "MexcConfigError",

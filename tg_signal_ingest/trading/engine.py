@@ -132,6 +132,11 @@ class TradingEngine:
                 boundary = self.store.activation_boundary()
                 if record.get("source") == "backfill":
                     reason = "historical backfill message; only new Telegram messages can trade"
+                elif record.get("source") == "recovery":
+                    reason = (
+                        "message recovered while bridging an outage; only messages "
+                        "delivered live after startup can trade"
+                    )
                 elif boundary is None:
                     reason = "trading activation boundary is not set; refusing to trade"
                 else:
@@ -190,6 +195,14 @@ class TradingEngine:
             and record.get("source") == "backfill"
         ):
             replay_reason = "historical backfill message; only new Telegram messages can trade"
+        elif (
+            self.cfg.trading.mode in ("testonly", "live")
+            and record.get("source") == "recovery"
+        ):
+            replay_reason = (
+                "message recovered while bridging an outage; only messages "
+                "delivered live after startup can trade"
+            )
         elif self.cfg.trading.mode in ("testonly", "live"):
             boundary = self.store.activation_boundary()
             if boundary is None:
@@ -263,7 +276,11 @@ class TradingEngine:
             return None
         decision = quantized
 
-        self.store.update_signal(signal_id, "validated")
+        if existing_intent is None:
+            # A duplicate delivery of an already-intended message must not
+            # temporarily downgrade a terminal rejected/open signal back to
+            # 'validated'.  create_intent reconciles the durable state.
+            self.store.update_signal(signal_id, "validated")
         try:
             intent, inserted = self.store.create_intent(
                 signal=parsed,
@@ -288,7 +305,12 @@ class TradingEngine:
 
         if not inserted:
             reason = f"intent already exists for Telegram message ({intent['intent_id']})"
-            self.store.update_signal(signal_id, "superseded", reason)
+            if str(intent.get("signal_id") or "") != signal_id:
+                # A different (newer) edit version cannot create a second
+                # order.  A same-version duplicate delivery, however, must not
+                # rewrite the existing signal as superseded; that would hide a
+                # terminal rejected/planned state.
+                self.store.update_signal(signal_id, "superseded", reason)
             self.store.audit(signal_id, "lifecycle", "duplicate_intent", reason)
             return self._resume_planned_intent(intent, parsed, reference)
 
@@ -371,9 +393,12 @@ class TradingEngine:
         return boundary is None or item.message_id <= boundary
 
     def _is_historical(self, item: QueueItem, record: dict[str, Any]) -> bool:
-        """True for backfill or any message at/below the activation boundary."""
+        """True for backfill/recovery or any message at/below the boundary."""
 
-        return record.get("source") == "backfill" or self._is_at_or_below_boundary(item)
+        return (
+            record.get("source") in ("backfill", "recovery")
+            or self._is_at_or_below_boundary(item)
+        )
 
     @staticmethod
     def idempotency_key(channel_id: int, message_id: int, signal: ParsedSignal) -> str:
@@ -407,9 +432,41 @@ class TradingEngine:
             if price is None:
                 return None
             value = Decimal(str(price))
+        except (MexcRateLimitError, MexcWafError):
+            # Let the caller distinguish throttling from an ordinary missing
+            # price so it can honor Retry-After instead of polling again.
+            raise
         except (MexcError, InvalidOperation, TypeError, ValueError):
             return None
         return value if value.is_finite() and value > 0 else None
+
+    def fetch_market_prices(self, symbols: Iterable[str]) -> dict[str, Decimal]:
+        """Read one batch ticker snapshot for all subscribed symbols.
+
+        ``GET /api/v3/ticker/price`` without a symbol returns every ticker for
+        the documented IP weight of 10, so N monitored symbols cost one request
+        instead of N.  Rate-limit/WAF errors propagate for the feed's backoff.
+        """
+
+        wanted = {str(s).upper() for s in symbols if s}
+        if self.client is None or not wanted:
+            return {}
+        raw = self.client.ticker_price()
+        entries = [raw] if isinstance(raw, dict) else list(raw or [])
+        out: dict[str, Decimal] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            symbol = str(entry.get("symbol") or "").upper()
+            if symbol not in wanted:
+                continue
+            try:
+                value = Decimal(str(entry.get("price")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if value.is_finite() and value > 0:
+                out[symbol] = value
+        return out
 
     def _symbol_meta(self, symbol: str | None) -> Any | None:
         if self.cfg.trading.mode == "sim" or not symbol:

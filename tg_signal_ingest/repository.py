@@ -348,6 +348,15 @@ class Repository:
         rows = self.db.conn.execute(sql, base_params).fetchall()
         return [dict(r) for r in rows]
 
+    def max_message_id(self, channel_id: int) -> int:
+        """Newest stored message id for one channel (0 when empty)."""
+
+        row = self.db.conn.execute(
+            "SELECT COALESCE(MAX(message_id), 0) AS m FROM messages WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+        return int(row["m"] or 0)
+
     def message_counts(self, channel_id: int) -> MessageCounts:
         row = self.db.conn.execute(
             "SELECT COUNT(*) AS total, SUM(deleted) AS deleted, "

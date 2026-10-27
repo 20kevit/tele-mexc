@@ -42,11 +42,15 @@ Implemented in `tg_signal_ingest/service.py`.
 3. Connect to Telegram directly, verify the saved session, resolve the selected
    channel.
 4. Requeue queue items left in `processing` by a crashed run.
-5. On the first connection cycle, read the channel's newest message id.
-6. Persist/advance the tradeable activation boundary.
+5. Snapshot the selected channel's newest already-stored message id, before
+   live handlers are attached.
+6. Persist/advance the tradeable activation boundary to that snapshot (forward
+   only), still before handlers are attached. A message delivered after the
+   snapshot stays above the boundary.
 7. Attach live new-message, edit, and delete handlers.
 8. If a previous watermark exists, sweep the id gap for messages posted while
-   offline; refresh the recent window to catch edits.
+   offline; those rows are `source='recovery'` and non-tradeable; refresh the
+   recent window to catch edits.
 9. Start background workers:
    - history import if `not_started` or `in_progress`;
    - processing-queue consumer;
@@ -139,8 +143,9 @@ stdlib `urllib` in a worker thread. It provides:
 
 - HMAC-SHA256 signing over the same sorted, URL-encoded parameter string that is
   sent; TLS verification stays on.
-- Separate weighted rate gates for general and order buckets; 429/418/403
-  trigger a global backoff honoring `Retry-After`, with a conservative default.
+- Documented per-endpoint weights, file-backed shared IP/UID/order gates, one
+  batch ticker request per monitor interval; 429/418/403 trigger a per-process
+  backoff honoring `Retry-After`, with a conservative default.
 - Typed errors; 5xx/network/unknown submit outcomes are ambiguous.
 - Dynamic symbol metadata and precision validation from `exchangeInfo`.
 - Decimal-only order-book parsing and depth validation.

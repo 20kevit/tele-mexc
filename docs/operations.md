@@ -161,9 +161,20 @@ systemctl is-active tg-ingest
 journalctl -u tg-ingest -n 50 --no-pager
 ```
 
-A restart advances the trading activation boundary to the channel's newest
-message. Everything older becomes non-tradeable history. Expect this on every
-restart.
+A restart advances the trading activation boundary to the newest message
+already stored **before live handlers are registered**. Everything at or below
+that snapshot becomes non-tradeable history. Messages recovered during the
+startup sweep remain above the snapshot but are non-tradeable by
+`source='recovery'`; a genuinely new live message delivered after the snapshot
+is still tradeable. Expect the boundary to advance on every restart, and do not
+rewrite it manually.
+
+MEXC REST calls are protected by a shared, file-backed weight limiter. The
+defaults are `60` IP weight/10 s and `100` UID weight/10 s (official limits are
+`300` and `500`). The order/cancel gate is `12` requests/second. The limiter
+state lives under `data/mexc-rate-limit-*.json`; do not delete it while a
+process is running. A `429` or `418` is honored via `Retry-After`; do not retry
+in a tight loop.
 
 ## Bots and offline pipelines
 
@@ -282,6 +293,22 @@ with the live/testonly credentials configured. In `sim` it is a local no-op for
 live rows. Repeat after network recovery. Do not cancel or resubmit based only on
 a local guess; inspect the exchange order id/status.
 
+### Terminal-intent / signal consistency repair
+
+Code now performs this synchronization inside the intent transition. For a row
+written before that fix, the explicit command is:
+
+```bash
+.venv/bin/tg-ingest trading repair-signals           # read-only dry-run
+.venv/bin/tg-ingest trading repair-signals --apply   # persist only active signal statuses
+```
+
+It maps `rejected`/`failed` intents to a `rejected` signal, never touches
+`superseded`/`canceled`/`deleted` signals, never transitions an intent, and never
+calls MEXC. Review the dry-run output before `--apply`. Prefer a maintenance
+window with `serve` stopped; the update is transactional but the service can
+still be processing unrelated messages.
+
 ## Diagnostics and troubleshooting
 
 ```bash
@@ -303,7 +330,9 @@ a local guess; inspect the exchange order id/status.
 | `database is locked` | Maintenance overlapped a long write; retry once |
 | Stale balance rejection | Check clock/account snapshot freshness and free balance |
 | Live order uncertain | Inspect intents, then `trading reconcile`; never guess/resubmit |
-| No tradeable message after restart | Expected: the activation boundary advanced |
+| MEXC `429`/`418` | Honor `Retry-After`; check the shared limiter files/logs; never hammer the API |
+| Terminal intent `rejected`, signal still active | Dry-run `trading repair-signals`, review the exact rows, then `--apply` |
+| No tradeable message after restart | Expected: the activation boundary advanced or the row is recovery/backfill-sourced |
 | Bounded validation unavailable | Run `analyze reindex` first and check management state |
 
 ## Backup and restore

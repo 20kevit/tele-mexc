@@ -163,6 +163,28 @@ class FakeMexc:
 ALERT = "BUY BTCUSDT\nENTRY: 100\nTP1: 110\nSL: 95"
 
 
+def test_fetch_market_prices_uses_one_all_symbol_call(cfg, repo):
+    class BatchMexc:
+        def __init__(self):
+            self.calls = 0
+
+        def ticker_price(self, symbol=None):
+            assert symbol is None
+            self.calls += 1
+            return [
+                {"symbol": "BTCUSDT", "price": "100"},
+                {"symbol": "ETHUSDT", "price": "50"},
+                {"symbol": "OTHERUSDT", "price": "1"},
+            ]
+
+    client = BatchMexc()
+    engine = _engine(cfg, repo)
+    engine.client = client
+    prices = engine.fetch_market_prices(["BTCUSDT", "ETHUSDT"])
+    assert prices == {"BTCUSDT": Decimal("100"), "ETHUSDT": Decimal("50")}
+    assert client.calls == 1
+
+
 def test_sim_alert_creates_one_filled_intent(cfg, repo):
     engine = _engine(cfg, repo)
     record = _store_message(repo, 1, ALERT)
@@ -644,6 +666,74 @@ def test_backfill_sourced_signal_is_not_executed_in_live_mode(cfg, repo):
     assert "backfill" in signal["rejection_reason"]
 
 
+def test_recovery_sourced_signal_above_boundary_is_never_executed(cfg, repo):
+    """Recovered downtime traffic is non-tradeable even when its id is newer."""
+
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    record = _store_message(repo, 41, ALERT, source="recovery")
+    assert engine.process_item(_item(100, 41), record) is None
+    assert client.place_calls == 0
+    assert engine.store.list_intents(limit=10) == []
+    signal = engine.store.get_signal("100:41:0")
+    assert signal is not None and signal["status"] == "rejected"
+    assert "recovered" in signal["rejection_reason"]
+
+
+def test_explicit_repair_reconciles_old_terminal_signal_without_orders(cfg, repo):
+    client = FakeMexc(place_error=MexcCliConfirmationRequired("write confirmation missing"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 61), _store_message(repo, 61, ALERT))
+    assert intent is not None and intent["state"] == "rejected"
+
+    # Simulate the pre-fix production shape: terminal intent, signal planned.
+    engine.store.update_signal("100:61:0", "planned")
+    audit = engine.store.inconsistent_terminal_signals()
+    assert [row["signal_id"] for row in audit] == ["100:61:0"]
+
+    dry = engine.store.repair_inconsistent_terminal_signals(apply=False)
+    assert dry and engine.store.get_signal("100:61:0")["status"] == "planned"
+    assert client.place_calls == 1
+
+    applied = engine.store.repair_inconsistent_terminal_signals(apply=True)
+    assert applied and engine.store.get_signal("100:61:0")["status"] == "rejected"
+    assert client.place_calls == 1
+    assert engine.store.inconsistent_terminal_signals() == []
+
+    # A newer edit's superseded state is not active and must be left alone.
+    engine.store.update_signal("100:61:0", "superseded")
+    assert engine.store.repair_inconsistent_terminal_signals(apply=True) == []
+
+
+def test_terminal_rejected_intent_synchronizes_signal_status(cfg, repo):
+    client = FakeMexc(place_error=MexcCliConfirmationRequired("write confirmation missing"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 60), _store_message(repo, 60, ALERT))
+
+    assert intent is not None and intent["state"] == "rejected"
+    signal = engine.store.get_signal("100:60:0")
+    assert signal is not None and signal["status"] == "rejected"
+    assert client.place_calls == 1
+
+    # A duplicate delivery of the same version must not rewrite the terminal
+    # signal as superseded, and must never submit again.
+    duplicate = engine.process_item(_item(100, 60), _store_message(repo, 60, ALERT))
+    assert duplicate is not None and duplicate["state"] == "rejected"
+    assert client.place_calls == 1
+    signal = engine.store.get_signal("100:60:0")
+    assert signal is not None and signal["status"] == "rejected"
+
+    # A later edit also cannot create or resubmit an order.
+    edited = _store_message(
+        repo, 60, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5)
+    )
+    assert engine.process_item(_item(100, 60, "edit"), edited) is not None
+    assert client.place_calls == 1
+    assert len(engine.store.list_intents(limit=10)) == 1
+    newer = engine.store.get_signal("100:60:1")
+    assert newer is not None and newer["status"] == "superseded"
+
+
 def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
     open_order = {
         "orderId": "ex-live", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
@@ -952,3 +1042,5 @@ def test_duplicate_delivery_of_open_intent_does_not_submit_again(cfg, repo):
     second = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert second is not None and second["intent_id"] == first["intent_id"]
     assert client.place_calls == 1
+    signal = engine.store.get_signal("100:1:0")
+    assert signal is not None and signal["status"] == "planned"

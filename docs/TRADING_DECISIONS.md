@@ -75,8 +75,8 @@ earlier local-only fallback remains available but is not the shipped live path.
    fills; its actual lifecycle is tracked and reconciled.
 - Idempotency: `sha256(channel_id:message_id:action:symbol)` → `client_order_id`;
   one Telegram message yields at most one intent; a conflicting edit is refused.
-- Backfilled and at/below-boundary messages are stored and audited but never
-  traded (activation boundary persists in
+- Backfilled, recovery-sourced, and at/below-boundary messages are stored and
+  audited but never traded (activation boundary persists in
   `app_state['trading.activation_boundary_message_id']`).
 
 ---------------------------------------------------------------
