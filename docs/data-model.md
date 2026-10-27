@@ -9,7 +9,7 @@ SQLite schema and persistence invariants. Source of truth:
 - WAL journal mode, `foreign_keys=ON`, 10-second busy timeout, `BEGIN IMMEDIATE`
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
-  `schema_migrations`. Current maximum version: **14**.
+  `schema_migrations`. Current maximum version: **16**.
 - CLI startup runs migrations; `manage status` opens read-only and never migrates.
 - There is no automatic retention, pruning, or archival job. The database grows
   with messages, edits, signals, queue rows, audit events, notifications, and
@@ -32,10 +32,12 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 8 | offline `signal_candidates`, reviews, analysis runs/failures |
 | 9 | bounded validation requests, drafts, ingestion constraints |
 | 10 | structured channel-format candidate fields and logical index |
-| 11 | `trading_notifications` |
-| 12 | `trading_budget_ledger` |
-| 13 | `trades`, `trade_orders` |
-| 14 | `order_protection` (exchange-side TP/SL intent and verification state) |
+| 11 | `trading_budget_ledger` |
+| 12 | `trades`, `trade_orders` |
+| 13 | `order_protection` (exchange-side TP/SL intent and verification state) |
+| 14 | `trading_notifications` |
+| 15 | management flow `order_amount_input` stage |
+| 16 | unique `(event_key, role)` notification outbox |
 
 ## Table groups
 

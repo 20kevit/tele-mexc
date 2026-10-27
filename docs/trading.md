@@ -397,7 +397,7 @@ the configured owner/developer ids; otherwise they stay pending in the outbox.
 
 ```bash
 .venv/bin/tg-ingest trading status
-.venv/bin/tg-ingest trading config
+.venv/bin/tg-ingest config check
 .venv/bin/tg-ingest trading preflight
 .venv/bin/tg-ingest trading preflight --network
 .venv/bin/tg-ingest trading signals --limit 20

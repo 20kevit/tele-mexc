@@ -19,7 +19,7 @@ Implemented and deployed native two-OCO exit orders into the live trading workfl
 | `tg_signal_ingest/mexc/cli.py` | Added `MexcCliAdapter.place_oco()` + `_normalize_oco()` — native `spot.trade.place-oco` call. |
 | `tg_signal_ingest/mexc/hybrid.py` | Added `HybridMexcClient.place_oco()` delegation to the CLI adapter. |
 | `tg_signal_ingest/trading/engine.py` | `submit_oco_sell()` already present from prior work — verified and retained. |
-| `tg_signal_ingest/db.py` | Migration 17: adds `oco_submitting`, `oco_active`, `oco_partial` to the `trade_state` CHECK constraint via table recreation. |
+| `tg_signal_ingest/db.py` | No schema migration needed: `trades.trade_state` and `trade_orders.kind` are free-text columns that already accept the OCO values. |
 | `tests/test_trading_tp_sl.py` | Rewritten for OCO flow: OCO placement at entry fill, OCO fill advancement, both-filled closes trade, stop-loss via OCO legs (no separate market sell), no duplicate orders, restart recovery, other-symbol isolation. |
 | `tests/test_trading_lifecycle_recovery.py` | Rewritten for OCO flow: partial quantities, both-filled close, stop-loss no market sell, no duplicates on repeat ticks, restart recovery, partial-fill recovery, uncertain submissions, partial survives restart, other-symbol isolation, client-order-ID limits. |
 | `tests/_trading_fakes.py` | Added `FakeEngine.submit_oco_sell()` mock. |
@@ -92,9 +92,9 @@ Verified against the installed `@mexc-ai/cli` v0.0.22 direct binary:
 
 ## Remaining Limitations / Owner Actions
 
-1. **OCO protection is active for future entries only.** Positions that existed before this change are not adopted by the new lifecycle and have no OCO protection from it. The owner should review them separately. No action was taken on them per the task constraint.
+1. **OCO wiring is active for future entries only, and has not been exercised by a live fill.** Positions that existed before this change are not adopted by the new lifecycle and have no OCO protection from it. The owner should review them separately. No action was taken on them per the task constraint.
 
-2. **Migration 17** is applied automatically on the next service start (it ran during restart). The database schema now includes the new OCO trade states.
+2. No database migration was required for the OCO states; the existing free-text state columns accept them.
 
 3. The aggregate budget remains a configurable reference value in `config.toml`; it is no longer a hard cap. The owner chooses the per-entry amount.
 
@@ -102,7 +102,7 @@ Verified against the installed `@mexc-ai/cli` v0.0.22 direct binary:
 
 ## Evidence Classification
 
-- **Implemented:** Two-OCO exit wiring in TradeManager, CLI/engine OCO adapter methods, migration 17, tests.
+- **Implemented:** Two-OCO exit wiring in TradeManager, CLI/engine OCO adapter methods, tests. No schema migration was needed: `trades.trade_state` and `trade_orders.kind` already accept the OCO values.
 - **Tested with mocks:** 744 tests pass (ruff + mypy clean).
 - **Verified against actual CLI:** `spot.trade.place-oco` schema confirmed against installed `@mexc-ai/cli` v0.0.22 (no live order placed).
 - **Running:** `tg-ingest.service` active; Telegram listener and market monitor started.

@@ -104,7 +104,7 @@ Safe without credentials or network:
 
 ```bash
 .venv/bin/tg-ingest --help
-.venv/bin/tg-ingest trading config
+.venv/bin/tg-ingest trading status
 .venv/bin/tg-ingest analyze summary --db-path /tmp/opencode/ingest-copy.sqlite3
 .venv/bin/python -c 'from tg_signal_ingest.config import load_config; print("import ok")'
 ```

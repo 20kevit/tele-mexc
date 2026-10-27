@@ -90,7 +90,7 @@ journalctl -u tg-ingest.service -f
   stop-loss); partial or uncertain protection is reported honestly and
   reconciled, never blindly resubmitted.
 - Live mode requires `mode = "live"` plus `live_enabled_token`; the default is
-  `sim`. See `docs/OPERATIONS.md`.
+  `sim`. See `docs/operations.md`.
 - The optional single-owner Telegram control bot defaults to human approval.
   It authenticates the personal session, verifies MEXC permissions, selects the
   channel, teaches from five confirmed examples, and presents nonce-bound,

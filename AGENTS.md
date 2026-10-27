@@ -51,7 +51,7 @@ Do not silently change behavior to match an old doc.
 | --- | --- |
 | `tg_signal_ingest/main.py` | CLI commands, process startup, locks, `serve` orchestration |
 | `tg_signal_ingest/config.py` | process env > `.env` > TOML > defaults, validation, trading safety caps |
-| `tg_signal_ingest/db.py` | SQLite connection, WAL, embedded migrations 1–13 |
+| `tg_signal_ingest/db.py` | SQLite connection, WAL, embedded migrations 1–16 |
 | `tg_signal_ingest/repository.py` | message upsert, edits, queue transitions, sync state |
 | `tg_signal_ingest/service.py` | live listener, recovery sweep, background workers |
 | `tg_signal_ingest/backfill.py` | resumable history import and checkpoints |
@@ -105,7 +105,6 @@ Do not silently change behavior to match an old doc.
 .venv/bin/tg-ingest status
 .venv/bin/tg-ingest backfill status
 .venv/bin/tg-ingest trading status
-.venv/bin/tg-ingest trading config
 .venv/bin/tg-ingest manage status
 .venv/bin/tg-ingest control status
 .venv/bin/tg-ingest analyze summary
