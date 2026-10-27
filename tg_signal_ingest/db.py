@@ -804,6 +804,198 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON signal_message_links (status);
         """,
     ),
+    (
+        11,
+        """
+        CREATE TABLE IF NOT EXISTS trading_budget_ledger (
+            intent_id    TEXT PRIMARY KEY,
+            reserved_quote TEXT NOT NULL DEFAULT '0',
+            spent_quote    TEXT NOT NULL DEFAULT '0',
+            fee_quote      TEXT NOT NULL DEFAULT '0',
+            active         INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+            state          TEXT NOT NULL DEFAULT 'reserved',
+            note           TEXT,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        """,
+    ),
+    (
+        12,
+        """
+        CREATE TABLE IF NOT EXISTS trades (
+            trade_id             TEXT PRIMARY KEY,
+            signal_id            TEXT NOT NULL,
+            idempotency_key      TEXT NOT NULL UNIQUE,
+            channel_id           INTEGER NOT NULL,
+            message_id           INTEGER NOT NULL,
+            symbol               TEXT NOT NULL,
+            side                 TEXT NOT NULL,
+            entry_mode           TEXT NOT NULL DEFAULT 'direct',
+            requested_quote      TEXT NOT NULL DEFAULT '0',
+            entry_price          TEXT,
+            trigger_offset_ticks TEXT,
+            trigger_price        TEXT,
+            trade_state          TEXT NOT NULL DEFAULT 'pending_entry',
+            tp1_price            TEXT,
+            tp2_price            TEXT,
+            tp1_allocation_pct   TEXT NOT NULL DEFAULT '0',
+            tp2_allocation_pct   TEXT NOT NULL DEFAULT '0',
+            acquired_base_qty    TEXT NOT NULL DEFAULT '0',
+            acquired_quote_spent TEXT NOT NULL DEFAULT '0',
+            avg_entry_price      TEXT,
+            fees_paid            TEXT NOT NULL DEFAULT '0',
+            tp1_allocated_qty    TEXT NOT NULL DEFAULT '0',
+            tp1_sold_qty         TEXT NOT NULL DEFAULT '0',
+            tp2_allocated_qty    TEXT NOT NULL DEFAULT '0',
+            tp2_sold_qty         TEXT NOT NULL DEFAULT '0',
+            sl_price             TEXT,
+            sl_state             TEXT NOT NULL DEFAULT 'dormant',
+            sl_order_id          TEXT,
+            sl_executed_qty      TEXT NOT NULL DEFAULT '0',
+            unsold_residual_qty  TEXT,
+            unsold_residual_reason TEXT,
+            entry_intent_id      TEXT,
+            entry_order_id       TEXT,
+            entry_exchange_status TEXT,
+            entry_filled_qty     TEXT NOT NULL DEFAULT '0',
+            retry_count          INTEGER NOT NULL DEFAULT 0,
+            last_error           TEXT,
+            last_error_category  TEXT,
+            activated_at         TEXT,
+            closed_at            TEXT,
+            created_at           TEXT NOT NULL,
+            updated_at           TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades(signal_id);
+        CREATE INDEX IF NOT EXISTS idx_trades_idempotency_key ON trades(idempotency_key);
+        CREATE INDEX IF NOT EXISTS idx_trades_entry_intent_id ON trades(entry_intent_id);
+        CREATE INDEX IF NOT EXISTS idx_trades_trade_state ON trades(trade_state);
+
+        CREATE TABLE IF NOT EXISTS trade_orders (
+            trade_order_id   TEXT PRIMARY KEY,
+            trade_id         TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            client_order_id  TEXT NOT NULL UNIQUE,
+            symbol           TEXT NOT NULL,
+            side             TEXT NOT NULL,
+            order_type       TEXT NOT NULL,
+            price            TEXT,
+            quantity         TEXT,
+            allocated_qty    TEXT NOT NULL DEFAULT '0',
+            sold_qty         TEXT NOT NULL DEFAULT '0',
+            state            TEXT NOT NULL DEFAULT 'pending',
+            exchange_order_id TEXT,
+            exchange_status  TEXT,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL,
+            FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trade_orders_trade_id ON trade_orders(trade_id);
+        CREATE INDEX IF NOT EXISTS idx_trade_orders_client_order_id ON trade_orders(client_order_id);
+        CREATE INDEX IF NOT EXISTS idx_trade_orders_kind ON trade_orders(kind);
+        CREATE INDEX IF NOT EXISTS idx_trade_orders_state ON trade_orders(state);
+        """,
+    ),
+    (
+        13,
+        """
+        CREATE TABLE IF NOT EXISTS order_protection (
+            intent_id              TEXT PRIMARY KEY,
+            client_order_id        TEXT NOT NULL,
+            symbol                 TEXT NOT NULL,
+            entry_order_id         TEXT,
+            take_profit_price      TEXT,
+            stop_loss_price        TEXT,
+            protection_mode        TEXT NOT NULL DEFAULT 'attached',
+            status                 TEXT NOT NULL DEFAULT 'unverified',
+            last_error             TEXT,
+            created_at             TEXT NOT NULL,
+            updated_at             TEXT NOT NULL,
+            exchange_tp_order_id   TEXT,
+            exchange_sl_order_id   TEXT,
+            verified_at            TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_protection_status ON order_protection(status);
+        """,
+    ),
+    (
+        14,
+        """
+        CREATE TABLE IF NOT EXISTS trading_notifications (
+            notification_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key         TEXT NOT NULL,
+            signal_id         TEXT,
+            intent_id         TEXT,
+            role              TEXT NOT NULL,
+            chat_id           INTEGER NOT NULL,
+            text              TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'pending',
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            sent_at           TEXT,
+            last_error        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_event_key ON trading_notifications(event_key);
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_status ON trading_notifications(status);
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_notification_id ON trading_notifications(notification_id);
+        """,
+    ),
+    (
+        15,
+        """
+        -- Expand the allowed flow states so the management bot can persist an
+        -- order-amount input stage without hitting the CHECK constraint.
+        CREATE TABLE IF NOT EXISTS mgmt_operator_flows_new (
+            operator_id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'idle'
+                CHECK (state IN ('idle', 'auth_phone', 'auth_code', 'auth_password', 'order_amount_input')),
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+        INSERT INTO mgmt_operator_flows_new (operator_id, state, updated_at, expires_at)
+            SELECT operator_id, state, updated_at, expires_at FROM mgmt_operator_flows;
+        DROP TABLE mgmt_operator_flows;
+        ALTER TABLE mgmt_operator_flows_new RENAME TO mgmt_operator_flows;
+        """,
+    ),
+    (
+        16,
+        """
+        -- Make notification outbox idempotent: the same (event_key, role) must
+        -- never be enqueued twice, so retries and restarts cannot duplicate
+        -- notifications.
+        CREATE TABLE IF NOT EXISTS trading_notifications_new (
+            notification_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key         TEXT NOT NULL,
+            signal_id         TEXT,
+            intent_id         TEXT,
+            role              TEXT NOT NULL,
+            chat_id           INTEGER NOT NULL,
+            text              TEXT NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'pending',
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            sent_at           TEXT,
+            last_error        TEXT,
+            UNIQUE (event_key, role)
+        );
+        INSERT INTO trading_notifications_new (
+            notification_id, event_key, signal_id, intent_id, role, chat_id,
+            text, status, attempts, created_at, updated_at, sent_at, last_error
+        )
+        SELECT notification_id, event_key, signal_id, intent_id, role, chat_id,
+               text, status, attempts, created_at, updated_at, sent_at, last_error
+        FROM trading_notifications;
+        DROP TABLE trading_notifications;
+        ALTER TABLE trading_notifications_new RENAME TO trading_notifications;
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_event_key ON trading_notifications(event_key);
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_status ON trading_notifications(status);
+        CREATE INDEX IF NOT EXISTS idx_trading_notifications_notification_id ON trading_notifications(notification_id);
+        """,
+    ),
 ]
 
 

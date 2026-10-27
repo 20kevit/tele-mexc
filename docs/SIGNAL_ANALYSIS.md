@@ -4,16 +4,15 @@ This pipeline turns **already-persisted Telegram messages** into structured
 candidate signals. It is deliberately independent of the trading engine, the
 MEXC client, and the live `serve` loop.
 
-> **Status: validated against the stored real channel corpus (2026-10-23).**
-> The stored corpus of channel `1530389001` (ten messages) is fully classified
-> by parsing version 2: 1 initial signal (`#205`, LONG, ICPUSDT.P) and 9
-> follow-ups (entry activations / take-profit hits), 0 SHORT, 0 ambiguous,
-> 0 parse failures. See `tests/fixtures/channel_signal_corpus.jsonl`
-> (`source = real_channel_corpus`, `human_reviewed = true`) and the
-> dry-run/apply evidence in the reindex section below. The synthetic redacted
-> corpus remains as a regression guard for the generic (v1) parser. Only this
-> one channel/format is validated; new channels need fresh observation before
-> any format claim.
+> **Status: validated against a private local channel corpus (not included).**
+> Parsing version 2 classified a bounded historical sample from one channel:
+> initial signals plus entry-activation and take-profit follow-ups, with no
+> parse failures and no SHORT entries. The private corpus is intentionally not
+> published. The synthetic redacted corpus
+> (`tests/fixtures/redacted_signal_corpus.jsonl`) is the only corpus shipped
+> and is the regression guard for the generic (v1) parser. Only the structured
+> format of the local sample is validated; new channels need fresh observation
+> before any format claim.
 
 ## Safety boundary
 
@@ -73,7 +72,7 @@ Every uncertain field or relationship adds an explicit ambiguity code and sets
 parser (`analysis/channel_format.py`) and falls back to the unchanged generic
 heuristic parser (`parse_message_generic`, v1 semantics) when no characteristic
 marker is present. Detection is deliberately strict: a logical-ID header
-(`🆔 #205`) plus an `EXCH:SYMBOL` line from a known exchange whitelist. Generic
+(`🆔 #301`) plus an `EXCH:SYMBOL` line from a known exchange whitelist. Generic
 messages such as `ENTRY: 100` are never claimed by the structured parser.
 
 ## Usage
@@ -139,7 +138,7 @@ Replay properties:
 The per-channel logical-signal index is rebuilt offline with:
 
 ```bash
-# always start from a verified backup; the real corpus is only what is stored
+# always start from a verified backup; the corpus is only what is stored
 tg-ingest analyze reindex --channel-id <id> --dry-run --report-path report.json
 tg-ingest analyze reindex --channel-id <id> --report-path report.json
 ```
@@ -165,15 +164,13 @@ tg-ingest analyze reindex --channel-id <id> --report-path report.json
   new; raw messages are never rewritten and link rows are only updated when
   the derived data changed.
 
-Observed real-corpus evidence (channel `1530389001`, dry-run + apply run
-2026-10-23): 10 messages scanned, 1 initial signal (`#205` LONG ICPUSDT.P,
-entry `2.779`, SL `2.719`, TP1–TP4 `2.797/2.811/2.824/2.834`, FULL `2.869`,
-deposit `1.00%`, suggested leverage `8 (-17.39%)`, Jalali date `1405/08/01`
-`08:45` → `2026-10-23T05:15:00Z`), 9 follow-ups, 0 SHORT, 0 ambiguous,
-0 conflicts, 2 linked rows (the signal itself and its `both`-method follow-up),
-8 `unresolved` rows for `#201…#204` (originals were never stored → reason
-`logical_signal_id_not_in_index` or missing reply target), 0 parse failures,
-`foreign_key_check` clean, and a fully idempotent second run.
+Synthetic validation snapshot (not exchange data): 6 messages scanned, 1
+initial signal (`#301` LONG `ABCUSDT.P`, entry `100`, SL `95`, TP1/TP2
+`105/110`, Jalali date `1405/08/01` `08:45` →
+`2026-10-23T05:15:00Z`), 5 follow-ups, 0 SHORT, 0 ambiguous, 0 conflicts,
+2 linked rows (the signal itself and its `both`-method follow-up), 3
+`unresolved` rows for follow-ups whose originals were not stored, 0 parse
+failures, `foreign_key_check` clean, and a fully idempotent second run.
 
 ## Management-bot human review
 
@@ -216,18 +213,13 @@ conflict) that fill `signal_message_links`.
 ```bash
 python -m tg_signal_ingest.main analyze corpus-check \
   --path tests/fixtures/redacted_signal_corpus.jsonl
-.venv/bin/tg-ingest analyze corpus-check \
-  --path tests/fixtures/channel_signal_corpus.jsonl
 ```
 
-`redacted_signal_corpus.jsonl` is synthetic (`human_reviewed = false`) and
-guards the generic parser. `channel_signal_corpus.jsonl` contains the ten real
-stored messages verbatim (`source = real_channel_corpus`,
-`human_reviewed = true`, cross-checked against the backup's message rows and
-datetimes) plus minimum synthetic edge cases (`source =
-synthetic_channel_format`) such as a SHORT signal, duplicate/unconvertible
-date, and both-direction ambiguity. A zero mismatch count is a regression
-check.
+`redacted_signal_corpus.jsonl` is synthetic (`human_reviewed = false`,
+`source = synthetic_redacted`) and guards the generic parser. Structured-format
+coverage lives in `tests/test_channel_format_parser.py` as inline synthetic
+cases (LONG/SHORT, duplicate IDs, unconvertible dates, both-direction
+ambiguity). Private channel corpora are never committed.
 
 Focused tests live in:
 
@@ -249,8 +241,8 @@ candidate rows, and the index itself never produce order artefacts.
 
 ## Known limitations
 
-- Only the observed TOOBIT futures channel format is validated; other channels
-  or unusual phrasing may need new patterns or human correction.
+- Only the structured channel format used by the local sample is validated;
+  other channels or unusual phrasing may need new patterns or human correction.
 - Image-only signals are not OCR'd; they stay `non_signal`/`needs_review`
   (`media_without_text`).
 - Forwarded messages are context only and never become a new actionable signal.
@@ -260,9 +252,9 @@ candidate rows, and the index itself never produce order artefacts.
   action.
 - Human corrections are recorded for audit but are not automatically applied to
   downstream trading logic.
-- The observed corpus contains a single initial signal; association of
-  subsequent follow-ups relies on the stored originals (missing ones stay
-  `unresolved` with recorded reasons).
+- The local sample contains a single initial signal; association of subsequent
+  follow-ups relies on the stored originals (missing ones stay `unresolved`
+  with recorded reasons).
 
 ## Next manual validation step
 

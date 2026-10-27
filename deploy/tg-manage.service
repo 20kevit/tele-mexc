@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram two-operator management bot (preview and developer self-authorized bounded validation, no trading)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/projects/akha1
+ExecStart=/opt/projects/akha1/.venv/bin/tg-ingest manage run
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectHome=no
+Environment=PYTHONUNBUFFERED=1
+# Direct networking only: strip ambient/legacy proxy variables if present.
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy TELEGRAM_PROXY_TYPE TELEGRAM_PROXY_HOST TELEGRAM_PROXY_PORT TELEGRAM_PROXY_USERNAME TELEGRAM_PROXY_PASSWORD
+
+[Install]
+WantedBy=multi-user.target

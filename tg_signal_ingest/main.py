@@ -32,6 +32,7 @@ from .config import PROJECT_ROOT, ConfigError, load_config
 from .connectivity import ConnectivityError, run_direct_diagnostics
 from .control.bot_api import BotApiClient, BotApiError
 from .db import Database
+from .mexc.errors import MexcAuthError, MexcConfigError, MexcNetworkError, MexcPermissionError
 from .repository import Repository
 from .session_guard import SessionBusyError, SessionGuard
 from .telethon import (
@@ -42,6 +43,7 @@ from .telethon import (
     logout_and_delete_session,
     secure_session_files,
 )
+from .trading.runtime import build_mexc_client
 from .utils import configure_logging, marked_channel_id
 
 ENV_TEMPLATE = """\
@@ -109,6 +111,72 @@ def _new_repo(cfg):
     db.migrate()
     repo = Repository(db, processing_max_attempts=cfg.processing_max_attempts)
     return db, repo
+
+
+def _report_mexc_verification(cfg, *, client=None) -> tuple[int, list[str]]:
+    """Read-only MEXC API key verification.
+
+    Classifies credential state without printing the key or secret and without
+    placing any order. Uses ``GET /api/v3/apiKeyInfo`` only.
+
+    Returns ``(exit_code, output_lines)``:
+
+    * 0 — credentials valid
+    * 1 — permission/auth failure
+    * 2 — missing credentials (no api_key/api_secret configured)
+    * 3 — network failure (could not reach MEXC)
+    """
+    import importlib
+
+    lines: list[str] = []
+
+    if client is None:
+        if not cfg.mexc.api_key or not cfg.mexc.api_secret:
+            lines.append("MEXC credentials are missing: set MEXC_API_KEY and MEXC_API_SECRET")
+            lines.append("  api key: <not configured>")
+            lines.append("  api secret: <not configured>")
+            return 2, lines
+
+        try:
+            client = build_mexc_client(cfg)
+        except ConfigError as exc:
+            lines.append(f"MEXC credentials error: {exc}")
+            return 2, lines
+
+    _credentials_mod = importlib.import_module("tg_signal_ingest.mexc.credentials")
+    validate_credentials = _credentials_mod.validate_credentials
+
+    try:
+        info = validate_credentials(client)
+    except MexcPermissionError as exc:
+        lines.append(f"MISSING PERMISSION: {exc}")
+        lines.append("  The key lacks SPOT_ACCOUNT_READ and/or SPOT_DEAL_READ.")
+        lines.append("  Never request withdrawal permissions.")
+        return 1, lines
+    except MexcAuthError as exc:
+        lines.append(f"REJECTED BY MEXC: {exc}")
+        lines.append("  The API key or secret was rejected. no order was attempted.")
+        return 1, lines
+    except MexcNetworkError as exc:
+        lines.append(f"NETWORK FAILURE: {exc}")
+        lines.append("  Could not reach MEXC. no order was attempted.")
+        return 3, lines
+    except MexcConfigError as exc:
+        lines.append(f"MEXC configuration error: {exc}")
+        return 1, lines
+
+    lines.append("MEXC API key verification: VALID")
+    lines.append("  read-only GET /api/v3/apiKeyInfo: OK")
+    lines.append(f"  status: {info.status}")
+    lines.append(f"  permissions: {', '.join(info.permissions)}")
+    if info.permanent:
+        lines.append("  expiry: permanent key")
+    else:
+        lines.append(f"  {info.remaining_validity} day(s) remaining")
+    lines.append(f"  IP whitelist: {', '.join(info.ip_whitelist) or '(none)'}")
+    lines.append(f"  note: {info.note or '(none)'}")
+    lines.append("  no order placed.")
+    return 0, lines
 
 
 # ------------------------------------------------------------------ commands
@@ -183,9 +251,10 @@ def cmd_config_check(_args) -> int:
     print(f"  database: {cfg.db_path}")
     print(f"  session:  {cfg.session_path}.session")
     print(f"  backfill: scope={cfg.backfill_scope} since={cfg.backfill_since}")
-    symbols = ", ".join(cfg.trading.allowed_symbols) if cfg.trading.allowed_symbols else "EMPTY (all rejected)"
+    symbols = ", ".join(cfg.trading.allowed_symbols) if cfg.trading.allowed_symbols else "not enforced"
     mexc_state = "configured" if cfg.mexc.api_key and cfg.mexc.api_secret else "missing"
-    print(f"  trading: mode={cfg.trading.mode} allowlist={symbols} MEXC credentials={mexc_state}")
+    print(f"  trading: mode={cfg.trading.mode} symbol allowlist={symbols} MEXC credentials={mexc_state}")
+    print(f"  order amount: {cfg.trading.order_quote_amount:g} USDT ({cfg.trading.order_quote_amount_source})")
     return 0
 
 
@@ -605,8 +674,6 @@ def _build_control_runtime(cfg, repo):
     )
     engine = build_trading_engine(cfg, repo)
     bot.attach_engine(engine)
-    engine.approval_gate = bot.should_require_approval
-    engine.sizing_provider = bot.apply_sizing
     return bot, engine
 
 
@@ -720,6 +787,9 @@ async def _cmd_manage_run() -> int:
             print(f"management bot refused to start: {exc}", file=sys.stderr)
             return 1
         db, repo = _new_repo(cfg)
+        from .trading.runtime import apply_persisted_trading_settings
+
+        apply_persisted_trading_settings(cfg, repo)
         manager = ManagementBot(cfg, repo, bot)
         stop = asyncio.Event()
         _install_stop_handlers(stop)
@@ -1037,11 +1107,9 @@ def cmd_trading_status(_args) -> int:
     t = cfg.trading
     print("MEXC Spot trading pipeline")
     print(f"  mode: {t.mode} (live requires explicit token; default is sim)")
-    print(f"  allowlist: {', '.join(t.allowed_symbols) if t.allowed_symbols else 'EMPTY (all signals rejected)'}")
-    print(f"  limits: max_quote_per_order={t.max_quote_per_order} daily_max_orders={t.daily_max_orders} "
-          f"max_open_orders={t.max_open_orders} max_signal_age_s={t.max_signal_age_s}")
-    print(f"  price deviation: {t.max_price_deviation_pct}%  order_type_policy={t.order_type_policy} "
-          f"require_stop_loss={t.require_stop_loss}")
+    print(f"  order amount: {t.order_quote_amount:g} USDT (source: {t.order_quote_amount_source})")
+    print("  risk gates: Spot BUY only; no daily/open-order caps, signal-age limit, or symbol allowlist")
+    print(f"  order type policy: {t.order_type_policy}")
     print(f"  emergency_stop: {t.emergency_stop}")
     print(f"  MEXC credentials: {'set' if cfg.mexc.api_key and cfg.mexc.api_secret else 'missing'}")
     print(f"  intents by state: {counts or 'none'}")
@@ -1172,6 +1240,128 @@ def cmd_trading_test_order(args) -> int:
             symbol=meta.symbol, side="SELL", order_type="MARKET", quantity=qty
         )
     print(f"official test-order accepted for {meta.symbol} {args.side.upper()} quote={quote} (NO real order placed)")
+    return 0
+
+
+def cmd_trading_verify(args) -> int:
+    """Read-only MEXC API key verification command.
+
+    Classifies credential problems without printing the key or secret and
+    without placing any order.
+    """
+    cfg = _load_or_exit(require_credentials=False)
+    code, lines = _report_mexc_verification(cfg)
+    for line in lines:
+        print(line)
+    return code
+
+
+def cmd_trading_preflight(args) -> int:
+    """Preflight checks for the MEXC CLI execution backend.
+
+    Verifies the CLI binary, version, schema, doctor status, credential
+    profile, and (in live mode) account identity against REST. No orders are
+    placed and no secrets are printed.
+    """
+    cfg = _load_or_exit(require_credentials=False)
+
+    if not cfg.mexc.cli_enabled:
+        print("MEXC CLI writes are disabled; preflight cannot proceed.")
+        print("RESULT: FAIL")
+        return 1
+
+    from .mexc.cli import MexcCliAdapter
+
+    adapter = MexcCliAdapter(
+        binary=getattr(cfg.mexc, "cli_binary", None),
+        profile=getattr(cfg.mexc, "cli_profile", None),
+        timeout_s=float(getattr(cfg.mexc, "cli_timeout_s", 5.0)),
+        min_version=getattr(cfg.mexc, "cli_min_version", "0.0.22"),
+        confirm_writes=bool(getattr(cfg.mexc, "cli_confirm_noninteractive_writes", False)),
+        symbols=None,
+    )
+
+    health = adapter.check()
+    if not health.ok:
+        print("MEXC CLI check failed:")
+        for problem in health.problems:
+            print(f"  - {problem}")
+        print("RESULT: FAIL")
+        return 2
+
+    if args.network:
+        doctor = adapter.doctor()
+        if not doctor.get("ok", False):
+            print("MEXC CLI doctor reported problems:")
+            for check in doctor.get("checks", []):
+                print(f"  - {check.get('name', '?')}: {check.get('message', '')}")
+            print("RESULT: FAIL")
+            return 2
+        adapter.read_only_access()
+    else:
+        print("NOT CHECKED: --network not requested; skipping live doctor/read checks.")
+
+    # CLI credential profile validation.
+    profiles_fn = getattr(adapter, "profiles", None)
+    if profiles_fn is not None:
+        profiles = profiles_fn()
+        active = profiles.get("active")
+        profile_list = profiles.get("profiles", [])
+        cli_profile = getattr(cfg.mexc, "cli_profile", None)
+        if not profile_list:
+            print("no CLI credential profile is saved.")
+            print("  Run 'mexc profile set' to store a MEXC website-issued Open API key.")
+            print("  The CLI profile uses the same MEXC website-issued Open API credentials.")
+            print("RESULT: FAIL")
+            return 1
+        if active is None or active not in profile_list:
+            print(f"no active CLI profile (saved: {', '.join(profile_list)}).")
+            print("  Run 'mexc profile use <name>' to select a profile.")
+            print("RESULT: FAIL")
+            return 1
+        if cli_profile is not None and cli_profile not in profile_list:
+            print(f"'{cli_profile}' is not saved in the CLI credential profiles.")
+            print("  Run 'mexc profile set' to store it, then 'mexc profile use' to select it.")
+            print("RESULT: FAIL")
+            return 1
+
+    # Live mode: verify CLI and REST account identity match.
+    if cfg.trading.mode == "live":
+        from .mexc.credentials import validate_credentials
+        from .trading.runtime import build_mexc_client
+
+        try:
+            rest = build_mexc_client(cfg)
+            info = validate_credentials(rest)
+            info_status = getattr(info, "status", "VALID")
+            if info_status.upper() != "VALID":
+                print(f"REST key not valid: status={info_status}")
+                print("RESULT: FAIL")
+                return 2
+            print("REST key: VALID")
+        except Exception as exc:  # noqa: BLE001
+            print(f"REST credential check failed: {exc}")
+            print("RESULT: FAIL")
+            return 2
+
+        cli_account_fn = getattr(adapter, "account", None)
+        rest_account_fn = getattr(rest, "account", None)
+        if cli_account_fn is not None and rest_account_fn is not None:
+            cli_account = cli_account_fn()
+            rest_account = rest_account_fn()
+            cli_balances = {
+                b.get("asset"): b.get("free") for b in cli_account.get("balances", [])
+            }
+            rest_balances = {
+                b.get("asset"): b.get("free") for b in rest_account.get("balances", [])
+            }
+            if cli_balances != rest_balances:
+                print("MISMATCH: CLI and REST account balances differ.")
+                print("RESULT: FAIL")
+                return 2
+            print("account identity: MATCH")
+
+    print("RESULT: PASS")
     return 0
 
 
@@ -1632,6 +1822,19 @@ def build_parser() -> argparse.ArgumentParser:
     ts_test.add_argument("--side", choices=["BUY", "SELL"], required=True)
     ts_test.add_argument("--quote", required=True, help="quote amount, e.g. 10 for 10 USDT")
     ts_test.set_defaults(func=cmd_trading_test_order)
+
+    ts_verify = ts_sub.add_parser("verify", help="read-only MEXC API key verification (no order placed)")
+    ts_verify.set_defaults(func=cmd_trading_verify)
+
+    ts_preflight = ts_sub.add_parser(
+        "preflight",
+        help="preflight checks for the MEXC CLI execution backend (no orders placed)",
+    )
+    ts_preflight.add_argument(
+        "--network", action="store_true",
+        help="run live doctor and read-only access checks (requires network)",
+    )
+    ts_preflight.set_defaults(func=cmd_trading_preflight)
 
     analyze = sub.add_parser(
         "analyze", help="offline signal analysis of persisted messages (no exchange calls)"

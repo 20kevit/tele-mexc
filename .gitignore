@@ -33,6 +33,9 @@ config/*
 auth/
 telethon/
 
+# Private real-channel test corpus (contains real usernames/message content — do not publish)
+tests/fixtures/channel_signal_corpus.jsonl
+
 # Databases and runtime state
 *.db
 *.sqlite

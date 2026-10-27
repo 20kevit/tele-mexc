@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from telethon.errors import FloodWaitError
 
 from tests.conftest import FAKE_MESSAGE_EPOCH, FakeMsg
-from tg_signal_ingest.backfill import run_backfill
+from tg_signal_ingest import backfill
+from tg_signal_ingest.backfill import _fetch_page, run_backfill
 
 
 class FakePageClient:
@@ -130,3 +132,29 @@ def test_backfill_failure_counts_reported(cfg, populated_repo):
     rep = asyncio.run(run_backfill(client, populated_repo, cfg, channel_bare_id=100))
     assert rep.completed is True
     assert rep.failed == 0
+
+
+def test_fetch_page_honors_full_flood_wait(monkeypatch):
+    import asyncio
+
+    class FloodOnceClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_messages(self, *a, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                raise FloodWaitError(None, 250)
+            return []
+
+    waits: list[float] = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(backfill.asyncio, "sleep", fake_sleep)
+    client = FloodOnceClient()
+    result = asyncio.run(_fetch_page(client, 100, 1, 10, 0))
+    assert result == []
+    assert client.calls == 2
+    assert waits and waits[0] >= 250

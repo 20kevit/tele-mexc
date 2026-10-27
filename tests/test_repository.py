@@ -151,3 +151,11 @@ class TestSelection:
         assert repo.selected_channel().channel_id == 2
         selected_count = sum(1 for c in repo.list_channels() if c.is_selected)
         assert selected_count == 1
+
+
+class TestSyncRecovery:
+    def test_reset_backfill_creates_missing_state_without_nested_transaction(self, repo):
+        repo.reset_backfill(999)
+        state = repo.sync_state(999)
+        assert state["backfill_status"] == "not_started"
+        assert state["backfill_target_mode"] == "full"

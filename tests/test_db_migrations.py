@@ -56,3 +56,21 @@ def test_transations_rollback_on_error(tmp_path):
     count = db.conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
     assert count == 0
     db.close()
+
+
+def test_v5_control_tables_and_setup_singleton(tmp_path):
+    db = Database(tmp_path / "db.sqlite3")
+    db.migrate()
+    names = {
+        r["name"]
+        for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    expected = {
+        "control_setup", "control_settings", "control_flow", "control_learning_samples",
+        "control_approvals", "control_updates", "control_secrets", "control_audit",
+        "control_notices",
+    }
+    assert expected <= names
+    rows = db.conn.execute("SELECT id, execution_mode, paused FROM control_setup").fetchall()
+    assert [tuple(row) for row in rows] == [(1, "approval", 0)]
+    db.close()

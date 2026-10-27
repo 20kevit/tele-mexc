@@ -60,14 +60,20 @@ class _Page:
 async def _fetch_page(
     client: Any, entity_ref: int, offset_id: int, limit: int, min_bound: int
 ) -> list[Any]:
+    last_flood: FloodWaitError | None = None
     for _attempt in range(MAX_FLOOD_RETRIES):
         try:
             raw = await client.get_messages(entity_ref, limit=limit, offset_id=offset_id, min_id=min_bound)
             return [m for m in raw if m is not None]
         except FloodWaitError as exc:
-            wait = min(exc.seconds, 120) + random.uniform(0, 1)
+            last_flood = exc
+            # Telegram's requested wait is authoritative and must not be capped
+            # by our own reconnect/backoff limits.
+            wait = exc.seconds + random.uniform(0, 1)
             log.warning("flood-wait during history fetch; sleeping %.1fs then retrying", wait)
             await asyncio.sleep(wait)
+    if last_flood is not None:
+        raise last_flood
     raise BackfillError("history fetch kept hitting FloodWait; will retry later")
 
 

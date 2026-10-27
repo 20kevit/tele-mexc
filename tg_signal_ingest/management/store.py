@@ -125,7 +125,7 @@ class ManagementStore:
     def set_flow(
         self, operator_id: int, state: str, *, ttl_s: int = FLOW_TTL_S
     ) -> None:
-        if state not in ("idle", "auth_phone", "auth_code", "auth_password"):
+        if state not in ("idle", "auth_phone", "auth_code", "auth_password", "order_amount_input"):
             raise ValueError("invalid management flow state")
         now = self._now()
         with self.db.transaction() as conn:
@@ -148,6 +148,25 @@ class ManagementStore:
 
     def clear_flow(self, operator_id: int) -> None:
         self.set_flow(operator_id, "idle")
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO control_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                (key, value),
+            )
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.db.conn.execute(
+            "SELECT value FROM control_settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            return row["value"]
+        return None
+
+    def clear_setting(self, key: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute("DELETE FROM control_settings WHERE key = ?", (key,))
 
     def clear_all_flows(self) -> int:
         with self.db.transaction() as conn:

@@ -24,7 +24,7 @@ class FakeClient:
 
     async def connect(self) -> None:
         if getattr(self, "connect_fails", False):
-            raise ConnectionError("simulated transport failure through proxy")
+            raise ConnectionError("simulated direct transport failure")
 
     async def is_user_authorized(self) -> bool:
         return self._authorized
@@ -126,8 +126,35 @@ def test_fresh_session_is_unauthenticated(cfg):
 
     client = build_client(cfg)
     try:
-        assert client.is_user_authorized() is not None  # construction works
         assert getattr(client.session, "authorized", False) is False or client.session.auth_key is None
     finally:
         with contextlib.suppress(Exception):
             client.session.close()
+
+
+def test_cli_login_holds_session_lock_and_refuses_when_busy(cfg, monkeypatch):
+    from tg_signal_ingest.session_guard import SessionBusyError, SessionGuard
+
+    async def fake_login(_cfg):
+        probe = SessionGuard(_cfg)
+        try:
+            with pytest.raises(SessionBusyError):
+                await probe.acquire()
+        finally:
+            probe.release()
+        return "Login succeeded (test)"
+
+    monkeypatch.setattr(cli, "interactive_login", fake_login)
+    monkeypatch.setattr(cli, "_load_or_exit", lambda **_kwargs: cfg)
+    rc = aio.run(cli.cmd_auth_login(type("A", (), {"verbose": False})()))
+    assert rc == 0
+
+    async def scenario():
+        guard = SessionGuard(cfg)
+        await guard.acquire()
+        try:
+            return await cli.cmd_auth_login(type("A", (), {"verbose": False})())
+        finally:
+            guard.release()
+
+    assert aio.run(scenario()) == 4

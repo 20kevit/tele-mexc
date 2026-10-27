@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 
 import pytest
+from telethon.errors import FloodWaitError
 
 from tests.conftest import FakeMsg
 from tg_signal_ingest.backfill import BackfillReport
@@ -191,3 +192,34 @@ class TestServiceLifecycle:
         assert stored["source"] == "live"
         svc.request_stop()
         await asyncio.wait_for(task, timeout=10)
+
+
+async def test_recovery_sweep_honors_full_flood_wait(cfg, selected_repo):
+    class FloodClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.raised = False
+
+        def iter_messages(self, ref, **kwargs):
+            async def gen():
+                if not self.raised:
+                    self.raised = True
+                    raise FloodWaitError(None, 321)
+                return
+                yield  # pragma: no cover
+
+            return gen()
+
+    client = FloodClient()
+    svc = IngestService(
+        cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg)
+    )
+    waits: list[float] = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    svc._sleep_with_stop = fake_sleep  # type: ignore[method-assign]
+    caught = await svc.sweep_gap(1004)
+    assert caught == 0
+    assert waits and waits[0] >= 321

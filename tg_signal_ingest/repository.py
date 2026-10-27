@@ -136,14 +136,22 @@ class Repository:
 
     # ----------------------------------------------------------- messages
 
-    def upsert_message(self, record: StoredMessage) -> UpsertResult:
-        """Insert or update one message; enqueue processing work on change."""
+    def upsert_message(
+        self, record: StoredMessage, *, enqueue_processing: bool = True
+    ) -> UpsertResult:
+        """Insert or update one message.
+
+        ``enqueue_processing`` is disabled by the management backfill: history
+        ingestion is data-only and must never activate downstream parsing or
+        trading just because a message was stored.
+        """
 
         now = UTC_NOW()
         with self.db.transaction() as conn:
             row = conn.execute(
                 "SELECT processing_version, edit_datetime, text, caption, media_type, media_meta, "
-                "reply_to_message_id, fwd_from_name, fwd_from_id, fwd_post_message_id, datetime "
+                "reply_to_message_id, fwd_from_name, fwd_from_id, fwd_post_message_id, datetime, "
+                "sender_id, sender_name, post_author, entities_json "
                 "FROM messages WHERE channel_id = ? AND message_id = ?",
                 (record.channel_id, record.message_id),
             ).fetchone()
@@ -153,8 +161,8 @@ class Repository:
                     INSERT INTO messages (channel_id, message_id, datetime, edit_datetime, text, caption,
                         media_type, media_meta, grouped_id, reply_to_message_id, fwd_from_name, fwd_from_id,
                         fwd_post_message_id, raw_json, source, processing_version, deleted, deleted_at,
-                        first_seen, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?)
+                        first_seen, last_updated, sender_id, sender_name, post_author, entities_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.channel_id,
@@ -174,9 +182,14 @@ class Repository:
                         record.source,
                         now,
                         now,
+                        record.sender_id,
+                        record.sender_name,
+                        record.post_author,
+                        record.entities_json,
                     ),
                 )
-                self._enqueue_locked(conn, record.channel_id, record.message_id, "message", 0)
+                if enqueue_processing:
+                    self._enqueue_locked(conn, record.channel_id, record.message_id, "message", 0)
                 return UpsertResult(UpsertOutcome.INSERTED, 0, 0)
 
             old_version = int(row["processing_version"])
@@ -191,6 +204,10 @@ class Repository:
                 row["fwd_post_message_id"],
                 row["edit_datetime"],
                 row["datetime"],
+                row["sender_id"],
+                row["sender_name"],
+                row["post_author"],
+                row["entities_json"],
             )
             new_fields = (
                 record.text,
@@ -203,6 +220,10 @@ class Repository:
                 record.fwd_post_message_id,
                 record.edit_datetime,
                 record.datetime,
+                record.sender_id,
+                record.sender_name,
+                record.post_author,
+                record.entities_json,
             )
             if content_fields == new_fields:
                 return UpsertResult(UpsertOutcome.UNCHANGED, old_version, old_version)
@@ -231,7 +252,8 @@ class Repository:
                 UPDATE messages SET datetime = ?, edit_datetime = ?, text = ?, caption = ?,
                     media_type = ?, media_meta = ?, grouped_id = ?, reply_to_message_id = ?,
                     fwd_from_name = ?, fwd_from_id = ?, fwd_post_message_id = ?, raw_json = ?,
-                    processing_version = ?, last_updated = ?
+                    processing_version = ?, last_updated = ?, sender_id = ?, sender_name = ?,
+                    post_author = ?, entities_json = ?
                 WHERE channel_id = ? AND message_id = ?
                 """,
                 (
@@ -249,6 +271,10 @@ class Repository:
                     record.raw_json,
                     new_version,
                     now,
+                    record.sender_id,
+                    record.sender_name,
+                    record.post_author,
+                    record.entities_json,
                     record.channel_id,
                     record.message_id,
                 ),
@@ -271,7 +297,8 @@ class Repository:
                     record.source,
                 ),
             )
-            self._enqueue_locked(conn, record.channel_id, record.message_id, "edit", new_version)
+            if enqueue_processing:
+                self._enqueue_locked(conn, record.channel_id, record.message_id, "edit", new_version)
             return UpsertResult(UpsertOutcome.UPDATED, old_version, new_version)
 
     def mark_deleted(self, channel_id: int, message_ids: Iterable[int]) -> int:
@@ -428,7 +455,14 @@ class Repository:
                 (now, channel_id),
             )
             if conn.execute("SELECT changes()").fetchone()[0] == 0:
-                self.init_sync_state(channel_id, "full", None)
+                conn.execute(
+                    """
+                    INSERT INTO sync_state (channel_id, backfill_target_mode, backfill_since,
+                        backfill_status, updated_at)
+                    VALUES (?, 'full', NULL, 'not_started', ?)
+                    """,
+                    (channel_id, now),
+                )
 
     def record_live_event(self, channel_id: int, message_id: int) -> None:
         now = UTC_NOW()

@@ -1,37 +1,37 @@
-"""Deterministic structured parser for the observed TOOBIT futures-signal format.
+"""Deterministic structured parser for the observed futures-signal format.
 
-The format below was derived from the real channel corpus stored in the local
-database and delivered by the bounded historical import (see
-``docs/SIGNAL_ANALYSIS.md`` and the fixture
-``tests/fixtures/redacted_signal_corpus.jsonl``).
+The shape below is a synthetic example. It is intentionally representative of
+the private channel sample used during development, but no real message text
+or author identity is stored here. See ``docs/SIGNAL_ANALYSIS.md`` and the
+synthetic fixture ``tests/fixtures/redacted_signal_corpus.jsonl``.
 
-A representative initial signal (stored message, line style preserved):
+A representative initial signal (line style preserved):
 
-    🆔 #205
+    🆔 #301
     ⏰ 1405/08/01
      TIME =08:45
      *LONG*🟢
-     ⚡️TOOBIT:ICPUSDT.P(15)
+     ⚡️TOOBIT:ABCUSDT.P(15)
 
-     ✅Entry: 2.779
-     🔰Stop Loss : 2.719
+     ✅Entry: 100.00
+     🔰Stop Loss : 95.00
 
-     📌TP1 : 2.797
-     📌TP2 : 2.811
-     📌TP3 : 2.824
-     📌TP4 : 2.834
+     📌TP1 : 105.00
+     📌TP2 : 110.00
+     📌TP3 : 115.00
+     📌TP4 : 120.00
       -----------------------------
-     🤑FULL Target : 2.869
+     🤑FULL Target : 130.00
      -----
      💰Deposit 1.00%
      💠MAX LEV Suggested  =  8 (-17.39%)
-     ⭐️ @tradermoein / @chart_Tora
+     ⭐️ @example_owner / @example_chart
 
-Follow-up messages repeat the same logical signal ID (``🆔 #204``) and describe
+Follow-up messages repeat the same logical signal ID (``🆔 #302``) and describe
 entry activation, target hits, closure or reversal, for example:
 
-    🆔 #201
-    TOOBIT:MYXUSDT.P (LONG)
+    🆔 #302
+    TOOBIT:XYZUSDT.P (LONG)
     🎯 تارگت 3 با موفقیت خورد!
     💰 12.6 % سود
 
@@ -113,7 +113,7 @@ KNOWN_EXCHANGES = frozenset(
     }
 )
 
-# "⚡️TOOBIT:ICPUSDT.P(15)" and follow-up variants "TOOBIT:LPTUSDT.P (LONG)".
+# "⚡️TOOBIT:ABCUSDT.P(15)" and follow-up variants "TOOBIT:XYZUSDT.P (LONG)".
 # The closing parenthesis must not be followed by a `\b` assertion: after a
 # `)` both neighbours are non-word characters, so `\b` would fail exactly at
 # the end of a line or message ("...(15)") and silently drop the timeframe.
@@ -236,7 +236,7 @@ def _extract_direction(upper: str) -> Direction | None:
 def _extract_exchange_symbol(upper: str) -> tuple[str | None, str | None, int | None]:
     match = _EXCHANGE_SYMBOL_RE.search(upper)
     if match is None:
-        # Follow-ups sometimes carry a bare symbol line (e.g. "ICPUSDT")
+        # Follow-ups sometimes carry a bare symbol line (e.g. "ABCUSDT")
         # without the exchange prefix; accept it on a standalone line.
         bare = _BARE_SYMBOL_LINE_RE.search(upper)
         if bare is not None:
@@ -251,7 +251,7 @@ def _extract_exchange_symbol(upper: str) -> tuple[str | None, str | None, int | 
 
 
 def _split_symbol(symbol_raw: str) -> tuple[str, str | None]:
-    """Split ``ICPUSDT.P`` into base ``ICPUSDT`` and quote ``USDT``."""
+    """Split ``ABCUSDT.P`` into base ``ABCUSDT`` and quote ``USDT``."""
 
     bare = symbol_raw.split(".")[0].upper()
     for quote in sorted(QUOTE_ASSETS, key=len, reverse=True):

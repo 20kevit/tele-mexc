@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -619,6 +620,9 @@ class ManagementBot:
                     "جستجو در این نسخه در دسترس نیست؛ فهرست را دوباره باز کنید.",
                 )
                 return
+            if flow["state"] == "order_amount_input":
+                await self._handle_order_amount_input(operator_id, text)
+                return
             await self._send(
                 operator_id,
                 "ورود از چت غیرفعال است. برای ورود امن از ترمینال SSH، /start را بزنید.",
@@ -735,6 +739,8 @@ class ManagementBot:
             await self._perform_logout(operator_id)
         elif action == "cancel_flow":
             await self._cancel_input_flow(operator_id)
+        elif action == "order_amount":
+            await self._show_order_amount(operator_id)
         elif action == "cancel_job":
             await self._cancel_job(operator_id)
         elif action == "resume_job":
@@ -932,9 +938,13 @@ class ManagementBot:
             rows.append(
                 [
                     _btn(
+                        "💰 مبلغ سفارش",
+                        "mg:" + self._token(operator_id, "order_amount"),
+                    ),
+                    _btn(
                         "🚪 خروج از حساب تلگرام",
                         "mg:" + self._token(operator_id, "logout"),
-                    )
+                    ),
                 ]
             )
         return _kb(rows)
@@ -1050,6 +1060,14 @@ class ManagementBot:
                     "expired",
                 ):
                     lines.append(f"  آخرین وضعیت: {str(request['error'])[:180]}")
+        # Order amount display (default and persisted).
+        order_amount = self.cfg.trading.order_quote_amount
+        source = getattr(self.cfg.trading, "order_quote_amount_source", "default")
+        lines.append(
+            f"• مبلغ سفارش پیش‌فرض: {order_amount:g} USDT در هر خرید "
+            f"(منبع: {source})"
+        )
+
         if probe_status == "valid":
             lines.append(
                 "\nپیش‌نمایش پیام‌ها فقط خواندنی است؛ رسانه دانلود و محتوا پردازش نمی‌شود."
@@ -1060,6 +1078,53 @@ class ManagementBot:
                 "کد ورود را در چت نفرستید."
             )
         return "\n".join(lines)
+
+    async def _show_order_amount(self, operator_id: int) -> None:
+        """Show current order amount and request a new value."""
+        current = self.cfg.trading.order_quote_amount
+        source = getattr(self.cfg.trading, "order_quote_amount_source", "default")
+        self.store.set_flow(
+            operator_id,
+            state="order_amount_input",
+        )
+        text = (
+            "💰 مقدار سفارش فعلی:\n"
+            f"• مبلغ فعلی: {current:g} USDT (منبع: {source})\n\n"
+            "مبلغ جدید را به‌صفته یک عدد مثبت وارد کنید (مثلاً 7.5). "
+            "برای لغو، /start بزنید."
+        )
+        await self._send(operator_id, text)
+
+    async def _handle_order_amount_input(self, operator_id: int, text: str) -> None:
+        """Validate and persist a new order quote amount from user input."""
+        try:
+            value = float(text.strip().replace(",", ""))
+        except ValueError:
+            self.store.clear_flow(operator_id)
+            await self._show_start(operator_id)
+            await self._send(
+                operator_id,
+                "عدد معتبر نیست. لطفاً یک عدد مثبت وارد کنید.",
+            )
+            return
+        if not math.isfinite(value) or value <= 0:
+            self.store.clear_flow(operator_id)
+            await self._show_start(operator_id)
+            await self._send(
+                operator_id,
+                "مبلغ باید بزرگتر از صفر باشد.",
+            )
+            return
+        self.store.set_setting("order_quote_amount", str(value))
+        self.store.clear_flow(operator_id)
+        self.cfg.trading.order_quote_amount = value
+        self.cfg.trading.order_quote_amount_source = "database (Telegram menu)"
+        self.store.audit("sizing_changed", f"order_quote_amount={value:g}")
+        await self._show_start(operator_id)
+        await self._send(
+            operator_id,
+            f"مبلغ سفارش تنظیم شد: {value:g} USDT",
+        )
 
     async def _show_help(self, operator_id: int) -> None:
         text = (

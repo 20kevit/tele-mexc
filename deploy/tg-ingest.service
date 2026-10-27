@@ -20,6 +20,8 @@ RestartMaxDelaySec=120
 # Secrets are loaded from the working directory config files, not the unit;
 # nothing sensitive is added here.
 Environment=PYTHONUNBUFFERED=1
+# Direct networking only: strip ambient/legacy proxy variables if present.
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy TELEGRAM_PROXY_TYPE TELEGRAM_PROXY_HOST TELEGRAM_PROXY_PORT TELEGRAM_PROXY_USERNAME TELEGRAM_PROXY_PASSWORD
 
 [Install]
 WantedBy=multi-user.target

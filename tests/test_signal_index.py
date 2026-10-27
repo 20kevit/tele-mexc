@@ -1,17 +1,13 @@
 """Reindex / relationship tests: association rules, migration 10, idempotency.
 
-Real-corpus evidence (observations) and synthetic defensive cases are kept
-apart: tests either use the ten stored historical messages of channel
-1530389001 (loaded from the verified pre-mission backup) or small fixtures
-built here, and never mix the two kinds of assertion.
+Every message used here is synthetic. The channel, logical IDs, symbols and
+prices are local test data and are not copied from a live channel.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -26,11 +22,6 @@ from tg_signal_ingest.db import MIGRATIONS, Database
 from tg_signal_ingest.normalize import message_to_record
 
 CHANNEL = 100
-
-#: Verified pre-mission backup of the real corpus (checksum validated when
-#: created; see docs/SIGNAL_ANALYSIS.md). The tests are skipped when the
-#: local backup is not present.
-BACKUP_DB = Path("/tmp/opencode/backup/pre-mission-ingest-20261023.sqlite3")
 
 INITIAL_301 = (
     "🆔 #301\n⏰ 1405/08/01\n TIME =08:45\n *LONG*🟢\n"
@@ -113,28 +104,6 @@ class TestMigration10:
             )
         assert [r["name"] for r in _rows(db, "PRAGMA foreign_key_check")] == []
         assert db.migrate() == []
-
-    @pytest.mark.skipif(not BACKUP_DB.is_file(), reason="real-corpus backup not present")
-    def test_migration_on_a_copy_of_the_real_backup(self, tmp_path):
-        copy_path = tmp_path / "real.sqlite3"
-        shutil.copy(BACKUP_DB, copy_path)
-        db = Database(copy_path)
-        applied = db.migrate()
-        assert 10 in applied
-        # Raw messages untouched by migration 10.
-        messages = _rows(
-            db,
-            "SELECT channel_id, message_id, text FROM messages ORDER BY message_id",
-        )
-        assert [int(m["message_id"]) for m in messages] == [
-            19025, 19026, 19027, 19028, 19029, 19030, 19031, 19032, 19033, 19034,
-        ]
-        assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert _rows(db, "PRAGMA foreign_key_check") == []
-        assert _rows(db, "SELECT COUNT(*) c FROM channel_signals")[0]["c"] == 0
-        assert _rows(db, "SELECT COUNT(*) c FROM signal_message_links")[0]["c"] == 0
-        db.close()
-
 
 # ------------------------------------------------------- association rule unit
 
@@ -526,78 +495,3 @@ class TestRebuildSignalIndex:
         assert _link(repo.db, 700)["status"] == "linked"
         # A SHORT reindex row must never produce any order artefact.
         assert _rows(repo.db, "SELECT COUNT(*) c FROM order_intents") == 0 or True
-
-
-# --------------------------------------------------- real corpus end to end
-
-
-@pytest.mark.skipif(not BACKUP_DB.is_file(), reason="real-corpus backup not present")
-class TestRealCorpusReindex:
-    @pytest.fixture()
-    def real_repo(self, tmp_path):
-        copy_path = tmp_path / "real.sqlite3"
-        shutil.copy(BACKUP_DB, copy_path)
-        db = Database(copy_path)
-        db.migrate()
-        yield db
-        db.close()
-
-    def _stats(self, db, dry_run):
-        return rebuild_signal_index(db, channel_id=1530389001, dry_run=dry_run)
-
-    def test_dry_run_counts_match_observed_corpus(self, real_repo):
-        stats = self._stats(real_repo, dry_run=True)
-        assert stats.messages_scanned == 10
-        assert stats.initial_signals == 1
-        assert stats.follow_ups == 9
-        # Diagnostic counter: structured messages carrying a LONG token in
-        # any classification (8 of the 10 stored messages mention LONG).
-        assert stats.long_signals == 8
-        assert stats.short_signals == 0
-        assert stats.signals_planned == 1
-        assert stats.needs_review == 0
-        assert stats.parse_failures == 0
-        assert stats.dry_run is True
-        # Only #205 resolves: the initial (19026, explicit_id) and its own
-        # follow-up (19027, explicit + reply -> both). Follow-ups of
-        # #201..#204 stay unresolved because their originals were never
-        # stored, and their reply targets are missing messages.
-
-        assert stats.links_linked == 2
-        assert stats.links_unresolved == 8
-        assert stats.links_conflict == 0
-
-    def test_apply_creates_one_signal_and_is_idempotent(self, real_repo):
-        stats = self._stats(real_repo, dry_run=False)
-        assert stats.initial_signals == 1
-        assert stats.links_created == 10
-        assert stats.signals_created == 1
-        assert stats.dry_run is False
-        row = _rows(real_repo, "SELECT * FROM channel_signals")[0]
-        assert row["logical_id"] == 205
-        assert row["direction"] == "long"
-        assert row["symbol"] == "ICPUSDT"
-        assert row["entry_price"] == "2.779"
-        assert row["source_timestamp_iso"] == "2026-10-23T05:15:00Z"
-        assert row["execution_status"] == "none"
-        assert real_repo.conn.execute("PRAGMA foreign_key_check").fetchall() == []
-
-        # Idempotent re-run and stable idempotent links.
-        stats2 = self._stats(real_repo, dry_run=False)
-        assert stats2.signals_created == 0
-        assert stats2.signals_unchanged == 1
-        assert stats2.links_created == 0
-        assert stats2.links_updated == 0
-
-        # Unresolved follow-ups (originals missing) recorded with reasons.
-        unresolved = _rows(
-            real_repo,
-            "SELECT message_id, reason FROM signal_message_links WHERE status = 'unresolved'",
-        )
-        assert {int(u["message_id"]) for u in unresolved} == {
-            19025, 19028, 19029, 19030, 19031, 19032, 19033, 19034,
-        }
-        assert {u["reason"] for u in unresolved} <= {
-            "reply_target_is_not_a_known_signal_message",
-            "logical_signal_id_not_in_index",
-        }

@@ -39,6 +39,10 @@ class StoredMessage:
     fwd_post_message_id: int | None
     raw_json: str
     source: str  # 'backfill' | 'live' | 'recovery'
+    sender_id: int | None = None
+    sender_name: str | None = None
+    post_author: str | None = None
+    entities_json: str | None = None
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -138,6 +142,35 @@ def message_to_record(channel_id: int, msg: Any, source: str) -> StoredMessage:
     reply_id = _attr(reply, "reply_to_msg_id") if reply is not None else None
     fwd_name, fwd_id, fwd_post = _forward_fields(msg)
     raw = _serialize_raw(msg)
+    sender_id = _attr(msg, "sender_id")
+    if sender_id is None:
+        from_id = _attr(msg, "from_id")
+        sender_id = (
+            _attr(from_id, "user_id", None)
+            or _attr(from_id, "_channel_id", None)
+            or _attr(from_id, "channel_id", None)
+        )
+    sender = _attr(msg, "sender", None)
+    sender_name = None
+    if sender is not None:
+        sender_name = (
+            getattr(sender, "title", None)
+            or " ".join(
+                part for part in (getattr(sender, "first_name", None), getattr(sender, "last_name", None)) if part
+            ).strip()
+            or getattr(sender, "username", None)
+        )
+    post_author = _attr(msg, "post_author")
+    entities = _attr(msg, "entities", None)
+    entities_json = None
+    if entities:
+        try:
+            entities_json = json.dumps(
+                [e.to_dict() if hasattr(e, "to_dict") else {"type": type(e).__name__} for e in entities],
+                ensure_ascii=False,
+            )
+        except Exception:
+            entities_json = None
 
     return StoredMessage(
         channel_id=channel_id,
@@ -155,6 +188,10 @@ def message_to_record(channel_id: int, msg: Any, source: str) -> StoredMessage:
         fwd_post_message_id=fwd_post,
         raw_json=raw,
         source=source,
+        sender_id=int(sender_id) if sender_id is not None else None,
+        sender_name=str(sender_name) if sender_name else None,
+        post_author=str(post_author) if post_author else None,
+        entities_json=entities_json,
     )
 
 

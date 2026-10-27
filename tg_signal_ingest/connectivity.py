@@ -1,189 +1,171 @@
-"""Proxy support and connectivity diagnostics.
+"""Direct Telegram connectivity checks.
 
-Telethon must be given the proxy explicitly (its MTProto socket does NOT honour
-HTTP_PROXY / HTTPS_PROXY environment variables). This module builds the proxy
-specifier for Telethon and provides standalone diagnostics that:
+Both Telegram transports used by this project are direct:
 
-  * probe a raw TCP connection to the proxy,
-  * perform an HTTP CONNECT (or SOCKS5 handshake) and tunnel to a Telegram DC,
-  * verify the VPN/proxy is actually required (direct egress is expected to fail),
-  * never fall back to a direct connection.
+  * the Bot API client opens an HTTPS connection to ``api.telegram.org``;
+  * Telethon opens its own MTProto TCP connection to Telegram data centres.
 
-Diagnostics never expose proxy credentials.
+Neither transport reads ``HTTP_PROXY``/``HTTPS_PROXY`` or any project-specific
+proxy setting. The checks here validate DNS, TCP and (for the Bot API) TLS
+against Telegram endpoints. They never print credentials and never send
+messages.
 """
 
 from __future__ import annotations
 
-import base64
+import os
 import socket
-import struct
+import ssl
 from dataclasses import dataclass
 
-from .config import AppConfig, ProxyConfig
+from .config import LEGACY_PROXY_ENV
 
-DEFAULT_DC_IP = "149.154.167.51"  # Tensor Cloud DC4 (Amsterdam), relevant for many EU VPSes
-PROD_DC_IPS = (
+BOT_API_HOST = "api.telegram.org"
+BOT_API_PORT = 443
+DEFAULT_DC_IPS = (
     "149.154.167.51",  # DC4
     "149.154.175.53",  # DC2
     "149.154.167.50",  # DC1/3
     "91.108.56.130",
 )
 
+AMBIENT_PROXY_ENV = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+class ConnectivityError(Exception):
+    """Direct network connectivity failed; the message is safe to display."""
 
-class ProxyError(Exception):
-    """The configured proxy cannot carry traffic; message is safe to log."""
+
+@dataclass(frozen=True)
+class EndpointCheck:
+    name: str
+    host: str
+    port: int
+    addresses: tuple[str, ...]
+    tcp_ok: bool
+    tls_ok: bool | None
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.tcp_ok and self.tls_ok is not False
 
 
-def telethon_proxy_arg(proxy: ProxyConfig):
-    """Build the ``proxy=`` argument for Telethon.
+@dataclass(frozen=True)
+class DirectDiagnostics:
+    bot_api: EndpointCheck
+    telegram_dcs: tuple[EndpointCheck, ...]
+    ambient_proxy_vars: tuple[str, ...]
+    legacy_proxy_vars: tuple[str, ...]
 
-    Telethon accepts ``(type, host, port, rdns, username, password)`` tuples in
-    the PySocks format. ``socks.HTTP`` tunnels via HTTP CONNECT, which was
-    verified to work against this VPS's xray-managed listener on 127.0.0.1:1081.
-    """
+    @property
+    def ok(self) -> bool:
+        return self.bot_api.ok and any(check.tcp_ok for check in self.telegram_dcs)
 
-    if not proxy.enabled:
-        raise ProxyError(
-            "Telethon requires an explicit proxy; direct Telegram egress is blocked on this VPS."
-        )
+
+def _resolve(host: str, port: int) -> tuple[str, ...]:
     try:
-        import socks  # provided by PySocks
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ProxyError("PySocks is not installed; run 'pip install -e .[dev]' again.") from exc
-
-    proxy_type = socks.HTTP if proxy.type == "http" else socks.SOCKS5
-    return (
-        proxy_type,
-        proxy.host,
-        proxy.port,
-        True,  # resolve hostnames remotely
-        proxy.username or None,
-        proxy.password or None,
-    )
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ConnectivityError(
+            f"DNS resolution for {host} failed ({exc.__class__.__name__})"
+        ) from exc
+    addresses = tuple(dict.fromkeys(str(info[4][0]) for info in infos))
+    if not addresses:
+        raise ConnectivityError(f"DNS resolution for {host} returned no addresses")
+    return addresses
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 6.0) -> None:
+def _tcp_connect(host: str, port: int, timeout: float) -> None:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             pass
     except OSError as exc:
-        raise ProxyError(f"TCP connect to proxy {host}:{port} failed ({exc.__class__.__name__}).") from exc
+        raise ConnectivityError(
+            f"TCP connect to {host}:{port} failed ({exc.__class__.__name__})"
+        ) from exc
 
 
-def _http_connect_check(proxy: ProxyConfig, target_ip: str, target_port: int, timeout: float = 8.0) -> None:
-    hostport = f"{target_ip}:{target_port}"
+def _tls_connect(host: str, port: int, timeout: float) -> str:
+    context = ssl.create_default_context()
     try:
-        with socket.create_connection((proxy.host, proxy.port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            req = f"CONNECT {hostport} HTTP/1.1\r\nHost: {hostport}\r\n"
-            if proxy.username and proxy.password:
-                token = base64.b64encode(f"{proxy.username}:{proxy.password}".encode()).decode()
-                req += f"Proxy-Authorization: Basic {token}\r\n"
-            req += "\r\n"
-            sock.sendall(req.encode())
-            resp = b""
-            while b"\r\n\r\n" not in resp and len(resp) < 8192:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                resp += chunk
-            status = resp.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-            if " 200 " not in f" {status} ":
-                raise ProxyError(f"HTTP CONNECT through proxy failed: {status!r}")
-    except ProxyError:
-        raise
-    except OSError as exc:
-        raise ProxyError(f"HTTP CONNECT through proxy failed ({exc.__class__.__name__}).") from exc
+        with (
+            socket.create_connection((host, port), timeout=timeout) as raw,
+            context.wrap_socket(raw, server_hostname=host) as tls,
+        ):
+            version = tls.version() or "TLS"
+            return f"TLS handshake OK: {version}"
+    except (OSError, ssl.SSLError) as exc:
+        raise ConnectivityError(
+            f"TLS connect to {host}:{port} failed ({exc.__class__.__name__})"
+        ) from exc
 
 
-def _socks5_check(proxy: ProxyConfig, target_ip: str, target_port: int, timeout: float = 8.0) -> None:
+def _check_endpoint(
+    name: str,
+    host: str,
+    port: int,
+    *,
+    tls: bool,
+    timeout: float,
+) -> EndpointCheck:
     try:
-        with socket.create_connection((proxy.host, proxy.port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            if proxy.username and proxy.password:
-                sock.sendall(b"\x05\x02\x00\x02")
-            else:
-                sock.sendall(b"\x05\x01\x00")
-            resp = sock.recv(2)
-            if len(resp) != 2 or resp[0] != 5 or resp[1] not in (0, 2):
-                raise ProxyError(f"SOCKS5 handshake unsupported by proxy {proxy.host}:{proxy.port}.")
-            if resp[1] == 2 and proxy.username and proxy.password:
-                user = proxy.username.encode()
-                pw = proxy.password.encode()
-                sock.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
-                if sock.recv(2)[-1:] != b"\x00":
-                    raise ProxyError("SOCKS5 authentication failed.")
-            addr = target_ip.split(".")
-            sock.sendall(
-                b"\x05\x01\x00\x01" + bytes(int(o) for o in addr) + struct.pack(">H", target_port)
-            )
-            resp = sock.recv(10)
-            if len(resp) < 2 or resp[1] != 0:
-                raise ProxyError(f"SOCKS5 CONNECT to {target_ip}:{target_port} refused.")
-    except ProxyError:
-        raise
-    except OSError as exc:
-        raise ProxyError(f"SOCKS5 CONNECT through proxy failed ({exc.__class__.__name__}).") from exc
-
-
-def check_direct_excluded(timeout: float = 5.0) -> bool:
-    """Return True if direct egress to a Telegram DC is blocked (expected).
-
-    Direct Telegram egress is expected to be blocked on this VPS; it is only reported.
-    """
-
+        addresses = _resolve(host, port)
+    except ConnectivityError as exc:
+        return EndpointCheck(name, host, port, (), False, False if tls else None, str(exc))
     try:
-        with socket.create_connection((DEFAULT_DC_IP, 443), timeout=timeout):
-            return True  # direct path exists (unexpected)
-    except OSError:
-        return False
-
-
-@dataclass
-class ProxyDiagnostics:
-    proxy_enabled: bool
-    proxy_type: str
-    proxy_addr_public: str
-    listener_reachable: bool
-    tunneled_connect_ok: bool
-    direct_egress_blocked: bool
-    detail: str = ""
-
-
-def run_proxy_diagnostics(cfg: AppConfig, timeout: float = 8.0) -> ProxyDiagnostics:
-    """Full standalone check. Raises ProxyError on tunnel failure when enabled."""
-
-    proxy = cfg.proxy
-    addr_public = f"{proxy.host}:{proxy.port} ({proxy.type})"
-    if not proxy.enabled:
-        raise ProxyError("Proxy is disabled in configuration; this deployment requires it.")
-
-    listener_reachable = True
+        _tcp_connect(host, port, timeout)
+    except ConnectivityError as exc:
+        return EndpointCheck(name, host, port, addresses, False, False if tls else None, str(exc))
+    if not tls:
+        return EndpointCheck(name, host, port, addresses, True, None, "TCP connect OK")
     try:
-        _tcp_probe(proxy.host, proxy.port, timeout=timeout)
-    except ProxyError:
-        listener_reachable = False
-        raise
-    for dc_ip in PROD_DC_IPS:
-        try:
-            if proxy.type == "http":
-                _http_connect_check(proxy, dc_ip, 443, timeout=timeout)
-            else:
-                _socks5_check(proxy, dc_ip, 443, timeout=timeout)
-            return ProxyDiagnostics(
-                proxy_enabled=proxy.enabled,
-                proxy_type=proxy.type,
-                proxy_addr_public=addr_public,
-                listener_reachable=listener_reachable,
-                tunneled_connect_ok=True,
-                direct_egress_blocked=not check_direct_excluded(),
-                detail=f"HTTP CONNECT tunnel established to Telegram DC {dc_ip}:443",
-            )
-        except ProxyError:
-            continue
-    raise ProxyError("Proxy tunnel to Telegram DCs failed for all tested production DC IPs.")
+        detail = _tls_connect(host, port, timeout)
+    except ConnectivityError as exc:
+        return EndpointCheck(name, host, port, addresses, True, False, str(exc))
+    return EndpointCheck(name, host, port, addresses, True, True, detail)
 
 
-def describe_proxy(cfg: AppConfig) -> str:
-    p = cfg.proxy
-    return f"{p.type}://{p.host}:{p.port}" if p.enabled else "disabled"
+def _present(environ: dict[str, str], names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(name for name in names if environ.get(name))
+
+
+def run_direct_diagnostics(
+    environ: dict[str, str] | None = None, timeout: float = 8.0
+) -> DirectDiagnostics:
+    """Check Bot API and MTProto reachability over the normal direct route."""
+
+    env = dict(os.environ if environ is None else environ)
+    bot_api = _check_endpoint("Telegram Bot API", BOT_API_HOST, BOT_API_PORT, tls=True, timeout=timeout)
+    dcs = tuple(
+        _check_endpoint(f"Telegram DC {index}", ip, 443, tls=False, timeout=timeout)
+        for index, ip in enumerate(DEFAULT_DC_IPS, start=1)
+    )
+    diagnostics = DirectDiagnostics(
+        bot_api=bot_api,
+        telegram_dcs=dcs,
+        ambient_proxy_vars=_present(env, AMBIENT_PROXY_ENV),
+        legacy_proxy_vars=_present(env, LEGACY_PROXY_ENV),
+    )
+    if not bot_api.ok:
+        raise ConnectivityError(
+            f"Direct Telegram Bot API check failed: {bot_api.detail}. "
+            "Verify outbound TCP 443 and DNS, then retry."
+        )
+    if not any(check.tcp_ok for check in dcs):
+        raise ConnectivityError(
+            "Direct TCP connectivity to every tested Telegram data centre failed. "
+            "Verify outbound TCP 443, then retry."
+        )
+    return diagnostics
+
+
+def describe_direct_transport() -> str:
+    return "direct TCP/TLS (ambient proxy variables are not used)"

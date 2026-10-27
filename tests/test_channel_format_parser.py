@@ -1,20 +1,14 @@
 """Tests for the structured channel-format parser (parser version 2).
 
-Two categories are covered, and each test only asserts what its category
-promises:
-
-* **observed** — cases derived from the real channel corpus stored in the
-  local database (the fixtures in ``channel_signal_corpus.jsonl`` are the
-  unmodified texts of the ten stored historical messages);
-* **defensive** — synthetic cases guaranteeing unsafe inputs are detected or
-  rejected (invalid prices, duplicate logical IDs, unconvertible dates,
-  direction conflicts), never silently accepted.
+All examples here are synthetic. They exercise the observed structured shape
+(logical ID, exchange-qualified symbol, Jalali date, entry/stop/targets) and
+defensive cases: invalid prices, duplicate logical IDs, unconvertible dates,
+and direction conflicts must be detected or rejected, never silently accepted.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -33,36 +27,7 @@ from tg_signal_ingest.analysis.channel_format import (
     parse_structured,
     source_timestamp_from,
 )
-from tg_signal_ingest.analysis.corpus import check_corpus, load_corpus
 from tg_signal_ingest.analysis.model import Direction, FollowUpEvent
-
-CHANNEL_FIXTURE = Path(__file__).parent / "fixtures" / "channel_signal_corpus.jsonl"
-
-
-@pytest.fixture(scope="module")
-def channel_report():
-    examples = load_corpus(CHANNEL_FIXTURE)
-    return examples, check_corpus(examples)
-
-
-class TestRealCorpusFixture:
-    def test_fixture_loads_with_real_and_synthetic_parts(
-        self, channel_report
-    ):
-        examples, report = channel_report
-        real = [e for e in examples if e.source == "real_channel_corpus"]
-        synthetic = [e for e in examples if e.source == "synthetic_channel_format"]
-        assert len(real) == 10 and len(synthetic) >= 5
-        assert all(e.human_reviewed for e in real)
-        assert all(not e.human_reviewed for e in synthetic)
-        assert report.mismatched == 0
-
-    def test_real_corpus_initial_signal(self, channel_report):
-        examples, report = channel_report
-        assert report.total == len(examples)
-        initial = next(e for e in examples if e.example_id == "real-19026")
-        assert initial.expected["source_timestamp_iso"] == "2026-10-23T05:15:00Z"
-        assert initial.expected_classification == "new_signal"
 
 
 class TestJalaliConversion:
@@ -74,7 +39,7 @@ class TestJalaliConversion:
             ((1403, 1, 1), (2024, 3, 20)),
             ((1404, 1, 1), (2025, 3, 21)),
             ((1405, 1, 1), (2026, 3, 21)),
-            ((1405, 8, 1), (2026, 10, 23)),  # the real corpus date
+            ((1405, 8, 1), (2026, 10, 23)),
             ((1400, 1, 1), (2021, 3, 21)),
             ((1399, 12, 30), (2021, 3, 20)),  # leap-year last day
             ((1403, 12, 30), (2025, 3, 20)),  # leap-year last day
@@ -112,20 +77,18 @@ class TestJalaliConversion:
         assert source_timestamp_from("1405/08/02", "25:00") is None
 
 
-class TestObservedFormats:
-    """Cases keyed to the real stored messages (classification is asserted in
-    the fixture check; this class verifies structurally important fields)."""
+class TestStructuredFormats:
+    """Synthetic cases exercising the structured channel format."""
 
     def test_initial_signal_parse_via_dispatch(self):
-        # The exact unmodified text of stored message 19026.
         text = (
-            "🆔 #205\n⏰ 1405/08/01\n TIME =08:45\n *LONG*🟢 \n"
-            " ⚡️TOOBIT:ICPUSDT.P(15)\n\n ✅Entry: 2.779\n 🔰Stop Loss : 2.719\n\n"
-            " 📌TP1 : 2.797\n 📌TP2 : 2.811\n 📌TP3 : 2.824\n 📌TP4 : 2.834\n"
-            "  -----------------------------\n 🤑FULL Target : 2.869\n ----- \n"
+            "🆔 #301\n⏰ 1405/08/01\n TIME =08:45\n *LONG*🟢 \n"
+            " ⚡️TOOBIT:ABCUSDT.P(15)\n\n ✅Entry: 100.00\n 🔰Stop Loss : 95.00\n\n"
+            " 📌TP1 : 105.00\n 📌TP2 : 110.00\n 📌TP3 : 115.00\n 📌TP4 : 120.00\n"
+            "  -----------------------------\n 🤑FULL Target : 130.00\n ----- \n"
             " 💰Deposit 1.00%  \n 💠MAX LEV Suggested  =  8 (-17.39%)\n"
             " 💬 : 💡 طبق پلن معاملاتی پیش بروید\n"
-            " ⭐️ @tradermoein / @chart_Tora"
+            " ⭐️ @example_owner / @example_chart"
         )
         parsed = parse_message(text)
         assert ANALYSIS_PARSER_VERSION >= 2
@@ -133,21 +96,21 @@ class TestObservedFormats:
         assert parsed.market_type == MarketType.NON_SPOT
         assert parsed.direction == Direction.LONG
         assert parsed.side == Side.BUY
-        assert parsed.logical_id == 205
-        assert parsed.symbol == "ICPUSDT"
+        assert parsed.logical_id == 301
+        assert parsed.symbol == "ABCUSDT"
         assert parsed.quote_asset == "USDT"
-        assert parsed.symbol_raw == "ICPUSDT.P"
+        assert parsed.symbol_raw == "ABCUSDT.P"
         assert parsed.exchange == "TOOBIT"
         assert parsed.timeframe == 15
-        assert parsed.entry_price == Decimal("2.779")
-        assert parsed.stop_loss == Decimal("2.719")
+        assert parsed.entry_price == Decimal("100.00")
+        assert parsed.stop_loss == Decimal("95.00")
         assert [(t.index, t.price) for t in parsed.targets] == [
-            (1, Decimal("2.797")),
-            (2, Decimal("2.811")),
-            (3, Decimal("2.824")),
-            (4, Decimal("2.834")),
+            (1, Decimal("105.00")),
+            (2, Decimal("110.00")),
+            (3, Decimal("115.00")),
+            (4, Decimal("120.00")),
         ]
-        assert parsed.full_target == Decimal("2.869")
+        assert parsed.full_target == Decimal("130.00")
         assert parsed.deposit_pct == Decimal("1.00")
         assert parsed.suggested_leverage == Decimal("8")
         assert parsed.leverage_pct == Decimal("-17.39")
@@ -159,16 +122,16 @@ class TestObservedFormats:
         assert parsed.source_date_text == "1405/08/01"
         assert parsed.source_time_text == "08:45"
         assert parsed.source_timestamp_iso == "2026-10-23T05:15:00Z"
-        # `#205` is a logical signal ID, never a Telegram message reference.
+        # `#301` is a logical signal ID, never a Telegram message reference.
         assert parsed.referenced_message_id is None
 
     def test_tp_hit_persian_follow_up(self):
         parsed = parse_message(
-            "🆔 #201\nTOOBIT:MYXUSDT.P (LONG)\n🎯 تارگت 3 با موفقیت خورد!\n"
+            "🆔 #302\nTOOBIT:XYZUSDT.P (LONG)\n🎯 تارگت 3 با موفقیت خورد!\n"
             "💰 12.6 % سود"
         )
         assert parsed.classification == SignalClassification.RESULT
-        assert parsed.logical_id == 201
+        assert parsed.logical_id == 302
         assert parsed.follow_up_event == FollowUpEvent.TP_HIT
         assert parsed.target_index == 3
         assert parsed.profit_pct == Decimal("12.6")
@@ -176,7 +139,7 @@ class TestObservedFormats:
 
     def test_tp_hit_english_variant(self):
         parsed = parse_message(
-            "🆔 #204\nTOOBIT:LPTUSDT.P LONG\n✅ TP2 hit\n📌 Profit: 8.5 % @ 1.582"
+            "🆔 #303\nTOOBIT:XYZUSDT.P LONG\n✅ TP2 hit\n📌 Profit: 8.5 % @ 1.582"
         )
         assert parsed.classification == SignalClassification.RESULT
         assert parsed.follow_up_event == FollowUpEvent.TP_HIT
@@ -186,7 +149,7 @@ class TestObservedFormats:
 
     def test_tp1_check_mark_follow_up(self):
         parsed = parse_message(
-            "🆔 #203\nTOOBIT:APEUSDT.P\n🔔 TP1 ✅\n💹 قیمت: 0.1379\n💰 سود: 4.7 %"
+            "🆔 #304\nTOOBIT:XYZUSDT.P\n🔔 TP1 ✅\n💹 قیمت: 0.1379\n💰 سود: 4.7 %"
         )
         assert parsed.classification == SignalClassification.RESULT
         assert parsed.follow_up_event == FollowUpEvent.TP_HIT
@@ -196,7 +159,7 @@ class TestObservedFormats:
 
     def test_entry_activated_follow_up_fa_with_price(self):
         parsed = parse_message(
-            "🆔 #202\nTOOBIT:PENDLEUSDT.P\n🟢 ورود پوزیشن LONG تریگر شد\n"
+            "🆔 #305\nTOOBIT:XYZUSDT.P\n🟢 ورود پوزیشن LONG تریگر شد\n"
             "🎯 Entry: 2.0867"
         )
         assert parsed.classification == SignalClassification.RESULT
@@ -209,9 +172,9 @@ class TestObservedFormats:
 
     def test_deposit_and_leverage_are_metadata_only(self):
         parsed = parse_message(
-            "🆔 #205\n⏰ 1405/08/01\n TIME =08:45\n *LONG*🟢 \n"
-            " ⚡️TOOBIT:ICPUSDT.P(15)\n ✅Entry: 2.779\n 🔰Stop Loss : 2.719\n"
-            " 📌TP1 : 2.797\n 💰Deposit 1.00%\n"
+            "🆔 #301\n⏰ 1405/08/01\n TIME =08:45\n *LONG*🟢 \n"
+            " ⚡️TOOBIT:ABCUSDT.P(15)\n ✅Entry: 100.00\n 🔰Stop Loss : 95.00\n"
+            " 📌TP1 : 105.00\n 💰Deposit 1.00%\n"
             " 💠MAX LEV Suggested  =  8 (-17.39%)"
         )
         # Retained for review, but never converted into order sizing or
@@ -321,9 +284,9 @@ class TestDefensiveCases:
         assert parsed.logical_id is None
 
     def test_original_text_never_mutated(self):
-        text = "🆔 #201\nTOOBIT:MYXUSDT.P (LONG)\n🎯 تارگت 2 با موفقیت خورد!"
+        text = "🆔 #306\nTOOBIT:XYZUSDT.P (LONG)\n🎯 تارگت 2 با موفقیت خورد!"
         parse_structured(text)
-        assert text == "🆔 #201\nTOOBIT:MYXUSDT.P (LONG)\n🎯 تارگت 2 با موفقیت خورد!"
+        assert text == "🆔 #306\nTOOBIT:XYZUSDT.P (LONG)\n🎯 تارگت 2 با موفقیت خورد!"
 
 
 class TestFollowUpLabels:

@@ -5,12 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tg-signal-ingest"
 version = "0.1.0"
-description = "Telegram signal-channel ingestion service (storage + downstream queue, no trading)"
+description = "Telegram signal ingestion, risk controls and durable MEXC Spot execution"
 requires-python = ">=3.12"
 dependencies = [
     "telethon>=1.36,<2",
-    "python-socks>=2,<3",
-    "pysocks>=1.7,<2",
     "tomli>=2.0; python_version < '3.11'",
 ]
 
