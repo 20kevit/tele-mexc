@@ -238,6 +238,10 @@ Local protection:
   sliding-window ledgers: `data/mexc-rate-limit-ip.json`,
   `data/mexc-rate-limit-uid.json`, and `data/mexc-rate-limit-order.json`.
   Do not delete these files while a process is running.
+- Signed requests are timestamped only after any `Retry-After` backoff and the
+  shared rate gate have completed. The gate can legitimately wait a full
+  `10 s` window; stamping before that wait would exceed `recvWindow` and produce
+  `700003` even with a correctly synchronized host clock.
 - Live CLI writes acquire the shared order bucket before invoking the MEXC CLI.
   The external CLI's internal requests cannot be observed by this limiter; that
   residual gap is documented in `docs/exchanges/MEXC_SPOT_INTEGRATION.md`.
@@ -299,6 +303,9 @@ Live balance preflight:
   (SELL).
 - Subtract outstanding local open intents for the same symbol; also keep
   `remaining_balance_reserve_pct` free.
+- A timestamp rejection (`700003`/`10073`) on the read-only account query is
+  retried once with a fresh signature. A second failure rejects before any
+  order call; other balance errors are never retried.
 - Any failure rejects before an exchange call.
 
 Intent states (DB check constraint): `planned`, `submitting`, `submitted`,

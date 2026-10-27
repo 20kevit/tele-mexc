@@ -32,6 +32,7 @@ from ..mexc.errors import (
     MexcOrderNotFound,
     MexcRateLimitError,
     MexcServerError,
+    MexcTimestampError,
     MexcUnexpectedResponse,
     MexcWafError,
 )
@@ -1304,6 +1305,23 @@ class TradingEngine:
         )
         return result
 
+    def _account_for_preflight(self, client: Any) -> Any:
+        """Read the Spot account, retrying a timestamp rejection once.
+
+        ``700003`` is returned before the exchange evaluates the request, so a
+        fresh read-only retry cannot duplicate a state change.  The retry is
+        deliberately bounded to one attempt; a persistent clock problem fails
+        the preflight and therefore never reaches order submission.
+        """
+
+        try:
+            return client.account()
+        except MexcTimestampError:
+            log.warning(
+                "MEXC balance query timestamp rejected; retrying once with a fresh signature"
+            )
+            return client.account()
+
     def _balance_preflight(self, intent: dict[str, Any]) -> str | None:
         """Return a rejection reason when live balance checks cannot pass."""
 
@@ -1318,7 +1336,7 @@ class TradingEngine:
         if client is None or not hasattr(client, "account"):
             return "MEXC client does not support account balance queries"
         try:
-            raw = client.account()
+            raw = self._account_for_preflight(client)
             snapshot = parse_account(raw, fetched_at=self._monotonic())
             outstanding = self.store.outstanding_balance_usage(
                 intent["symbol"], exclude_intent_id=intent["intent_id"]

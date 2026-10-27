@@ -10,6 +10,7 @@ from tg_signal_ingest.mexc.errors import (
     MexcNetworkError,
     MexcOrderNotFound,
     MexcRateLimitError,
+    MexcTimestampError,
 )
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
@@ -90,6 +91,7 @@ class FakeMexc:
         trades_error=None,
         account_response=None,
         account_error=None,
+        account_errors=None,
     ):
         self.price = price
         self.place_response = place_response or {"orderId": "ex-1", "status": "NEW"}
@@ -100,6 +102,7 @@ class FakeMexc:
         self.trades_error = trades_error
         self.account_response = account_response
         self.account_error = account_error
+        self.account_errors = list(account_errors or [])
         self.symbols = FakeRegistry()
         self.place_calls = 0
         self.test_calls = 0
@@ -132,6 +135,8 @@ class FakeMexc:
 
     def account(self):
         self.account_calls += 1
+        if self.account_errors:
+            raise self.account_errors.pop(0)
         if self.account_error:
             raise self.account_error
         if self.account_response is not None:
@@ -804,7 +809,42 @@ def test_balance_api_failure_rejects_without_submitting(cfg, repo):
 
     assert intent is not None and intent["state"] == "rejected"
     assert client.place_calls == 0
+    assert client.account_calls == 1  # non-timestamp failures are not retried
     assert "balance query failed" in intent["reject_reason"]
+
+
+def test_balance_preflight_retries_timestamp_error_once_then_succeeds(cfg, repo):
+    open_order = {
+        "orderId": "ex-1", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+        "price": "100", "origQty": "0.1", "executedQty": "0",
+        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+    }
+    client = FakeMexc(
+        account_response=_account(),
+        account_errors=[MexcTimestampError("timestamp outside recvWindow", code=700003)],
+        query_results=[open_order],
+    )
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 90), _store_message(repo, 90, ALERT))
+
+    assert intent is not None and intent["state"] == "open"
+    assert client.account_calls == 2
+    assert client.place_calls == 1
+
+
+def test_persistent_timestamp_error_rejects_with_zero_order_submissions(cfg, repo):
+    client = FakeMexc(
+        account_error=MexcTimestampError("timestamp outside recvWindow", code=700003),
+    )
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 91), _store_message(repo, 91, ALERT))
+
+    assert intent is not None and intent["state"] == "rejected"
+    assert client.account_calls == 2  # exactly one bounded retry
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    assert "MexcTimestampError" in intent["reject_reason"]
+    assert engine.store.fills_count() == 0
 
 
 def test_balance_preflight_counts_competing_local_intents(cfg, repo):
