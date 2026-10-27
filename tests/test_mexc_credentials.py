@@ -25,7 +25,7 @@ from tg_signal_ingest.mexc import (
 
 DOC_SAMPLE = {
     "note": "P2P",
-    "accessKey": "mx0vgxxxxxxxvwe9Pq",
+    "accessKey": "mx0FAKEKEY0000000000",
     "createTime": "2026-08-31T02:22:18.000+00:00",
     "permissions": "CONTRACT_ACCOUNT_READ,SPOT_ACCOUNT_READ,SPOT_ACCOUNT_WRITE,"
     "SPOT_DEAL_READ,SPOT_DEAL_WRITE,SPOT_TRANSFER_READ",

@@ -96,16 +96,18 @@ odd field name, ambiguity A4), `quoteAmountPrecisionMarket`,
 
 ## 3. Signature generation (verified against published examples)
 
-Official examples (`introduction#post-apiv3order-example`), apiKey
-`mx0aBYs33eIilxBWC5`, secret `45d0b3c26f2644f19bfb98b07741b2f5`:
+Synthetic offline vector (never a live or published credential), apiKey
+`<test-api-key>`, secret `<test-secret>`:
 
 | Example | totalParams | Published digest |
 | --- | --- | --- |
-| 1 & 2 (all params in query OR body) | `symbol=BTCUSDT&side=BUY&type=LIMIT&quantity=1&price=11&recvWindow=5000&timestamp=1644489390087` | `fd3e4e8543c5188531eb7279d68ae7d26a573d0fc5ab0d18eb692451654d837a` |
-| 3 (mixed: query + body) | `symbol=BTCUSDT&side=BUY&type=LIMIT` + `quantity=1&price=11&recvWindow=5000&timestamp=1644489390087` (no `&` between parts) | `d1a676610ceb39174c8039b3f548357994b2a34139a8addd33baadba65684592` |
+| 1 & 2 (all params in query OR body) | `symbol=BTCUSDT&side=BUY&type=LIMIT&quantity=1&price=11&recvWindow=5000&timestamp=1644489390087` | `0ac3f412a5be580b1ff879fd4194a303bcf0f5d0fabcd07a681e31e42f1563ec` |
+| 3 (mixed: query + body) | `symbol=BTCUSDT&side=BUY&type=LIMIT` + `quantity=1&price=11&recvWindow=5000&timestamp=1644489390087` (no `&` between parts) | `1c2f9ed04448f8e704b73ee00cb6ec1ce1bae45c58e2761583f8402ac8322c7a` |
 
 Both digests are reproduced byte-for-byte by `MexcSpotClient._sign()` in
-`tests/test_mexc_official_contract.py`. The adapter canonicalizes by sorting
+`tests/test_mexc_official_contract.py`. The parameter shapes follow the official
+documentation; the key, secret, and digests in this repository are synthetic so
+no credential is published. The adapter canonicalizes by sorting
 parameters before signing (allowed: the docs specify any order, as long as the
 signed order equals the transmitted order) and encodes special characters
 (commas etc.) with uppercase percent-encoding during signing.

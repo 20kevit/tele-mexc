@@ -154,6 +154,6 @@ def test_success_report_contains_no_secret_like_values(monkeypatch, _credentials
     )
     output = "\n".join(lines)
     # raw documented sample values must never appear in the report
-    assert "mx0vgxxxxxxxvwe9Pq" not in output
+    assert "mx0FAKEKEY0000000000" not in output
     assert "162.133.62.1" in output  # whitelist IPs are public account metadata
     assert "P2P" in output  # key note/label helps the owner confirm the right key
