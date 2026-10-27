@@ -409,7 +409,12 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
             raise ConfigError("mexc_cli.min_version must be a dotted version (e.g. 0.0.22).")
         m.cli_min_version = str(cli_min_version)
 
+    cli_confirm_present = "confirm_noninteractive_writes" in cli_raw
     cli_confirm = cli_raw.get("confirm_noninteractive_writes")
+    if cli_confirm is not None and not isinstance(cli_confirm, bool):
+        raise ConfigError(
+            "mexc_cli.confirm_noninteractive_writes must be true or false."
+        )
     if isinstance(cli_confirm, bool):
         m.cli_confirm_noninteractive_writes = cli_confirm
 
@@ -440,6 +445,12 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
             "trading.mode = 'live' requires [mexc_cli] enabled = true in config.toml "
             "(the MEXC CLI backend is required for live Spot writes)."
         )
+    if t.mode == "live" and not cli_confirm_present:
+        # A service cannot answer the CLI's terminal prompt.  The explicit live
+        # token above is the owner's authorization; without this default every
+        # live signal would be rejected locally after validation.  An explicit
+        # false is still honored as a fail-closed operator override.
+        m.cli_confirm_noninteractive_writes = True
 
     positive_specs = (
         ("max_quote_per_order", float),
