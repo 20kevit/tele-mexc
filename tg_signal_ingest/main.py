@@ -254,6 +254,10 @@ def cmd_config_check(_args) -> int:
     symbols = ", ".join(cfg.trading.allowed_symbols) if cfg.trading.allowed_symbols else "not enforced"
     mexc_state = "configured" if cfg.mexc.api_key and cfg.mexc.api_secret else "missing"
     print(f"  trading: mode={cfg.trading.mode} symbol allowlist={symbols} MEXC credentials={mexc_state}")
+    cli_write_state = (
+        "armed (--yes)" if cfg.mexc.cli_confirm_noninteractive_writes else "fail-closed (no --yes)"
+    )
+    print(f"  MEXC CLI: enabled={cfg.mexc.cli_enabled} live writes={cli_write_state}")
     print(f"  order amount: {cfg.trading.order_quote_amount:g} USDT ({cfg.trading.order_quote_amount_source})")
     return 0
 

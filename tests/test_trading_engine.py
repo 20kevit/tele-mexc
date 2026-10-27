@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from tg_signal_ingest.mexc.errors import MexcNetworkError, MexcOrderNotFound, MexcRateLimitError
+from tg_signal_ingest.mexc.errors import (
+    MexcCliConfirmationRequired,
+    MexcNetworkError,
+    MexcOrderNotFound,
+    MexcRateLimitError,
+)
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import SignalParser, TradingEngine, TradingStore
@@ -260,6 +265,76 @@ def test_network_uncertainty_never_retries_and_reconciles_to_filled(cfg, repo):
     assert final is not None
     assert final["state"] == "filled"
     assert final["executed_qty"] == "0.1"
+
+
+def test_cli_confirmation_required_is_terminal_budget_neutral_and_not_retried(cfg, repo):
+    client = FakeMexc(
+        place_error=MexcCliConfirmationRequired(
+            "MEXC CLI requires explicit non-interactive confirmation; no order was sent"
+        )
+    )
+    engine = _engine(cfg, repo, client, mode="live")
+    record = _store_message(repo, 14, ALERT)
+
+    intent = engine.process_item(_item(100, 14), record)
+    assert intent is not None
+    assert intent["state"] == "rejected"
+    assert intent["exchange_order_id"] is None
+    assert client.place_calls == 1
+
+    ledger = repo.db.conn.execute(
+        "SELECT reserved_quote, spent_quote, fee_quote, active, state "
+        "FROM trading_budget_ledger WHERE intent_id = ?",
+        (intent["intent_id"],),
+    ).fetchone()
+    assert ledger is not None
+    assert Decimal(str(ledger["reserved_quote"])) == 0
+    assert Decimal(str(ledger["spent_quote"])) == 0
+    assert Decimal(str(ledger["fee_quote"])) == 0
+    assert int(ledger["active"]) == 0
+    assert ledger["state"] == "released"
+
+    again = engine.process_item(_item(100, 14), record)
+    assert again is not None and again["state"] == "rejected"
+    assert client.place_calls == 1  # local rejection is terminal; never retried
+
+
+def test_cli_success_without_exchange_order_id_is_unknown_not_accepted(cfg, repo):
+    client = FakeMexc(place_response={"status": "NEW"})
+    engine = _engine(cfg, repo, client, mode="live")
+    record = _store_message(repo, 15, ALERT)
+
+    intent = engine.process_item(_item(100, 15), record)
+    assert intent is not None
+    assert intent["state"] == "unknown_requires_reconciliation"
+    assert intent["exchange_order_id"] is None
+    assert client.place_calls == 1
+
+    again = engine.process_item(_item(100, 15), record)
+    assert again is not None
+    assert again["state"] == "unknown_requires_reconciliation"
+    assert client.place_calls == 1  # ambiguous outcome is reconciled, never retried
+
+
+def test_submitted_requires_exchange_order_evidence(cfg, repo):
+    open_order = {
+        "orderId": "ex-evidence", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+        "price": "100", "origQty": "0.1", "executedQty": "0",
+        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+    }
+    client = FakeMexc(
+        place_response={"orderId": "ex-evidence", "status": "NEW"},
+        query_results=[open_order],
+    )
+    engine = _engine(cfg, repo, client, mode="live")
+
+    intent = engine.process_item(_item(100, 16), _store_message(repo, 16, ALERT))
+
+    assert intent is not None
+    assert intent["exchange_order_id"] == "ex-evidence"
+    assert intent["exchange_status"] == "NEW"
+    assert intent["state"] == "open"
+    assert client.place_calls == 1
 
 
 def test_partial_fill_is_preserved_then_canceled(cfg, repo):

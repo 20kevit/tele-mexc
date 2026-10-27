@@ -49,13 +49,20 @@ Reads remain on REST so there is one market-data/account implementation.
 | `profile` | active profile | optional profile name passed as `--profile` |
 | `timeout_s` | `20.0` | subprocess timeout in `(0, 120]` |
 | `min_version` | `0.0.22` | minimum accepted CLI version |
-| `confirm_noninteractive_writes` | `false` | when true, live writes pass `--yes`; never automatic |
+| `confirm_noninteractive_writes` | auto | live mode arms `--yes` when absent; explicit `false` keeps live writes fail-closed; non-live modes default `false` |
 
 Writes always pass `--no-retry`; the adapter never retries a placement. The
 `clientOrderId` is reused verbatim. A CLI `duplicate` response means the earlier
 attempt landed, so it becomes `unknown_requires_reconciliation` and is
 reconciled, never resubmitted. A CLI write without explicit confirmation is
 rejected locally and no request reaches the exchange.
+
+Live mode is already an explicit owner authorization: the service cannot answer
+the CLI's terminal prompt, so when `confirm_noninteractive_writes` is absent the
+loader arms `--yes` for live writes. Setting it to `false` is honored as a
+fail-closed override, but then every live write is rejected locally. Set it to
+`false` only when intentionally disabling live writes; otherwise leave it unset
+or set `true`.
 
 ### CLI credential profile (owner-only)
 
@@ -430,8 +437,10 @@ modifies an order.
 - `oco_active` means every required OCO leg has an exchange order id. It does
   not mean the exchange has been observed to trigger either leg. Triggered
   OCO/exit behavior has not been validated with real credentials here.
-- Non-interactive writes require the explicit
-  `confirm_noninteractive_writes = true` owner setting; the default fails shut.
+- Non-interactive writes pass the CLI's verified global `--yes` flag. Live mode
+  arms it automatically when `confirm_noninteractive_writes` is absent; an
+  explicit `false` keeps writes fail-closed. A confirmation-required response
+  remains a terminal local rejection and contributes no spend.
 
 
 ## Live-enablement checklist (manual, separate approval)
@@ -445,7 +454,10 @@ modifies an order.
 4. Set `aggregate_budget_quote` to an owner-approved positive value (default 50 USDT; no hard ceiling).
 5. Run with `testonly` first; inspect intents, balances, precision, and logs.
 6. Set `mode = "live"` and the exact `live_enabled_token`.
-7. Restart once; confirm the activation boundary advanced.
-8. Submit one minimal test signal only after a separate explicit approval.
-9. Monitor `trading status`, `trading intents`, `trading trades`, and the
-   notification outbox.
+7. Leave `mexc_cli.confirm_noninteractive_writes` unset (live arms `--yes`) or
+   set it to `true`; never leave an explicit `false` when live writes are
+   intended.
+8. Restart once; confirm the activation boundary advanced.
+9. Submit one minimal test signal only after a separate explicit approval.
+10. Monitor `trading status`, `trading intents`, `trading trades`, and the
+    notification outbox.

@@ -106,7 +106,7 @@ def test_place_argv_is_array_only_and_never_auto_confirms():
     assert result["orderId"] == "ex-1"
 
 
-def test_place_uses_yes_only_when_explicitly_enabled():
+def test_place_uses_verified_yes_flag_when_enabled():
     seen: list[list[str]] = []
 
     def runner(argv, timeout):
@@ -117,7 +117,9 @@ def test_place_uses_yes_only_when_explicitly_enabled():
         symbol="BTCUSDT", side="BUY", order_type="limit",
         quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
     )
-    assert "--yes" in seen[0]
+    assert seen[0][1] == "--no-retry"
+    assert seen[0][2] == "--yes"
+    assert "--read-only" not in seen[0]
 
 
 def test_dry_run_sends_no_yes_and_no_request():
@@ -260,7 +262,10 @@ def test_exchange_api_key_format_error_is_auth_not_server():
 
 
 def test_write_without_confirmation_is_terminal_and_clear():
+    calls: list[list[str]] = []
+
     def runner(argv, timeout):
+        calls.append(list(argv))
         return completed(argv, code=2, stderr="write operations require --yes")
 
     with pytest.raises(MexcCliConfirmationRequired):
@@ -268,6 +273,9 @@ def test_write_without_confirmation_is_terminal_and_clear():
             symbol="BTCUSDT", side="BUY", order_type="limit",
             quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
         )
+    assert len(calls) == 1
+    assert "--no-retry" in calls[0]
+    assert "--yes" not in calls[0]
 
 
 def test_verify_protection_only_claims_active_when_echoed():

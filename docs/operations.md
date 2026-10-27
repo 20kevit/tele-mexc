@@ -244,8 +244,9 @@ mexc profile list              # no credentials needed
 problem, when the configured CLI profile is missing, or when the CLI profile and
 the REST key read different Spot account balances. Live mode additionally
 rejects `[mexc_cli] enabled = false` at config load. The minimum version is
-`0.0.22`. Non-interactive CLI writes are disabled by default; enabling
-`mexc_cli.confirm_noninteractive_writes` is a separate, explicit owner decision.
+`0.0.22`. Live mode arms non-interactive CLI writes (`--yes`) automatically when
+`mexc_cli.confirm_noninteractive_writes` is absent; an explicit `false` remains a
+fail-closed override and makes every live write reject locally.
 
 ## Recovery
 

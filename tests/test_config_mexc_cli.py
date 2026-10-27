@@ -45,6 +45,44 @@ def test_cli_section_overrides_defaults():
     assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
+def test_live_mode_arms_noninteractive_cli_writes_by_default():
+    app = _app()
+    _load_mexc_and_trading(
+        app,
+        {"trading": {
+            "mode": "live",
+            "live_enabled_token": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
+        }},
+        {},
+    )
+    assert app.trading.mode == "live"
+    assert app.mexc.cli_confirm_noninteractive_writes is True
+
+
+def test_live_mode_preserves_an_explicit_noninteractive_opt_out():
+    app = _app()
+    _load_mexc_and_trading(
+        app,
+        {
+            "mexc_cli": {"confirm_noninteractive_writes": False},
+            "trading": {
+                "mode": "live",
+                "live_enabled_token": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
+            },
+        },
+        {},
+    )
+    assert app.mexc.cli_confirm_noninteractive_writes is False
+
+
+def test_non_bool_noninteractive_setting_is_rejected():
+    app = _app()
+    with pytest.raises(ConfigError, match=r"confirm_noninteractive_writes"):
+        _load_mexc_and_trading(
+            app, {"mexc_cli": {"confirm_noninteractive_writes": "yes"}}, {}
+        )
+
+
 @pytest.mark.parametrize("value", [0, -1, 121, float("nan")])
 def test_cli_timeout_must_be_bounded(value):
     app = _app()
