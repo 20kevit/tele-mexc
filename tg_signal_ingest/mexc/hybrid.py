@@ -49,6 +49,11 @@ class HybridMexcClient:
         take_profit_price: Decimal | None = None,
         stop_loss_price: Decimal | None = None,
     ) -> dict[str, Any]:
+        # The external CLI is a separate network client, but our own callers
+        # still share the documented 12 requests/second order bucket.  Acquire
+        # the shared gate before spawning it so two local processes cannot
+        # both burst writes at once.
+        self.rest.order_gate.acquire(1)
         return self.cli.place_order(
             symbol=symbol,
             side=side,
@@ -72,6 +77,7 @@ class HybridMexcClient:
         trigger_limit_price: Decimal | None = None,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
+        self.rest.order_gate.acquire(1)
         return self.cli.place_oco(
             symbol=symbol,
             side=side,
@@ -89,6 +95,7 @@ class HybridMexcClient:
         order_id: str | None = None,
         orig_client_order_id: str | None = None,
     ) -> dict[str, Any]:
+        self.rest.order_gate.acquire(1)
         return self.cli.cancel_order(
             symbol=symbol,
             order_id=order_id,
@@ -102,7 +109,9 @@ class HybridMexcClient:
         order_id: str | None = None,
         orig_client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.cli.query_order(
+        # Reads stay on REST so they are covered by the shared endpoint-weight
+        # limiter.  The CLI is reserved for write-only capabilities.
+        return self.rest.query_order(
             symbol=symbol,
             order_id=order_id,
             orig_client_order_id=orig_client_order_id,

@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -24,7 +25,13 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
+
+try:  # POSIX file locking for a limiter shared by serve/CLI/control processes
+    import fcntl
+except ImportError:  # pragma: no cover - Linux is the supported deployment
+    fcntl = None  # type: ignore[assignment]
 
 from .errors import (
     _BALANCE_CODES,
@@ -57,6 +64,26 @@ USER_AGENT = "tg-signal-ingest/0.1 (spot-client)"
 ORDER_PLACEMENT_RPS = 12.0  # official shared place+cancel UID bucket: 12 requests/s
 DEFAULT_WAF_BACKOFF_S = 60.0  # no Retry-After header: stop instead of escalating a ban
 MAX_RECV_WINDOW_MS = 60000  # Introduction/docs: recvWindow max is 60000 ms
+
+# Official Spot v3 weights (verified against mexc.com/api-docs on 2026-10-27).
+# Unknown paths deliberately use the heaviest documented market-data weight so
+# a future endpoint cannot silently consume a 1-weight allowance.
+DEFAULT_ENDPOINT_WEIGHT = 25
+ENDPOINT_RULES: dict[tuple[str, str], tuple[str, int]] = {
+    ("GET", "/api/v3/ping"): ("ip", 1),
+    ("GET", "/api/v3/time"): ("ip", 1),
+    ("GET", "/api/v3/exchangeInfo"): ("ip", 25),
+    ("GET", "/api/v3/ticker/price"): ("ip", 10),
+    ("GET", "/api/v3/depth"): ("ip", 3),
+    ("GET", "/api/v3/order"): ("ip", 2),
+    ("GET", "/api/v3/openOrders"): ("ip", 3),
+    ("GET", "/api/v3/myTrades"): ("ip", 10),
+    ("GET", "/api/v3/account"): ("ip", 10),
+    ("GET", "/api/v3/apiKeyInfo"): ("ip", 1),
+    ("POST", "/api/v3/order/test"): ("ip", 1),
+    # POST/DELETE /api/v3/order share the documented 12 requests/second UID
+    # bucket. The request methods pass bucket="order" explicitly.
+}
 
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, dict[str, str], bytes]]
 
@@ -108,6 +135,90 @@ class WeightedRateGate:
                 self._sleep(max(0.01, (oldest + self.window_s) - now))
 
 
+class SharedWeightedRateGate(WeightedRateGate):
+    """Weighted sliding window shared by every local process.
+
+    ``serve``, ``trading reconcile`` and the control bot can all issue MEXC
+    requests from the same IP/UID.  The ledger is protected by an OS advisory
+    lock, so two independently started clients observe one budget.  State is
+    only timestamps and integer weights; no credentials or request data are
+    written.
+    """
+
+    def __init__(
+        self,
+        max_weight: int,
+        window_s: float,
+        *,
+        state_path: str | Path,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        super().__init__(max_weight, window_s, clock=clock, sleep=sleep)
+        self.state_path = Path(state_path)
+        self.lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local_fallback: WeightedRateGate | None = None
+        if fcntl is None:  # pragma: no cover - Linux deployment
+            self._local_fallback = WeightedRateGate(
+                max_weight, window_s, clock=clock, sleep=sleep
+            )
+
+    def _read_events(self) -> deque[tuple[float, int]]:
+        try:
+            raw = self.state_path.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else {}
+            events = data.get("events", []) if isinstance(data, dict) else []
+            out: deque[tuple[float, int]] = deque()
+            for item in events:
+                if not isinstance(item, list) or len(item) != 2:
+                    continue
+                out.append((float(item[0]), int(item[1])))
+            return out
+        except (OSError, ValueError, TypeError):
+            return deque()
+
+    def _write_events(self, events: deque[tuple[float, int]]) -> None:
+        tmp = self.state_path.with_suffix(self.state_path.suffix + f".tmp.{os.getpid()}")
+        tmp.write_text(
+            json.dumps({"events": [[ts, weight] for ts, weight in events]}),
+            encoding="utf-8",
+        )
+        with tmp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.state_path)
+
+    def acquire(self, weight: int = 1) -> None:
+        if self._local_fallback is not None:  # pragma: no cover - non-POSIX
+            self._local_fallback.acquire(weight)
+            return
+        if weight < 1:
+            raise ValueError("weight must be >= 1")
+        if weight > self.max_weight:
+            raise ValueError("request weight exceeds the configured bucket capacity")
+        while True:
+            with self.lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    now = self._clock()
+                    events = self._read_events()
+                    self._prune_events(now, events)
+                    used = sum(w for _ts, w in events)
+                    if used + weight <= self.max_weight:
+                        events.append((now, weight))
+                        self._write_events(events)
+                        return
+                    wait = max(0.01, (events[0][0] + self.window_s) - now)
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            self._sleep(wait)
+
+    def _prune_events(self, now: float, events: deque[tuple[float, int]]) -> None:
+        cutoff = now - self.window_s
+        while events and events[0][0] <= cutoff:
+            events.popleft()
+
+
 class MexcSpotClient:
     """Thin typed client. All calls are sync; async wrappers use to_thread.
 
@@ -129,6 +240,7 @@ class MexcSpotClient:
         clock: Callable[[], int] | None = None,
         order_gate: WeightedRateGate | None = None,
         general_gate: WeightedRateGate | None = None,
+        uid_gate: WeightedRateGate | None = None,
         symbol_registry: SymbolRegistry | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -150,6 +262,7 @@ class MexcSpotClient:
         self._clock = clock or (lambda: int(time.time() * 1000))
         self.order_gate = order_gate or WeightedRateGate(int(ORDER_PLACEMENT_RPS), 1.0)
         self.general_gate = general_gate or WeightedRateGate(60, 10.0)
+        self.uid_gate = uid_gate or WeightedRateGate(100, 10.0)
         self.symbols = symbol_registry or SymbolRegistry(self)
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or time.sleep
@@ -306,8 +419,28 @@ class MexcSpotClient:
             headers["Content-Type"] = "application/json"
 
         self._await_backoff()
-        gate = self.order_gate if bucket == "order" else self.general_gate
-        gate.acquire(1)
+        if bucket == "order":
+            # Official POST/DELETE order bucket: 12 requests/second per UID.
+            self.order_gate.acquire(1)
+        else:
+            limit_kind, weight = ENDPOINT_RULES.get(
+                (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
+            )
+            try:
+                if limit_kind == "uid":
+                    self.uid_gate.acquire(weight)
+                else:
+                    self.general_gate.acquire(weight)
+                    if signed:
+                        # Signed endpoints are also account-scoped; tracking the
+                        # separate UID budget is conservative against the docs'
+                        # per-endpoint IP/UID wording change.
+                        self.uid_gate.acquire(1)
+            except ValueError as exc:
+                raise MexcConfigError(
+                    f"configured rate budget is too small for {method} {path} "
+                    f"(weight {weight}): {exc}"
+                ) from exc
 
         started = time.monotonic()
         timeout = (timeout_override or self.request_timeout_s) + self.connect_timeout_s
@@ -428,7 +561,8 @@ class MexcSpotClient:
             p["price"] = _fmt(price)
         if client_order_id:
             p["newClientOrderId"] = client_order_id
-        self.request("POST", "/api/v3/order/test", params=p, signed=True, bucket="order")
+        # Official /order/test is Weight(IP): 1, not the live order bucket.
+        self.request("POST", "/api/v3/order/test", params=p, signed=True)
         return True
 
     def query_order(

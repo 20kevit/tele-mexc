@@ -134,6 +134,39 @@ silent drops are possible because intents are write-ahead.
 - All REST I/O is dispatched through `asyncio.to_thread` (client methods are
   sync and deliberately so: transport is one injectable call).
 
+### Rate-limit and polling contract
+
+Official Spot v3 limits are IP `300 weight/10 s`, UID `500 weight/10 s`, and a
+shared order/cancel UID bucket of `12 requests/s`. The client charges the
+documented per-endpoint weights rather than one unit per request:
+
+| Endpoint | Weight |
+| --- | --- |
+| `GET /api/v3/ticker/price` | `10` |
+| `GET /api/v3/exchangeInfo` | `25` |
+| `GET /api/v3/account` | `10` |
+| `GET /api/v3/myTrades` | `10` |
+| `GET /api/v3/openOrders` | `3` |
+| `GET /api/v3/order` | `2` |
+| `GET /api/v3/depth` | `3` |
+| `GET /api/v3/ping`, `/time` | `1` |
+| `POST /api/v3/order/test` | `1` |
+| `POST`/`DELETE /api/v3/order` | shared order bucket |
+
+Unknown endpoints use weight `25`. Local caps are `60` IP weight/10 s and
+`100` UID weight/10 s. `serve`, the `trading` CLI, and the CLI write path use
+file-backed shared ledgers under `data/mexc-rate-limit-*.json`.
+
+The monitor uses one all-symbol `GET /api/v3/ticker/price` request per polling
+interval (weight `10`), not one request per symbol. At the default 2 s interval
+that is `50 weight/10 s`; more symbols do not multiply requests. A `429`/`418`
+response blocks the affected feed and honors `Retry-After`; polling never places
+or retries an order.
+
+Residual gap: live writes are executed by the external MEXC CLI. The application
+acquires the shared order bucket before invoking the CLI, but requests made
+inside the CLI process cannot be counted by the application limiter.
+
 ## 9. What must be configured before integration can be enabled
 
 1. `MEXC_API_KEY` / `MEXC_API_SECRET` in the private `.env` (never committed).

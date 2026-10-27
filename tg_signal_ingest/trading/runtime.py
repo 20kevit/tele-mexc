@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 from ..config import AppConfig, ConfigError
-from ..mexc import MexcSpotClient, SymbolRegistry, WeightedRateGate
+from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..repository import Repository
 from .engine import TradingEngine
 from .store import TradingStore
@@ -79,6 +79,8 @@ def build_mexc_client(cfg: AppConfig, *, for_live_writes: bool = False) -> Any:
             "MEXC credentials are missing; set MEXC_API_KEY and MEXC_API_SECRET "
             "in the private .env (never commit them)."
         )
+    state_dir = cfg.data_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
     rest = MexcSpotClient(
         cfg.mexc.api_key,
         cfg.mexc.api_secret,
@@ -86,7 +88,24 @@ def build_mexc_client(cfg: AppConfig, *, for_live_writes: bool = False) -> Any:
         recv_window_ms=cfg.mexc.recv_window_ms,
         connect_timeout_s=cfg.mexc.connect_timeout_s,
         request_timeout_s=cfg.mexc.request_timeout_s,
-        general_gate=WeightedRateGate(max(1, cfg.mexc.max_ip_weight_per_10s), 10.0),
+        # One IP budget and one UID budget shared by serve, reconcile CLI and
+        # any other local process.  Official limits are 300/10s (IP) and
+        # 500/10s (UID); the configured values stay well below them.
+        general_gate=SharedWeightedRateGate(
+            max(1, cfg.mexc.max_ip_weight_per_10s),
+            10.0,
+            state_path=state_dir / "mexc-rate-limit-ip.json",
+        ),
+        uid_gate=SharedWeightedRateGate(
+            max(1, cfg.mexc.max_uid_weight_per_10s),
+            10.0,
+            state_path=state_dir / "mexc-rate-limit-uid.json",
+        ),
+        order_gate=SharedWeightedRateGate(
+            12,
+            1.0,
+            state_path=state_dir / "mexc-rate-limit-order.json",
+        ),
     )
     if for_live_writes and cfg.mexc.cli_enabled:
         from ..mexc.cli import MexcCliAdapter

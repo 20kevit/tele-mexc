@@ -14,6 +14,7 @@ from tg_signal_ingest.mexc import (
     MexcRateLimitError,
     MexcSpotClient,
     MexcWafError,
+    SharedWeightedRateGate,
     WeightedRateGate,
 )
 
@@ -196,3 +197,136 @@ def test_api_key_info_sends_the_required_access_key_parameter():
     url = transport.calls[0]["url"]
     assert "accessKey=key-from-test" in url
     assert "signature=" in url
+
+
+class RecordingGate(WeightedRateGate):
+    def __init__(self):
+        super().__init__(1000, 10.0, sleep=lambda _s: None)
+        self.weights: list[int] = []
+
+    def acquire(self, weight: int = 1) -> None:
+        self.weights.append(weight)
+        super().acquire(weight)
+
+
+def test_ticker_price_charges_documented_weight_10():
+    general = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY, API_SECRET, transport=Transport(payload={"symbol": "BTCUSDT", "price": "1"}),
+        clock=lambda: CLOCK_MS, general_gate=general,
+    )
+    client.ticker_price(symbol="BTCUSDT")
+    assert general.weights == [10]
+
+
+def test_exchange_info_charges_documented_weight_25():
+    general = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY, API_SECRET, transport=Transport(payload={"symbols": []}),
+        clock=lambda: CLOCK_MS, general_gate=general,
+    )
+    client.exchange_info()
+    assert general.weights == [25]
+
+
+def test_signed_reads_consume_ip_and_uid_budgets():
+    general = RecordingGate()
+    uid = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY,
+        API_SECRET,
+        transport=Transport(payload={"balances": []}),
+        clock=lambda: CLOCK_MS,
+        general_gate=general,
+        uid_gate=uid,
+    )
+    client.account()
+    assert general.weights == [10]
+    assert uid.weights == [1]
+
+
+def test_order_test_uses_ip_weight_1_not_the_live_order_bucket():
+    general = RecordingGate()
+    uid = RecordingGate()
+    order = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY,
+        API_SECRET,
+        transport=Transport(payload={}),
+        clock=lambda: CLOCK_MS,
+        general_gate=general,
+        uid_gate=uid,
+        order_gate=order,
+    )
+    client.place_test_order(
+        symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+        quantity=Decimal("0.1"), price=Decimal("100"),
+    )
+    assert general.weights == [1]
+    assert uid.weights == [1]
+    assert order.weights == []
+
+
+def test_order_writes_use_only_the_official_12_rps_uid_bucket():
+    general = RecordingGate()
+    uid = RecordingGate()
+    order = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY,
+        API_SECRET,
+        transport=Transport(payload={"orderId": "1", "status": "NEW"}),
+        clock=lambda: CLOCK_MS,
+        general_gate=general,
+        uid_gate=uid,
+        order_gate=order,
+    )
+    client.place_order(
+        symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+        quantity=Decimal("0.1"), price=Decimal("100"),
+    )
+    assert general.weights == []
+    assert uid.weights == []
+    assert order.weights == [1]
+
+
+def test_unknown_endpoint_uses_conservative_default_weight():
+    general = RecordingGate()
+    client = MexcSpotClient(
+        API_KEY, API_SECRET, transport=Transport(payload={}),
+        clock=lambda: CLOCK_MS, general_gate=general,
+    )
+    client.request("GET", "/api/v3/future-unlisted-endpoint")
+    assert general.weights == [25]
+
+
+def test_shared_gate_enforces_one_budget_across_clients(tmp_path):
+    now = [100.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    path = tmp_path / "ip.json"
+    first = SharedWeightedRateGate(
+        2, 10.0, state_path=path, clock=lambda: now[0], sleep=sleep
+    )
+    second = SharedWeightedRateGate(
+        2, 10.0, state_path=path, clock=lambda: now[0], sleep=sleep
+    )
+
+    first.acquire(2)
+    second.acquire(1)
+    assert sleeps and sleeps[0] >= 9.9
+
+
+def test_shared_gate_prunes_expired_events(tmp_path):
+    now = [100.0]
+    gate = SharedWeightedRateGate(
+        1, 10.0, state_path=tmp_path / "ip.json",
+        clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s),
+    )
+    gate.acquire(1)
+    now[0] += 10.1
+    gate.acquire(1)
+    assert gate.state_path.exists()

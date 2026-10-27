@@ -96,6 +96,7 @@ class PollingPriceFeed(PriceFeed):
         self,
         fetch_price: Callable[[str], Decimal | None],
         *,
+        fetch_prices: Callable[[list[str]], dict[str, Decimal]] | None = None,
         poll_interval_s: float = 2.0,
         max_retries: int = 5,
         backoff_base_s: float = 1.0,
@@ -103,6 +104,7 @@ class PollingPriceFeed(PriceFeed):
         sleep: Callable[[float], None] | None = None,
     ):
         self._fetch_price = fetch_price
+        self._fetch_prices = fetch_prices
         self._poll_interval_s = poll_interval_s
         self._max_retries = max_retries
         self._backoff_base_s = backoff_base_s
@@ -148,6 +150,9 @@ class PollingPriceFeed(PriceFeed):
     # --------------------------------------------------------------- internals
 
     async def _run_loop(self) -> None:
+        if self._fetch_prices is not None:
+            await self._run_batch_loop()
+            return
         while not self._stop.is_set():
             symbols = list(self._subscriptions)
             if not symbols:
@@ -157,6 +162,7 @@ class PollingPriceFeed(PriceFeed):
                 await self._sleep_with_stop(self._poll_interval_s)
                 continue
             now = self._clock()
+            stop_cycle = False
             for symbol in symbols:
                 if self._stop.is_set():
                     break
@@ -165,11 +171,11 @@ class PollingPriceFeed(PriceFeed):
                 except Exception as exc:  # noqa: BLE001 - one bad fetch must not stop the feed
                     failures = self._failures.get(symbol, 0) + 1
                     self._failures[symbol] = failures
-                    log.warning(
-                        "price feed poll failed for %s (attempt %s): %s",
-                        symbol, failures, exc.__class__.__name__,
+                    stop_cycle = await self._sleep_after_failure(
+                        f"poll for {symbol}", failures, exc
                     )
-                    await self._sleep_with_stop(self._backoff_for(failures))
+                    if stop_cycle:
+                        break
                     continue
                 self._failures.pop(symbol, None)
                 if price is not None and price.is_finite() and price > 0:
@@ -179,12 +185,67 @@ class PollingPriceFeed(PriceFeed):
                     if callback is not None:
                         callback(symbol, price, now)
                 await self._sleep_with_stop(self._poll_interval_s)
+            if stop_cycle:
+                await self._sleep_with_stop(self._poll_interval_s)
+
+    async def _run_batch_loop(self) -> None:
+        """One all-symbol ticker request per interval (official weight 10)."""
+
+        fetch_prices = self._fetch_prices
+        assert fetch_prices is not None
+        failures = 0
+        while not self._stop.is_set():
+            symbols = list(self._subscriptions)
+            if not symbols:
+                await self._sleep_with_stop(self._poll_interval_s)
+                continue
+            try:
+                prices = await asyncio.to_thread(fetch_prices, symbols)
+            except Exception as exc:  # noqa: BLE001 - backoff, never crash
+                failures += 1
+                await self._sleep_after_failure("batch ticker poll", failures, exc)
+                continue
+            failures = 0
+            now = self._clock()
+            for symbol, price in prices.items():
+                if symbol not in self._subscriptions:
+                    continue
+                if price is None or not price.is_finite() or price <= 0:
+                    continue
+                tick = PriceTick(symbol=symbol, price=price, received_at=now)
+                self._last_price[symbol] = tick
+                callback = self._subscriptions.get(symbol)
+                if callback is not None:
+                    callback(symbol, price, now)
+            await self._sleep_with_stop(self._poll_interval_s)
+
+    async def _sleep_after_failure(self, context: str, failures: int, exc: Exception) -> bool:
+        """Sleep after a failure; return True when the whole cycle must stop."""
+
+        retry_after = getattr(exc, "retry_after_s", None)
+        if retry_after is not None and float(retry_after) >= 0:
+            # 429/418: the exchange's instruction wins over local backoff, with
+            # a one-second floor so a missing/zero header cannot hot-loop.
+            delay = max(1.0, float(retry_after)) + random.uniform(0, 0.5)
+            log.warning(
+                "%s rate-limited (%s); honoring Retry-After %.1fs",
+                context, exc.__class__.__name__, delay,
+            )
+            await self._sleep_with_stop(delay)
+            return True
+        delay = self._backoff_for(failures)
+        log.warning(
+            "%s failed (attempt %s, %s); backing off %.1fs",
+            context, failures, exc.__class__.__name__, delay,
+        )
+        await self._sleep_with_stop(delay)
+        return False
 
     def _backoff_for(self, failures: int) -> float:
-        # Bounded exponential backoff with full jitter.
+        # Bounded exponential backoff with additive jitter (never zero).
         base = self._backoff_base_s
-        cap = base * (2 ** min(failures - 1, 6))
-        return random.uniform(0, min(cap, 30.0))
+        cap = min(base * (2 ** min(max(0, failures - 1), 6)), 30.0)
+        return random.uniform(cap / 2, cap) if cap > 0 else 0.0
 
     async def _sleep_with_stop(self, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):
@@ -451,6 +512,7 @@ class MarketMonitor:
         cfg: AppConfig,
         fetch_price: Callable[[str], Decimal | None],
         on_price: Callable[[str, Decimal, float], None],
+        fetch_prices: Callable[[list[str]], dict[str, Decimal]] | None = None,
         feed: PriceFeed | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -467,6 +529,7 @@ class MarketMonitor:
         else:
             polling = PollingPriceFeed(
                 fetch_price,
+                fetch_prices=fetch_prices,
                 poll_interval_s=float(cfg.trading.monitor_poll_interval_s),
                 max_retries=int(cfg.trading.monitor_max_retries),
                 backoff_base_s=float(cfg.trading.monitor_backoff_base_s),
@@ -544,6 +607,8 @@ class _PrimaryWithFallback(PriceFeed):
         if self._primary_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._primary_task
+        with contextlib.suppress(Exception):
+            await self._primary.stop()
         await self._fallback.stop()
 
     async def subscribe(self, symbol: str, callback: PriceCallback) -> None:

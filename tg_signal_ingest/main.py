@@ -1137,6 +1137,30 @@ def cmd_trading_signals(args) -> int:
     return 0
 
 
+def cmd_trading_repair_signals(args) -> int:
+    from .trading.store import TradingStore
+
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+    store = TradingStore(repo.db, cfg.trading)
+    rows = store.repair_inconsistent_terminal_signals(limit=args.limit, apply=args.apply)
+    if not rows:
+        print("no inconsistent terminal signals found")
+        db.close()
+        return 0
+    for row in rows:
+        print(
+            f"{row['signal_id']:<24} signal={row['signal_status']:<10} "
+            f"intent={row['intent_id']:<34} state={row['intent_state']}"
+        )
+    if args.apply:
+        print(f"repaired {len(rows)} signal status(es); no exchange call was made")
+    else:
+        print("dry-run only; pass --apply to persist these signal status corrections")
+    db.close()
+    return 0
+
+
 def cmd_trading_intents(args) -> int:
     from .trading.store import TradingStore
 
@@ -1815,6 +1839,16 @@ def build_parser() -> argparse.ArgumentParser:
     ts_intents = ts_sub.add_parser("intents", help="list order intents and states")
     ts_intents.add_argument("--limit", type=int, default=20)
     ts_intents.set_defaults(func=cmd_trading_intents)
+    ts_repair = ts_sub.add_parser(
+        "repair-signals",
+        help="audit/repair signals left active by a terminal rejected/failed intent (no orders)",
+    )
+    ts_repair.add_argument("--limit", type=int, default=50)
+    ts_repair.add_argument(
+        "--apply", action="store_true",
+        help="persist the status correction; default is a read-only dry-run",
+    )
+    ts_repair.set_defaults(func=cmd_trading_repair_signals)
     ts_parse = ts_sub.add_parser("parse", help="parse one stored message without trading")
     ts_parse.add_argument("id", type=int)
     ts_parse.set_defaults(func=cmd_trading_parse)

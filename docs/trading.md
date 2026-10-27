@@ -168,10 +168,21 @@ The engine re-validates immediately before submission.
 ## Replay boundary and idempotency
 
 The activation boundary is `app_state['trading.activation_boundary_message_id']`.
-At each `serve` start it advances to the channel's newest id (never backwards).
-In `testonly`/`live`, a message at or below it is rejected as historical. Every
-backfill-sourced message is non-tradeable in all modes that reach the trading
-handler.
+At each `serve` start, **before live handlers are registered**, the engine
+snapshots the selected channel's newest stored message id and persists
+`max(existing boundary, snapshot)`. The boundary is forward-only.
+
+In `testonly`/`live`:
+
+- a message at or below the boundary is rejected as historical;
+- `source='backfill'` and `source='recovery'` rows are non-tradeable regardless
+  of their message id;
+- a live row delivered after the snapshot, including while the recovery sweep
+  is running, remains above the boundary and can trade.
+
+The persisted boundary can therefore be lower than the newest recovered/backfill
+row. That is intentional: source is the primary guard for downtime traffic, and
+the boundary protects against identity/replay confusion.
 
 Idempotency:
 
@@ -182,7 +193,67 @@ intent_id       = "intent-" + client_order_id
 ```
 
 If a message already has an intent with a different action/symbol, the edit is
-superseded and audited; no second order is placed.
+superseded and audited; no second order is placed. A same-version duplicate
+delivery does not supersede the signal and cannot resubmit a terminal intent.
+A newer edit may supersede the old signal but still cannot create a second
+intent for the same message.
+
+Terminal `rejected`/`failed` intent transitions update an active
+(`parsed`/`validated`/`planned`) signal to `rejected` in the same transaction.
+They never overwrite `superseded`, `canceled`, or `deleted` signals.
+
+## MEXC rate limits and market polling
+
+Official Spot v3 limits (verified 2026-10-27):
+
+| Bucket | Official limit |
+| --- | --- |
+| IP weight | `300` per `10 s` |
+| UID weight | `500` per `10 s` |
+| Order + cancel | `12` requests per second, shared UID bucket |
+
+Endpoint weights used by this service:
+
+| Endpoint | Weight |
+| --- | --- |
+| `GET /api/v3/ticker/price` | `10` (IP) |
+| `GET /api/v3/exchangeInfo` | `25` (IP) |
+| `GET /api/v3/account` | `10` (IP) |
+| `GET /api/v3/myTrades` | `10` (IP) |
+| `GET /api/v3/openOrders` | `3` (IP) |
+| `GET /api/v3/order` | `2` (IP) |
+| `GET /api/v3/depth` | `3` (IP) |
+| `GET /api/v3/ping`, `/time` | `1` (IP) |
+| `POST /api/v3/order/test` | `1` (IP) |
+| `POST`/`DELETE /api/v3/order` | shared order bucket |
+
+Unknown endpoints are charged a conservative default weight of `25`.
+
+Local protection:
+
+- Configured caps are `max_ip_weight_per_10s=60` and
+  `max_uid_weight_per_10s=100`; these are deliberately far below the official
+  limits, not additional trading limits.
+- `serve`, the `trading` CLI, and other local processes share file-backed
+  sliding-window ledgers: `data/mexc-rate-limit-ip.json`,
+  `data/mexc-rate-limit-uid.json`, and `data/mexc-rate-limit-order.json`.
+  Do not delete these files while a process is running.
+- Live CLI writes acquire the shared order bucket before invoking the MEXC CLI.
+  The external CLI's internal requests cannot be observed by this limiter; that
+  residual gap is documented in `docs/exchanges/MEXC_SPOT_INTEGRATION.md`.
+
+Market polling:
+
+- `GET /api/v3/ticker/price` without a symbol returns all tickers for one
+  weight-`10` request. The monitor uses that batch path, so the number of open
+  symbols does not multiply requests.
+- At `monitor_poll_interval_s=2.0`, one batch every 2 s is `0.5 req/s`, or
+  `50 weight/10 s` — below the configured `60` cap. Larger symbol sets add no
+  requests. The shared gate throttles intervals that would exceed the cap.
+- HTTP `429`/`418` responses stop the affected feed and honor `Retry-After`
+  with bounded jitter. The polling feed does not retry orders; it only reads
+  prices. Order submission remains governed by the no-retry
+  `unknown_requires_reconciliation` path.
 
 ## Budget ledger
 

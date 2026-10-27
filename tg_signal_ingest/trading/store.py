@@ -135,6 +135,62 @@ class TradingStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def inconsistent_terminal_signals(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Terminal rejected/failed intents whose signal is still active.
+
+        This is a read-only audit.  It exists for rows created before the
+        transactional synchronization in :meth:`transition_intent`.
+        """
+
+        rows = self.db.conn.execute(
+            "SELECT s.signal_id, s.status AS signal_status, s.created_at, "
+            "       oi.intent_id, oi.state AS intent_state, oi.reject_reason "
+            "FROM order_intents oi JOIN signals s ON s.signal_id = oi.signal_id "
+            "WHERE oi.state IN ('rejected', 'failed') "
+            "  AND s.status IN ('parsed', 'validated', 'planned') "
+            "ORDER BY s.created_at DESC, s.signal_id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def repair_inconsistent_terminal_signals(
+        self, *, limit: int = 50, apply: bool = False
+    ) -> list[dict[str, Any]]:
+        """Explicitly reconcile old terminal-intent/signal mismatches.
+
+        Dry-run by default.  Only active signal statuses are changed; newer
+        edits (``superseded``), cancels and deletes are never overwritten.  No
+        exchange call and no intent transition is made, so this can never
+        resubmit an order.
+        """
+
+        rows = self.inconsistent_terminal_signals(limit=limit)
+        if not apply or not rows:
+            return rows
+        now = self._ts()
+        with self.db.transaction() as conn:
+            for row in rows:
+                reason = row.get("reject_reason") or (
+                    f"terminal intent state is {row['intent_state']}"
+                )
+                conn.execute(
+                    "UPDATE signals SET status = 'rejected', "
+                    "rejection_reason = COALESCE(rejection_reason, ?), updated_at = ? "
+                    "WHERE signal_id = ? AND status IN ('parsed', 'validated', 'planned')",
+                    (str(reason)[:500], now, row["signal_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO audit_events "
+                    "(correlation, category, event, detail, created_at) "
+                    "VALUES (?, 'lifecycle', 'terminal_signal_repaired', ?, ?)",
+                    (
+                        str(row["signal_id"])[:200],
+                        f"intent={row['intent_id']} state={row['intent_state']}"[:2000],
+                        now,
+                    ),
+                )
+        return rows
+
     def find_duplicate_signal(
         self,
         *,
@@ -523,6 +579,22 @@ class TradingStore:
                 "SELECT * FROM order_intents WHERE idempotency_key = ?", (idempotency_key,)
             ).fetchone()
             if existing is not None:
+                # Retrying the same version must restore the status implied by
+                # the durable intent instead of leaving a transient 'validated'
+                # (or overwriting a terminal rejection with 'superseded').
+                if existing["signal_id"] == signal_id:
+                    if existing["state"] in ("rejected", "failed"):
+                        conn.execute(
+                            "UPDATE signals SET status = 'rejected', updated_at = ? "
+                            "WHERE signal_id = ? AND status IN ('parsed', 'validated', 'planned')",
+                            (now, signal_id),
+                        )
+                    elif existing["state"] not in ("canceled", "canceled_local", "filled"):
+                        conn.execute(
+                            "UPDATE signals SET status = 'planned', updated_at = ? "
+                            "WHERE signal_id = ? AND status IN ('parsed', 'validated')",
+                            (now, signal_id),
+                        )
                 return dict(existing), False
 
             intent_id = f"intent-{client_order_id}"
@@ -841,7 +913,7 @@ class TradingStore:
         terminal = new_state in TERMINAL_INTENT_STATES
         with self.db.transaction() as conn:
             current = conn.execute(
-                "SELECT state FROM order_intents WHERE intent_id = ?", (intent_id,)
+                "SELECT state, signal_id FROM order_intents WHERE intent_id = ?", (intent_id,)
             ).fetchone()
             if current is None:
                 raise TradingError(f"intent {intent_id} not found")
@@ -877,6 +949,16 @@ class TradingStore:
                     params.append(now)
             params.append(intent_id)
             conn.execute(f"UPDATE order_intents SET {', '.join(sets)} WHERE intent_id = ?", params)
+            if new_state in ("rejected", "failed"):
+                # Terminal local/exchange rejection and its signal status are
+                # one invariant.  Never overwrite a newer edit's superseded
+                # state, or an explicit cancel/delete.
+                conn.execute(
+                    "UPDATE signals SET status = 'rejected', "
+                    "rejection_reason = COALESCE(rejection_reason, ?), updated_at = ? "
+                    "WHERE signal_id = ? AND status IN ('parsed', 'validated', 'planned')",
+                    ((reject_reason or note)[:500], now, current["signal_id"]),
+                )
             conn.execute(
                 "INSERT INTO order_status_history "
                 "(intent_id, exchange_order_id, previous_state, new_state, note, changed_at) "
@@ -1136,13 +1218,17 @@ class TradingStore:
                     )
                 return int(minimum)
             return existing
-        row = self.db.conn.execute(
-            "SELECT COALESCE(MAX(message_id), 0) AS m FROM messages WHERE channel_id = ?",
-            (channel_id,),
-        ).fetchone()
-        boundary = int(row["m"] or 0)
         if minimum is not None:
-            boundary = max(boundary, int(minimum))
+            # The startup caller captured the newest pre-handler id.  Use that
+            # exact snapshot: a message delivered during handler registration
+            # is newer and must remain above the boundary.
+            boundary = max(0, int(minimum))
+        else:
+            row = self.db.conn.execute(
+                "SELECT COALESCE(MAX(message_id), 0) AS m FROM messages WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            boundary = int(row["m"] or 0)
         effective = self.set_app_state_once(
             "trading.activation_boundary_message_id", str(boundary)
         )

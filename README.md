@@ -15,12 +15,14 @@ config. No withdrawals, no futures, no unofficial endpoints.
 - Storage: SQLite with reproducible migrations.
 - Config: `.env` (secrets) + private `config.toml` (runtime paths/options).
 - CLI: `tg-ingest` (setup, auth, channels, backfill, serve, status, diagnostics,
-  trading status/signals/intents/parse/reconcile/test-order, offline
-  `analyze` replay/summary/list/show/review/failures/corpus-check, owner control
-  bot, and a two-operator `manage run`/`manage status` bot with developer
+  trading status/signals/intents/parse/reconcile/repair-signals/test-order,
+  offline `analyze` replay/summary/list/show/review/failures/corpus-check, owner
+  control bot, and a two-operator `manage run`/`manage status` bot with developer
   self-authorized bounded validation).
-- Exchange: MEXC Spot v3 REST (HMAC-SHA256 signing, weighted rate gates,
-  Decimal arithmetic, idempotent intents, partial-fill tracking/reconciliation).
+- Exchange: MEXC Spot v3 REST (HMAC-SHA256 signing, documented endpoint weights,
+  process-shared rate gates, Decimal arithmetic, idempotent intents,
+  partial-fill tracking/reconciliation). Market monitoring batches all symbols
+  into one ticker request per interval and honors `429`/`418` `Retry-After`.
 
 See `docs/operations.md` for the full operator guide,
 `docs/SIGNAL_ANALYSIS.md` for the offline, non-trading candidate/review

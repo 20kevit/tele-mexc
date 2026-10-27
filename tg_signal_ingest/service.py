@@ -165,6 +165,15 @@ class IngestService:
             log.info("re-queued %s item(s) left in 'processing' state by a previous crashed run", recovered)
         log.info("telegram session verified; transport=direct TCP/TLS")
         await self._resolve_channel_entity()
+        # Capture the newest already-stored id *before* live handlers are
+        # attached.  Messages that arrive afterwards are genuinely new and must
+        # stay above the boundary; recovered downtime traffic is separately
+        # marked non-tradeable by source.
+        startup_max = self.repo.max_message_id(self._selected_channel_id or 0)
+        # Persist the forward-only boundary before any live handler can run,
+        # so a delayed delivery of a pre-start message cannot trade in the
+        # window between snapshot and handler registration.
+        self._arm_trading_boundary(startup_max)
         self._register_handlers()
         await self._run_recovery_sweep_if_needed()
         self._start_background_work()
@@ -196,6 +205,30 @@ class IngestService:
         self._selected_channel_id = selected.channel_id
         self._selected_marked_id = marked_channel_id(selected.channel_id)
         log.info("listening to channel: id=%s marked=%s title=%r", selected.channel_id, self._selected_marked_id, title)
+
+    def _arm_trading_boundary(self, startup_max: int) -> int | None:
+        """Advance the activation boundary to the pre-handler stored maximum.
+
+        The boundary is the newest message that existed before this connection
+        cycle began listening.  It only moves forward.  Recovery/backfill rows
+        are rejected by source even when their ids are higher, so a downtime
+        gap cannot trade while a message delivered live during recovery still
+        can.
+        """
+
+        if self.cfg.trading.mode not in ("testonly", "live"):
+            return None
+        store = getattr(self.trading, "store", None)
+        if store is None or self._selected_channel_id is None:
+            return None
+        boundary = store.ensure_activation_boundary(
+            self._selected_channel_id, minimum=startup_max
+        )
+        log.info(
+            "trading activation boundary armed at message id %s (startup max %s)",
+            boundary, startup_max,
+        )
+        return int(boundary)
 
     def _register_handlers(self) -> None:
         marked = self._selected_marked_id
@@ -387,12 +420,14 @@ class IngestService:
         if fetch_price is None:
             log.error("live trading engine has no market price reader; monitor not started")
             return None
+        fetch_prices = getattr(self.trading, "fetch_market_prices", None)
         try:
             from .trading.monitor import MarketMonitor
 
             return MarketMonitor(
                 cfg=self.cfg,
                 fetch_price=fetch_price,
+                fetch_prices=fetch_prices,
                 on_price=self._enqueue_tick,
             )
         except Exception as exc:  # noqa: BLE001 - monitoring is best effort
