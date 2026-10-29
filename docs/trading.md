@@ -3,6 +3,15 @@
 MEXC Spot order execution, from stored Telegram text to durable order state.
 Architecture context: `docs/architecture.md`; schema: `docs/data-model.md`.
 
+## Audit note (2026-10-29)
+
+See [independent audit](INDEPENDENT_AUDIT_2026-10-29.md) for evidence and limits.
+OCO rows in `submitting`, `cancel_requested`, or
+`unknown_requires_reconciliation` are not confirmed protection, even when an
+older exchange order ID is present. They remain reconciliation-only for
+placement purposes; this classification never authorizes resubmission. An
+otherwise healthy sibling means partial, not full, protection.
+
 ## Non-negotiable behavior
 
 - Spot **BUY only** for signals. SHORT/SELL is parsed for reporting and then

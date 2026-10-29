@@ -1171,17 +1171,14 @@ class TradeManager:
         orders = self._list_trade_orders(trade["trade_id"], kind=kind)
         if any(order["state"] == "filled" for order in orders):
             return "filled"
-        for existing_order in orders:
-            if (
-                existing_order.get("exchange_order_id")
-                and existing_order["state"] not in TERMINAL_ORDER_STATES
-            ) or existing_order["state"] in (
-                "open", "partially_filled", "submitting", "cancel_requested",
-            ):
-                return "confirmed"
-        if any(order["state"] == "unknown_requires_reconciliation" for order in orders):
-            # Never resubmit an uncertain leg: its exchange state is unknown.
+        if any(order["state"] in (
+            "submitting", "cancel_requested", "unknown_requires_reconciliation",
+        ) for order in orders):
+            # A write claim or a previously assigned exchange id is not proof
+            # of current protection. Reconcile these rows; never resend them.
             return "uncertain"
+        if any(order["state"] in ("open", "partially_filled") for order in orders):
+            return "confirmed"
         if any(order["state"] == "canceled" for order in orders):
             # An OCO leg can only disappear because it was canceled/replaced on
             # the exchange; resubmitting automatically could oversell.
@@ -1759,13 +1756,12 @@ class TradeManager:
             confirmed = [
                 kind for kind in required
                 if any(
-                    order["state"] == "filled"
-                    or (
-                        order.get("exchange_order_id")
-                        and order["state"] not in TERMINAL_ORDER_STATES
-                    )
-                    or order["state"] in (
-                        "open", "partially_filled", "submitting", "cancel_requested",
+                    order["state"] in ("filled", "open", "partially_filled")
+                    for order in self._oco_orders(trade, kind)
+                )
+                and not any(
+                    order["state"] in (
+                        "submitting", "cancel_requested", "unknown_requires_reconciliation",
                     )
                     for order in self._oco_orders(trade, kind)
                 )
