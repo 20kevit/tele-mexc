@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,38 @@ from tg_signal_ingest.db import Database  # noqa: E402
 from tg_signal_ingest.repository import Repository  # noqa: E402
 
 FAKE_MESSAGE_EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def block_internet_sockets(monkeypatch):
+    """Prevent accidental IPv4/IPv6 connections in the pytest process.
+
+    Unix socket pairs still work for asyncio. Subprocesses need their own
+    isolation; this is a guardrail, not an OS-level network sandbox.
+    """
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+    original_sendto = socket.socket.sendto
+
+    def check(sock):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            raise AssertionError("Internet sockets are disabled in the test suite")
+
+    def connect(sock, *args, **kwargs):
+        check(sock)
+        return original_connect(sock, *args, **kwargs)
+
+    def connect_ex(sock, *args, **kwargs):
+        check(sock)
+        return original_connect_ex(sock, *args, **kwargs)
+
+    def sendto(sock, *args, **kwargs):
+        check(sock)
+        return original_sendto(sock, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket.socket, "sendto", sendto)
 
 
 class FakeMsg:

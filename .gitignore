@@ -30,6 +30,8 @@ config/*
 # Telegram session / auth data
 *.session
 *.session-journal
+*.session-wal
+*.session-shm
 auth/
 telethon/
 
@@ -41,6 +43,14 @@ tests/fixtures/channel_signal_corpus.jsonl
 *.sqlite
 *.sqlite3
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 data/
 var/
 

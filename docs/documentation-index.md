@@ -34,6 +34,7 @@ When a document contradicts executable code, the code wins; fix the document.
 | `docs/LIVE_VERIFICATION.md` | Owner | Manual one-time Telegram integration check with real credentials | Manual procedure, not automated |
 | `docs/OPERATIONS.md` | — | Compatibility redirect to `docs/operations.md` | Redirect only; do not extend |
 | `docs/TRADING_DECISIONS.md` | Operators, developers | Canonical record of trading-scope, sizing, entry/exit, CLI-limitation, and notification decisions | Canonical decision record |
+| `docs/MAINTENANCE_AUDIT_2026-10-29.md` | Maintainers | Offline maintenance findings, check results, and verification limits | Historical audit, not live certification |
 
 ## Exchange research
 

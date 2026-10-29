@@ -5,16 +5,17 @@ Setup, checks, and change workflow. Production operation is in
 
 ## Prerequisites
 
-- Linux, Python 3.12, Git.
-- Outbound DNS/TCP/TLS only for manual integration runs. The test suite is
-  network-free and deterministic.
-- No proxy variables. The config loader rejects legacy Telegram proxy settings.
+- Linux, Python 3.12 or newer, Git.
+- Installing dependencies requires package-index access. Normal tests use
+  fakes and temporary data; manual integration runs require network access.
+- The config loader rejects legacy Telegram proxy settings; service units unset
+  ambient proxy variables for direct networking.
 
 ## Local setup
 
 ```bash
-cd /opt/projects/akha1
-python3 -m venv .venv
+# From the repository root; use a Python version >= 3.12.
+python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
@@ -37,7 +38,16 @@ ruff line length 120, and mypy Python 3.12 with `check_untyped_defs`.
 
 Tests use temporary SQLite databases and fake clients/transports; they must not
 contact Telegram or MEXC. Shared fakes live in `tests/conftest.py` and
-`tests/_trading_fakes.py`.
+`tests/_trading_fakes.py`. An autouse fixture blocks IPv4/IPv6 connect and
+sendto calls in the pytest process while allowing Unix socket pairs for asyncio.
+It is not an OS-level network sandbox and does not cover subprocesses or DNS;
+keep subprocesses fake or separately isolated and never use real credentials.
+
+Ruff formatting is not an existing quality gate: `ruff format --check .` can
+be used to assess it, but the repository has substantial pre-existing formatter
+differences. Avoid a whole-repository reformat in an unrelated change. Tool
+versions have lower bounds rather than a lockfile, so results may vary with
+newer releases.
 
 ## High-value test areas
 
@@ -80,7 +90,10 @@ in `schema_migrations`. It refuses to migrate a read-only connection.
   - `tg-ingest analyze replay ...` re-runs the separate offline analyzer.
 - Backfill must keep `enqueue_processing=False`; historical traffic is never
   tradeable.
-- Recovery must remain read-only with respect to exchange state.
+- Ingestion gap recovery does not make historical messages tradeable. Trade
+  lifecycle recovery is not read-only: it can place pending protection and retry
+  requested cancellations. Preserve existing uncertainty and retry semantics;
+  any change requires separate safety review.
 
 ## Changing trading behavior
 
@@ -105,14 +118,14 @@ Safe without credentials or network:
 
 ```bash
 .venv/bin/tg-ingest --help
-.venv/bin/tg-ingest trading status
-.venv/bin/tg-ingest analyze summary --db-path /tmp/opencode/ingest-copy.sqlite3
 .venv/bin/python -c 'from tg_signal_ingest.config import load_config; print("import ok")'
 ```
 
-`status`, `backfill status`, `trading status`, `manage status`, and
-`control status` read the configured database and are safe when the service is
-running, but may briefly contend for SQLite locks.
+Use only disposable configuration and data when testing status or analysis
+commands. `status`, `backfill status`, `trading status`, `control status`, and
+analysis commands open the configured or selected database and run migrations;
+these are not strictly read-only. `manage status` opens an existing database
+read-only. Commands using SQLite may contend with the running service.
 
 ## Debugging notes
 
