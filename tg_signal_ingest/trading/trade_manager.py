@@ -1115,7 +1115,9 @@ class TradeManager:
         for kind, (qty, price) in required.items():
             results[kind] = self._ensure_oco_leg(trade, kind, qty, price, sl_price)
 
-        confirmed = [k for k, v in results.items() if v in ("confirmed", "filled")]
+        working = [k for k, v in results.items() if v == "confirmed"]
+        completed = [k for k, v in results.items() if v == "filled"]
+        confirmed = working + completed
         uncertain = [k for k, v in results.items() if v == "uncertain"]
         failed = [k for k, v in results.items() if v in ("rejected", "failed", "canceled")]
         trade = self._refresh(trade)
@@ -1127,12 +1129,22 @@ class TradeManager:
             if new_state != previous_state:
                 self._notify_trade(trade, event_key, text)
 
-        if len(confirmed) == len(required):
+        if len(completed) == len(required):
+            self._finalize_trade(trade)
+            return
+        coverage = sum(
+            (max(Decimal("0"), (_dec(order.get("quantity")) or Decimal("0"))
+                 - (_dec(order.get("sold_qty")) or Decimal("0")))
+             for kind in working for order in self._oco_orders(trade, kind)
+             if order["state"] in ("open", "partially_filled")),
+            Decimal("0"),
+        )
+        if len(confirmed) == len(required) and coverage >= self._remaining_base(trade):
             _publish(
                 "oco_active",
-                "all required OCO exit legs confirmed",
+                "remaining position covered by working OCO allocations",
                 "OCO_PROTECTION_ACTIVE",
-                f"{len(confirmed)} OCO exit leg(s) confirmed",
+                f"{len(working)} working OCO allocation(s); {len(completed)} completed",
             )
         elif confirmed:
             _publish(
@@ -1169,19 +1181,23 @@ class TradeManager:
         """Return the per-leg state: confirmed/filled/uncertain/rejected/failed/canceled."""
 
         orders = self._list_trade_orders(trade["trade_id"], kind=kind)
-        if any(order["state"] == "filled" for order in orders):
-            return "filled"
-        for existing_order in orders:
-            if (
-                existing_order.get("exchange_order_id")
-                and existing_order["state"] not in TERMINAL_ORDER_STATES
-            ) or existing_order["state"] in (
-                "open", "partially_filled", "submitting", "cancel_requested",
-            ):
-                return "confirmed"
-        if any(order["state"] == "unknown_requires_reconciliation" for order in orders):
-            # Never resubmit an uncertain leg: its exchange state is unknown.
+        if any(order["state"] in (
+            "submitting", "cancel_requested", "unknown_requires_reconciliation",
+        ) for order in orders):
+            # A write claim or a previously assigned exchange id is not proof
+            # of current protection. Reconcile these rows; never resend them.
             return "uncertain"
+        filled = [order for order in orders if order["state"] == "filled"]
+        active = [order for order in orders if order["state"] in ("open", "partially_filled")]
+        if filled:
+            # Completion is not active protection. Contradictory overlapping
+            # orders or incomplete execution evidence must be reviewed.
+            sold = sum((_dec(order.get("sold_qty")) or Decimal("0") for order in orders), Decimal("0"))
+            return "filled" if not active and sold >= wanted_qty else "uncertain"
+        if len(active) > 1:
+            return "uncertain"
+        if active:
+            return "confirmed"
         if any(order["state"] == "canceled" for order in orders):
             # An OCO leg can only disappear because it was canceled/replaced on
             # the exchange; resubmitting automatically could oversell.
@@ -1220,17 +1236,18 @@ class TradeManager:
                 trade, kind, qty, price_q, order_type="OCO_STOP_LIMIT_ORDER"
             )
 
-        result = self._submit_oco_order(trade, kind, next_order, qty, price_q, stop_price)
+        self._submit_oco_order(trade, kind, next_order, qty, price_q, stop_price)
         refreshed = self.store.get_trade_order(next_order["trade_order_id"])
-        if result is not None and result.get("exchange_order_id"):
-            return "confirmed"
         state = (refreshed or {}).get("state")
-        if state == "unknown_requires_reconciliation":
+        if state in ("open", "partially_filled"):
+            return "confirmed"
+        if state in ("unknown_requires_reconciliation", "submitting", "cancel_requested"):
             return "uncertain"
         if state == "rejected":
             return "rejected"
         if state == "filled":
-            return "filled"
+            sold = _dec((refreshed or {}).get("sold_qty")) or Decimal("0")
+            return "filled" if sold >= wanted_qty else "uncertain"
         return "failed"
 
     def _target_qty(self, trade: dict[str, Any], target: str) -> Decimal:
@@ -1752,32 +1769,6 @@ class TradeManager:
             if self._ocos_terminal(trade):
                 self._finalize_trade(trade)
                 return
-            required = [
-                kind for kind in ("tp1", "tp2")
-                if self._target_qty(trade, kind) > 0
-            ]
-            confirmed = [
-                kind for kind in required
-                if any(
-                    order["state"] == "filled"
-                    or (
-                        order.get("exchange_order_id")
-                        and order["state"] not in TERMINAL_ORDER_STATES
-                    )
-                    or order["state"] in (
-                        "open", "partially_filled", "submitting", "cancel_requested",
-                    )
-                    for order in self._oco_orders(trade, kind)
-                )
-            ]
-            if state == "oco_active" and len(confirmed) == len(required):
-                return
-            if state == "oco_active" and len(confirmed) < len(required):
-                self.store.update_trade_state(
-                    trade["trade_id"], "oco_partial",
-                    note="an OCO leg is no longer confirmed; protection is partial",
-                )
-                trade = self._refresh(trade)
             # Reuse pending/confirmed legs and retry only bounded rejected legs.
             self._place_oco_exits(trade)
             return

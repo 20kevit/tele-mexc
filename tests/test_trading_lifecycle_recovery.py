@@ -420,3 +420,79 @@ def test_generated_client_order_ids_fit_the_cli_limit(env):
     ]
     assert ids
     assert all(len(cid) <= 32 and cid.isascii() for cid in ids)
+
+
+@pytest.mark.parametrize("state", ["submitting", "cancel_requested", "unknown_requires_reconciliation"])
+@pytest.mark.parametrize("has_exchange_id", [False, True])
+def test_uncertain_oco_is_not_confirmed_protection(env, state, has_exchange_id, monkeypatch):
+    """A durable write claim or old identifier is not evidence of protection."""
+    cfg, store, engine, client, notifier, tm = env
+    trade, _ = setup_trade(env, fill=Decimal("0.1"))
+    order = _oco_orders(store, trade, "tp1")[0]
+    store.transition_trade_order(
+        order["trade_order_id"], state, note="simulated interrupted operation",
+    )
+    # Clear the ID explicitly: transition_trade_order preserves absent fields.
+    with store.db.transaction() as conn:
+        conn.execute(
+            "UPDATE trade_orders SET exchange_order_id=? WHERE trade_order_id=?",
+            (order["exchange_order_id"] if has_exchange_id else None, order["trade_order_id"]),
+        )
+    def forbidden_write(*args, **kwargs):
+        pytest.fail("certainty classification must not submit or cancel orders")
+
+    monkeypatch.setattr(engine, "submit_oco_sell", forbidden_write)
+    monkeypatch.setattr(engine, "cancel_trade_order", forbidden_write)
+    before = len(store.list_trade_orders(trade["trade_id"]))
+    assert tm._ensure_oco_leg(trade, "tp1", Decimal("0.05"), TP1, SL) == "uncertain"
+    tm._place_oco_exits(trade)
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "oco_partial"
+    assert len(store.list_trade_orders(trade["trade_id"])) == before
+
+
+def test_recovery_downgrades_unknown_oco_with_old_exchange_id(env, monkeypatch):
+    cfg, store, engine, client, notifier, tm = env
+    trade, _ = setup_trade(env, fill=Decimal("0.1"))
+    order = _oco_orders(store, trade, "tp1")[0]
+    store.transition_trade_order(order["trade_order_id"], "unknown_requires_reconciliation")
+    monkeypatch.setattr(tm, "_query_order", lambda order: None)
+    before = len(store.list_trade_orders(trade["trade_id"]))
+    tm._reconcile_trade(trade["trade_id"])
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "oco_partial"
+    assert len(store.list_trade_orders(trade["trade_id"])) == before
+
+
+@pytest.mark.parametrize("other_state", ["open", "filled"])
+@pytest.mark.parametrize("uncertain_state", ["submitting", "cancel_requested", "unknown_requires_reconciliation"])
+def test_mixed_oco_uncertainty_wins(env, monkeypatch, other_state, uncertain_state):
+    cfg, store, engine, client, notifier, tm = env
+    trade, _ = setup_trade(env, fill=Decimal("0.1"))
+    first = _oco_orders(store, trade, "tp1")[0]
+    store.transition_trade_order(first["trade_order_id"], other_state, sold_qty=Decimal("0.05")
+                                 if other_state == "filled" else Decimal("0"))
+    extra = tm._create_trade_order(trade, "tp1", Decimal("0.05"), TP1, order_type="OCO_STOP_LIMIT_ORDER")
+    store.transition_trade_order(extra["trade_order_id"], uncertain_state)
+    def forbidden(*args, **kwargs):
+        pytest.fail("must not write when any prior placement is uncertain")
+    monkeypatch.setattr(engine, "submit_oco_sell", forbidden)
+    assert tm._ensure_oco_leg(trade, "tp1", Decimal("0.05"), TP1, SL) == "uncertain"
+    tm._place_oco_exits(trade)
+    assert store.get_trade(trade["trade_id"])["trade_state"] != "oco_active"
+
+
+def test_both_completed_ocos_are_not_active_protection(env):
+    cfg, store, engine, client, notifier, tm = env
+    trade, _ = setup_trade(env, fill=Decimal("0.1"))
+    for order in store.list_trade_orders(trade["trade_id"]):
+        store.transition_trade_order(order["trade_order_id"], "filled", sold_qty=Decimal(order["quantity"]))
+    tm._place_oco_exits(trade)
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "closed"
+
+
+def test_filled_without_full_allocation_is_not_confirmed(env):
+    cfg, store, engine, client, notifier, tm = env
+    trade, _ = setup_trade(env, fill=Decimal("0.1"))
+    order = _oco_orders(store, trade, "tp1")[0]
+    store.transition_trade_order(order["trade_order_id"], "filled", sold_qty=Decimal("0.01"))
+    tm._place_oco_exits(trade)
+    assert store.get_trade(trade["trade_id"])["trade_state"] != "oco_active"
