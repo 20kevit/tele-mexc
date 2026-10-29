@@ -10,7 +10,11 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
 - `live` requires an explicit token and a positive fixed `order_quote_amount`.
 - No withdrawals, futures, leverage, short selling, or per-signal approval gate.
 - The service opens no inbound ports and exposes no HTTP API.
-- Telegram and MEXC use direct outbound TLS. Proxy variables are rejected.
+- Telegram and MEXC use direct outbound TLS. Legacy Telegram proxy settings
+  are rejected; service units unset ambient proxy variables.
+- Trade lifecycle startup recovery and periodic reconciliation can place pending
+  protective orders or retry requested cancellations. They are not read-only
+  diagnostics. Uncertain submissions are not blindly resubmitted.
 
 ## Install and configure
 
@@ -105,7 +109,8 @@ and notification delivery. It holds `<db_path>.serve.lock`; a second `serve`
 exits with an `already holds ... serve.lock` message. Stop with Ctrl+C or
 SIGTERM for a clean shutdown.
 
-Foreground inspection while it runs:
+Foreground status and message inspection while it runs (normal repository
+commands may initialize or migrate the configured database):
 
 ```bash
 .venv/bin/tg-ingest status
@@ -113,8 +118,10 @@ Foreground inspection while it runs:
 .venv/bin/tg-ingest messages list --limit 20
 .venv/bin/tg-ingest messages show <message_id>
 .venv/bin/tg-ingest queue list --status pending
-.venv/bin/tg-ingest queue retry
 ```
+
+`queue retry` is a separate action that re-enqueues failed items, not an
+inspection command. Run it only when reprocessing is intended.
 
 Quiet periods are normal: `status` may show no recent live event without any
 failure.

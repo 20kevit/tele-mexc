@@ -40,8 +40,8 @@ Two transports are used deliberately, not as competing integrations:
 
 | Concern | Backend | Reason |
 | --- | --- | --- |
-| Exchange metadata, balances, order/fill history | REST `MexcSpotClient` | Verified Spot v3 endpoints; already the accounting source of truth |
-| Live BUY/SELL placement, cancel, single-order query | `@mexc-ai/cli` adapter | Only supported way to attach TP/SL to a new order |
+| Exchange metadata, balances, single-order query and fills | REST `MexcSpotClient` | Spot v3 read and accounting implementation |
+| Live BUY/SELL and OCO placement, cancellation | `@mexc-ai/cli` adapter | Live write backend |
 | `testonly` validation | REST `POST /api/v3/order/test` | Official validation endpoint; no matching-engine order |
 
 The CLI adapter (`mexc/cli.py`) is argv-only, bounded by a timeout, and never
@@ -56,7 +56,7 @@ Reads remain on REST so there is one market-data/account implementation.
 | `enabled` | `true` | live mode refuses `false`; a missing binary fails closed |
 | `binary` | auto | explicit path; else `MEXC_CLI_BINARY`, the known per-platform path, then `PATH` |
 | `profile` | active profile | optional profile name passed as `--profile` |
-| `timeout_s` | `20.0` | subprocess timeout in `(0, 120]` |
+| `timeout_s` | `5.0` | subprocess timeout in `(0, 60]` |
 | `min_version` | `0.0.22` | minimum accepted CLI version |
 | `confirm_noninteractive_writes` | auto | live mode arms `--yes` when absent; explicit `false` keeps live writes fail-closed; non-live modes default `false` |
 
@@ -114,18 +114,16 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
 | `aggregate_budget_quote` | `50.0` | cumulative spend reference for reporting; must be >0; never caps per-order size and is not enforced as a ceiling |
 | `order_type_policy` | `limit` | `limit` or `market`; explicit signal semantics still apply |
-| `remaining_balance_reserve_pct` | `0.0` | `0 ≤ value < 100` |
+| `remaining_balance_reserve_pct` | `20.0` | `0 ≤ value < 100` |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5` |
 | `balance_max_age_s` | `5.0` | `(0, 300]`; stale account snapshots fail closed |
 | `recon_interval_s` | `30.0` | live reconciliation period, minimum 5 s |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
 | `entry_trigger_offset_ticks` | unset | unset = direct entry; otherwise integer ≥1 enables conditional entry |
-| `entry_trigger_stale_threshold_s` | `30.0` | positive; older price ticks are ignored |
+| `entry_trigger_stale_threshold_s` | `60.0` | positive; older price ticks are ignored |
 | `tp1_allocation_pct_of_acquired` | `50.0` | 0–100 of actual acquired quantity |
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
-| `stop_loss_policy` | `market_sell` | only accepted value |
-| `stop_loss_max_retries` | `3` | parsed, currently unused |
-| `stop_loss_retry_backoff_base_s` | `1.0` | positive; parsed, currently unused |
+| `stop_loss_max_retries` | `3` | integer ≥1; caps definitive TP/SL rejection retries |
 | `stop_loss_trigger_offset_ticks` | `3` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
 | `monitor_poll_interval_s` | `2.0` | positive |
 | `monitor_max_retries` | `5` | integer ≥1 |
@@ -587,13 +585,12 @@ changes; audit events are written as `trading.buy_block`.
 
 ### Remaining limitations
 
-- `stop_loss_max_retries` caps how many definitive stop-loss/TP rejections are
-  retried. `stop_loss_retry_backoff_base_s` is still parsed but not applied;
+- `stop_loss_max_retries` caps definitive stop-loss/TP rejection retries;
   recovery cadence comes from market ticks and the reconciliation worker.
-- The CLI has no direct lookup by `clientOrderId`; it resolves the id against the
-  first page (up to 100 rows) of `current-orders`, then `history-orders`. An
-  order outside that window stays `unknown_requires_reconciliation`; it is not
-  resubmitted blindly.
+- The standalone CLI adapter resolves a `clientOrderId` against the first page
+  (up to 100 rows) of `current-orders`, then `history-orders`. The live hybrid
+  client delegates single-order queries to REST instead. Unresolved orders
+  remain uncertain and are not blindly resubmitted.
 - Attached TP/SL is only available on `spot trade place` (limit). Market entries
   rely on local management.
 - Exchange-side protection is `active` only when the order detail echoes the
@@ -702,9 +699,9 @@ modifies an order.
 
 ### CLI protection: verified limits
 
-- The CLI has no lookup by `clientOrderId`; it is resolved against the first page
-  (up to 100 rows) of `current-orders` then `history-orders` and matching the
-  field. An order outside that window is reported `not_found` and stays
+- The standalone CLI adapter resolves `clientOrderId` against only the first
+  page (up to 100 rows) of `current-orders`, then `history-orders`. The hybrid
+  live client uses REST for single-order queries; unresolved results remain
   uncertain rather than being resubmitted.
 - `spot.trade.place-oco` supports a native SELL OCO pair (limit TP leg plus
   stop-limit SL leg). `spot.trade.place` still supports one attached TP/SL on a
@@ -734,8 +731,7 @@ modifies an order.
    intended.
 8. Restart once; confirm the activation boundary advanced.
 9. Submit one minimal test signal only after a separate explicit approval.
-10. Monitor `trading status`, `trading intents`, `trading trades`, and the
-    notification outbox.
+10. Monitor `trading status`, `trading intents`, and the notification outbox.
 
 ### OCO certainty follow-up review
 

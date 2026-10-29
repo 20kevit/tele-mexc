@@ -85,7 +85,13 @@ def test_logout_safe_when_session_missing(cfg):
 
 def test_logout_refused_while_service_running(cfg, monkeypatch, session_pair):
     session, _ = session_pair
+    monkeypatch.setattr(cli, "_load_or_exit", lambda **_kwargs: cfg)
     monkeypatch.setattr(cli, "_ingestion_process_running", lambda _cfg: "systemd unit active")
+
+    async def refuse_logout(*_args, **_kwargs):
+        pytest.fail("logout must not be attempted while ingestion is running")
+
+    monkeypatch.setattr(cli, "logout_and_delete_session", refuse_logout)
     rc = aio.run(
         cli.cmd_auth_logout(
             type("A", (), {"verbose": False})(),

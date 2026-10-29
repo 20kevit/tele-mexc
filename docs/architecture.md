@@ -189,18 +189,19 @@ Implemented and covered by tests:
 - The monitor's REST fallback (`IngestService._fetch_price`) uses the MEXC
   client, not the Telethon client.
 - `serve` runs `TradeManager.recover_on_startup()` once and calls
-  `reconcile_all_open()` from the periodic reconciliation worker.
+  `reconcile_all_open()` from the periodic reconciliation worker. These are
+  action-capable: lifecycle recovery can place pending protection and retry
+  requested cancellations; it is not a read-only diagnostic.
 - Uncertain entry/exit submissions are reconciled by `clientOrderId`; they are
   not blindly resubmitted.
 
 Remaining limits:
 
-- `stop_loss_max_retries` caps definitive TP/SL rejection retries. The
-  `stop_loss_retry_backoff_base_s` value is parsed but not applied; recovery
-  cadence comes from the tick/reconciliation loop and is idempotent.
-- The CLI resolves a client order id only within the first page of
-  `current-orders`, then `history-orders`; an order outside that window remains
-  `unknown_requires_reconciliation`.
+- `stop_loss_max_retries` caps definitive TP/SL rejection retries; recovery
+  cadence comes from the tick/reconciliation loop.
+- The standalone CLI adapter resolves a client order id only within the first
+  page of `current-orders`, then `history-orders`. The live hybrid client
+  delegates single-order queries to REST; unresolved results remain uncertain.
 - Exchange-side attached TP/SL has not been validated against real credentials.
 
 ## Documentation verification scope

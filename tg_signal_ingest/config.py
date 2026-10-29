@@ -2,8 +2,8 @@
 
 Sources (highest precedence first):
   1. process environment variables
-  2. ``config/config.toml`` (private, gitignored)
-  3. ``.env`` at the project root (gitignored)
+  2. ``.env`` at the project root (gitignored)
+  3. ``config/config.toml`` (private, gitignored)
   4. built-in defaults
 
 Secrets (Telegram API credentials) are supplied via environment or private

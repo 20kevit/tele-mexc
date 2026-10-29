@@ -35,6 +35,7 @@ When a document contradicts executable code, the code wins; fix the document.
 | `docs/OPERATIONS.md` | — | Compatibility redirect to `docs/operations.md` | Redirect only; do not extend |
 | `docs/TRADING_DECISIONS.md` | Operators, developers | Canonical record of trading-scope, sizing, entry/exit, CLI-limitation, and notification decisions | Canonical decision record |
 | `docs/trading-audit-notifications-design.md` | Maintainers, OpenCode implementers | Proposed structured audit journal, recipient policies, OCO/position evidence, and read-only investigation plan | Design only; not implemented and not a source of current runtime behavior |
+| `docs/MAINTENANCE_AUDIT_2026-10-29.md` | Maintainers | Offline maintenance findings, check results, and verification limits | Historical audit, not live certification |
 
 ## Exchange research
 

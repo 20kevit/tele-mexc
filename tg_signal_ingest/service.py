@@ -607,8 +607,9 @@ class IngestService:
         trade_manager = self._trade_manager()
         if trade_manager is not None:
             try:
-                # Rehydrate trades before any tick can act on them.  Uncertain
-                # orders are queried only; they are never resubmitted here.
+                # Rehydrate trades before any tick can act on them. Lifecycle
+                # recovery can also place pending protection or retry cancels;
+                # uncertain submissions are not blindly resubmitted.
                 await asyncio.to_thread(trade_manager.recover_on_startup)
             except Exception as exc:  # noqa: BLE001
                 log.error("trade recovery failed (%s); continuing", exc.__class__.__name__)

@@ -48,7 +48,8 @@ For a real installation, copy `.env.example` to `.env` and fill placeholders, or
 run `.venv/bin/tg-ingest config init`. Then use `.venv/bin/tg-ingest config check`,
 `auth login` in a trusted SSH terminal, `channels list`, and
 `channel select <id-or-@username>` before `serve`. The database is created and
-migrated on first start; `tg-ingest status` is an offline status view.
+migrated when a normal repository is opened; `tg-ingest status` is an offline
+status view, but may create or migrate the configured database.
 
 Production service commands (owner/operator only):
 

@@ -10,7 +10,9 @@ SQLite schema and persistence invariants. Source of truth:
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
   `schema_migrations`. Current maximum version: **16**.
-- CLI startup runs migrations; `manage status` opens read-only and never migrates.
+- Commands that open a normal repository run migrations; `manage status` opens
+  read-only and never migrates. Help and commands that do not open a repository
+  do not necessarily run migrations.
 - There is no automatic retention, pruning, or archival job. The database grows
   with messages, edits, signals, queue rows, audit events, notifications, and
   trades.
@@ -213,7 +215,8 @@ Restore with the service stopped; remove stale `-wal`/`-shm` files; keep mode
 `0600`. Verify with `tg-ingest status` and `tg-ingest trading status` before
 starting `serve`.
 
-Useful read-only inspections:
+Offline inspections (except `manage status`, repository-opening status and
+analysis commands may initialize or migrate the selected database):
 
 ```bash
 .venv/bin/tg-ingest status
@@ -221,6 +224,5 @@ Useful read-only inspections:
 .venv/bin/tg-ingest queue list --status failed
 .venv/bin/tg-ingest trading status
 .venv/bin/tg-ingest trading intents
-.venv/bin/tg-ingest trading trades
-.venv/bin/tg-ingest analyze summary --db-path /tmp/opencode/ingest-copy.sqlite3
+.venv/bin/tg-ingest analyze summary --db-path <disposable-database-path>
 ```
