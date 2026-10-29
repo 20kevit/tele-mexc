@@ -33,6 +33,7 @@ session file was **not** deleted, replaced, or logged out during this audit.
 | Check | Result |
 | --- | --- |
 | `/start` resumes persisted setup; unauthorized users are rejected before state access | covered by `tests/test_control_service.py` |
+| Configured developer receives owner-equivalent control-bot access (start/version/pause/resume); owner access preserved; strangers blocked | covered by `tests/test_control_service.py` |
 | Existing valid session requires explicit adoption; in-chat login is disabled; stale challenges are discarded; codes/phone/passwords are never persisted | covered by `tests/test_control_auth.py`, service tests, and terminal-login tests |
 | Five consecutive actionable approvals complete learning; invalid examples cannot be approved | covered by `tests/test_control_store.py` and service tests |
 | Approval callbacks are owner-bound, nonce-checked, expiring, one-time, version-checked | covered by store and service tests |

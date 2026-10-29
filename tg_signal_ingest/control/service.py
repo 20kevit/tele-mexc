@@ -304,7 +304,22 @@ class ControlBot:
             await self._send(chat_id, "از منوی زیر انتخاب کنید یا /start را بزنید.", self._menu_kb())
 
     def _authorized(self, user_id: int | None) -> bool:
-        return user_id is not None and user_id == self.cfg.control.owner_user_id
+        """Return True for the configured owner or the configured developer.
+
+        Both operators have owner-equivalent access to every control-bot command
+        and administrative action (start/status, pause/resume, version, MEXC
+        setup, channel selection, learning, sizing, execution mode, notifications,
+        disconnect, adopt). Usernames are never used for authorization. The owner
+        account and its permissions are preserved; the developer is added as an
+        additional explicitly configured numeric Telegram user id.
+        """
+        if user_id is None:
+            return False
+        owner = self.cfg.control.owner_user_id
+        developer = self.cfg.control.developer_user_id
+        if user_id == owner:
+            return True
+        return developer is not None and user_id == developer
 
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id") or "")
