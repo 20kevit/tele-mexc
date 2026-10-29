@@ -293,6 +293,15 @@ with the live/testonly credentials configured. In `sim` it is a local no-op for
 live rows. Repeat after network recovery. Do not cancel or resubmit based only on
 a local guess; inspect the exchange order id/status.
 
+```bash
+.venv/bin/tg-ingest trading notifications       # pending/failed outbox rows
+.venv/bin/tg-ingest trading notifications --status ambiguous --limit 50
+```
+
+The notification outbox is independent of order state; reviewing it never
+re-submits an order. Ambiguous deliveries (process ended mid-delivery) are
+recovered once on startup and never retried automatically.
+
 ### Terminal-intent / signal consistency repair
 
 Code now performs this synchronization inside the intent transition. For a row

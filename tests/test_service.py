@@ -223,3 +223,37 @@ async def test_recovery_sweep_honors_full_flood_wait(cfg, selected_repo):
     caught = await svc.sweep_gap(1004)
     assert caught == 0
     assert waits and waits[0] >= 321
+
+
+def test_service_notifications_are_delivered_once_per_recipient(cfg, selected_repo):
+    """Service lifecycle events are delivered via the existing notifier and
+    deduplicated by (event_key, role) so restarts/retries never duplicate them.
+    """
+
+    from tg_signal_ingest.trading.notify import TradingNotifier
+
+    svc = IngestService(cfg, selected_repo, client=FakeClient())
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, str]] = []
+
+        def send_message(self, chat_id: int, text: str, reply_markup=None) -> dict:
+            self.sent.append((int(chat_id), str(text)))
+            return {"message_id": len(self.sent)}
+
+    bot = FakeBot()
+    svc.trading.notifier = TradingNotifier(svc.trading.store, bot, owner_id=1, developer_id=2)
+
+    # Critical events go to owner + developer and are deduplicated by event key.
+    svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
+    svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
+
+    assert len(bot.sent) == 2  # one per recipient, not four
+    assert {chat for chat, _ in bot.sent} == {1, 2}
+    assert all("serve started" in text for _, text in bot.sent)
+
+    # Recovery is developer-only by default (owner opts in).
+    svc._notify_service_event(event_key="svc:recovery", text="recovery done", category="recovery")
+    assert len(bot.sent) == 3
+    assert bot.sent[-1] == (2, "recovery done")

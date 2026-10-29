@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import ssl
 from collections.abc import Callable
 from typing import Any
@@ -29,6 +30,22 @@ class _DirectHTTPSConnection(http.client.HTTPSConnection):
 
 class BotApiError(Exception):
     """Bot API call failed; description is safe to show to the owner."""
+
+
+class BotApiTransportError(BotApiError):
+    """The request may or may not have reached Telegram (ambiguous)."""
+
+
+class BotApiRateLimitError(BotApiError):
+    """Telegram asked us to wait; the request was not applied."""
+
+    def __init__(self, message: str, *, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class BotApiForbiddenError(BotApiError):
+    """Telegram definitively refused this chat (blocked/kicked/deactivated)."""
 
 
 class BotApiClient:
@@ -113,8 +130,21 @@ class BotApiClient:
             raise BotApiError(f"Telegram Bot API transport failure ({exc.__class__.__name__})") from None
         if not isinstance(response, dict) or not response.get("ok"):
             description = ""
+            retry_after: int | None = None
             if isinstance(response, dict):
                 description = str(response.get("description") or "")[:200]
+                m = re.search(r"retry after\s*(\d+)", description or "", re.IGNORECASE)
+                if m:
+                    retry_after = int(m.group(1))
+            if retry_after is not None:
+                raise BotApiRateLimitError(
+                    f"Telegram Bot API rejected {method}: {description or 'rate limited'}",
+                    retry_after=retry_after,
+                )
+            if "blocked" in description.lower() or "deactivated" in description.lower():
+                raise BotApiForbiddenError(
+                    f"Telegram Bot API rejected {method}: {description or 'chat blocked or deactivated'}"
+                )
             raise BotApiError(f"Telegram Bot API rejected {method}: {description or 'unknown error'}")
         return response.get("result")
 

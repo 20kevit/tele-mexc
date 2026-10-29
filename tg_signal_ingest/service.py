@@ -96,6 +96,28 @@ class IngestService:
                 with contextlib.suppress(NotImplementedError, RuntimeError):  # pragma: no cover
                     loop.add_signal_handler(sig, self.request_stop)
 
+    def _notify_service_event(
+        self,
+        *,
+        event_key: str,
+        text: str,
+        category: str = "critical",
+    ) -> None:
+        """Best-effort service-lifecycle notification via the trading notifier.
+
+        Reuses the existing durable outbox: events are persisted before delivery,
+        keyed by ``(event_key, role)`` so restarts and retries cannot duplicate
+        them.  No secrets, session data, or signal text are included.
+        """
+
+        notifier = getattr(self.trading, "notifier", None)
+        if notifier is None:
+            return
+        try:
+            notifier.notify(event_key=event_key, text=text, category=category)
+        except Exception as exc:  # noqa: BLE001 - service events must not affect ingestion
+            log.warning("service event notification failed (%s)", exc.__class__.__name__)
+
     # ------------------------------------------------------------ loop run
 
     async def run(self) -> int:
@@ -104,6 +126,18 @@ class IngestService:
         backoff = 1.0
         exit_code = 0
         self.install_signal_handlers(asyncio.get_running_loop())
+        self.trading.store.audit(
+            "serve_start", "lifecycle", "serve_started", "serve process starting",
+            event_type="lifecycle.serve_started", severity="INFO",
+        )
+        self._notify_service_event(
+            event_key="service:serve_started",
+            text=(
+                f"tg-ingest serve started (mode={self.cfg.trading.mode}); "
+                "new signals are evaluated automatically, no owner approval required"
+            ),
+            category="critical",
+        )
         if self._control_bot is not None:
             self._control_task = asyncio.create_task(self._control_worker())
             log.info("control bot task started")
@@ -133,6 +167,11 @@ class IngestService:
                     exit_code = 4
                 else:
                     log.error("unexpected service error (%s): %s", exc.__class__.__name__, str(exc)[:200])
+                self._notify_service_event(
+                    event_key=f"service:error:{exc.__class__.__name__}",
+                    text=f"tg-ingest service error: {exc.__class__.__name__}: {str(exc)[:200]}",
+                    category="critical",
+                )
                 if self._stop.is_set():
                     break
                 with contextlib.suppress(Exception):
@@ -148,6 +187,15 @@ class IngestService:
                     backoff = min(backoff * 2, self.cfg.reconnect_backoff_max_s)
                 await self._sleep_with_stop(delay)
         await self._shutdown_tasks()
+        self.trading.store.audit(
+            "serve_stopped", "lifecycle", "serve_stopped", "serve process stopped",
+            event_type="lifecycle.serve_stopped", severity="INFO",
+        )
+        self._notify_service_event(
+            event_key="service:serve_stopped",
+            text="tg-ingest serve stopped",
+            category="critical",
+        )
         return exit_code
 
     def _build_fresh_client(self) -> None:
@@ -314,6 +362,11 @@ class IngestService:
         refreshed = await self.refresh_recent_window(int(last))
         self.repo.record_recovery(self._selected_channel_id)
         log.info("recovery sweep complete: %s gap message(s) fetched, %s recent refreshed", caught, refreshed)
+        self._notify_service_event(
+            event_key="service:recovery_sweep",
+            text=f"recovery sweep complete: {caught} gap message(s) fetched, {refreshed} recent refreshed",
+            category="recovery",
+        )
 
     async def sweep_gap(self, last_id: int) -> int:
         """Fetch messages with id > ``last_id`` (posted while offline).

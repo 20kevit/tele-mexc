@@ -9,14 +9,42 @@ possible.
 from __future__ import annotations
 
 import hashlib
+import os
+import secrets
+import socket
 import sqlite3
+import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..config import TradingConfig
 from ..db import Database
+from .audit import normalize_event_type, normalize_severity, redact_payload, redact_text
 from .parser import PARSER_VERSION, ParsedSignal
+
+_APPLICATION_VERSION = "0.1.0"
+
+# Clock health state thresholds (seconds)
+CLOCK_SKEW_FRESH_MS: int = 1000    # within 1s of exchange: fresh
+CLOCK_SKEW_STALE_MS: int = 2000    # 1-2s drift: degraded
+CLOCK_SKEW_UNHEALTHY_MS: int = 5000  # >2s drift: unhealthy (exceeds recvWindow default)
+
+
+def clock_health_state(skew_ms: int) -> str:
+    """Determine clock health state from skew in milliseconds.
+
+    Returns one of: "fresh", "degraded", "unhealthy"
+    """
+    if skew_ms < CLOCK_SKEW_FRESH_MS:
+        return "fresh"
+    if skew_ms < CLOCK_SKEW_STALE_MS:
+        return "degraded"
+    return "unhealthy"
+
+
+def now_iso_utc() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 ACTIVE_SIGNAL_STATES = ("parsed", "validated", "planned")
 OPEN_INTENT_STATES = (
@@ -33,6 +61,51 @@ PROTECTION_STATES = (
     "rejected",
     "unknown_requires_reconciliation",
 )
+
+# Notification routing defaults.  A missing preference row falls back here, so
+# the policy is explicit in code as well as in the migration seed.
+NOTIFICATION_CATEGORIES = (
+    "signal_decision",
+    "signal_accepted",
+    "exchange_operation",
+    "order_lifecycle",
+    "oco_lifecycle",
+    "take_profit",
+    "stop_loss",
+    "reconciliation",
+    "critical",
+    "diagnostic",
+    "notification_delivery",
+    "recovery",
+)
+
+NOTIFICATION_DEFAULTS: dict[str, dict[str, bool]] = {
+    "owner": {
+        "signal_decision": False,
+        "signal_accepted": True,
+        "exchange_operation": True,
+        "order_lifecycle": True,
+        "oco_lifecycle": True,
+        "take_profit": True,
+        "stop_loss": True,
+        "reconciliation": True,
+        "critical": True,
+        "diagnostic": False,
+        "notification_delivery": False,
+        "recovery": False,
+    },
+    "developer": {category: True for category in NOTIFICATION_CATEGORIES},
+}
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class TradingError(Exception):
@@ -62,13 +135,281 @@ class TradingStore:
 
     # ------------------------------------------------------------- audit
 
-    def audit(self, correlation: str, category: str, event: str, detail: str | None = None) -> None:
+    def audit(
+        self,
+        correlation: str,
+        category: str,
+        event: str,
+        detail: str | None = None,
+        *,
+        event_id: str | None = None,
+        event_type: str | None = None,
+        schema_version: str = "2.0",
+        severity: str = "INFO",
+        occurred_at_utc: str | None = None,
+        recorded_at_utc: str | None = None,
+        monotonic_elapsed_ns: int = 0,
+        clock_health: str | None = None,
+        process_id: int | None = None,
+        hostname: str | None = None,
+        instance_id: str | None = None,
+        application_version: str | None = None,
+        component: str | None = None,
+        operation: str | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        telegram_channel_id: int | None = None,
+        telegram_message_id: int | None = None,
+        message_edit_version: int | None = None,
+        signal_id: str | None = None,
+        intent_id: str | None = None,
+        trade_id: str | None = None,
+        order_id: str | None = None,
+        exchange_order_id: str | None = None,
+        symbol: str | None = None,
+        reason_code: str | None = None,
+        outcome: str | None = None,
+        source_ref: str | None = None,
+        evidence_source: str | None = None,
+        evidence_limitations: str | None = None,
+        payload: dict[str, Any] | None = None,
+        actor: str | None = None,
+        dedupe_key: str | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        """Insert one structured audit event and return its ``event_id``.
+
+        The call is safe to embed in an enclosing transaction by passing
+        ``conn``.  Text is redacted and bounded; a ``dedupe_key`` makes the
+        write idempotent across retries and restarts.  ``event`` remains the
+        human-readable name (required by the legacy schema) while
+        ``event_type`` is the stable machine key (``category.event``).
+        """
+
+        now = self._ts()
+        recorded = recorded_at_utc or now
+        occurred = occurred_at_utc or recorded
+        event_id = event_id or uuid.uuid4().hex
+        canonical_type = normalize_event_type(category, event, event_type)
+        severity_value = normalize_severity(severity)
+        safe_detail = redact_text(detail)
+        payload_json = redact_payload(payload) if payload is not None else None
+        values = (
+            schema_version,
+            event_id,
+            str(event)[:200],
+            canonical_type,
+            severity_value,
+            occurred,
+            recorded,
+            int(monotonic_elapsed_ns or 0),
+            clock_health,
+            process_id if process_id is not None else os.getpid(),
+            hostname or socket.gethostname(),
+            instance_id,
+            application_version or _APPLICATION_VERSION,
+            component or category,
+            operation or str(event)[:120],
+            correlation_id or correlation,
+            causation_id,
+            telegram_channel_id,
+            telegram_message_id,
+            message_edit_version,
+            signal_id,
+            intent_id,
+            trade_id,
+            order_id,
+            exchange_order_id,
+            str(symbol).upper() if symbol else None,
+            reason_code,
+            outcome,
+            source_ref,
+            evidence_source,
+            redact_text(evidence_limitations),
+            payload_json,
+            actor,
+            redact_text(dedupe_key, limit=300),
+            safe_detail,
+            correlation,
+            category,
+            now,
+        )
+
+        def _insert(target: sqlite3.Connection) -> None:
+            verb = "INSERT OR IGNORE" if dedupe_key else "INSERT"
+            target.execute(
+                f"""{verb} INTO audit_events
+                (schema_version, event_id, event, event_type, severity, occurred_at_utc,
+                 recorded_at_utc, monotonic_elapsed_ns, clock_health, process_id,
+                 hostname, instance_id, application_version, component, operation,
+                 correlation_id, causation_id, telegram_channel_id, telegram_message_id,
+                 message_edit_version, signal_id, intent_id, trade_id, order_id,
+                 exchange_order_id, symbol, reason_code, outcome, source_ref,
+                 evidence_source, evidence_limitations, payload_json, actor, dedupe_key,
+                 detail, secrets_redacted, correlation, category, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                values,
+            )
+
+        if conn is not None:
+            _insert(conn)
+        else:
+            with self.db.transaction() as tx:
+                _insert(tx)
+        return event_id
+
+    # -------------------------------------------------- exchange evidence
+
+    def begin_exchange_operation(
+        self,
+        *,
+        operation_type: str,
+        operation_class: str,
+        purpose: str | None = None,
+        transport: str | None = None,
+        endpoint: str | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        intent_id: str | None = None,
+        trade_id: str | None = None,
+        trade_order_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
+        request_payload: dict[str, Any] | None = None,
+        write_attempted: bool = False,
+        clock_health: str | None = None,
+        evidence_source: str = "local_process",
+        evidence_limitations: str | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        """Persist the intent to call the exchange *before* the call happens.
+
+        A crash between the insert and the response therefore still leaves a
+        durable, correlated record that a write may have been attempted.
+        """
+
+        if operation_class not in ("read", "write"):
+            raise TradingError(f"invalid exchange operation class {operation_class!r}")
+        operation_id = uuid.uuid4().hex
+        now = self._ts()
+        payload_json = redact_payload(request_payload)
+        values = (
+            operation_id, correlation_id, causation_id, intent_id, trade_id,
+            trade_order_id, signal_id, str(symbol).upper() if symbol else None,
+            str(operation_type)[:120], operation_class, purpose, transport,
+            endpoint, client_order_id, exchange_order_id, payload_json, now,
+            1 if write_attempted or operation_class == "write" else 0,
+            clock_health, evidence_source, redact_text(evidence_limitations), now, now,
+        )
+
+        def _insert(target: sqlite3.Connection) -> None:
+            target.execute(
+                """INSERT INTO exchange_operations
+                (operation_id, correlation_id, causation_id, intent_id, trade_id,
+                 trade_order_id, signal_id, symbol, operation_type, operation_class,
+                 purpose, transport, endpoint, client_order_id, exchange_order_id,
+                 request_payload, request_started_at, write_attempted, clock_health,
+                 evidence_source, evidence_limitations, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+
+        if conn is not None:
+            _insert(conn)
+        else:
+            with self.db.transaction() as tx:
+                _insert(tx)
+        return operation_id
+
+    def finish_exchange_operation(
+        self,
+        operation_id: str,
+        *,
+        success: bool,
+        response_payload: dict[str, Any] | None = None,
+        response_classification: str | None = None,
+        response_status: str | None = None,
+        exchange_code: str | None = None,
+        http_status: int | None = None,
+        exchange_order_id: str | None = None,
+        error_class: str | None = None,
+        error_message: str | None = None,
+        rate_limit_wait_ms: int | None = None,
+        uncertainty: str | None = None,
+        recovery_attempts: int | None = None,
+        observed_at: str | None = None,
+        evidence_limitations: str | None = None,
+    ) -> None:
+        now = self._ts()
         with self.db.transaction() as conn:
             conn.execute(
-                "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (correlation[:200], category, event[:200], (detail or "")[:2000], self._ts()),
+                """UPDATE exchange_operations SET
+                    request_finished_at = ?, response_received = ?,
+                    response_classification = ?, response_status = ?,
+                    exchange_code = ?, http_status = ?, response_payload = ?,
+                    error_class = ?, error_message = ?, rate_limit_wait_ms = ?,
+                    uncertainty = COALESCE(?, uncertainty),
+                    recovery_attempts = COALESCE(?, recovery_attempts),
+                    observed_at = COALESCE(?, observed_at),
+                    evidence_limitations = COALESCE(?, evidence_limitations),
+                    updated_at = ?
+                WHERE operation_id = ?""",
+                (
+                    now, 1 if success else 0, response_classification,
+                    redact_text(response_status, limit=80), exchange_code, http_status,
+                    redact_payload(response_payload), error_class,
+                    redact_text(error_message), rate_limit_wait_ms,
+                    uncertainty, recovery_attempts, observed_at,
+                    redact_text(evidence_limitations), now, operation_id,
+                ),
             )
+
+    def mark_operation_uncertain(
+        self, operation_id: str, *, reason: str, uncertainty: str = "uncertain"
+    ) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE exchange_operations SET uncertainty = ?, error_message = ?, "
+                "updated_at = ? WHERE operation_id = ?",
+                (uncertainty, redact_text(reason), self._ts(), operation_id),
+            )
+
+    def list_exchange_operations(
+        self,
+        *,
+        intent_id: str | None = None,
+        trade_id: str | None = None,
+        client_order_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if intent_id:
+            clauses.append("intent_id = ?")
+            params.append(intent_id)
+        if trade_id:
+            clauses.append("trade_id = ?")
+            params.append(trade_id)
+        if client_order_id:
+            clauses.append("client_order_id = ?")
+            params.append(client_order_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.conn.execute(
+            f"SELECT * FROM exchange_operations {where} ORDER BY created_at DESC, operation_id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def exchange_operation_counts(self) -> dict[str, int]:
+        return {
+            str(row["uncertainty"]): int(row["c"])
+            for row in self.db.conn.execute(
+                "SELECT uncertainty, COUNT(*) AS c FROM exchange_operations GROUP BY uncertainty"
+            )
+        }
 
     # ------------------------------------------------------------ signals
 
@@ -1121,6 +1462,7 @@ class TradingStore:
         exchange_state: str | None,
         outcome: str,
         detail: str,
+        emit_audit: bool = True,
     ) -> None:
         with self.db.transaction() as conn:
             conn.execute(
@@ -1129,6 +1471,19 @@ class TradingStore:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (intent_id, client_order_id, local_state, exchange_state, outcome, detail[:2000], self._ts()),
             )
+            if emit_audit and intent_id:
+                self.audit(
+                    intent_id, "reconcile", f"reconcile_{outcome}",
+                    detail[:2000],
+                    event_type="reconcile.outcome",
+                    trade_id=None,
+                    intent_id=intent_id,
+                    order_id=client_order_id,
+                    outcome=outcome,
+                    severity="INFO" if outcome in ("consistent", "filled") else "WARNING",
+                    dedupe_key=f"reconcile:{intent_id}:{outcome}:{detail[:40]}",
+                    conn=conn,
+                )
 
     def reconciliation_counts(self) -> dict[str, int]:
         return {
@@ -1236,6 +1591,38 @@ class TradingStore:
 
     # -------------------------------------------------------- notifications
 
+    def notification_enabled(self, role: str, category: str) -> bool:
+        """Return the persisted preference, falling back to the code defaults."""
+
+        row = self.db.conn.execute(
+            "SELECT enabled FROM notification_preferences WHERE role = ? AND category = ?",
+            (role, category),
+        ).fetchone()
+        if row is not None:
+            return bool(int(row["enabled"]))
+        return NOTIFICATION_DEFAULTS.get(role, {}).get(category, False)
+
+    def set_notification_preference(self, role: str, category: str, enabled: bool) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO notification_preferences (role, category, enabled, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(role, category) DO UPDATE SET "
+                "enabled = excluded.enabled, updated_at = excluded.updated_at",
+                (role, category, 1 if enabled else 0, self._ts()),
+            )
+
+    def notification_preferences(self, role: str | None = None) -> list[dict[str, Any]]:
+        if role is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM notification_preferences ORDER BY role, category"
+            ).fetchall()
+        else:
+            rows = self.db.conn.execute(
+                "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
+                (role,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def enqueue_notification(
         self,
         *,
@@ -1245,41 +1632,200 @@ class TradingStore:
         role: str,
         chat_id: int,
         text: str,
-    ) -> None:
+        category: str = "signal_decision",
+        event_type: str = "signal.decision",
+        compact_text: str | None = None,
+        expanded_text: str | None = None,
+    ) -> bool:
         now = self._ts()
         with self.db.transaction() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO trading_notifications "
-                "(event_key, signal_id, intent_id, role, chat_id, text, status, attempts, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
-                (event_key[:300], signal_id, intent_id, role, chat_id, text[:4000], now, now),
+                "(event_key, signal_id, intent_id, category, event_type, role, chat_id, "
+                "text, compact_text, expanded_text, status, attempts, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
+                (
+                    event_key[:300], signal_id, intent_id, category[:80], event_type[:120],
+                    role, chat_id, text[:4000], redact_text(compact_text),
+                    redact_text(expanded_text), now, now,
+                ),
             )
+            return cur.rowcount > 0
+
+    def notification(self, notification_id: int) -> dict[str, Any] | None:
+        return _row(
+            self.db.conn.execute(
+                "SELECT * FROM trading_notifications WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+        )
 
     def pending_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+        now = self._ts()
         rows = self.db.conn.execute(
-            "SELECT * FROM trading_notifications WHERE status IN ('pending', 'failed') "
+            "SELECT * FROM trading_notifications "
+            "WHERE status IN ('pending', 'failed') "
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
             "ORDER BY notification_id LIMIT ?",
-            (limit,),
+            (now, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def mark_notification_sent(self, notification_id: int) -> None:
+    def claim_notification(self, notification_id: int, token: str) -> bool:
         now = self._ts()
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE trading_notifications SET status = 'sent', attempts = attempts + 1, "
-                "last_error = NULL, sent_at = ?, updated_at = ? WHERE notification_id = ?",
-                (now, now, notification_id),
+            cur = conn.execute(
+                "UPDATE trading_notifications SET status = 'sending', claim_token = ?, "
+                "claimed_at = ?, updated_at = ? "
+                "WHERE notification_id = ? AND status IN ('pending', 'failed')",
+                (token, now, now, notification_id),
             )
+            return cur.rowcount > 0
+
+    def recover_ambiguous_sending(self, *, older_than_s: int = 120) -> int:
+        """A crash during delivery leaves an unknowable outcome.
+
+        Such rows are marked ``ambiguous`` and are never resent automatically;
+        the owner/developer can inspect and explicitly re-queue them.
+        """
+
+        cutoff = (self._now() - timedelta(seconds=max(1, older_than_s))).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE trading_notifications SET status = 'ambiguous', "
+                "last_error = COALESCE(last_error, 'process ended during delivery'), "
+                "claim_token = NULL, updated_at = ? "
+                "WHERE status = 'sending' AND claimed_at IS NOT NULL AND claimed_at < ?",
+                (self._ts(), cutoff),
+            )
+            return cur.rowcount
+
+    def finish_notification(
+        self,
+        notification_id: int,
+        *,
+        outcome: str,
+        error: str | None = None,
+        telegram_message_id: int | None = None,
+        retry_after_s: int | None = None,
+        attempt_no: int | None = None,
+        ambiguous: bool = False,
+    ) -> None:
+        """Record one delivery attempt and apply its durable outcome."""
+
+        now_dt = self._now()
+        now = self._ts()
+        next_attempt: str | None = None
+        if outcome == "retry" and retry_after_s:
+            next_attempt = (
+                now_dt + timedelta(seconds=max(1, int(retry_after_s)))
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT attempts, role FROM trading_notifications WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempt = int(attempt_no or (int(row["attempts"]) + 1))
+            conn.execute(
+                "INSERT INTO notification_delivery_attempts "
+                "(notification_id, attempt_no, attempted_at, outcome, error, "
+                "telegram_message_id, retry_after_s, ambiguous) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    notification_id, attempt, now, outcome, redact_text(error),
+                    telegram_message_id, retry_after_s, 1 if ambiguous else 0,
+                ),
+            )
+            if outcome == "sent":
+                conn.execute(
+                    "UPDATE trading_notifications SET status = 'sent', attempts = ?, "
+                    "last_error = NULL, sent_at = ?, telegram_message_id = COALESCE(?, telegram_message_id), "
+                    "claim_token = NULL, updated_at = ? WHERE notification_id = ?",
+                    (attempt, now, telegram_message_id, now, notification_id),
+                )
+            elif outcome == "retry":
+                conn.execute(
+                    "UPDATE trading_notifications SET status = 'pending', attempts = ?, "
+                    "last_error = ?, next_attempt_at = ?, claim_token = NULL, updated_at = ? "
+                    "WHERE notification_id = ?",
+                    (attempt, redact_text(error, limit=500), next_attempt, now, notification_id),
+                )
+            else:
+                status = "ambiguous" if ambiguous or outcome == "ambiguous" else "failed"
+                conn.execute(
+                    "UPDATE trading_notifications SET status = ?, attempts = ?, "
+                    "last_error = ?, claim_token = NULL, updated_at = ? WHERE notification_id = ?",
+                    (status, attempt, redact_text(error, limit=500), now, notification_id),
+                )
+
+    def mark_notification_sent(
+        self, notification_id: int, *, telegram_message_id: int | None = None
+    ) -> None:
+        self.finish_notification(
+            notification_id, outcome="sent", telegram_message_id=telegram_message_id
+        )
 
     def mark_notification_failed(self, notification_id: int, error: str) -> None:
-        now = self._ts()
+        self.finish_notification(notification_id, outcome="failed", error=error)
+
+    def notification_attempts(self, notification_id: int) -> list[dict[str, Any]]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM notification_delivery_attempts WHERE notification_id = ? "
+            "ORDER BY attempt_no",
+            (notification_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------- notification callbacks
+
+    def create_notification_callback(
+        self,
+        *,
+        notification_id: int,
+        role: str,
+        action: str,
+        ttl_s: int = 7 * 24 * 3600,
+    ) -> str:
+        token = secrets.token_urlsafe(18)
+        now_dt = self._now()
+        expires = (now_dt + timedelta(seconds=ttl_s)).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
         with self.db.transaction() as conn:
             conn.execute(
-                "UPDATE trading_notifications SET status = 'failed', attempts = attempts + 1, "
-                "last_error = ?, updated_at = ? WHERE notification_id = ?",
-                (error[:500], now, notification_id),
+                "INSERT INTO notification_callbacks "
+                "(token, notification_id, role, action, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (token, notification_id, role, action, self._ts(), expires),
             )
+        return token
+
+    def notification_callback(self, token: str) -> dict[str, Any] | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM notification_callbacks WHERE token = ?", (token,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        expires = _parse_iso(data.get("expires_at"))
+        if expires is not None and expires < self._now():
+            return None
+        return data
+
+    def consume_notification_callback(self, token: str, role: str) -> dict[str, Any] | None:
+        data = self.notification_callback(token)
+        if data is None or data.get("role") != role:
+            return None
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE notification_callbacks SET use_count = use_count + 1, used_at = ? "
+                "WHERE token = ?",
+                (self._ts(), token),
+            )
+        return data
 
 
 def _trade_identity(raw: dict[str, Any], exchange_order_id: str) -> str:

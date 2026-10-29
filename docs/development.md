@@ -61,8 +61,11 @@ boundary, no-retry-on-uncertainty) without an explicit product decision.
 
 ## Changing the schema
 
-1. Append a new `(version, sql)` tuple to `MIGRATIONS` in
-   `tg_signal_ingest/db.py`. Never edit an applied migration.
+1. Append a new `(version, step)` tuple to `MIGRATIONS` in `tg_signal_ingest/db.py`.
+   A `step` is either a SQL string or a Python callable `(conn) -> None`; use a
+   callable when you need to converge from a partially/manual schema (idempotent
+   `ALTER TABLE ... ADD COLUMN` for missing columns only). Never edit an applied
+   migration.
 2. Use `CREATE TABLE/INDEX IF NOT EXISTS` and idempotent `ALTER TABLE`.
 3. Add repository/store methods and tests, including reopen-and-migrate.
 4. Update `docs/data-model.md` with tables, enums, and invariants.

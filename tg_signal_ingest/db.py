@@ -9,9 +9,466 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
-MIGRATIONS: list[tuple[int, str]] = [
+MigrationStep = str | Callable[[sqlite3.Connection], None]
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]) -> None:
+    """Add only missing columns.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``.  Several production databases
+    were partially upgraded by hand before this migration system supported
+    Python steps, so migrations must be able to converge from either the old or
+    an intermediate shape instead of assuming a pristine table.
+    """
+
+    existing = _columns(conn, table)
+    for name, declaration in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            existing.add(name)
+
+
+def _migration_18_audit_journal(conn: sqlite3.Connection) -> None:
+    """Normalize the structured audit journal and preserve legacy rows."""
+
+    _add_columns(
+        conn,
+        "audit_events",
+        [
+            ("schema_version", "TEXT NOT NULL DEFAULT '2.0'"),
+            ("event_id", "TEXT"),
+            ("event_type", "TEXT"),
+            ("severity", "TEXT NOT NULL DEFAULT 'INFO'"),
+            ("occurred_at_utc", "TEXT"),
+            ("recorded_at_utc", "TEXT"),
+            ("monotonic_elapsed_ns", "INTEGER DEFAULT 0"),
+            ("clock_health", "TEXT"),
+            ("process_id", "INTEGER"),
+            ("hostname", "TEXT"),
+            ("instance_id", "TEXT"),
+            ("application_version", "TEXT"),
+            ("component", "TEXT"),
+            ("operation", "TEXT"),
+            ("correlation_id", "TEXT"),
+            ("causation_id", "TEXT"),
+            ("telegram_channel_id", "INTEGER"),
+            ("telegram_message_id", "INTEGER"),
+            ("message_edit_version", "INTEGER"),
+            ("signal_id", "TEXT"),
+            ("intent_id", "TEXT"),
+            ("trade_id", "TEXT"),
+            ("order_id", "TEXT"),
+            ("exchange_order_id", "TEXT"),
+            ("symbol", "TEXT"),
+            ("reason_code", "TEXT"),
+            ("outcome", "TEXT"),
+            ("secrets_redacted", "INTEGER NOT NULL DEFAULT 1"),
+            ("source_ref", "TEXT"),
+            ("evidence_source", "TEXT"),
+            ("evidence_limitations", "TEXT"),
+            ("payload_json", "TEXT"),
+            ("observed_at_utc", "TEXT"),
+            ("actor", "TEXT"),
+            ("dedupe_key", "TEXT"),
+        ],
+    )
+    # Backfill only from evidence already present in the row.  A legacy row is
+    # explicitly labelled as legacy; it is never upgraded into an
+    # exchange-confirmed fact.
+    conn.execute(
+        "UPDATE audit_events SET "
+        "event_type = COALESCE(event_type, event), "
+        "occurred_at_utc = COALESCE(occurred_at_utc, created_at), "
+        "recorded_at_utc = COALESCE(recorded_at_utc, created_at), "
+        "component = COALESCE(component, category), "
+        "operation = COALESCE(operation, event), "
+        "correlation_id = COALESCE(correlation_id, correlation), "
+        "event_id = COALESCE(event_id, 'legacy-' || audit_id), "
+        "source_ref = COALESCE(source_ref, 'legacy:audit:' || audit_id), "
+        "payload_json = COALESCE(payload_json, detail), "
+        "secrets_redacted = COALESCE(secrets_redacted, 1)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_event_id "
+        "ON audit_events (event_id) WHERE event_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_dedupe "
+        "ON audit_events (dedupe_key) WHERE dedupe_key IS NOT NULL"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_correlation ON audit_events (correlation_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_events (category, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_events (event_type, severity)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_occurred ON audit_events (occurred_at_utc)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_symbol ON audit_events (symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_intent ON audit_events (intent_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_trade ON audit_events (trade_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_exchange_order ON audit_events (exchange_order_id)")
+
+
+def _migration_19_trade_evidence_columns(conn: sqlite3.Connection) -> None:
+    """Per-leg OCO evidence and the release that was already recorded as v17.
+
+    Some deployments recorded migration 17 before its body was extended with
+    ``trade_orders.stop_trigger_price``.  Rewriting an applied migration can
+    never repair those databases, so the column is converged here.
+    """
+
+    _add_columns(
+        conn,
+        "trade_orders",
+        [
+            ("stop_trigger_price", "TEXT"),
+            ("oco_group_id", "TEXT"),
+            ("leg_role", "TEXT"),
+            ("last_observed_at", "TEXT"),
+            ("evidence_id", "TEXT"),
+            ("not_observed_reason", "TEXT"),
+            ("cancel_reason", "TEXT"),
+            ("canceled_by_leg", "TEXT"),
+            ("filled_quote", "TEXT"),
+            ("fee_amount", "TEXT"),
+            ("fee_asset", "TEXT"),
+        ],
+    )
+    conn.execute(
+        "UPDATE trade_orders SET leg_role = CASE "
+        "WHEN kind = 'stop_loss' THEN 'stop_loss' ELSE 'take_profit' END "
+        "WHERE leg_role IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trade_orders_oco_group "
+        "ON trade_orders (oco_group_id, kind)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trade_orders_exchange "
+        "ON trade_orders (exchange_order_id)"
+    )
+    _add_columns(
+        conn,
+        "trades",
+        [
+            ("oco_group_id", "TEXT"),
+            ("protection_config_json", "TEXT"),
+            ("position_state", "TEXT"),
+            ("outcome", "TEXT"),
+            ("outcome_reason", "TEXT"),
+            ("evidence_status", "TEXT"),
+        ],
+    )
+    conn.execute(
+        "UPDATE trades SET position_state = COALESCE(position_state, trade_state), "
+        "evidence_status = COALESCE(evidence_status, 'legacy_unverified')"
+    )
+    _add_columns(
+        conn,
+        "reconciliation_results",
+        [
+            ("trade_id", "TEXT"),
+            ("order_id", "TEXT"),
+            ("evidence_id", "TEXT"),
+            ("scope", "TEXT"),
+            ("observed_at", "TEXT"),
+        ],
+    )
+    _add_columns(
+        conn,
+        "messages",
+        [
+            ("content_sha256", "TEXT"),
+            ("source_ref", "TEXT"),
+        ],
+    )
+    _add_columns(conn, "signals", [("source_ref", "TEXT")])
+
+
+def _migration_20_audit_evidence_notifications(conn: sqlite3.Connection) -> None:
+    """Exchange evidence, OCO group model, and delivery-ready notification outbox."""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exchange_operations (
+            operation_id       TEXT PRIMARY KEY,
+            schema_version     TEXT NOT NULL DEFAULT '1.0',
+            correlation_id     TEXT,
+            causation_id       TEXT,
+            intent_id          TEXT,
+            trade_id           TEXT,
+            trade_order_id     TEXT,
+            signal_id          TEXT,
+            symbol             TEXT,
+            operation_type     TEXT NOT NULL,
+            operation_class    TEXT NOT NULL CHECK (operation_class IN ('read', 'write')),
+            purpose            TEXT,
+            transport          TEXT,
+            endpoint           TEXT,
+            client_order_id    TEXT,
+            exchange_order_id  TEXT,
+            request_payload    TEXT,
+            request_started_at TEXT NOT NULL,
+            request_finished_at TEXT,
+            write_attempted    INTEGER NOT NULL DEFAULT 0 CHECK (write_attempted IN (0, 1)),
+            clock_health       TEXT,
+            response_received  INTEGER NOT NULL DEFAULT 0 CHECK (response_received IN (0, 1)),
+            response_classification TEXT,
+            response_status    TEXT,
+            exchange_code      TEXT,
+            http_status        INTEGER,
+            response_payload   TEXT,
+            error_class        TEXT,
+            error_message      TEXT,
+            rate_limit_wait_ms INTEGER,
+            uncertainty        TEXT NOT NULL DEFAULT 'none'
+                CHECK (uncertainty IN ('none', 'uncertain', 'reconciled', 'read_only_uncertain')),
+            recovery_attempts  INTEGER NOT NULL DEFAULT 0,
+            observed_at        TEXT,
+            evidence_source    TEXT,
+            evidence_limitations TEXT,
+            redacted           INTEGER NOT NULL DEFAULT 1 CHECK (redacted IN (0, 1)),
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL
+        )
+        """
+    )
+    _add_columns(conn, "exchange_operations", [("clock_health", "TEXT")])
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_exchange_ops_intent ON exchange_operations (intent_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_exchange_ops_trade ON exchange_operations (trade_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_exchange_ops_client ON exchange_operations (client_order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_exchange_ops_exchange ON exchange_operations (exchange_order_id)",
+        "CREATE INDEX idx_exchange_ops_uncertain ON exchange_operations (operation_class, uncertainty, created_at)",
+    ):
+        conn.execute(sql)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oco_groups (
+            oco_group_id      TEXT PRIMARY KEY,
+            trade_id          TEXT NOT NULL UNIQUE,
+            intent_id         TEXT,
+            symbol            TEXT NOT NULL,
+            state             TEXT NOT NULL DEFAULT 'intended'
+                CHECK (state IN ('intended', 'submitting', 'active', 'partial',
+                                 'triggered', 'completed', 'canceled', 'uncertain',
+                                 'needs_review')),
+            intended_config   TEXT,
+            protection_status TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            closed_at         TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_oco_groups_state ON oco_groups (state, updated_at)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oco_legs (
+            leg_id             TEXT PRIMARY KEY,
+            oco_group_id       TEXT NOT NULL,
+            trade_id           TEXT NOT NULL,
+            trade_order_id     TEXT,
+            kind               TEXT NOT NULL CHECK (kind IN ('take_profit', 'stop_loss')),
+            target             TEXT NOT NULL,
+            client_order_id    TEXT,
+            exchange_order_id  TEXT,
+            intended_price     TEXT,
+            intended_trigger_price TEXT,
+            intended_qty       TEXT,
+            state              TEXT NOT NULL DEFAULT 'intended',
+            exchange_status    TEXT,
+            filled_qty         TEXT NOT NULL DEFAULT '0',
+            filled_quote       TEXT,
+            fee_amount         TEXT,
+            fee_asset          TEXT,
+            cancel_reason      TEXT,
+            canceled_by_target TEXT,
+            evidence_id        TEXT,
+            last_observed_at   TEXT,
+            not_observed_reason TEXT,
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            UNIQUE (oco_group_id, target)
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_oco_legs_trade ON oco_legs (trade_id, kind)",
+        "CREATE INDEX IF NOT EXISTS idx_oco_legs_state ON oco_legs (state)",
+        "CREATE INDEX IF NOT EXISTS idx_oco_legs_exchange ON oco_legs (exchange_order_id)",
+    ):
+        conn.execute(sql)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_preferences (
+            role       TEXT NOT NULL,
+            category   TEXT NOT NULL,
+            enabled    INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (role, category)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_callbacks (
+            token           TEXT PRIMARY KEY,
+            notification_id INTEGER NOT NULL,
+            role            TEXT NOT NULL,
+            action          TEXT NOT NULL CHECK (action IN ('expand', 'signal_source', 'ack')),
+            created_at      TEXT NOT NULL,
+            expires_at      TEXT NOT NULL,
+            used_at         TEXT,
+            use_count       INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notification_callbacks_notification "
+        "ON notification_callbacks (notification_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+            attempt_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            notification_id  INTEGER NOT NULL,
+            attempt_no       INTEGER NOT NULL,
+            attempted_at     TEXT NOT NULL,
+            outcome          TEXT NOT NULL,
+            error            TEXT,
+            telegram_message_id INTEGER,
+            retry_after_s    INTEGER,
+            ambiguous        INTEGER NOT NULL DEFAULT 0 CHECK (ambiguous IN (0, 1))
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notification_attempts "
+        "ON notification_delivery_attempts (notification_id, attempt_no)"
+    )
+
+    columns = _columns(conn, "trading_notifications")
+    if "category" not in columns:
+        # The v16 CHECK constraint only allowed pending/sent/failed.  SQLite
+        # cannot alter a CHECK constraint, so rebuild once while preserving
+        # every outbox row and notification id.
+        conn.execute("ALTER TABLE trading_notifications RENAME TO trading_notifications_v16")
+        conn.execute(
+            """
+            CREATE TABLE trading_notifications (
+                notification_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key         TEXT NOT NULL,
+                signal_id         TEXT,
+                intent_id         TEXT,
+                category          TEXT NOT NULL DEFAULT 'legacy',
+                event_type        TEXT NOT NULL DEFAULT 'legacy',
+                role              TEXT NOT NULL CHECK (role IN ('owner', 'developer')),
+                chat_id           INTEGER NOT NULL,
+                text              TEXT NOT NULL,
+                compact_text      TEXT,
+                expanded_text     TEXT,
+                status            TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'sending', 'sent', 'failed',
+                                      'ambiguous', 'suppressed', 'canceled')),
+                attempts          INTEGER NOT NULL DEFAULT 0,
+                last_error        TEXT,
+                next_attempt_at   TEXT,
+                claim_token       TEXT,
+                claimed_at        TEXT,
+                telegram_message_id INTEGER,
+                created_at        TEXT NOT NULL,
+                updated_at        TEXT NOT NULL,
+                sent_at           TEXT,
+                UNIQUE (event_key, role)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO trading_notifications (
+                notification_id, event_key, signal_id, intent_id, category, event_type,
+                role, chat_id, text, compact_text, expanded_text, status, attempts,
+                last_error, next_attempt_at, created_at, updated_at, sent_at
+            )
+            SELECT notification_id, event_key, signal_id, intent_id, 'legacy', 'legacy',
+                   role, chat_id, text, text, NULL, status, attempts,
+                   last_error, updated_at, created_at, updated_at, sent_at
+            FROM trading_notifications_v16
+            """
+        )
+        conn.execute("DROP TABLE trading_notifications_v16")
+    else:
+        _add_columns(
+            conn,
+            "trading_notifications",
+            [
+                ("event_type", "TEXT NOT NULL DEFAULT 'legacy'"),
+                ("compact_text", "TEXT"),
+                ("expanded_text", "TEXT"),
+                ("next_attempt_at", "TEXT"),
+                ("claim_token", "TEXT"),
+                ("claimed_at", "TEXT"),
+                ("telegram_message_id", "INTEGER"),
+            ],
+        )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_status "
+        "ON trading_notifications (status, next_attempt_at, notification_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_event_key "
+        "ON trading_notifications (event_key)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_signal "
+        "ON trading_notifications (signal_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_intent "
+        "ON trading_notifications (intent_id)",
+    ):
+        conn.execute(sql)
+
+    # Developer defaults: every meaningful category.  Owner defaults: material
+    # trading/exchange evidence only.  Code applies the same defaults, so a
+    # missing row is never interpreted as "send everything".
+    now = "2026-01-01T00:00:00Z"
+    for role, category, enabled in (
+        ("owner", "signal_decision", 0),
+        ("owner", "signal_accepted", 1),
+        ("owner", "exchange_operation", 1),
+        ("owner", "order_lifecycle", 1),
+        ("owner", "oco_lifecycle", 1),
+        ("owner", "take_profit", 1),
+        ("owner", "stop_loss", 1),
+        ("owner", "reconciliation", 1),
+        ("owner", "critical", 1),
+        ("owner", "diagnostic", 0),
+        ("owner", "notification_delivery", 0),
+        ("owner", "recovery", 0),
+        ("developer", "signal_decision", 1),
+        ("developer", "signal_accepted", 1),
+        ("developer", "exchange_operation", 1),
+        ("developer", "order_lifecycle", 1),
+        ("developer", "oco_lifecycle", 1),
+        ("developer", "take_profit", 1),
+        ("developer", "stop_loss", 1),
+        ("developer", "reconciliation", 1),
+        ("developer", "critical", 1),
+        ("developer", "diagnostic", 1),
+        ("developer", "notification_delivery", 1),
+        ("developer", "recovery", 1),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO notification_preferences (role, category, enabled, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (role, category, enabled, now),
+        )
+
+
+MIGRATIONS: list[tuple[int, MigrationStep]] = [
     (
         1,
         """
@@ -1006,6 +1463,9 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE trade_orders ADD COLUMN stop_trigger_price TEXT;
         """,
     ),
+    (18, _migration_18_audit_journal),
+    (19, _migration_19_trade_evidence_columns),
+    (20, _migration_20_audit_evidence_notifications),
 ]
 
 
@@ -1042,14 +1502,17 @@ class Database:
                 "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
             )
             done = {r["version"] for r in self.conn.execute("SELECT version FROM schema_migrations")}
-            for version, sql in MIGRATIONS:
+            for version, step in MIGRATIONS:
                 if version in done:
                     continue
                 with self.transaction():
-                    # executescript would implicitly COMMIT; run statements one by one
-                    for statement in sql.split(";"):
-                        if statement.strip():
-                            self.conn.execute(statement)
+                    if callable(step):
+                        step(self.conn)
+                    else:
+                        # executescript would implicitly COMMIT; run statements one by one
+                        for statement in step.split(";"):
+                            if statement.strip():
+                                self.conn.execute(statement)
                     self.conn.execute(
                         "INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))",
                         (version,),
