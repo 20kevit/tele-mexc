@@ -548,3 +548,13 @@ modifies an order.
 9. Submit one minimal test signal only after a separate explicit approval.
 10. Monitor `trading status`, `trading intents`, `trading trades`, and the
     notification outbox.
+
+### OCO certainty follow-up review
+
+Uncertainty takes precedence over a filled or working row for the same target;
+multiple overlapping working rows require reconciliation. `filled` means a
+completed allocation with sufficient recorded execution quantity, never active
+protection. An `oco_active` summary requires working quantity to cover the
+remaining recorded position (completed allocations do not add coverage). Two
+completed allocations finalize only through the existing residual-position
+check. These checks change status certainty, not submission authorization.
