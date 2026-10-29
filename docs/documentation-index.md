@@ -34,6 +34,7 @@ When a document contradicts executable code, the code wins; fix the document.
 | `docs/LIVE_VERIFICATION.md` | Owner | Manual one-time Telegram integration check with real credentials | Manual procedure, not automated |
 | `docs/OPERATIONS.md` | — | Compatibility redirect to `docs/operations.md` | Redirect only; do not extend |
 | `docs/TRADING_DECISIONS.md` | Operators, developers | Canonical record of trading-scope, sizing, entry/exit, CLI-limitation, and notification decisions | Canonical decision record |
+| `docs/trading-audit-notifications-design.md` | Maintainers, OpenCode implementers | Proposed structured audit journal, recipient policies, OCO/position evidence, and read-only investigation plan | Design only; not implemented and not a source of current runtime behavior |
 
 ## Exchange research
 
@@ -54,6 +55,7 @@ and API details, but not a description of shipped behavior.
 | Understand the system | `docs/architecture.md` → `docs/data-model.md` → `docs/trading.md` |
 | Change code | `AGENTS.md` → `docs/development.md` → relevant canonical guide |
 | Work on signals only | `docs/SIGNAL_ANALYSIS.md` → `docs/architecture.md` |
+| Design audit/notification work | `AGENTS.md` → `docs/trading-audit-notifications-design.md` → relevant canonical guides; verify every proposal against code/tests |
 | Run a bot interface | `docs/CONTROL_BOT_FA.md` or `docs/MANAGEMENT_BOT_FA.md` |
 | Verify against real Telegram | `docs/LIVE_VERIFICATION.md` |
 
