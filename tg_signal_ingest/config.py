@@ -106,7 +106,7 @@ class TradingConfig:
     # above the configured stop-loss exit price so it can activate earlier as
     # the market falls. Zero disables the offset (trigger == exit price).
     # The configured stop-loss exit price itself is never changed.
-    stop_loss_trigger_offset_ticks: int = 5
+    stop_loss_trigger_offset_ticks: int = 3
     # Price feed polling (monitor) configuration.
     monitor_poll_interval_s: float = 2.0
     monitor_max_retries: int = 5

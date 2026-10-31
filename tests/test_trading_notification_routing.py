@@ -43,7 +43,9 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
     assert "سیگنال جدید دریافت شد" not in _joined(bot)
 
 
-def test_genuine_sell_notifies_both_and_is_explicitly_ignored(cfg, repo):
+def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, repo):
+    """Owner policy: routine local signal rejections go to the developer only,
+    never to the owner, unless the owner re-enables the category."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client, mode="live")
     bot = FlakyBot()
@@ -54,8 +56,8 @@ def test_genuine_sell_notifies_both_and_is_explicitly_ignored(cfg, repo):
 
     assert result is None
     assert client.place_calls == 0 and client.test_calls == 0
-    assert len(bot.sent) == 2
-    _assert_both(bot)
+    assert len(bot.sent) == 1
+    assert {chat for chat, _ in bot.sent} == {DEVELOPER}
     joined = _joined(bot)
     assert "status: IGNORED_SELL_SPOT_BUY_ONLY" in joined
     assert "Spot BUY only" in joined
@@ -64,7 +66,9 @@ def test_genuine_sell_notifies_both_and_is_explicitly_ignored(cfg, repo):
     assert "ACCEPTED_OPEN" not in joined and "SUBMISSION_REJECTED" not in joined
 
 
-def test_locally_rejected_genuine_buy_notifies_both_with_reason(cfg, repo):
+def test_locally_rejected_genuine_buy_notifies_developer_only_with_reason(cfg, repo):
+    """Owner policy: a genuine signal rejected locally is a routine local
+    rejection and is reported to the developer, not the owner."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client, mode="testonly")
     bot = FlakyBot()
@@ -75,8 +79,8 @@ def test_locally_rejected_genuine_buy_notifies_both_with_reason(cfg, repo):
 
     assert result is None
     assert client.place_calls == 0 and client.test_calls == 0
-    assert len(bot.sent) == 2
-    _assert_both(bot)
+    assert len(bot.sent) == 1
+    assert {chat for chat, _ in bot.sent} == {DEVELOPER}
     joined = _joined(bot)
     assert "status: REJECTED_LOCALLY" in joined
     assert "no entry price" in joined

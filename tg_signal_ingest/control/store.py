@@ -168,6 +168,43 @@ class ControlStore:
             "channel_page_size": min(10, max(1, self.get_int_setting("channel_page_size", 10))),
         }
 
+    # -------------------------------------------------- notification settings
+
+    def get_notification_setting(self, role: str, category: str) -> bool | None:
+        row = self.db.conn.execute(
+            "SELECT enabled FROM notification_preferences WHERE role = ? AND category = ?",
+            (role, category),
+        ).fetchone()
+        if row is None:
+            return None
+        return bool(int(row["enabled"]))
+
+    def set_notification_setting(self, role: str, category: str, enabled: bool) -> None:
+        now = self._ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO notification_preferences (role, category, enabled, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(role, category) DO UPDATE SET "
+                "enabled = excluded.enabled, updated_at = excluded.updated_at",
+                (role, category, 1 if enabled else 0, now),
+            )
+        self.audit(
+            f"notification_{role}_{category}",
+            f"{'enabled' if enabled else 'disabled'}: notification {category} for {role}",
+        )
+
+    def list_notification_settings(self, role: str | None = None) -> list[dict[str, Any]]:
+        if role is None:
+            rows = self.db.conn.execute(
+                "SELECT * FROM notification_preferences ORDER BY role, category"
+            ).fetchall()
+        else:
+            rows = self.db.conn.execute(
+                "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
+                (role,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # ---------------------------------------------------------------- flow
 
     def set_flow(self, state: str, payload: dict[str, Any] | None = None, ttl_s: int = FLOW_TTL_S) -> None:

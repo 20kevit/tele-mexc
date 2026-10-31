@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from tg_signal_ingest.control.service import ControlBot
@@ -332,7 +332,9 @@ async def test_learning_requires_five_valid_examples_and_never_enables_trading(c
     assert control.should_require_approval({}) is True
 
 
-async def test_approval_is_owner_bound_nonce_checked_one_time_and_executes_once(cfg, repo):
+async def test_no_signal_approval_prompt_is_created(cfg, repo):
+    """Eligible signals are evaluated automatically; tick() must not create
+    per-signal approval prompts."""
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
@@ -340,42 +342,124 @@ async def test_approval_is_owner_bound_nonce_checked_one_time_and_executes_once(
     control, fake, engine = _bot(cfg, repo)
 
     await control.tick()
-    approval = store.list_approvals("pending", 1)[0]
-    assert approval["chat_id"] == OWNER
-    assert approval["message_id"]
+    # No new approval prompt is created for the planned intent.
+    assert store.list_approvals("pending", 1) == []
     assert engine.executed == []
-    buttons = fake.last_buttons()
-    approve = next(btn for btn in buttons if btn["callback_data"].startswith("ap:y:"))
-    approval_id = approval["approval_id"]
-
-    await control.handle_update(_callback(100, f"ap:y:{approval_id}:wrong-nonce"))
-    assert "معتبر نیست" in fake.sent[-1]["text"]
-    assert engine.executed == []
-
-    await control.handle_update(_callback(101, approve["callback_data"]))
-    assert engine.executed == ["intent-1"]
-    assert store.get_approval(approval_id)["result_detail"] == "filled"
-    assert any("نتیجه اجرا: filled" in item["text"] for item in fake.edited)
-
-    await control.handle_update(_callback(102, approve["callback_data"]))
-    assert engine.executed == ["intent-1"]
-    assert "قبلاً ثبت شده" in fake.sent[-1]["text"]
+    assert not any(btn["callback_data"].startswith("ap:y:") for btn in fake.last_buttons())
 
 
-async def test_rejecting_approval_cancels_intent_without_execution(cfg, repo):
+async def test_approval_expiration_does_not_cancel_or_resubmit_intent(cfg, repo):
+    """An expired approval record must never cancel or resubmit an intent.
+    The trading engine owns the intent lifecycle."""
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
     _add_intent(repo)
     control, fake, engine = _bot(cfg, repo)
 
-    await control.tick()
-    reject = next(btn for btn in fake.last_buttons() if btn["callback_data"].startswith("ap:n:"))
-    await control.handle_update(_callback(100, reject["callback_data"]))
-
+    # Manually create a legacy pending approval, then set it to expired.
+    approval, _created = store.create_approval(
+        intent_id="intent-1", signal_id="sig-1",
+        intent_version="v1",
+    )
+    now = datetime.now(UTC)
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE control_approvals SET expires_at = ? WHERE approval_id = ?",
+            (
+                (now - timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                approval["approval_id"],
+            ),
+        )
+    await control.tick()  # expire_approvals marks it expired, does not touch intent
+    assert store.get_approval(approval["approval_id"])["status"] == "expired"
+    # Intent state is unchanged: no cancellation, no resubmission.
+    assert engine.store.get_intent("intent-1")["state"] == "planned"
     assert engine.executed == []
-    assert engine.store.get_intent("intent-1")["state"] == "canceled_local"
-    assert store.get_approval(store.list_approvals("rejected", 1)[0]["approval_id"])["status"] == "rejected"
+
+
+async def test_legacy_approval_callback_is_rejected(cfg, repo):
+    """Legacy ap:y:/ap:n: callbacks no longer execute any order."""
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    _add_intent(repo)
+    control, fake, engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(100, "ap:y:dummy-approval-id:dummy-nonce"))
+    assert "حذف شد" in fake.sent[-1]["text"] or "حذف است" in fake.sent[-1]["text"]
+    assert engine.executed == []
+
+
+async def test_tick_does_not_create_signal_approval_or_send_timeout(cfg, repo):
+    """The control bot's tick() must not create per-signal approval prompts
+    or send approval-timeout messages.  Signals are auto-executed by the
+    trading engine."""
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    _add_intent(repo)
+    control, fake, engine = _bot(cfg, repo)
+
+    before_sent = len(fake.sent)
+    await control.tick()
+    # No new messages (no approval prompt, no timeout).
+    assert len(fake.sent) == before_sent
+    # No approval records created.
+    assert store.list_approvals("pending", 1) == []
+
+
+async def test_version_command_reports_runtime_info(cfg, repo):
+    """The /version command returns non-secret runtime info to the owner."""
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_message(10, "/version"))
+    text = fake.sent[-1]["text"]
+    assert "نسخه اجرا" in text
+    assert "نسخه برنامه:" in text
+    assert "commit SHA:" in text
+    assert "شاخه:" in text
+    assert "حالت معامله:" in text
+    assert "مجوز لایو:" in text
+    # No secrets leaked.
+    assert "api_key" not in text.lower()
+    assert "secret" not in text.lower()
+    assert "token" not in text.lower()
+
+
+async def test_version_command_is_owner_only(cfg, repo):
+    """Unauthorized users must not receive /version output."""
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_message(10, "/version", user=999))
+    assert "دسترسی مجاز نیست" in fake.sent[-1]["text"]
+
+
+async def test_auto_mode_toggle_is_administrative_control(cfg, repo):
+    """Auto-mode enable/disable remains a genuine administrative control,
+    separate from per-signal approval."""
+    cfg.trading.order_quote_amount = 10.0
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, engine = _bot(cfg, repo)
+
+    assert store.setup()["execution_mode"] == "approval"
+    assert control.should_require_approval({}) is True
+
+    await control.handle_update(_callback(100, "m:auto"))
+    await control.handle_update(_callback(101, "m:auto2"))
+    assert store.setup()["execution_mode"] == "auto"
+    assert control.should_require_approval({}) is False
+
+    await control.handle_update(_callback(102, "m:manual"))
+    assert store.setup()["execution_mode"] == "approval"
 
 
 async def test_auto_mode_requires_two_steps_and_restart_clears_it(cfg, repo):

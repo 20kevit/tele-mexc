@@ -941,7 +941,8 @@ class TradeManager:
         )
         try:
             result = engine.submit_sell_limit(
-                trade, order["client_order_id"], price, qty, kind=target
+                trade, order["client_order_id"], price, qty, kind=target,
+                trade_order_id=order["trade_order_id"],
             )
         except MexcDuplicateOrder as exc:
             # The earlier attempt may have landed.  Never submit a second
@@ -995,6 +996,96 @@ class TradeManager:
     def _oco_orders(self, trade: dict[str, Any], kind: str) -> list[dict[str, Any]]:
         """Return trade orders for a given OCO target (tp1 / tp2)."""
         return self._list_trade_orders(trade["trade_id"], kind=kind)
+
+    # ---------------------------------------------------------- OCO evidence
+
+    def _oco_group_id(self, trade: dict[str, Any]) -> str | None:
+        group = self.store.get_oco_group(trade["trade_id"])
+        return str(group["oco_group_id"]) if group else None
+
+    def _sync_oco_legs(self, trade: dict[str, Any]) -> str | None:
+        """Project per-leg order state into ``oco_groups``/``oco_legs``."""
+
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return None
+        for kind in ("tp1", "tp2"):
+            for order in self._oco_orders(trade, kind):
+                self.store.upsert_oco_leg(
+                    group_id=group_id,
+                    trade=trade,
+                    order=order,
+                    state=str(order.get("state") or "unknown"),
+                    leg_role=kind,
+                    exchange_status=order.get("exchange_status"),
+                    cancel_reason=order.get("cancel_reason"),
+                    canceled_by_leg=order.get("canceled_by_leg"),
+                    evidence_id=order.get("evidence_id"),
+                    not_observed_reason=order.get("not_observed_reason"),
+                    filled_quote=_dec(order.get("filled_quote")),
+                    fee_amount=_dec(order.get("fee_amount")),
+                    fee_asset=order.get("fee_asset"),
+                )
+        return group_id
+
+    def _sync_oco_group_state(self, trade: dict[str, Any], *, note: str | None = None) -> None:
+        mapping = {
+            "oco_submitting": "submitting",
+            "oco_active": "active",
+            "oco_partial": "partial",
+            "needs_reconciliation": "needs_review",
+            "tp1_completed": "triggered",
+            "tp2_completed": "completed",
+            "closed": "completed",
+            "stop_loss_executing": "triggered",
+            "exit_pending": "triggered",
+        }
+        refreshed = self.store.get_trade(trade["trade_id"]) or trade
+        state = mapping.get(str(refreshed.get("trade_state")), "intended")
+        self.store.set_oco_group_state(
+            trade["trade_id"], state,
+            protection_status=str(refreshed.get("trade_state")),
+            note=note, closed=state == "completed",
+        )
+
+    def _attribute_oco_siblings(self, trade: dict[str, Any]) -> dict[str, str]:
+        """Attribute a canceled OCO leg to a filled sibling.
+
+        This is observation only: it records *why* a leg disappeared.  It never
+        resubmits an exit and never marks a partially exited trade as closed.
+        """
+
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return {}
+        filled = [
+            kind for kind in ("tp1", "tp2")
+            if any(o["state"] == "filled" for o in self._oco_orders(trade, kind))
+        ]
+        attributed: dict[str, str] = {}
+        if len(filled) != 1:
+            return attributed
+        winner = filled[0]
+        for kind in ("tp1", "tp2"):
+            if kind == winner:
+                continue
+            for order in self._oco_orders(trade, kind):
+                if (
+                    order["state"] == "canceled"
+                    and not order.get("canceled_by_leg")
+                    and (_dec(order.get("sold_qty")) or Decimal("0")) <= 0
+                ):
+                    self.store.transition_trade_order(
+                        order["trade_order_id"], "canceled",
+                        note=f"OCO sibling {winner} filled; {kind} canceled by the exchange",
+                        cancel_reason="oco_sibling_filled",
+                        canceled_by_leg=winner,
+                    )
+                    self.store.attribute_sibling_cancel(
+                        group_id, filled_target=winner, canceled_target=kind
+                    )
+                    attributed[kind] = winner
+        return attributed
 
     def _list_trade_orders(
         self, trade_id: str, kind: str | None = None
@@ -1088,6 +1179,31 @@ class TradeManager:
         # The validation above guarantees a usable, ordered exit ladder.
         assert sl_price is not None and tp1_price is not None and tp2_price is not None
 
+        group_id = self.store.ensure_oco_group(
+            trade,
+            intended_config={
+                "entry_price": str(entry_price),
+                "tp1_price": str(tp1_price),
+                "tp2_price": str(tp2_price),
+                "stop_loss_price": str(sl_price),
+                "tp1_allocation_pct": str(trade.get("tp1_allocation_pct")),
+                "tp2_allocation_pct": str(trade.get("tp2_allocation_pct")),
+            },
+            protection_status="placing",
+        )
+        self.store.set_oco_group_state(trade["trade_id"], "submitting")
+        trade = self._refresh(trade)
+        self.store.audit(
+            trade["trade_id"], "lifecycle", "oco_group_created",
+            f"intended {len(('tp1', 'tp2'))} legs for {trade['symbol']}",
+            event_type="oco.intended",
+            trade_id=trade["trade_id"],
+            intent_id=trade.get("entry_intent_id"),
+            symbol=trade["symbol"],
+            payload={"oco_group_id": group_id, "stop_loss": str(sl_price)},
+            dedupe_key=f"oco-intended:{group_id}",
+        )
+
         # Allocations are computed once from the actual acquired position.
         # A restart must never shrink or re-expand an existing allocation.
         tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
@@ -1132,11 +1248,19 @@ class TradeManager:
         uncertain = [k for k, v in results.items() if v == "uncertain"]
         failed = [k for k, v in results.items() if v in ("rejected", "failed", "canceled")]
         trade = self._refresh(trade)
+        self._sync_oco_legs(trade)
 
         def _publish(
             new_state: str, note: str, event_key: str, text: str
         ) -> None:
             self.store.update_trade_state(trade["trade_id"], new_state, note=note)
+            self._sync_oco_group_state(trade, note=note)
+            self.store.audit(
+                trade["trade_id"], "lifecycle", event_key.lower(),
+                text, event_type="oco.state",
+                trade_id=trade["trade_id"], symbol=trade["symbol"],
+                outcome=new_state, payload={"legs": results},
+            )
             if new_state != previous_state:
                 self._notify_trade(trade, event_key, text)
 
@@ -1284,7 +1408,8 @@ class TradeManager:
         )
         try:
             result = engine.submit_oco_sell(
-                trade, order["client_order_id"], price, qty, stop_price, kind=target
+                trade, order["client_order_id"], price, qty, stop_price, kind=target,
+                trade_order_id=order["trade_order_id"],
             )
         except MexcDuplicateOrder as exc:
             self.store.transition_trade_order(
@@ -1586,6 +1711,14 @@ class TradeManager:
         self.store.update_trade_state(
             trade["trade_id"], "closed", note="position fully exited", sl_state="completed"
         )
+        self._sync_oco_legs(trade)
+        self._sync_oco_group_state(trade, note="position fully exited")
+        self.store.audit(
+            trade["trade_id"], "lifecycle", "trade_closed",
+            "position fully exited", event_type="trade.closed",
+            trade_id=trade["trade_id"], symbol=trade["symbol"],
+            intent_id=trade.get("entry_intent_id"), outcome="closed",
+        )
         self._notify_trade(trade, "TRADE_CLOSED", "trade fully closed")
 
     # ===================================================================
@@ -1781,6 +1914,19 @@ class TradeManager:
             # Reconcile OCO exit orders against the exchange.  All required legs
             # must confirm before protection is considered active; an uncertain
             # leg is reconciled but never resubmitted.
+            attributed = self._attribute_oco_siblings(trade)
+            if attributed:
+                # Observation only: attribution never re-arms an exit.
+                self.store.audit(
+                    trade["trade_id"], "lifecycle", "oco_sibling_canceled",
+                    "a filled OCO sibling canceled the other leg: "
+                    + ", ".join(f"{k}<-{v}" for k, v in attributed.items()),
+                    event_type="oco.sibling_canceled",
+                    trade_id=trade["trade_id"], symbol=trade["symbol"],
+                    payload={"attributed": attributed},
+                )
+            self._sync_oco_legs(trade)
+            self._sync_oco_group_state(trade)
             if self._ocos_terminal(trade):
                 self._finalize_trade(trade)
                 return
@@ -1922,6 +2068,9 @@ class TradeManager:
             return order
         fresh = self._query_order(order)
         if fresh is None:
+            self.store.mark_trade_order_not_observed(
+                order["trade_order_id"], "exchange query returned no usable result"
+            )
             self._record_error(
                 trade, f"order query failed for {order['trade_order_id']}", "exchange"
             )
@@ -1977,6 +2126,8 @@ class TradeManager:
             exchange_order_id=str(exchange_id) if exchange_id else None,
             exchange_status=str(raw_state) if raw_state is not None else None,
             sold_qty=sold,
+            last_observed_at=self._ts(),
+            not_observed_reason=None,
         )
 
     def _refresh_sold_fields(self, trade: dict[str, Any]) -> None:

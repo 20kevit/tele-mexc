@@ -86,6 +86,9 @@ def test_notification_events_are_idempotent(cfg, repo):
     engine = _engine(cfg, repo, mode="testonly")
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
-    notifier.notify(event_key="fixed-event", text="hello")
-    notifier.notify(event_key="fixed-event", text="hello")
+    # signal_accepted is delivered to both owner and developer; repeating the
+    # same event_key must not duplicate the delivery.
+    notifier.notify(event_key="fixed-event", text="hello", category="signal_accepted")
+    notifier.notify(event_key="fixed-event", text="hello", category="signal_accepted")
     assert len(bot.sent) == 2  # one per role, not four
+    assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}

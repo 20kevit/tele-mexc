@@ -1024,6 +1024,201 @@ async def cmd_diag_telegram(_args) -> int:
     return 0
 
 
+def cmd_diag_clock(args) -> int:
+    """Show clock health and skew diagnostics."""
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+
+    # Check clock skew via MEXC client if available
+    from .mexc.client import MexcSpotClient
+    from tg_signal_ingest.trading.store import clock_health_state, CLOCK_SKEW_FRESH_MS, CLOCK_SKEW_STALE_MS, CLOCK_SKEW_UNHEALTHY_MS
+
+    # Read current database state for clock health tracking
+    sync = repo.sync_status()
+    counts = repo.message_counts(sync.channel_id or 0)
+
+    lines: list[str] = []
+    lines.append("clock health diagnostics")
+    lines.append(f"  VPS clock sync: NTP enabled (drift possible after startup)")
+    lines.append(f"  recvWindow default: {cfg.trading.mode} mode uses {cfg.mecv.recv_window_ms if hasattr(cfg.mecv, 'recv_window_ms') else 5000} ms")
+    # Note: actual skew measurement requires an active MEXC client with live/auth config
+    lines.append("  (run with live credentials to measure actual skew)")
+    lines.append("")
+    lines.append(f"  clock health thresholds:")
+    lines.append(f"    fresh: < {CLOCK_SKEW_FRESH_MS} ms")
+    lines.append(f"    degraded: {CLOCK_SKEW_FRESH_MS}-{CLOCK_SKEW_STALE_MS} ms")
+    lines.append(f"    unhealthy: >= {CLOCK_SKEW_UNHEALTHY_MS} ms (exceeds default recvWindow)")
+    lines.append("")
+    lines.append(f"  channel: {sync.channel_title or '-'} (id={sync.channel_id})")
+    lines.append(f"  backfill: {sync.backfill_status} (mode={sync.backfill_target_mode})")
+    lines.append(f"  stored messages: total={counts.total}")
+    db.close()
+    for line in lines:
+        print(line)
+    return 0
+
+
+def cmd_diag_audit(args) -> int:
+    """Show audit journal health and event counts."""
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+
+    # Query audit event counts from the database
+    total = repo.db.conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    by_severity = {}
+    by_category = {}
+    by_outcome = {}
+
+    rows = repo.db.conn.execute(
+        "SELECT severity, COUNT(*) FROM audit_events GROUP BY severity"
+    ).fetchall()
+    for row in rows:
+        by_severity[row[0]] = row[1]
+
+    rows = repo.db.conn.execute(
+        "SELECT category, COUNT(*) FROM audit_events GROUP BY category"
+    ).fetchall()
+    for row in rows:
+        by_category[row[0]] = row[1]
+
+    # Check for events with clock_health set
+    clock_events = repo.db.conn.execute(
+        "SELECT clock_health, COUNT(*) FROM audit_events WHERE clock_health IS NOT NULL GROUP BY clock_health"
+    ).fetchall()
+    by_clock_health = {}
+    for row in clock_events:
+        by_clock_health[row[0]] = row[1]
+
+    lines: list[str] = []
+    lines.append("audit journal health")
+    lines.append(f"  total events: {total}")
+    lines.append("")
+    lines.append("  by severity:")
+    for sev, count in sorted(by_severity.items()):
+        lines.append(f"    {sev}: {count}")
+    lines.append("")
+    lines.append("  by category:")
+    for cat, count in sorted(by_category.items()):
+        lines.append(f"    {cat}: {count}")
+    lines.append("")
+    lines.append("  by clock_health state:")
+    if by_clock_health:
+        for state, count in sorted(by_clock_health.items()):
+            lines.append(f"    {state}: {count}")
+    else:
+        lines.append("    (no events with clock_health set yet)")
+    lines.append("")
+    lines.append("  recent events (last 20):")
+    rows = repo.db.conn.execute(
+        "SELECT event_id, event, severity, occurred_at_utc, clock_health, component "
+        "FROM audit_events ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+    for row in rows:
+        clock_str = f" clock={row[5]}" if row[5] else ""
+        lines.append(f"    {row[0][:30]}{clock_str} | {row[1]} | {row[2]} | {row[3]}")
+    db.close()
+    for line in lines:
+        print(line)
+    return 0
+
+
+def cmd_diag_orders(args) -> int:
+    """Show order intent traces and state diagnostics."""
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+
+    from .trading.store import TradingStore
+
+    store = TradingStore(repo.db, cfg.trading)
+    counts = store.count_intents_by_state()
+
+    lines: list[str] = []
+    lines.append("order intent state diagnostics")
+    lines.append(f"  intents by state:")
+    for state, count in sorted(counts.items()):
+        lines.append(f"    {state}: {count}")
+    lines.append("")
+
+    # Show intents with unknown_requires_reconciliation
+    unreconciled = store.pending_reconciliation(limit=100)
+    lines.append(f"  pending reconciliation ({len(unreconciled)} intents):")
+    for intent in unreconciled:
+        reason = intent.get("reject_reason") or ""
+        lines.append(
+            f"    {intent['intent_id']} mode={intent['mode']} state={intent['state']} "
+            f"sym={intent['symbol']} reason={reason[:80]}"
+        )
+    lines.append("")
+
+    # Show budget summary
+    budget = store.budget_summary()
+    lines.append("  budget summary:")
+    lines.append(f"    limit: {budget['limit']} USDT")
+    lines.append(f"    reserved: {budget['reserved']} USDT")
+    lines.append(f"    spent: {budget['spent']} USDT")
+    lines.append(f"    remaining: {budget['remaining']} USDT")
+    db.close()
+    for line in lines:
+        print(line)
+    return 0
+
+
+def cmd_diag_reconcile(args) -> int:
+    """Show unresolved reconciliation diagnostics."""
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+
+    from .trading.engine import TradeEngine
+    from .trading.runtime import build_trading_engine
+
+    # Build engine in sim mode (no client needed for read-only diagnostics)
+    engine = build_trading_engine(cfg, repo, require_client=False)
+
+    # Get pending reconciliation intents
+    pending = engine.store.pending_reconciliation(limit=args.limit if hasattr(args, 'limit') else 50)
+
+    lines: list[str] = []
+    lines.append("unresolved reconciliation diagnostics")
+    lines.append(f"  checked: {len(pending)} intents pending reconciliation")
+    lines.append("")
+
+    # Group by outcome
+    outcomes: dict[str, int] = {}
+    for intent in pending:
+        # Check last reconciliation result
+        rows = engine.repo.db.conn.execute(
+            "SELECT outcome FROM reconciliation_results WHERE intent_id = ? "
+            "ORDER BY recon_id DESC LIMIT 1",
+            (intent["intent_id"],),
+        ).fetchall()
+        outcome = rows[0]["outcome"] if rows else "none"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+    lines.append("  outcomes:")
+    for outcome, count in sorted(outcomes.items()):
+        lines.append(f"    {outcome}: {count}")
+    lines.append("")
+
+    # Show details of intents with uncertain outcomes
+    uncertain_outcomes = {"ambiguous", "not_found", "discrepancy"}
+    uncertain_intents = [i for i in pending if outcomes.get(i["intent_id"], "none") in uncertain_outcomes]
+
+    lines.append(f"  uncertain intents ({len(uncertain_intents)}):")
+    for intent in uncertain_intents[:20]:
+        reason = intent.get("reject_reason") or ""
+        lines.append(
+            f"    {intent['intent_id']} state={intent['state']} "
+            f"sym={intent['symbol']} mode={intent['mode']} reason={reason[:80]}"
+        )
+    if len(uncertain_intents) > 20:
+        lines.append(f"    ... and {len(uncertain_intents) - 20} more")
+
+    db.close()
+    for line in lines:
+        print(line)
+    return 0
+
+
 def cmd_messages_list(args) -> int:
     cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
@@ -1233,6 +1428,32 @@ def cmd_trading_reconcile(args) -> int:
     )
     db.close()
     return 0 if stats.errors == 0 else 1
+
+
+def cmd_trading_notifications(args) -> int:
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+    from .trading.store import TradingStore
+
+    store = TradingStore(repo.db, cfg.trading)
+    rows = store.pending_notifications(limit=args.limit)
+    if args.status:
+        rows = [r for r in rows if r["status"] == args.status]
+    print(f"trading notifications ({len(rows)} pending/failed):")
+    for r in rows:
+        attempts = store.notification_attempts(int(r["notification_id"]))
+        last = attempts[-1] if attempts else None
+        print(
+            f"  id={r['notification_id']} status={r['status']} role={r['role']} "
+            f"category={r['category']} event_type={r['event_type']} "
+            f"attempts={r['attempts']} next={r['next_attempt_at'] or '-'} "
+            f"last={last['outcome'] if last else '-'} {last['error'] or '' if last else ''}"
+        )
+        if last:
+            print(f"        attempt={last['attempt_no']} at={last['attempted_at']} "
+                  f"ambiguous={last['ambiguous']} retry_after={last['retry_after_s']}")
+    db.close()
+    return 0
 
 
 def cmd_trading_test_order(args) -> int:
@@ -1805,6 +2026,14 @@ def build_parser() -> argparse.ArgumentParser:
     dbot.set_defaults(func=cmd_diag_bot)
     dt = diag_sub.add_parser("telegram", help="direct network + real session + channel access")
     dt.set_defaults(func=cmd_diag_telegram)
+    dc = diag_sub.add_parser("clock", help="clock health and skew diagnostics")
+    dc.set_defaults(func=cmd_diag_clock)
+    da = diag_sub.add_parser("audit", help="audit journal health and event counts")
+    da.set_defaults(func=cmd_diag_audit)
+    do_ = diag_sub.add_parser("orders", help="order intent traces and state diagnostics")
+    do_.set_defaults(func=cmd_diag_orders)
+    dr = diag_sub.add_parser("reconcile", help="unresolved reconciliation diagnostics")
+    dr.set_defaults(func=cmd_diag_reconcile)
 
     messages = sub.add_parser("messages", help="inspect stored messages")
     m_sub = messages.add_subparsers(dest="messages_cmd", required=True)
@@ -1855,6 +2084,10 @@ def build_parser() -> argparse.ArgumentParser:
     ts_recon = ts_sub.add_parser("reconcile", help="reconcile non-terminal live intents")
     ts_recon.add_argument("--limit", type=int, default=50)
     ts_recon.set_defaults(func=cmd_trading_reconcile)
+    ts_notify = ts_sub.add_parser("notifications", help="list trading notification outbox state")
+    ts_notify.add_argument("--status", default=None, help="filter by status (pending, failed, ambiguous, sent)")
+    ts_notify.add_argument("--limit", type=int, default=50)
+    ts_notify.set_defaults(func=cmd_trading_notifications)
     ts_test = ts_sub.add_parser("test-order", help="validate an order via the official /order/test endpoint")
     ts_test.add_argument("--symbol", required=True)
     ts_test.add_argument("--side", choices=["BUY", "SELL"], required=True)

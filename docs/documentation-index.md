@@ -67,3 +67,11 @@ and API details, but not a description of shipped behavior.
 - Link to authoritative detail rather than duplicating it.
 - Never add secrets, `.env`/`config.toml` values, session data, database
   contents, or private message content.
+
+## Design-note status
+
+The implementation proceeds from the mission requirements plus `docs/evidence/*`
+because `docs/trading-audit-notifications-design.md` (referenced by the design
+task) was **not present** in the checkout. That absence is documented here; no
+design file was invented. Implemented behavior is described in
+`docs/trading.md`, `docs/data-model.md`, and `docs/operations.md`.

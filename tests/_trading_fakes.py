@@ -289,7 +289,9 @@ class FakeEngine:
         return refreshed
 
     # --- TP / SL order submission ------------------------------------------
-    def submit_sell_limit(self, trade, client_order_id, price, quantity, kind=None):
+    def submit_sell_limit(
+        self, trade, client_order_id, price, quantity, kind=None, trade_order_id=None
+    ):
         resp = self.client.place_order(
             symbol=trade["symbol"],
             side="SELL",
@@ -328,7 +330,10 @@ class FakeEngine:
         self.sl_client_ids.append(cid)
         return order
 
-    def submit_oco_sell(self, trade, client_order_id, price, quantity, stop_price, kind=None):
+    def submit_oco_sell(
+        self, trade, client_order_id, price, quantity, stop_price, kind=None,
+        trade_order_id=None,
+    ):
         resp = self.client.place_order(
             symbol=trade["symbol"],
             side="SELL",

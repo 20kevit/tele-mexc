@@ -8,10 +8,20 @@ referenced by ``trades.entry_intent_id``.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .audit import redact_payload
 from .store import TradingStore, _row, dec_str
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
 
 
 class TradeError(Exception):
@@ -348,6 +358,16 @@ class TradeStore(TradingStore):
         sold_qty: Decimal | None = None,
         allocated_qty: Decimal | None = None,
         stop_trigger_price: Decimal | None = None,
+        evidence_id: str | None = None,
+        last_observed_at: str | None = None,
+        not_observed_reason: str | None = None,
+        cancel_reason: str | None = None,
+        canceled_by_leg: str | None = None,
+        filled_quote: Decimal | None = None,
+        fee_amount: Decimal | None = None,
+        fee_asset: str | None = None,
+        oco_group_id: str | None = None,
+        leg_role: str | None = None,
     ) -> dict[str, Any] | None:
         now = self._ts()
         sets = ["state = ?", "updated_at = ?"]
@@ -367,9 +387,208 @@ class TradeStore(TradingStore):
         if stop_trigger_price is not None:
             sets.append("stop_trigger_price = ?")
             params.append(dec_str(stop_trigger_price))
+        for column, value in (
+            ("evidence_id", evidence_id),
+            ("last_observed_at", last_observed_at),
+            ("cancel_reason", cancel_reason),
+            ("canceled_by_leg", canceled_by_leg),
+            ("fee_asset", fee_asset),
+            ("oco_group_id", oco_group_id),
+            ("leg_role", leg_role),
+        ):
+            if value is not None:
+                sets.append(f"{column} = ?")
+                params.append(value)
+        if not_observed_reason is not None or last_observed_at is not None:
+            sets.append("not_observed_reason = ?")
+            params.append(not_observed_reason)
+        for column, decimal in (
+            ("filled_quote", filled_quote),
+            ("fee_amount", fee_amount),
+        ):
+            if decimal is not None:
+                sets.append(f"{column} = ?")
+                params.append(dec_str(decimal))
         params.append(trade_order_id)
         with self.db.transaction() as conn:
             conn.execute(
                 f"UPDATE trade_orders SET {', '.join(sets)} WHERE trade_order_id = ?", params
             )
         return self.get_trade_order(trade_order_id)
+
+    # ------------------------------------------------------------ OCO groups
+
+    def ensure_oco_group(
+        self,
+        trade: dict[str, Any],
+        *,
+        intended_config: dict[str, Any] | None = None,
+        protection_status: str | None = None,
+    ) -> str:
+        """Create (or return) the explicit OCO lifecycle group for a trade."""
+
+        now = self._ts()
+        group_id = str(trade.get("oco_group_id") or f"oco-{trade['trade_id']}")
+        with self.db.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM oco_groups WHERE trade_id = ?", (trade["trade_id"],)
+            ).fetchone()
+            if existing is not None:
+                return str(existing["oco_group_id"])
+            conn.execute(
+                "INSERT INTO oco_groups (oco_group_id, trade_id, intent_id, symbol, state, "
+                "intended_config, protection_status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'intended', ?, ?, ?, ?)",
+                (
+                    group_id, trade["trade_id"], trade.get("entry_intent_id"),
+                    str(trade["symbol"]).upper(), redact_payload(intended_config),
+                    protection_status, now, now,
+                ),
+            )
+            conn.execute(
+                "UPDATE trades SET oco_group_id = COALESCE(oco_group_id, ?), updated_at = ? "
+                "WHERE trade_id = ?",
+                (group_id, now, trade["trade_id"]),
+            )
+        return group_id
+
+    def set_oco_group_state(
+        self,
+        trade_id: str,
+        state: str,
+        *,
+        protection_status: str | None = None,
+        note: str | None = None,
+        closed: bool = False,
+    ) -> None:
+        now = self._ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE oco_groups SET state = ?, protection_status = COALESCE(?, protection_status), "
+                "updated_at = ?, closed_at = CASE WHEN ? THEN ? ELSE closed_at END "
+                "WHERE trade_id = ?",
+                (state, protection_status, now, 1 if closed else 0, now, trade_id),
+            )
+            if note:
+                conn.execute(
+                    "UPDATE trades SET protection_config_json = COALESCE(protection_config_json, ?), "
+                    "updated_at = ? WHERE trade_id = ?",
+                    (redact_payload({"last_oco_note": note}), now, trade_id),
+                )
+
+    def get_oco_group(self, trade_id: str) -> dict[str, Any] | None:
+        return _row(
+            self.db.conn.execute(
+                "SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
+        )
+
+    def upsert_oco_leg(
+        self,
+        *,
+        group_id: str,
+        trade: dict[str, Any],
+        order: dict[str, Any],
+        state: str,
+        leg_role: str | None = None,
+        exchange_status: str | None = None,
+        cancel_reason: str | None = None,
+        canceled_by_leg: str | None = None,
+        evidence_id: str | None = None,
+        not_observed_reason: str | None = None,
+        filled_qty: Decimal | None = None,
+        filled_quote: Decimal | None = None,
+        fee_amount: Decimal | None = None,
+        fee_asset: str | None = None,
+    ) -> str:
+        """Upsert the per-leg projection for one OCO target (tp1/tp2)."""
+
+        now = self._ts()
+        target = str(order.get("target") or order.get("kind") or leg_role or "unknown")
+        kind = (
+            "stop_loss"
+            if target == "stop_loss"
+            else ("take_profit" if target in ("tp1", "tp2", "take_profit") else "take_profit")
+        )
+        leg_id = f"{group_id}:{target}"
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO oco_legs (
+                    leg_id, oco_group_id, trade_id, trade_order_id, kind, target,
+                    client_order_id, exchange_order_id, intended_price,
+                    intended_trigger_price, intended_qty, state, exchange_status,
+                    filled_qty, filled_quote, fee_amount, fee_asset, cancel_reason,
+                    canceled_by_target, evidence_id, last_observed_at,
+                    not_observed_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(leg_id) DO UPDATE SET
+                    trade_order_id = COALESCE(excluded.trade_order_id, oco_legs.trade_order_id),
+                    client_order_id = COALESCE(excluded.client_order_id, oco_legs.client_order_id),
+                    exchange_order_id = COALESCE(excluded.exchange_order_id, oco_legs.exchange_order_id),
+                    intended_price = COALESCE(excluded.intended_price, oco_legs.intended_price),
+                    intended_trigger_price = COALESCE(excluded.intended_trigger_price, oco_legs.intended_trigger_price),
+                    intended_qty = COALESCE(excluded.intended_qty, oco_legs.intended_qty),
+                    state = excluded.state,
+                    exchange_status = COALESCE(excluded.exchange_status, oco_legs.exchange_status),
+                    filled_qty = CASE
+                        WHEN CAST(excluded.filled_qty AS REAL) >= CAST(oco_legs.filled_qty AS REAL)
+                        THEN excluded.filled_qty ELSE oco_legs.filled_qty END,
+                    filled_quote = COALESCE(excluded.filled_quote, oco_legs.filled_quote),
+                    fee_amount = COALESCE(excluded.fee_amount, oco_legs.fee_amount),
+                    fee_asset = COALESCE(excluded.fee_asset, oco_legs.fee_asset),
+                    cancel_reason = COALESCE(excluded.cancel_reason, oco_legs.cancel_reason),
+                    canceled_by_target = COALESCE(excluded.canceled_by_target, oco_legs.canceled_by_target),
+                    evidence_id = COALESCE(excluded.evidence_id, oco_legs.evidence_id),
+                    last_observed_at = COALESCE(excluded.last_observed_at, oco_legs.last_observed_at),
+                    not_observed_reason = COALESCE(excluded.not_observed_reason, oco_legs.not_observed_reason),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    leg_id, group_id, trade["trade_id"], order.get("trade_order_id"),
+                    kind, target, order.get("client_order_id"), order.get("exchange_order_id"),
+                    dec_str(_optional_decimal(order.get("price"))),
+                    dec_str(_optional_decimal(order.get("stop_trigger_price"))),
+                    dec_str(_optional_decimal(order.get("quantity"))),
+                    state, exchange_status,
+                    dec_str(filled_qty or _optional_decimal(order.get("sold_qty")) or Decimal("0")),
+                    dec_str(filled_quote), dec_str(fee_amount), fee_asset,
+                    cancel_reason, canceled_by_leg, evidence_id, now,
+                    not_observed_reason, now, now,
+                ),
+            )
+        return leg_id
+
+    def list_oco_legs(self, group_id: str) -> list[dict[str, Any]]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM oco_legs WHERE oco_group_id = ? ORDER BY target", (group_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_trade_order_not_observed(self, trade_order_id: str, reason: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE trade_orders SET not_observed_reason = ?, updated_at = ? "
+                "WHERE trade_order_id = ?",
+                (reason[:500], self._ts(), trade_order_id),
+            )
+
+    def attribute_sibling_cancel(
+        self, group_id: str, *, filled_target: str, canceled_target: str
+    ) -> None:
+        """Record that an OCO sibling was canceled *because* its peer filled."""
+
+        now = self._ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE oco_legs SET cancel_reason = 'oco_sibling_filled', "
+                "canceled_by_target = ?, updated_at = ? "
+                "WHERE oco_group_id = ? AND target = ?",
+                (filled_target, now, group_id, canceled_target),
+            )
+            conn.execute(
+                "UPDATE trade_orders SET cancel_reason = 'oco_sibling_filled', "
+                "canceled_by_leg = ?, updated_at = ? "
+                "WHERE oco_group_id = ? AND kind = ?",
+                (filled_target, now, group_id, canceled_target),
+            )

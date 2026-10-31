@@ -38,6 +38,10 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 14 | `trading_notifications` |
 | 15 | management flow `order_amount_input` stage |
 | 16 | unique `(event_key, role)` notification outbox |
+| 17 | `trade_orders.stop_trigger_price` (recorded; body extended later) |
+| 18 | normalized `audit_events` v2 schema (event_type, dedupe_key, indexes) |
+| 19 | `trade_orders` per-leg evidence columns; `trades` OCO/outcome columns; `reconciliation_results`/`messages`/`signals` `source_ref` |
+| 20 | `exchange_operations`, `oco_groups`, `oco_legs`, `notification_preferences`, `notification_callbacks`, `notification_delivery_attempts` |
 
 ## Table groups
 
@@ -65,7 +69,7 @@ tradeable, and only above the activation boundary.
 | `order_status_history` | append-only intent state transitions |
 | `order_fills` | unique `(exchange_order_id, exchange_trade_id)`; price, quantity, quote, fee, trade time |
 | `reconciliation_results` | append-only outcome (`consistent`, `resolved`, `discrepancy`, `ambiguous`, `not_found`) |
-| `audit_events` | correlation/category/event/detail timeline |
+| `audit_events` | v2 structured timeline: `event_id`, `event_type` (`category.event`), `severity`, `occurred_at_utc`, `recorded_at_utc`, correlation/causation ids, `trade_id`/`intent_id`/`order_id`/`exchange_order_id`, `symbol`, `reason_code`, `outcome`, `source_ref`, `evidence_source`, `evidence_limitations`, `payload_json`, `dedupe_key`; redacted and bounded `detail` |
 | `trading_daily_spend` | per-day quote/count bookkeeping; no cap currently reads it |
 
 Relationships:
@@ -83,17 +87,37 @@ signals 1 ── * order_intents 1 ── * order_fills
 | Table | Purpose |
 | --- | --- |
 | `trading_budget_ledger` | one row per executable intent: reserved/spent/fee quote, active flag, state (`reserved`, `uncertain`, `settled`, `released`) |
-| `trading_notifications` | durable outbox; unique `(event_key, role)`, status `pending`/`sent`/`failed`, attempts/error |
+| `trading_notifications` | durable outbox; unique `(event_key, role)`, status `pending`/`sending`/`sent`/`failed`/`ambiguous`/`suppressed`/`canceled`, `category`/`event_type`, attempts/error/next attempt |
 
 The ledger is the authoritative cumulative budget tracker. It is never reset by restart.
 The notification outbox is independent of order state.
 
+### Exchange evidence and OCO lifecycle
+
+| Table | Purpose |
+| --- | --- |
+| `exchange_operations` | one row per exchange call, inserted **before** the request; `operation_class` (`read`/`write`), endpoint, payloads (redacted), response classification/code, error, `uncertainty` |
+| `oco_groups` | one row per trade (`oco_group_id` PK, `trade_id` unique); `state` mirrors trade state, `intended_config`, `protection_status`, `closed_at` |
+| `oco_legs` | one row per OCO target (`leg_id` PK, unique per group+target); `kind`, `target`, prices/qtys, state, exchange status, fills/fees, `cancel_reason`, `canceled_by_target` |
+| `notification_preferences` | `(role, category)` PK with `enabled`; owner defaults material trading only, developer all |
+| `notification_callbacks` | single-use time-limited tokens for `expand`/`signal_source`/`ack` actions |
+| `notification_delivery_attempts` | per-notification attempt history: outcome, error, message id, retry-after, `ambiguous` flag |
+
+`exchange_operations.uncertainty`: `none`, `uncertain`, `reconciled`,
+`read_only_uncertain`. An uncertain write is never auto-resubmitted.
+`oco_groups.state`: `intended`, `submitting`, `active`, `partial`,
+`triggered`, `completed`, `canceled`, `uncertain`, `needs_review`.
+Sibling cancellation is attributed on the canceled leg via
+`cancel_reason = 'oco_sibling_filled'` / `canceled_by_target`; it is observed,
+never invented.
+
 ### Trade lifecycle
+
 
 | Table | Purpose |
 | --- | --- |
 | `trades` | one row per live executed signal (`signal_id` unique); entry mode/price, trigger, TP1/TP2/SL prices and allocations, acquired/sold quantities, state, entry intent/order, retry/error fields |
-| `trade_orders` | TP1/TP2/SL orders; unique client order id, exchange id, allocated/sold qty, state |
+| `trade_orders` | TP1/TP2/SL orders; unique client order id, exchange id, allocated/sold qty, state, plus `stop_trigger_price`, `oco_group_id`, `leg_role`, `last_observed_at`, `evidence_id`, `not_observed_reason`, `cancel_reason`, `canceled_by_leg`, `filled_quote`, `fee_amount`, `fee_asset` |
 | `order_protection` | intended/verified exchange-side TP/SL for an entry intent: prices, mode, status, entry order id, verified timestamp, error |
 
 `trades.trade_state`: `pending_entry`, `entry_active`, `position_open`,

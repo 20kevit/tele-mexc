@@ -303,12 +303,12 @@ def test_oco_partial_rejection_retries_only_missing_leg(env):
     calls = {"tp1": 0, "tp2": 0}
     fail = {"tp2": True}
 
-    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None):
+    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None, **kwargs):
         calls[kind] += 1
         if kind == "tp2" and fail["tp2"]:
             fail["tp2"] = False
             raise ValueError("tp2 rejected by exchange")
-        return original(trade, client_order_id, price, quantity, stop_price, kind=kind)
+        return original(trade, client_order_id, price, quantity, stop_price, kind=kind, **kwargs)
 
     engine.submit_oco_sell = flaky
     trade, intent = _setup_direct_entry(env, fill_qty=Decimal("0.1"))
@@ -330,11 +330,11 @@ def test_uncertain_oco_leg_is_never_resubmitted(env):
     original = engine.submit_oco_sell
     calls = {"tp1": 0, "tp2": 0}
 
-    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None):
+    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None, **kwargs):
         calls[kind] += 1
         if kind == "tp2":
             raise MexcNetworkError("timeout after send")
-        return original(trade, client_order_id, price, quantity, stop_price, kind=kind)
+        return original(trade, client_order_id, price, quantity, stop_price, kind=kind, **kwargs)
 
     engine.submit_oco_sell = flaky
     trade, intent = _setup_direct_entry(env, fill_qty=Decimal("0.1"))
@@ -357,12 +357,12 @@ def test_restart_recovers_partial_oco_protection(env):
     calls = {"tp1": 0, "tp2": 0}
     fail = {"tp2": True}
 
-    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None):
+    def flaky(trade, client_order_id, price, quantity, stop_price, kind=None, **kwargs):
         calls[kind] += 1
         if kind == "tp2" and fail["tp2"]:
             fail["tp2"] = False
             raise ValueError("rejected once")
-        return original(trade, client_order_id, price, quantity, stop_price, kind=kind)
+        return original(trade, client_order_id, price, quantity, stop_price, kind=kind, **kwargs)
 
     engine.submit_oco_sell = flaky
     trade, intent = _setup_direct_entry(env, fill_qty=Decimal("0.1"))

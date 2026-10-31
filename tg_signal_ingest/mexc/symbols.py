@@ -203,8 +203,8 @@ def compute_stop_loss_trigger_price(
 
     The configured stop-loss *exit* price (the stop-limit execution price) is
     intentionally left unchanged: only the activation trigger moves upward. For
-    example, with exit price ``0.1190``, tick size ``0.0001`` and five ticks,
-    the trigger is ``0.1195`` while the stop-limit order still executes at
+    example, with exit price ``0.1190``, tick size ``0.0001`` and three ticks,
+    the trigger is ``0.1193`` while the stop-limit order still executes at
     ``0.1190``.
 
     Raises :class:`SymbolValidationError` when any input is invalid so callers

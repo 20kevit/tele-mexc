@@ -1,4 +1,4 @@
-"""Stop-loss trigger offset: five ticks above the configured exit price.
+"""Stop-loss trigger offset: three ticks above the configured exit price.
 
 All tests are deterministic and offline.  No real orders are placed and no
 live exchange is contacted.
@@ -17,39 +17,39 @@ from tg_signal_ingest.mexc.symbols import (
 )
 
 # ---------------------------------------------------------------------------
-# Task 5 #4/#5: five-tick trigger calculation + Decimal precision
+# Task 5 #4/#5: three-tick trigger calculation + Decimal precision
 # ---------------------------------------------------------------------------
 
 
-def test_five_ticks_above_exit_price():
-    # From Task 2's illustrative example: exit 0.1190, tick 0.0001 -> 0.1195.
+def test_three_ticks_above_exit_price():
+    # From Task 2's illustrative example: exit 0.1190, tick 0.0001 -> 0.1193.
     assert compute_stop_loss_trigger_price(
-        Decimal("0.1190"), Decimal("0.0001"), 5
-    ) == Decimal("0.1195")
+        Decimal("0.1190"), Decimal("0.0001"), 3
+    ) == Decimal("0.1193")
 
 
 def test_trigger_offset_applies_to_several_tick_sizes():
     cases = [
-        (Decimal("0.1190"), Decimal("0.0001"), 5, Decimal("0.1195")),
-        (Decimal("100.00"), Decimal("0.01"), 5, Decimal("100.05")),
-        (Decimal("0.123456"), Decimal("0.000001"), 5, Decimal("0.123461")),
-        (Decimal("1.2345"), Decimal("0.001"), 5, Decimal("1.240")),
+        (Decimal("0.1190"), Decimal("0.0001"), 3, Decimal("0.1193")),
+        (Decimal("100.00"), Decimal("0.01"), 3, Decimal("100.03")),
+        (Decimal("0.123456"), Decimal("0.000001"), 3, Decimal("0.123459")),
+        (Decimal("1.2345"), Decimal("0.001"), 3, Decimal("1.238")),
     ]
     for exit_price, tick, ticks, expected in cases:
         assert compute_stop_loss_trigger_price(exit_price, tick, ticks) == expected
 
 
-def test_offset_is_exactly_five_ticks_not_four_or_six():
-    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 5) == Decimal("15")
-    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 5) != Decimal("14")
-    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 5) != Decimal("16")
+def test_offset_is_exactly_three_ticks_not_two_or_four():
+    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 3) == Decimal("13")
+    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 3) != Decimal("12")
+    assert compute_stop_loss_trigger_price(Decimal("10"), Decimal("1"), 3) != Decimal("14")
 
 
 def test_decimal_not_binary_arithmetic():
-    # Binary float would give 0.11950000000000003; Decimal gives exact 0.1195.
-    result = compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("0.0001"), 5)
-    assert result == Decimal("0.1195")
-    assert str(result) == "0.1195"
+    # Binary float would give 0.11930000000000002; Decimal gives exact 0.1193.
+    result = compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("0.0001"), 3)
+    assert result == Decimal("0.1193")
+    assert str(result) == "0.1193"
 
 
 def test_rounds_up_to_tick_never_down_toward_exit():
@@ -65,18 +65,18 @@ def test_rounds_up_to_tick_never_down_toward_exit():
 
 def test_invalid_exit_price_rejected():
     with pytest.raises(SymbolValidationError):
-        compute_stop_loss_trigger_price(Decimal("0"), Decimal("0.0001"), 5)
+        compute_stop_loss_trigger_price(Decimal("0"), Decimal("0.0001"), 3)
     with pytest.raises(SymbolValidationError):
-        compute_stop_loss_trigger_price(Decimal("-0.1190"), Decimal("0.0001"), 5)
+        compute_stop_loss_trigger_price(Decimal("-0.1190"), Decimal("0.0001"), 3)
     with pytest.raises(SymbolValidationError):
-        compute_stop_loss_trigger_price(Decimal("nan"), Decimal("0.0001"), 5)
+        compute_stop_loss_trigger_price(Decimal("nan"), Decimal("0.0001"), 3)
 
 
 def test_invalid_tick_size_rejected():
     with pytest.raises(SymbolValidationError):
-        compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("0"), 5)
+        compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("0"), 3)
     with pytest.raises(SymbolValidationError):
-        compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("-0.0001"), 5)
+        compute_stop_loss_trigger_price(Decimal("0.1190"), Decimal("-0.0001"), 3)
 
 
 def test_zero_offset_rejected():
@@ -94,17 +94,17 @@ def test_zero_offset_rejected():
 def test_trigger_is_above_exit_for_sell_stop_loss():
     exit_price = Decimal("0.1190")
     tick = Decimal("0.0001")
-    trigger = compute_stop_loss_trigger_price(exit_price, tick, 5)
+    trigger = compute_stop_loss_trigger_price(exit_price, tick, 3)
     # For a SELL stop-loss on a LONG position, the trigger must be ABOVE the
     # exit price so price falling from above crosses the trigger first.
     assert trigger > exit_price
-    assert trigger - exit_price == Decimal("0.0005")
+    assert trigger - exit_price == Decimal("0.0003")
 
 
 def test_trigger_activates_before_exit_price_on_the_way_down():
     exit_price = Decimal("0.1190")
-    trigger = compute_stop_loss_trigger_price(exit_price, Decimal("0.0001"), 5)
-    falling = [Decimal("0.1197"), Decimal("0.1196"), Decimal("0.1194")]
+    trigger = compute_stop_loss_trigger_price(exit_price, Decimal("0.0001"), 3)
+    falling = [Decimal("0.1197"), Decimal("0.1196"), Decimal("0.1192")]
     assert all(p > trigger for p in falling[:2])  # above trigger: not armed yet
     assert falling[2] < trigger  # below trigger: armed (as market falls)
 
@@ -199,7 +199,7 @@ class _FakeEngine:
 
     def __init__(self, tick="0.0001", fail_trigger=False):
         self.cfg = type("C", (), {})()
-        self.cfg.trading = type("T", (), {"stop_loss_trigger_offset_ticks": 5})()
+        self.cfg.trading = type("T", (), {"stop_loss_trigger_offset_ticks": 3})()
         self.client = _FakeClient(tick)
         self.fail_trigger = fail_trigger
 
@@ -256,11 +256,11 @@ def test_engine_oco_transmits_trigger_above_exit_price():
     )
     assert len(engine.client.submitted) == 1
     call = engine.client.submitted[0]
-    # trigger_price (activation) is five ticks above the exit price.
-    assert call["trigger_price"] == Decimal("0.1195")
+    # trigger_price (activation) is three ticks above the exit price.
+    assert call["trigger_price"] == Decimal("0.1193")
     # trigger_limit_price (execution) stays at the configured exit price.
     assert call["trigger_limit_price"] == Decimal("0.1190")
-    assert result["trigger_price"] == "0.1195"
+    assert result["trigger_price"] == "0.1193"
     assert result["trigger_limit_price"] == "0.1190"
 
 
@@ -296,7 +296,7 @@ def test_implementation_does_not_touch_existing_orders_or_legacy_positions():
     # order, position, or the configured stop-loss exit price.
     exit_price = Decimal("0.1190")
     before = exit_price
-    trigger = compute_stop_loss_trigger_price(exit_price, Decimal("0.0001"), 5)
+    trigger = compute_stop_loss_trigger_price(exit_price, Decimal("0.0001"), 3)
     assert exit_price == before  # exit price unchanged
     assert trigger != exit_price  # only the trigger moved
     assert trigger > exit_price

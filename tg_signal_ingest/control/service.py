@@ -23,6 +23,7 @@ from ..repository import Repository
 from ..trading.balance import BalanceError, parse_account
 from ..trading.parser import ParsedSignal
 from ..trading.sizing import SizingError, apply_sizing
+from ..version import format_version_text, get_version_info
 from .auth import AuthFlowError, TelegramLoginManager
 from .bot_api import BotApiClient, BotApiError
 from .channels import ChannelChoice, fetch_channels, find_channel
@@ -270,6 +271,9 @@ class ControlBot:
         if text.startswith("/resume"):
             await self._resume(chat_id)
             return
+        if text.startswith("/version"):
+            await self._show_version(chat_id)
+            return
 
         flow = self.store.flow()
         if flow["expired"]:
@@ -329,13 +333,18 @@ class ControlBot:
         elif head == "lr":
             await self._learning_action(chat_id, parts)
         elif head == "ap":
-            await self._approval_action(chat_id, parts)
+            # Signal-level approval prompts are intentionally removed.  Legacy
+            # ``ap:y:``/``ap:n:`` callbacks no longer execute any order.
+            await self._send(chat_id, "تأیید سیگنال‌های در انتظار حذف شد؛ سیگنال‌ها به‌صورت اتوماتیک اجرا می‌شوند. /start")
+            return
         elif head == "au":
             await self._auth_action(chat_id, parts)
         elif head == "mx":
             await self._mexc_action(chat_id, parts)
         elif head == "l":
             await self._learning_menu_action(chat_id, parts)
+        elif head == "n":
+            await self._notification_action(chat_id, parts)
         else:
             await self._send(chat_id, "دکمه نامعتبر است. /start")
 
@@ -360,6 +369,7 @@ class ControlBot:
                 rows.append([_btn("📏 اندازه سفارش", "m:sizing")])
                 rows.append([_btn("⚙️ حالت اجرا", "m:mode")])
                 rows.append([_btn("📝 در انتظار تأیید", "m:pending")])
+                rows.append([_btn("🔔 تنظیمات اعلان‌ها", "n:settings")])
                 if int(s.get("paused") or 0):
                     rows.append([_btn("▶️ ادامه اجرا", "m:resume")])
                 else:
@@ -1110,6 +1120,75 @@ class ControlBot:
         await self._send(chat_id, "درصد فروش ذخیره شد.")
         await self._show_sizing(chat_id)
 
+    # -------------------------------------------------- notification settings
+
+    async def _show_notification_settings(self, chat_id: int) -> None:
+        """Persian notification-preferences menu for owner and developer."""
+
+        rows: list[list[dict[str, str]]] = []
+        for role in ("owner", "developer"):
+            enabled_categories: list[str] = []
+            disabled_categories: list[str] = []
+            for setting in self.store.list_notification_settings(role):
+                cat = setting["category"]
+                if setting["enabled"]:
+                    enabled_categories.append(cat)
+                else:
+                    disabled_categories.append(cat)
+            label = "مالک" if role == "owner" else "توسعه‌دهنده"
+            rows.append([
+                _btn(f"{label}: فعال ({len(enabled_categories)})", f"n:{role}:on"),
+                _btn(f"{label}: غیرفعال ({len(disabled_categories)})", f"n:{role}:off"),
+            ])
+            # Show a few representative toggle buttons for the role.
+            for cat in (
+                "signal_decision",
+                "signal_accepted",
+                "exchange_operation",
+                "oco_lifecycle",
+                "reconciliation",
+                "critical",
+                "diagnostic",
+            ):
+                current = self.store.get_notification_setting(role, cat)
+                if current is None:
+                    continue
+                state = "✅" if current else "❌"
+                rows.append([_btn(f"{state} {role}/{cat}", f"n:toggle:{role}:{cat}")])
+        rows.append([_btn("بازگشت", "m:status")])
+        await self._send(
+            chat_id,
+            "🔔 تنظیمات اعلان‌ها\n"
+            "برای فعال/غیرفعال کردن دسته‌بندی اعلان‌ها برای مالک یا توسعه‌دهنده، "
+            "دکمه مربوطه را بزنید. حالت پیش‌فرض مالک فقط اعلان‌های معامله‌ای است؛ "
+            "توسعه‌دهنده همه دسته‌بندی‌ها دریافت می‌کند.",
+            _kb(rows),
+        )
+
+    async def _notification_action(self, chat_id: int, parts: list[str]) -> None:
+        head = parts[1] if len(parts) > 1 else ""
+        if head == "settings":
+            await self._show_notification_settings(chat_id)
+            return
+        if head == "toggle" and len(parts) >= 4:
+            role = parts[2]
+            category = parts[3]
+            if role not in ("owner", "developer"):
+                await self._send(chat_id, "نقش نامعتبر است.")
+                return
+            current = self.store.get_notification_setting(role, category)
+            if current is None:
+                await self._send(chat_id, "دسته‌بندی یافت نشد.")
+                return
+            self.store.set_notification_setting(role, category, not current)
+            await self._send(
+                chat_id,
+                f"اعلان {category} برای {role} {'فعال' if not current else 'غیرفعال'} شد.",
+                _kb([[_btn("بازگشت به اعلان‌ها", "n:settings")]]),
+            )
+            return
+        await self._send(chat_id, "عملیات اعلان نامعتبر است.", self._menu_kb())
+
     # -------------------------------------------------------------- modes
 
     def _ready_for_auto(self) -> tuple[bool, str]:
@@ -1205,108 +1284,17 @@ class ControlBot:
         await self._send(chat_id, "▶️ اجرا ادامه یافت؛ حالت تأیید انسانی فعال است.")
         await self._show_start(chat_id)
 
-    # ----------------------------------------------------------- approvals
+    async def _show_version(self, chat_id: int) -> None:
+        """Read-only runtime version report (owner only, no state changes)."""
 
-    async def _show_pending(self, chat_id: int) -> None:
-        rows = self.store.list_approvals("pending", 20)
-        if not rows:
-            await self._send(chat_id, "در حال حاضر تأیید در انتظاری وجود ندارد.", _kb([[_btn("بازگشت", "m:status")]]))
-            return
-        lines = ["📝 تأییدهای در انتظار:"]
-        for row in rows:
-            lines.append(f"• {row['approval_id']} — سفارش {row['intent_id']} — انقضا {row['expires_at']}")
-        lines.append("\nبرای مشاهده جزئیات، پیام همان سفارش را باز کنید. تأییدهای منقضی قابل اجرا نیستند.")
-        await self._send(chat_id, "\n".join(lines), _kb([[_btn("بازگشت", "m:status")]]))
-
-    async def _approval_action(self, chat_id: int, parts: list[str]) -> None:
-        if len(parts) < 4:
-            await self._show_pending(chat_id)
-            return
-        decision = "approved" if parts[1] == "y" else "rejected"
-        approval_id, nonce = parts[2], parts[3]
-        if int(self.store.setup().get("paused") or 0) and decision == "approved":
-            await self._send(chat_id, "⏸ حالت توقف فعال است؛ برای تأیید ابتدا /resume را بزنید.")
-            return
-        outcome, approval = self.store.consume_approval(approval_id, nonce, decision)
-        if outcome == "missing":
-            await self._send(chat_id, "این درخواست تأیید پیدا نشد.")
-            return
-        if outcome == "stale":
-            await self._send(chat_id, "این دکمه معتبر نیست یا جعل شده است. هیچ اقدامی انجام نشد.")
-            return
-        if outcome == "expired":
-            await self._send(chat_id, "⏰ مهلت این تأیید به پایان رسیده و قابل اجرا نیست.")
-            return
-        if outcome == "already" or approval is None:
-            await self._send(chat_id, "این تصمیم قبلاً ثبت شده است (کلیک تکراری).")
-            return
-        intent_id = approval["intent_id"]
-        if decision == "rejected":
-            await self._reject_intent(intent_id)
-            self.store.mark_approval_result(approval_id, "owner rejected")
-            await self._edit_approval_message(approval, "❌ سفارش توسط مالک رد شد. هیچ سفارشی ارسال نشد.")
-            await self._send(chat_id, "سفارش رد شد.")
-            return
-        await self._execute_approval(chat_id, approval)
-
-    async def _reject_intent(self, intent_id: str) -> None:
-        if self._engine is None:
-            return
-        intent = self._engine.store.get_intent(intent_id)
-        if intent is None:
-            return
-        if intent["state"] == "planned":
-            self._engine.store.transition_intent(
-                intent_id, "canceled_local", note="owner rejected the pending approval"
-            )
-
-    async def _execute_approval(self, chat_id: int, approval: dict[str, Any]) -> None:
-        if self._engine is None:
-            await self._send(chat_id, "موتور معامله متصل نیست؛ هیچ سفارشی ارسال نشد.")
-            return
-        intent = self._engine.store.get_intent(approval["intent_id"])
-        if intent is None:
-            await self._edit_approval_message(approval, "سفارش پیدا نشد؛ هیچ اقدامی انجام نشد.")
-            return
-        if intent["state"] != "planned":
-            await self._edit_approval_message(
-                approval, f"این سفارش دیگر در انتظار تأیید نیست (وضعیت: {intent['state']})."
-            )
-            return
-        current_version = ControlStore.intent_version(intent)
-        if approval.get("intent_version") != current_version:
-            await self._edit_approval_message(
-                approval, "نسخه سفارش پس از ساخت تأیید تغییر کرده است؛ برای امنیت اجرا نشد."
-            )
-            return
-        try:
-            result = await asyncio.to_thread(self._engine.execute_approved_intent, intent["intent_id"])
-        except Exception as exc:  # noqa: BLE001 - never resubmit on UI failure
-            log.warning("approval execution failed (%s)", exc.__class__.__name__)
-            self.store.mark_approval_result(approval["approval_id"], f"execution error {exc.__class__.__name__}")
-            await self._edit_approval_message(
-                approval,
-                "⚠️ اجرا با خطای غیرمنتظره مواجه شد. هیچ ارسال مجددی انجام نمی‌شود؛ "
-                "وضعیت را با تطبیق بررسی کنید.",
-            )
-            return
-        state = str(result.get("state"))
-        self.store.mark_approval_result(approval["approval_id"], state)
-        if state == "unknown_requires_reconciliation":
-            summary = (
-                "⚠️ نتیجه ارسال نامشخص است. سفارش دوباره ارسال نمی‌شود؛ "
-                "موتور تطبیق وضعیت را بررسی می‌کند."
-            )
-        elif state == "rejected":
-            summary = f"❌ سفارش رد شد: {_fmt(result.get('reject_reason'))}"
-        else:
-            summary = (
-                f"✅ نتیجه اجرا: {state}\n"
-                f"شناسه سفارش: {_fmt(result.get('exchange_order_id'))}\n"
-                f"اجرا‌شده: {_fmt(result.get('executed_qty'))} — مبلغ: {_fmt(result.get('cumulative_quote'))}"
-            )
-        await self._edit_approval_message(approval, summary)
-        await self._send(chat_id, summary)
+        info = get_version_info(
+            trading_mode=self.cfg.trading.mode,
+            live_authorized=bool(
+                self.cfg.trading.mode == "live"
+                and self.cfg.trading.live_enabled_token == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+            ),
+        )
+        await self._send(chat_id, format_version_text(info))
 
     async def _edit_approval_message(self, approval: dict[str, Any], text: str) -> None:
         chat_id = approval.get("chat_id")
@@ -1314,76 +1302,36 @@ class ControlBot:
         if chat_id and message_id:
             await self._edit(int(chat_id), int(message_id), text, None)
 
-    def _approval_text(self, intent: dict[str, Any], signal: dict[str, Any], approval: dict[str, Any]) -> str:
-        now = datetime.now(UTC)
-        age = _age_s(signal.get("created_at"), now)
-        tp = signal.get("target_prices") or "—"
-        lines = [
-            "🔔 سیگنال جدید نیازمند تأیید",
-            f"نماد: {intent['symbol']} — جهت: {'خرید' if intent['side'] == 'buy' else 'فروش'}",
-            f"نوع سفارش: {intent['order_type']}",
-            f"قیمت ورود/حد: {_fmt(intent.get('limit_price'))}",
-            f"مقدار پیشنهادی: {_fmt(intent.get('base_quantity'))}",
-            f"مبلغ اسمی: {_fmt(intent.get('quote_amount'))}",
-            f"حد سود: {tp}",
-            f"حد ضرر: {_fmt(signal.get('stop_loss'))}",
-            f"سن سیگنال: {age:.0f} ثانیه" if age is not None else "سن سیگنال: نامشخص",
-            f"مهلت تأیید: {approval['expires_at']}",
-        ]
-        if self._engine is not None and self.cfg.trading.mode != "sim":
-            try:
-                reason = self._engine.balance_check(intent)
-            except Exception as exc:  # noqa: BLE001
-                reason = f"بررسی موجودی ممکن نشد ({exc.__class__.__name__})"
-            lines.append(
-                "بررسی موجودی: ✅ قابل قبول" if reason is None else f"بررسی موجودی: ⚠️ {reason}"
-            )
-        else:
-            lines.append("بررسی موجودی: در حالت شبیه‌سازی/آزمایش، سفارش واقعی ارسال نمی‌شود.")
-        lines.append("")
-        lines.append("این تأیید فقط برای همین نسخه سفارش است و یک‌بار مصرف می‌شود.")
-        return "\n".join(lines)
+    # ----------------------------------------------------------- approvals (legacy, read-only)
+
+    async def _show_pending(self, chat_id: int) -> None:
+        """Read-only view of legacy pending approvals. No new signal approvals
+        are created: eligible signals are executed automatically by the trading
+        engine.  This menu exists only to inspect pre-existing records."""
+        rows = self.store.list_approvals("pending", 20)
+        if not rows:
+            await self._send(chat_id, "در حال حاضر تأیید در انتظاری وجود ندارد.", _kb([[_btn("بازگشت", "m:status")]]))
+            return
+        lines = ["📝 تأییدهای قدیمی در انتظار (بدون اجرا):"]
+        for row in rows:
+            lines.append(f"• {row['approval_id']} — سفارش {row['intent_id']} — انقضا {row['expires_at']}")
+        lines.append("\nحالت اجرای سیگنال‌ها اتوماتیک است؛ تأیید مالک برای هر سیگنال لازم نیست.")
+        await self._send(chat_id, "\n".join(lines), _kb([[_btn("بازگشت", "m:status")]]))
 
     async def _sync_approvals(self) -> None:
-        if self._engine is None:
-            return
-        setup = self.store.setup()
-        if setup.get("execution_mode") != "approval" or int(setup.get("paused") or 0):
-            return
-        cutoff = datetime.fromtimestamp(datetime.now(UTC).timestamp() - 6 * 3600, UTC)
-        cutoff_iso = cutoff.isoformat(timespec="seconds").replace("+00:00", "Z")
-        rows = self.repo.db.conn.execute(
-            """
-            SELECT i.* FROM order_intents i
-            LEFT JOIN control_approvals a ON a.intent_id = i.intent_id
-            WHERE i.state = 'planned' AND a.approval_id IS NULL
-              AND i.planned_at >= ?
-            ORDER BY i.planned_at ASC LIMIT 20
-            """,
-            (cutoff_iso,),
-        ).fetchall()
-        for raw in rows:
-            intent = dict(raw)
-            signal = self._engine.store.get_signal(intent["signal_id"])
-            if signal is None:
-                continue
-            approval, created = self.store.create_approval(
-                intent_id=intent["intent_id"], signal_id=intent["signal_id"],
-                intent_version=ControlStore.intent_version(intent),
-            )
-            if not created and (approval.get("message_id") or approval.get("status") != "pending"):
-                continue
-            text = self._approval_text(intent, signal, approval)
-            kb = _kb([[
-                _btn("✅ تأیید سفارش", f"ap:y:{approval['approval_id']}:{approval['nonce']}"),
-                _btn("❌ رد سفارش", f"ap:n:{approval['approval_id']}:{approval['nonce']}"),
-            ]])
-            sent = await self._send(int(self.cfg.control.owner_user_id or 0), text, kb)
-            message_id = sent.get("message_id") if isinstance(sent, dict) else None
-            if message_id is not None:
-                self.store.set_approval_message(
-                    approval["approval_id"], int(self.cfg.control.owner_user_id or 0), int(message_id)
-                )
+        """Signal-level approval prompts are intentionally disabled.
+
+        Eligible new signals are evaluated and executed automatically by the
+        trading engine without asking the owner to approve or reject each
+        signal.  The control bot preserves only administrative authorizations
+        (auto-mode enablement, emergency stop, session disconnect, ...).
+        Keeping a per-signal approval prompt here was a defect: it raced with
+        the engine's auto-execution and its timeout/expiration could misleadingly
+        suggest that an order was held when it was already submitted.  This
+        method is retained as a no-op so the ``control_approvals`` table and any
+        legacy rows remain intact; no new signal approvals are created.
+        """
+        return
 
     async def _sync_auto_notices(self) -> None:
         if self._engine is None or self.store.setup().get("execution_mode") != "auto":
@@ -1416,13 +1364,27 @@ class ControlBot:
         if now - self._last_tick < 3:
             return
         self._last_tick = now
+        # Recover deliveries that were in flight when the process ended; they
+        # are never retried automatically.  Then flush the trading outbox.
+        if self._engine is not None:
+            store = self._engine.store
+            try:
+                recovered = store.recover_ambiguous_sending(older_than_s=120)
+                if recovered:
+                    log.info("recovered %d ambiguous notifications", recovered)
+            except Exception:  # noqa: BLE001
+                log.warning("ambiguous-notification recovery failed", exc_info=True)
+            notifier = getattr(self._engine, "notifier", None)
+            if notifier is not None:
+                try:
+                    notifier.flush(limit=50)
+                except Exception:  # noqa: BLE001 - notifications never block control
+                    log.warning("notification flush failed", exc_info=True)
         for row in self.store.expire_approvals():
-            if self._engine is not None:
-                intent = self._engine.store.get_intent(row["intent_id"])
-                if intent is not None and intent["state"] == "planned":
-                    self._engine.store.transition_intent(
-                        row["intent_id"], "canceled_local", note="approval expired before owner decision"
-                    )
+            # Expired signal approvals are recorded as expired in the control
+            # store only.  They are NOT transitioned to canceled_local here:
+            # the trading engine owns the intent lifecycle, and an approval
+            # timeout must never cancel or resubmit a tradeable intent.
             await self._edit_approval_message(row, "⏰ مهلت تأیید به پایان رسید؛ سفارش اجرا نشد.")
         await self._sync_approvals()
         await self._sync_auto_notices()
@@ -1442,6 +1404,7 @@ class ControlBot:
                             {"command": "status", "description": "خلاصه وضعیت"},
                             {"command": "pause", "description": "توقف اجرای سفارش"},
                             {"command": "resume", "description": "ادامه اجرا"},
+                            {"command": "version", "description": "نسخه اجرا و وضعیت زمان-run"},
                             {"command": "help", "description": "راهنما"},
                         ],
                     )

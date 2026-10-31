@@ -38,7 +38,9 @@ from ..mexc.errors import (
 )
 from ..mexc.symbols import SymbolValidationError, compute_stop_loss_trigger_price
 from ..repository import QueueItem, Repository
+from .audit import normalize_event_type
 from .balance import BalanceError, parse_account, validate_balance
+from .evidence import ExchangeEvidence
 from .parser import ParsedSignal, SignalParser
 from .risk import RiskDecision, RiskManager
 from .store import TERMINAL_INTENT_STATES, RiskLimitExceeded, TradingStore, dec_str
@@ -84,6 +86,11 @@ class TradingEngine:
         self._now = now or (lambda: datetime.now(UTC))
         self._monotonic = monotonic or time.monotonic
         self.store = TradingStore(repo.db, cfg.trading, now=self._now)
+        # Durable exchange evidence.  Every order/account call is recorded
+        # before it is sent, so an ambiguous write is never guessed later.
+        self.evidence = ExchangeEvidence(
+            self.store, clock_health=lambda: getattr(self, "_clock_health", None)
+        )
         self.parser = parser or SignalParser()
         self.risk = RiskManager(cfg.trading, self.store)
         self.client = client
@@ -521,6 +528,8 @@ class TradingEngine:
         signal_id: str | None = None,
         intent_id: str | None = None,
         roles: Iterable[str] | None = None,
+        category: str = "order_lifecycle",
+        event_type: str | None = None,
     ) -> None:
         """Best-effort durable notification; never affects order handling."""
 
@@ -533,6 +542,8 @@ class TradingEngine:
                 signal_id=signal_id,
                 intent_id=intent_id,
                 roles=roles,
+                category=category,
+                event_type=event_type or normalize_event_type("order_lifecycle", event_key),
             )
         except Exception as exc:  # noqa: BLE001 - reporting must not break execution
             log.warning("notification enqueue failed (%s)", exc.__class__.__name__)
@@ -620,6 +631,8 @@ class TradingEngine:
         submission_attempted: bool = False,
         diagnostics: str | None = None,
         roles: Iterable[str] | None = NOTIFY_BOTH,
+        category: str = "signal_decision",
+        event_type: str | None = None,
     ) -> None:
         """Central formatter for signal decisions and diagnostics."""
 
@@ -645,6 +658,8 @@ class TradingEngine:
             intent_id=intent.get("intent_id") if intent else None,
             text="\n".join(lines),
             roles=roles,
+            category=category,
+            event_type=event_type,
         )
 
     def _notify_non_signal(
@@ -675,6 +690,8 @@ class TradingEngine:
             signal_id=signal_id,
             diagnostics=parsed.reason_text or None,
             roles=NOTIFY_DEVELOPER,
+            category="signal_decision",
+            event_type="signal.not_a_signal",
         )
 
     def _notify_rejected(
@@ -708,6 +725,8 @@ class TradingEngine:
             record=record,
             signal_id=signal_id,
             diagnostics=parsed.reason_text or None,
+            category="signal_decision",
+            event_type="signal.rejected_locally",
         )
 
     def _notify_intent_decision(
@@ -732,6 +751,8 @@ class TradingEngine:
             signal_id=signal_id or intent.get("signal_id"),
             intent=intent,
             submission_attempted=False,
+            category="signal_decision",
+            event_type="signal.rejected_locally",
         )
 
     @staticmethod
@@ -1125,7 +1146,18 @@ class TradingEngine:
             return result
         self.store.transition_intent(intent["intent_id"], "submitting", note="test-order validation")
         try:
-            self.client.place_test_order(**self._order_payload(intent))
+            with self.evidence.operation(
+                operation_type="place_test_order",
+                purpose="test_order_validation",
+                endpoint="/api/v3/order/test",
+                correlation_id=intent["intent_id"],
+                signal_id=intent.get("signal_id"),
+                intent_id=intent["intent_id"],
+                symbol=intent["symbol"],
+                client_order_id=intent["client_order_id"],
+                request_payload=self._order_payload(intent),
+            ) as op:
+                op.succeed(self.client.place_test_order(**self._order_payload(intent)))
         except MexcError as exc:
             self.store.transition_intent(
                 intent["intent_id"], "rejected", note=f"test order rejected: {exc}", reject_reason=str(exc)
@@ -1215,11 +1247,24 @@ class TradingEngine:
             payload["take_profit_price"] = tp_price
             payload["stop_loss_price"] = sl_price
         try:
-            response = self.client.place_order(**payload)
+            with self.evidence.operation(
+                operation_type="place_order",
+                purpose="entry_submission",
+                endpoint="/api/v3/order",
+                correlation_id=intent_id,
+                signal_id=intent.get("signal_id"),
+                intent_id=intent_id,
+                symbol=intent["symbol"],
+                client_order_id=intent["client_order_id"],
+                request_payload=payload,
+            ) as op:
+                response = self.client.place_order(**payload)
+                op.succeed(response)
         except (
             MexcDuplicateOrder,
             MexcNetworkError, MexcServerError, MexcUnexpectedResponse,
             MexcRateLimitError, MexcWafError,
+            MexcTimestampError,  # timestamp drift -> uncertain; never auto-retry
         ) as exc:
             self.store.transition_intent(
                 intent_id, "unknown_requires_reconciliation",
@@ -1306,7 +1351,7 @@ class TradingEngine:
         )
         return result
 
-    def _account_for_preflight(self, client: Any) -> Any:
+    def _account_for_preflight(self, client: Any, intent: dict[str, Any] | None = None) -> Any:
         """Read the Spot account, retrying a timestamp rejection once.
 
         ``700003`` is returned before the exchange evaluates the request, so a
@@ -1315,13 +1360,29 @@ class TradingEngine:
         the preflight and therefore never reaches order submission.
         """
 
-        try:
-            return client.account()
-        except MexcTimestampError:
-            log.warning(
-                "MEXC balance query timestamp rejected; retrying once with a fresh signature"
+        context: dict[str, Any] = {
+            "operation_type": "account",
+            "operation_class": "read",
+            "purpose": "balance_preflight",
+            "endpoint": "/api/v3/account",
+        }
+        if intent is not None:
+            context.update(
+                correlation_id=intent.get("intent_id"),
+                signal_id=intent.get("signal_id"),
+                intent_id=intent.get("intent_id"),
+                symbol=intent.get("symbol"),
             )
-            return client.account()
+        with self.evidence.operation(**context) as op:
+            try:
+                raw = client.account()
+            except MexcTimestampError:
+                log.warning(
+                    "MEXC balance query timestamp rejected; retrying once with a fresh signature"
+                )
+                raw = client.account()
+            op.succeed(raw)
+            return raw
 
     def _balance_preflight(self, intent: dict[str, Any]) -> str | None:
         """Return a rejection reason when live balance checks cannot pass."""
@@ -1337,7 +1398,7 @@ class TradingEngine:
         if client is None or not hasattr(client, "account"):
             return "MEXC client does not support account balance queries"
         try:
-            raw = self._account_for_preflight(client)
+            raw = self._account_for_preflight(client, intent)
             snapshot = parse_account(raw, fetched_at=self._monotonic())
             outstanding = self.store.outstanding_balance_usage(
                 intent["symbol"], exclude_intent_id=intent["intent_id"]
@@ -1383,11 +1444,28 @@ class TradingEngine:
         client = self._live_client()
         if intent.get("state") not in ("open", "partially_filled", "submitted"):
             return
-        with contextlib.suppress(MexcOrderNotFound):
-            client.cancel_order(
-                symbol=intent["symbol"],
-                order_id=exchange_id,
-                orig_client_order_id=client_order_id if not exchange_id else None,
+        with contextlib.suppress(MexcOrderNotFound), self.evidence.operation(
+            operation_type="cancel_order",
+            purpose="cancel_entry_intent",
+            endpoint="/api/v3/order",
+            correlation_id=intent["intent_id"],
+            signal_id=intent.get("signal_id"),
+            intent_id=intent["intent_id"],
+            symbol=intent["symbol"],
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_id,
+            request_payload={
+                "symbol": intent["symbol"],
+                "order_id": exchange_id,
+                "orig_client_order_id": client_order_id if not exchange_id else None,
+            },
+        ) as op:
+            op.succeed(
+                client.cancel_order(
+                    symbol=intent["symbol"],
+                    order_id=exchange_id,
+                    orig_client_order_id=client_order_id if not exchange_id else None,
+                )
             )
 
     def cancel_trade_order(self, order: dict[str, Any]) -> None:
@@ -1397,11 +1475,29 @@ class TradingEngine:
         if not exchange_id and not client_order_id:
             return
         client = self._live_client()
-        client.cancel_order(
+        with self.evidence.operation(
+            operation_type="cancel_order",
+            purpose="cancel_trade_order",
+            endpoint="/api/v3/order",
+            correlation_id=str(order.get("trade_id") or order["trade_order_id"]),
+            trade_id=order.get("trade_id"),
+            trade_order_id=order["trade_order_id"],
             symbol=order["symbol"],
-            order_id=exchange_id,
-            orig_client_order_id=client_order_id if not exchange_id else None,
-        )
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_id,
+            request_payload={
+                "symbol": order["symbol"],
+                "order_id": exchange_id,
+                "orig_client_order_id": client_order_id if not exchange_id else None,
+            },
+        ) as op:
+            op.succeed(
+                client.cancel_order(
+                    symbol=order["symbol"],
+                    order_id=exchange_id,
+                    orig_client_order_id=client_order_id if not exchange_id else None,
+                )
+            )
 
     def submit_sell_limit(
         self,
@@ -1410,17 +1506,38 @@ class TradingEngine:
         price: Decimal,
         quantity: Decimal,
         kind: str | None = None,
+        trade_order_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit a LIMIT sell for a TP target. Returns an exchange result dict."""
         client = self._live_client()
-        response = client.place_order(
+        with self.evidence.operation(
+            operation_type="place_order",
+            purpose=f"exit_submission:{kind or 'take_profit'}",
+            endpoint="/api/v3/order",
+            correlation_id=str(trade.get("trade_id")),
+            trade_id=trade.get("trade_id"),
+            trade_order_id=trade_order_id,
+            signal_id=trade.get("signal_id"),
             symbol=trade["symbol"],
-            side="SELL",
-            order_type="LIMIT",
-            quantity=quantity,
-            price=price,
             client_order_id=client_order_id,
-        )
+            request_payload={
+                "symbol": trade["symbol"],
+                "side": "SELL",
+                "order_type": "LIMIT",
+                "quantity": quantity,
+                "price": price,
+                "client_order_id": client_order_id,
+            },
+        ) as op:
+            response = client.place_order(
+                symbol=trade["symbol"],
+                side="SELL",
+                order_type="LIMIT",
+                quantity=quantity,
+                price=price,
+                client_order_id=client_order_id,
+            )
+            op.succeed(response)
         order_id = response.get("orderId")
         return {
             "exchange_order_id": str(order_id) if order_id is not None else None,
@@ -1441,7 +1558,7 @@ class TradingEngine:
         unavailable, so no exit is placed without a verified trigger price.
         """
         offset = int(
-            getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 5) or 5
+            getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 3) or 3
         )
         if offset < 1:
             # Owner disabled the offset: trigger equals the exit price.
@@ -1462,11 +1579,12 @@ class TradingEngine:
         quantity: Decimal,
         stop_price: Decimal,
         kind: str | None = None,
+        trade_order_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit a native OCO SELL pair (limit leg + stop-limit leg) via the CLI.
 
         The limit leg is the take-profit (price); the stop-limit leg is the
-        stop-loss.  The stop-loss activation *trigger* is five symbol ticks
+        stop-loss.  The stop-loss activation *trigger* is three symbol ticks
         above the configured stop-loss exit price so it activates earlier as
         the market falls, while the stop-limit execution price stays at the
         configured exit price.  ``trigger_price`` (activation) and
@@ -1486,15 +1604,36 @@ class TradingEngine:
                 f"stop-loss trigger {trigger_price} is not below the entry "
                 f"price {entry_price}; refusing to place an inverted exit"
             )
-        response = client.place_oco(
+        with self.evidence.operation(
+            operation_type="place_oco",
+            purpose=f"oco_exit:{kind or 'take_profit'}",
+            endpoint="/api/v3/order/oco",
+            correlation_id=str(trade.get("trade_id")),
+            trade_id=trade.get("trade_id"),
+            trade_order_id=trade_order_id,
+            signal_id=trade.get("signal_id"),
             symbol=trade["symbol"],
-            side="SELL",
-            quantity=quantity,
-            price=price,
-            trigger_price=trigger_price,
-            trigger_limit_price=stop_price,
             client_order_id=client_order_id,
-        )
+            request_payload={
+                "symbol": trade["symbol"],
+                "side": "SELL",
+                "quantity": quantity,
+                "price": price,
+                "trigger_price": trigger_price,
+                "trigger_limit_price": stop_price,
+                "client_order_id": client_order_id,
+            },
+        ) as op:
+            response = client.place_oco(
+                symbol=trade["symbol"],
+                side="SELL",
+                quantity=quantity,
+                price=price,
+                trigger_price=trigger_price,
+                trigger_limit_price=stop_price,
+                client_order_id=client_order_id,
+            )
+            op.succeed(response)
         order_id = response.get("orderId")
         return {
             "exchange_order_id": str(order_id) if order_id is not None else None,
@@ -1515,15 +1654,33 @@ class TradingEngine:
         """Submit a MARKET sell for the remaining position (stop-loss policy)."""
         client = self._live_client()
         cid = client_order_id or f"sl-{trade['trade_id'][-24:]}"
-        response = client.place_order(
+        with self.evidence.operation(
+            operation_type="place_order",
+            purpose="stop_loss_market_exit",
+            endpoint="/api/v3/order",
+            correlation_id=str(trade.get("trade_id")),
+            trade_id=trade.get("trade_id"),
+            signal_id=trade.get("signal_id"),
             symbol=trade["symbol"],
-            side="SELL",
-            order_type="MARKET",
-            quote_order_qty=None,
-            quantity=quantity,
-            price=None,
             client_order_id=cid,
-        )
+            request_payload={
+                "symbol": trade["symbol"],
+                "side": "SELL",
+                "order_type": "MARKET",
+                "quantity": quantity,
+                "client_order_id": cid,
+            },
+        ) as op:
+            response = client.place_order(
+                symbol=trade["symbol"],
+                side="SELL",
+                order_type="MARKET",
+                quote_order_qty=None,
+                quantity=quantity,
+                price=None,
+                client_order_id=cid,
+            )
+            op.succeed(response)
         order_id = response.get("orderId")
         return {
             "exchange_order_id": str(order_id) if order_id is not None else None,
@@ -1545,14 +1702,32 @@ class TradingEngine:
         client_order_id = order.get("client_order_id")
         if not exchange_id and not client_order_id:
             return {"state": "NOT_FOUND", "executed_qty": Decimal("0")}
-        try:
-            raw = client.query_order(
-                symbol=order["symbol"],
-                order_id=exchange_id,
-                orig_client_order_id=client_order_id if not exchange_id else None,
-            )
-        except MexcOrderNotFound:
-            return {"state": "NOT_FOUND", "executed_qty": Decimal("0")}
+        with self.evidence.operation(
+            operation_type="query_trade_order",
+            purpose="exit_order_status",
+            endpoint="/api/v3/order",
+            correlation_id=str(order.get("trade_id") or order["trade_order_id"]),
+            trade_id=order.get("trade_id"),
+            trade_order_id=order["trade_order_id"],
+            symbol=order["symbol"],
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_id,
+            request_payload={
+                "symbol": order["symbol"],
+                "order_id": exchange_id,
+                "orig_client_order_id": client_order_id if not exchange_id else None,
+            },
+        ) as op:
+            try:
+                raw = client.query_order(
+                    symbol=order["symbol"],
+                    order_id=exchange_id,
+                    orig_client_order_id=client_order_id if not exchange_id else None,
+                )
+            except MexcOrderNotFound:
+                op.succeed({"status": "NOT_FOUND"})
+                return {"state": "NOT_FOUND", "executed_qty": Decimal("0")}
+            op.succeed(raw)
         order_id = raw.get("orderId") or exchange_id
         return {
             "state": str(raw.get("status") or "UNKNOWN").upper(),
@@ -1597,11 +1772,29 @@ class TradingEngine:
             self.store.transition_intent(intent_id, "canceled_local", note=f"{reason} (no live exchange call)")
             return
         try:
-            self.client.cancel_order(
+            with self.evidence.operation(
+                operation_type="cancel_order",
+                purpose="cancel_signal",
+                endpoint="/api/v3/order",
+                correlation_id=intent_id,
+                signal_id=intent.get("signal_id"),
+                intent_id=intent_id,
                 symbol=intent["symbol"],
-                order_id=intent.get("exchange_order_id"),
-                orig_client_order_id=intent.get("client_order_id"),
-            )
+                client_order_id=intent.get("client_order_id"),
+                exchange_order_id=intent.get("exchange_order_id"),
+                request_payload={
+                    "symbol": intent["symbol"],
+                    "order_id": intent.get("exchange_order_id"),
+                    "orig_client_order_id": intent.get("client_order_id"),
+                },
+            ) as op:
+                op.succeed(
+                    self.client.cancel_order(
+                        symbol=intent["symbol"],
+                        order_id=intent.get("exchange_order_id"),
+                        orig_client_order_id=intent.get("client_order_id"),
+                    )
+                )
         except MexcOrderNotFound:
             self.reconcile_intent(intent_id)
             return
@@ -1634,11 +1827,32 @@ class TradingEngine:
             return self._resync_terminal_fills(intent, intent_id, notify=notify)
 
         try:
-            raw = self.client.query_order(
+            with self.evidence.operation(
+                operation_type="query_order",
+                purpose="entry_reconciliation",
+                endpoint="/api/v3/order",
+                correlation_id=intent_id,
+                signal_id=intent.get("signal_id"),
+                intent_id=intent_id,
                 symbol=intent["symbol"],
-                order_id=intent.get("exchange_order_id"),
-                orig_client_order_id=intent.get("client_order_id"),
-            )
+                client_order_id=intent.get("client_order_id"),
+                exchange_order_id=intent.get("exchange_order_id"),
+                request_payload={
+                    "symbol": intent["symbol"],
+                    "order_id": intent.get("exchange_order_id"),
+                    "orig_client_order_id": intent.get("client_order_id"),
+                },
+            ) as op:
+                try:
+                    raw = self.client.query_order(
+                        symbol=intent["symbol"],
+                        order_id=intent.get("exchange_order_id"),
+                        orig_client_order_id=intent.get("client_order_id"),
+                    )
+                except MexcOrderNotFound:
+                    op.succeed({"status": "NOT_FOUND"})
+                    raise
+                op.succeed(raw)
         except MexcOrderNotFound:
             outcome = "not_found"
             # -2011 can be a live order that is not query-visible yet, or one
@@ -1670,6 +1884,33 @@ class TradingEngine:
                     text=self._intent_text(
                         result,
                         self._headline_for_status(status),
+                        submission_attempted=True,
+                    ),
+                )
+            return result
+        except MexcTimestampError as exc:
+            outcome = "not_found"
+            self.store.transition_intent(
+                intent_id, "unknown_requires_reconciliation", note=f"timestamp drift detected ({exc.__class__.__name__}); clock sync needed",
+                category="reconcile",
+            )
+            self.store.record_reconciliation(
+                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"], exchange_state=None, outcome=outcome,
+                detail=f"timestamp drift: {exc}",
+            )
+            result = self.store.get_intent(intent_id)
+            assert result is not None
+            if notify and result["state"] != intent["state"]:
+                status = self._order_status_label(result)
+                self._notify(
+                    event_key=f"{intent_id}:reconcile:{result['state']}:TIMESTAMP_DRIFT",
+                    signal_id=intent.get("signal_id"),
+                    intent_id=intent_id,
+                    text=self._intent_text(
+                        result,
+                        self._headline_for_status(status)
+                        + " — clock drift detected; reconcile after NTP sync",
                         submission_attempted=True,
                     ),
                 )

@@ -126,7 +126,7 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `stop_loss_policy` | `market_sell` | only accepted value |
 | `stop_loss_max_retries` | `3` | parsed, currently unused |
 | `stop_loss_retry_backoff_base_s` | `1.0` | positive; parsed, currently unused |
-| `stop_loss_trigger_offset_ticks` | `5` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
+| `stop_loss_trigger_offset_ticks` | `3` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
 | `monitor_poll_interval_s` | `2.0` | positive |
 | `monitor_max_retries` | `5` | integer ≥1 |
 | `monitor_backoff_base_s` | `1.0` | positive |
@@ -333,7 +333,7 @@ native MEXC OCO SELL orders against the **actual acquired base quantity**:
 - OCO 1: `tp1_allocation_pct` (default 50%) at TP1, with a stop-limit leg whose
   *execution price* is the configured stop-loss and whose *activation trigger*
   is `stop_loss + (stop_loss_trigger_offset_ticks × symbol_tick_size)` (default
-  five ticks above the exit price), so the stop can activate earlier as the
+  three ticks above the exit price), so the stop can activate earlier as the
   market falls.
 - OCO 2: the remaining allocation at TP2, with the same split between the
   stop-limit execution price (configured stop-loss, unchanged) and the
@@ -390,6 +390,51 @@ the discrepancy is recorded.
 `trading reconcile` and the `live` background worker use the same path.
 Cancellation from a Telegram cancel/delete also reconciles afterward rather than
 assuming success.
+
+## Audit journal
+
+Every trading and exchange event is written to `audit_events` before or inside
+the same transaction as the state change it describes. Rows carry
+`event_id`, `event_type` (`category.event`), `severity`, `occurred_at_utc`,
+`recorded_at_utc`, correlation/causation ids, optional `trade_id`/`intent_id`/
+`order_id`/`exchange_order_id`, `symbol`, `reason_code`, `outcome`,
+`source_ref`, `evidence_source`, `evidence_limitations`, `payload_json`, and a
+bounded, redacted `detail`. `secrets_redacted` is always set; the redaction
+layer masks bot tokens, bearer credentials, API keys, secrets, and long blobs.
+
+- `INSERT OR IGNORE` plus a `dedupe_key` makes each audit event idempotent
+  across retries and restarts; repeating the same event never duplicates a row.
+- `event` keeps the legacy human-readable name; `event_type` is the stable
+  machine key (`mexc_request.place_order`, `trade.closed`, `reconcile.outcome`,
+  `oco.sibling_canceled`, …).
+- Legacy migration-17/pre-18 rows are converged by migration 18: missing
+  columns are added, timestamps/ids are backfilled from existing columns, and
+  the row is explicitly labelled legacy — never upgraded into an
+  exchange-confirmed fact.
+- Startup/shutdown, intent lifecycle, protection state changes, OCO group and
+  leg transitions, reconciliation outcomes, and notification deliveries all
+  emit audit events.
+
+## Exchange evidence
+
+Every order/account exchange call is recorded in `exchange_operations`
+**before** the request is sent, and finalized after the response arrives.
+A crash between the insert and the response therefore leaves a durable,
+correlated record that a write may have been attempted.
+
+- `operation_class` is `read` or `write`; `write_attempted` is set for writes.
+- Fields include `endpoint`, `client_order_id`, `exchange_order_id`,
+  `request_payload` (redacted), `request_started_at`, `request_finished_at`,
+  `response_classification` (`success`/`rejected`/`uncertain`/`rate_limited`/
+  `error`), `exchange_code`, `http_status`, `response_payload` (redacted),
+  `error_class`, `error_message` (redacted), `rate_limit_wait_ms`, and
+  `uncertainty` (`none`/`uncertain`/`reconciled`/`read_only_uncertain`).
+- Market-data reads (ticker/depth/klines) are intentionally **not** recorded per
+  call: they are high-frequency and carry no order state. Order submission,
+  cancellation, and status queries are always recorded.
+- An uncertain write stays `uncertain` until a read-only reconciliation proves
+  what happened on the exchange. It is never auto-resubmitted with a new client
+  id.
 
 ## Trade lifecycle (`TradeManager`)
 
@@ -454,6 +499,27 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
   resumed, and its quantity is rebased against current fills so a late fill
   cannot make it oversell. A `pending` stop-loss row is canceled locally and
   replaced by a new exit for the confirmed remainder.
+### OCO group and leg observation
+
+Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended_config`,
+`protection_status`) and per-target `oco_legs` rows (`target`, `state`,
+`exchange_status`, `filled_qty`, `cancel_reason`, `canceled_by_target`,
+`evidence_id`, `last_observed_at`). The group state mirrors the trade state
+(`intended`, `submitting`, `active`, `partial`, `triggered`, `completed`,
+`uncertain`, `needs_review`).
+
+- Sibling cancellation is **observed**, not invented: when one OCO leg fills and
+  its peer is canceled with zero sells, the canceled leg is attributed to the
+  filled sibling (`cancel_reason = 'oco_sibling_filled'`,
+  `canceled_by_target = <filled target>`). This never resubmits an exit and
+  never closes a trade that still owns base quantity.
+- Every OCO transition writes an audit event (`oco.intended`, `oco.state`,
+  `oco.sibling_canceled`) and a notification (`OCO_PROTECTION_ACTIVE`,
+  `OCO_PROTECTION_PARTIAL`, `OCO_PROTECTION_UNCERTAIN`, `OCO_PROTECTION_FAILED`)
+  routed per the owner/developer preferences below.
+- `oco_active` means every required leg has an exchange order id; it does not
+  mean either leg has been observed triggered.
+
 - All exit monitoring is active even when `entry_trigger_offset_ticks` is unset
   (conditional entry disabled). New trade symbols are subscribed to the monitor
   after startup, and the REST fallback fetches prices through the MEXC client.
@@ -493,10 +559,61 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
 Owner/developer notices are written to `trading_notifications` before delivery
 and retried independently of order execution. The outbox key is
 `(event_key, role)`; long text is split into chunks. A notification failure can
-never resubmit an order. If `CONTROL_BOT_TOKEN` is set, `serve` sends notices to
-the configured owner/developer ids; otherwise they stay pending in the outbox.
+never resubmit an order. Each event carries a `category` and `event_type`, and
+delivery goes only to recipients whose persisted preference enables that
+category.
+
+### Notification categories and defaults
+
+| Category | Owner default | Developer default |
+| --- | --- | --- |
+| `signal_decision` | off | on |
+| `signal_accepted` | on | on |
+| `exchange_operation` | on | on |
+| `order_lifecycle` | on | on |
+| `oco_lifecycle` | on | on |
+| `take_profit` | on | on |
+| `stop_loss` | on | on |
+| `reconciliation` | on | on |
+| `critical` | on | on |
+| `diagnostic` | off | on |
+| `notification_delivery` | off | on |
+| `recovery` | off | on |
+
+The owner opts out of routine local signal rejections (`signal_decision` off);
+the developer receives every category. Preferences are stored in
+`notification_preferences` and can be toggled through the control bot's Persian
+"تنظیمات اعلان‌ها" menu (`n:settings`), with fallback to these code defaults
+when a row is missing.
+
+### Delivery outcomes and ambiguous recovery
+
+- `sent` — Telegram accepted the message.
+- `retry` — transient failure or Telegram `retry_after`; scheduled again after
+  the wait (capped at 24h).
+- `failed` — definitive rejection; not retried automatically.
+- `ambiguous` — the process ended mid-delivery or acceptance could not be
+  confirmed; recovered once on startup to `ambiguous` and **never** retried
+  automatically.
+- `suppressed` — the chat is blocked/deactivated; not retried.
+
+Delivery attempts are recorded in `notification_delivery_attempts` with
+outcome, error, telegram message id, retry-after, and an `ambiguous` flag.
+
+### Control-bot integration
+
+The control bot polls `getUpdates`, routes Persian callback data, and on each
+`tick` recovers ambiguous notifications older than 120s and flushes the trading
+outbox. Notification callbacks (`expand`, `signal_source`, `ack`) are issued as
+single-use, time-limited tokens in `notification_callbacks` and are consumed
+once per role.
+
+If `CONTROL_BOT_TOKEN` is set, `serve` sends notices to the configured
+owner/developer ids; otherwise they stay pending in the outbox. The notifier
+tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 
 ## Inspect and operate
+
 
 ```bash
 .venv/bin/tg-ingest trading status
@@ -509,6 +626,7 @@ the configured owner/developer ids; otherwise they stay pending in the outbox.
 .venv/bin/tg-ingest trading reconcile
 .venv/bin/tg-ingest trading trades [--state <state>]
 .venv/bin/tg-ingest trading trade <trade-id>
+.venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
 .venv/bin/tg-ingest trading verify
 .venv/bin/tg-ingest trading test-order --symbol BTCUSDT --side BUY --quote 10
 ```
