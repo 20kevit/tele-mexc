@@ -46,6 +46,20 @@ DEFAULT_READ_MAX_AGE_S = 30.0
 DEFAULT_WRITE_MAX_AGE_S = 10.0
 DEFAULT_HARD_STALE_S = 300.0
 DEFAULT_MIN_REFRESH_INTERVAL_S = 1.0
+# Reject a sample whose offset differs from the round median by more than this.
+DEFAULT_MAX_OFFSET_DEVIATION_MS = 5000
+# Clamp the final offset so one bogus serverTime cannot move the clock by hours.
+DEFAULT_MAX_OFFSET_MS = 300_000
+
+
+def _median_int(values: list[int]) -> int:
+    """Return the integer median of a non-empty list."""
+
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return int(ordered[middle])
+    return int(round((ordered[middle - 1] + ordered[middle]) / 2))
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,8 @@ class ServerClock:
         write_max_age_s: float = DEFAULT_WRITE_MAX_AGE_S,
         hard_stale_s: float = DEFAULT_HARD_STALE_S,
         min_refresh_interval_s: float = DEFAULT_MIN_REFRESH_INTERVAL_S,
+        max_offset_deviation_ms: int = DEFAULT_MAX_OFFSET_DEVIATION_MS,
+        max_offset_ms: int = DEFAULT_MAX_OFFSET_MS,
     ):
         if sample_count < 1:
             raise ValueError("sample_count must be >= 1")
@@ -86,6 +102,8 @@ class ServerClock:
             raise ValueError("hard_stale_s must be >= read_max_age_s")
         if min_refresh_interval_s < 0:
             raise ValueError("min_refresh_interval_s must be >= 0")
+        if max_offset_deviation_ms < 0 or max_offset_ms <= 0:
+            raise ValueError("offset limits must be positive")
         self._fetch_server_time = fetch_server_time
         self._wall_clock = wall_clock or (lambda: int(time.time() * 1000))
         self._monotonic = monotonic or time.monotonic
@@ -96,6 +114,8 @@ class ServerClock:
         self.write_max_age_s = float(write_max_age_s)
         self.hard_stale_s = float(hard_stale_s)
         self.min_refresh_interval_s = float(min_refresh_interval_s)
+        self.max_offset_deviation_ms = int(max_offset_deviation_ms)
+        self.max_offset_ms = int(max_offset_ms)
 
         self._lock = threading.Lock()
         self._last_sample: ClockSample | None = None
@@ -185,12 +205,35 @@ class ServerClock:
                     f"exchange clock unavailable: {self._last_error}"
                 )
 
-            best = min(samples, key=lambda sample: sample.rtt_ms)
+            # Median-of-three (or median of the available samples) is more
+            # robust than a single observation.  RTT filtering keeps fast
+            # samples first; the offset is then clamped against both a
+            # round-median deviation limit (outlier rejection) and an absolute
+            # limit (a bogus serverTime cannot move the clock by hours).
+            low_rtt = [s for s in samples if s.rtt_ms <= self.max_rtt_ms]
+            usable = low_rtt or samples
+            median_offset = _median_int([s.offset_ms for s in usable])
+            kept = [
+                s for s in usable
+                if abs(s.offset_ms - median_offset) <= self.max_offset_deviation_ms
+            ]
+            if not kept:
+                kept = usable
+            median_offset = _median_int([s.offset_ms for s in kept])
+            clamped_offset = max(
+                -self.max_offset_ms, min(self.max_offset_ms, median_offset)
+            )
+            anchor = min(kept, key=lambda sample: sample.rtt_ms)
+            best = ClockSample(
+                server_time_ms=anchor.wall_midpoint_ms + clamped_offset,
+                wall_midpoint_ms=anchor.wall_midpoint_ms,
+                monotonic_midpoint_s=anchor.monotonic_midpoint_s,
+                rtt_ms=anchor.rtt_ms,
+                offset_ms=clamped_offset,
+            )
             self._last_sample = best
             self._last_success_count = len(samples)
-            self._last_low_rtt_count = sum(
-                1 for sample in samples if sample.rtt_ms <= self.max_rtt_ms
-            )
+            self._last_low_rtt_count = len(low_rtt)
             self._last_refresh_monotonic = self._monotonic()
             self._last_error = "; ".join(errors)[:300] if errors else None
             if best.rtt_ms > self.max_rtt_ms:
@@ -199,6 +242,13 @@ class ServerClock:
                     "writes will fail closed",
                     best.rtt_ms,
                     self.max_rtt_ms,
+                )
+            if clamped_offset != median_offset:
+                log.warning(
+                    "MEXC clock offset %sms exceeded the clamp ±%sms; using %sms",
+                    median_offset,
+                    self.max_offset_ms,
+                    clamped_offset,
                 )
             return best
 

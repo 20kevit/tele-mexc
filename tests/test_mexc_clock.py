@@ -262,3 +262,61 @@ def test_legacy_injected_clock_disables_server_sampling():
     assert client.clock_snapshot() is None
     client.account()
     assert len(transport.calls) == 1
+
+
+def test_median_of_three_rejects_offset_outlier():
+    harness = Harness(
+        rtts_ms=[0.0, 0.0, 0.0],
+        server_times=[BASE_SERVER_MS + 100, BASE_SERVER_MS + 120, BASE_SERVER_MS + 5000],
+    )
+    clock = _clock(
+        harness,
+        sample_count=3,
+        min_samples_for_write=2,
+        max_rtt_ms=1500,
+        max_offset_deviation_ms=1000,
+    )
+
+    clock.refresh(force=True)
+
+    # 5000 ms is an outlier; the median of the remaining offsets is 110 ms.
+    assert clock.snapshot()["offset_ms"] == 110
+    assert clock.trusted is True
+
+
+def test_rtt_filter_excludes_slow_samples_from_offset():
+    harness = Harness(
+        rtts_ms=[0.0, 2000.0, 2000.0],
+        server_times=[BASE_SERVER_MS + 100, BASE_SERVER_MS + 9000, BASE_SERVER_MS + 9000],
+    )
+    clock = _clock(
+        harness,
+        sample_count=3,
+        min_samples_for_write=1,
+        max_rtt_ms=100,
+        max_offset_deviation_ms=10_000,
+    )
+
+    clock.refresh(force=True)
+
+    assert clock.snapshot()["offset_ms"] == 100
+    assert clock.snapshot()["low_rtt_samples"] == 1
+
+
+def test_offset_is_clamped_to_absolute_limit():
+    harness = Harness(
+        rtts_ms=[0.0],
+        server_times=[BASE_SERVER_MS + 10_000_000],
+    )
+    clock = _clock(
+        harness,
+        sample_count=1,
+        min_samples_for_write=1,
+        max_rtt_ms=1500,
+        max_offset_deviation_ms=20_000_000,
+        max_offset_ms=300_000,
+    )
+
+    sample = clock.refresh(force=True)
+
+    assert sample.offset_ms == 300_000

@@ -260,9 +260,15 @@ Server-clock synchronization and timestamp policy:
   `timestamp < serverTime + 1000` and `serverTime - timestamp <= recvWindow`;
   `recvWindow` defaults to `5000 ms` and may not exceed `60000 ms`.
 - A `ServerClock` anchors `GET /api/v3/time` to the process monotonic clock,
-  samples several low-RTT observations, and returns
-  `server_time_at_anchor + monotonic_elapsed`. A wall-clock jump after the
-  anchor cannot move the signed time.
+  samples three observations, keeps the lowest-RTT anchor, and uses the
+  **median offset** of the low-RTT samples (half-RTT compensation). The
+  result is `server_time_at_anchor + monotonic_elapsed`; a wall-clock jump
+  after the anchor cannot move the signed time.
+- Samples whose RTT exceeds `max_rtt_ms` are excluded from the offset
+  calculation. Samples whose offset differs from the round median by more
+  than `max_offset_deviation_ms` are treated as outliers and dropped, and the
+  final offset is clamped to `±max_offset_ms` so one bogus `serverTime`
+  cannot move the clock by hours.
 - Signed, read-only requests (`account`, `myTrades`, `openOrders`, `order`)
   may refresh the clock and retry **once** after `700003`/`10073`. Writes are
   never retried automatically; an ambiguous write outcome is reconciled, not
@@ -272,7 +278,11 @@ Server-clock synchronization and timestamp policy:
   is treated as a safe local rejection, never an uncertain submission.
 - Production (`build_mexc_client` with no injected `clock`) uses the RTT-aware
   `ServerClock` with defaults: `sample_count=3`, `min_samples_for_write=2`,
-  `max_rtt_ms=1500`, `read_max_age_s=30`, `write_max_age_s=10`.
+  `max_rtt_ms=1500`, `read_max_age_s=30`, `write_max_age_s=10`,
+  `max_offset_deviation_ms=5000`, `max_offset_ms=300000`. Refreshes are
+  debounced by `min_refresh_interval_s=1`, serialized by a lock, and happen
+  lazily when the anchor is older than `read_max_age_s` or immediately before
+  a signed write; the timestamp is stamped after any rate-gate wait.
 - Tests that inject `clock=lambda: ...` keep the legacy path exactly: no
   server-time sampling, no retry, unchanged timestamps.
 - CLI writes (`HybridMexcClient`) are performed by an external process and
