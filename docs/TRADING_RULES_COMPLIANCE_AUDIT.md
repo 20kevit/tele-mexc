@@ -117,8 +117,8 @@ Statuses: `COMPLIANT` — enforced by actual runtime paths and supported by rele
 
 | Rule | Short title | Status | Severity | Primary location |
 |---|---|---|---|---|
-| 4.1 | No automatic Market Sell fallback | **COMPLIANT** | P0 | `tg_signal_ingest/trading/trade_manager.py:1351–1475` — failed limit exits are held, not fallen back to market |
-| 4.2 | No emergency Market Sell without explicit owner authorization | **PARTIALLY COMPLIANT** | P0 | `tg_signal_ingest/trading/engine.py:1466–1491` (`submit_stop_loss_market_sell`) gated only by `LIVE_TOKEN`; no separate `emergency_market_sell_enabled` flag |
+| 4.1 | No automatic Market Sell fallback | **COMPLIANT** | P0 | **Current:** `tg_signal_ingest/trading/trade_manager.py:921–980` (`_submit_tp_order` on failure → `unknown_requires_reconciliation`, never market fallback) and `trade_manager.py:1408` (`_enter_stop_loss` → `_handle_unprotected_sl` → `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL`, never market). **Historical:** `trade_manager.py:1351-1475` was stop-loss market path, now removed (see 4.2) |
+| 4.2 | No emergency Market Sell without explicit owner authorization | **COMPLIANT** | P0 | **Current:** `tg_signal_ingest/trading/engine.py:1553–1572` (`submit_stop_loss_market_sell` raises `RuntimeError` — disabled, grep confirms zero reachable callers outside tests); SL via verified native OCO `STOP_LIMIT` only, missing/rejected/uncertain → `needs_reconciliation`+`SL_UNPROTECTED_CRITICAL`+read-only reconcile (see `trade_manager.py:400-460,1408,1433-1450`). **Historical:** `engine.py:1466-1491` was market-sell path, now removed (owner-confirmed §7) |
 | 4.3 | Telegram SELL not override restriction | **COMPLIANT** | P0 | `tg_signal_ingest/trading/engine.py:679–704` |
 | 4.4 | SL order type/trigger/offset not changed casually | **PARTIALLY COMPLIANT** | P1 | `tg_signal_ingest/config.py:105–109`, `tg_signal_ingest/trading/trade_manager.py:1016–1130` (configurable without mandatory review gate) |
 | 4.5 | Change to SL not cause immediate Market execution/fees | **UNVERIFIED** | P1 | No evidence that a market-SL for `price ≤ SL` cannot execute through thin book with excess slippage/fees; no fee-impact test |
@@ -381,12 +381,13 @@ Each finding lists: Rule ID · Status · Severity · File/function · Line refs 
 - **Implements:** No handler converts a failed/rejected limit exit to an automatic market sell. `tg_signal_ingest/trading/trade_manager.py:921–980` (`_submit_tp_order`) on `Mexc*` failure goes to `unknown_requires_reconciliation`, not market. `docs/trading.md:Remaining limitations` confirms market exit only via explicit stop-loss.
 - **Remediation:** None.
 
-#### 4.2 No emergency Market Sell without explicit owner authorization — PARTIALLY COMPLIANT / P0
+#### 4.2 No emergency Market Sell without explicit owner authorization — COMPLIANT (current) / P0 — Historical note retained
 
 - **Expected:** A distinct authorization flag for emergency market exits, separate from general live trading.
-- **Actual:** `tg_signal_ingest/trading/engine.py:1466–1491` (`submit_stop_loss_market_sell`) submits `side=SELL, type=MARKET` whenever `_enter_stop_loss` is reached (price ≤ SL). The only gate is `LIVE_TOKEN == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` at `engine.py:1368–1374` (`_live_client`). There is no `emergency_market_sell_enabled` or `allow_stop_loss_market_sell` flag; Telegram SELL instructions correctly do not create this market sell (4.3), but the stop-loss market sell path itself lacks a second authorization.
-- **Failure scenario:** A misconfigured or malicious TP/SL price (e.g., `SL` set just below current market to force an early stop) triggers `on_tick` → `_enter_stop_loss` → market sell of the entire remaining position with no additional approval beyond the general live token — the exact risk 4.2 is meant to contain.
-- **Remediation:** Add a dedicated `trading.allow_stop_loss_market_sell` boolean (default `false`) stored like `order_quote_amount`, requiring explicit owner approval via the management bot before any `MARKET` sell can be submitted; log and block otherwise.
+- **Historical (pre-2026-01, now removed):** `tg_signal_ingest/trading/engine.py:1466–1491` (`submit_stop_loss_market_sell`) submitted `side=SELL, type=MARKET` whenever `_enter_stop_loss` was reached (price ≤ SL), gated only by `LIVE_TOKEN == \"I_UNDERSTAND_REAL_MONEY_AND_RISKS\"`.
+- **Current (native OCO-only, verified 2026-01-03):** `tg_signal_ingest/trading/engine.py:1553–1572` (`submit_stop_loss_market_sell` raises `RuntimeError` — disabled, zero `grep -rn submit_stop_loss_market_sell` hits outside `tests/` + `trade_store.py` legacy shim), `tg_signal_ingest/trading/trade_manager.py:1408` (`_enter_stop_loss` → `_handle_unprotected_sl` persists `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL` + audit, narrow per-symbol restriction, no market fallback), `tg_signal_ingest/trading/trade_manager.py:1433–1450` (`_resume_stop_loss`/`_submit_stop_loss_order` stubs). SL is via verified native OCO `STOP_LIMIT` legs only; missing/rejected/uncertain → `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL` + read-only reconcile, never autonomous market sell or replacement order.
+- **Failure scenario (historical):** A misconfigured SL could have triggered `on_tick` → `_enter_stop_loss` → market sell. **Current:** same trigger now persists `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL` and notifies, never submits a market order. Verified by 6 spy tests `test_no_market_sell_*` (both OCOs active, OCO1 missing, OCO2 uncertain, rejection, cancel, restart) proving zero `place_order` market-sell calls.
+- **Remediation (historical):** Dedicated flag was considered but owner confirmed **removal** of market-sell path instead (see `reports/trading_compliance/` and `docs/NON_NEGOTIABLE_TRADING_RULES_EN.md:7`).
 
 #### 4.3 Telegram SELL not override restriction — COMPLIANT / P0
 
@@ -603,7 +604,7 @@ Each finding lists: Rule ID · Status · Severity · File/function · Line refs 
 
 ### 5.3 Stop-loss behavior (audit requirement D)
 
-- **Every stop-loss path traced:** Entry `_check_tp_sl` at `trade_manager.py:424–439` → `_enter_stop_loss` at `trade_manager.py:1351–1475` → `_submit_stop_loss_order` → `engine.py:1466–1491` (`submit_stop_loss_market_sell`: `side=SELL, type=MARKET`). No conditional or OCO path converts this to a market order after the fact; the OCO legs are `STOP_LIMIT`.
+- **Every stop-loss path traced (current, native OCO-only):** Entry `_check_tp_sl`/`_evaluate_trade_tick` → `_enter_stop_loss` at `trade_manager.py:1408` → `_handle_unprotected_sl` at `trade_manager.py:400-460` (persists `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL` + audit, narrow per-symbol restriction, never market sell) → `trade_manager.py:1433-1450` (`_resume_stop_loss`/`_submit_stop_loss_order` stubs). `_handle_unprotected_sl` is the only SL-execution path; OCO legs are `STOP_LIMIT` via `submit_oco_sell`. **Historical:** `trade_manager.py:1351-1475` → `_submit_stop_loss_order` → `engine.py:1466-1491` (`submit_stop_loss_market_sell`: `side=SELL, type=MARKET`) — now removed, `engine.py:1553-1572` raises `RuntimeError` (verified `grep -rn submit_stop_loss_market_sell` → only `tests/` + `trade_store.py` shim remain).
 - **Immediate-execution risk:** A market stop-loss is by definition immediately marketable; an OCO stop-limit with `trigger == limit == SL` is not, but thin-book slippage was not proven bounded — marked `UNVERIFIED`.
 - **No fallback:** `trade_manager.py:921–980` holds a failed TP sell in `rejected/unknown` rather than falling back to market.
 
@@ -658,7 +659,7 @@ All contradictions were documented, not fixed, per the documentation-only bounda
 
 ### P0-3 Introduce a distinct stop-loss market-sell authorization (rule 4.2)
 
-*What to build:* `TradingConfig.allow_stop_loss_market_sell: bool = False` persisted like `order_quote_amount`; require explicit owner approval via management bot before `engine.submit_stop_loss_market_sell` is callable. `engine._live_client` check must include this flag. Without it, SL triggers must use `STOP_LIMIT` only.
+*Historical note (superseded by removal):* `TradingConfig.allow_stop_loss_market_sell: bool = False` was considered but **owner confirmed removal** of the market-sell path instead (2026-01-03). **Current:** `engine.submit_stop_loss_market_sell` at `engine.py:1553-1572` raises `RuntimeError` (disabled); SL is via native OCO `STOP_LIMIT` only. Missing/rejected/uncertain protection → `needs_reconciliation` + `SL_UNPROTECTED_CRITICAL` + read-only reconciliation, never market sell or autonomous replacement.
 
 ### P0-4 Add explicit legacy-protection deny-list for PENDLEUSDT/MYXUSDT (rule 8.1)
 

@@ -62,12 +62,31 @@ class TradeDecision:
     reason: str | None = None
 
 
-# Terminal trade states: no further action required.
+# Terminal trade states: genuinely closed / successfully completed — no further
+# action required.  ``needs_reconciliation`` is explicitly NOT terminal:
+# it is a fail-closed, reconcilable state that must remain eligible for
+# safe read-only reconciliation during startup recovery and periodic
+# reconciliation (see _reconcile_trade).  Historical audit evidence
+# (docs/TRADING_RULES_COMPLIANCE_AUDIT.md @71a952b) described stop-loss
+# Market Sell as current — current implementation (1a27058+) has no automatic
+# Market Sell fallback; SL protection is solely via verified native OCO legs.
 TERMINAL_TRADE_STATES = (
     "closed",
     "tp2_completed",
-    "needs_reconciliation",
 )
+
+# Reconciliation-required state — not terminal, not successfully completed.
+# Trades in this state must:
+#  1. remain eligible for safe read-only reconciliation (on_tick,
+#     recover_on_startup, reconcile_all_open),
+#  2. never be auto-submitted (no BUY/SELL/OCO/replacement),
+#  3. never auto-transition back to ordinary active trading on a bare
+#     reconciliation attempt,
+#  4. retain needs_reconciliation with reason/notify if still unknown,
+#  5. transition to an explicit auditable state (e.g. closed) only when
+#     exchange outcome is conclusively established.
+RECONCILIATION_REQUIRED_STATE = "needs_reconciliation"
+RECONCILIABLE_TRADE_STATES = (RECONCILIATION_REQUIRED_STATE,)
 
 # Order states that still represent exposure on the exchange (or an unknown
 # outcome that must be resolved before placing another sell).
@@ -321,26 +340,43 @@ class TradeManager:
         trade_id = f"trade-{client_order_id}"
         quote_amount = _dec(intent.get("quote_amount")) or Decimal("0")
 
-        return self.store.create_trade(
-            trade_id=trade_id,
-            signal_id=intent["signal_id"],
-            idempotency_key=intent["idempotency_key"],
-            channel_id=int(intent["create_channel_id"]),
-            message_id=int(intent["create_msg_id"]),
-            symbol=str(intent["symbol"]),
-            side=str(intent["side"]),
-            entry_mode=entry_mode,
-            requested_quote=quote_amount,
-            entry_price=entry_price,
-            trigger_offset_ticks=offset,
-            trigger_price=trigger_price,
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
-            tp1_allocation_pct=Decimal(str(self.cfg.tp1_allocation_pct_of_acquired)),
-            tp2_allocation_pct=Decimal(str(self.cfg.tp2_allocation_pct_of_remaining)),
-            sl_price=sl_price,
-            entry_intent_id=intent["intent_id"],
-        )
+        try:
+            return self.store.create_trade(
+                trade_id=trade_id,
+                signal_id=intent["signal_id"],
+                idempotency_key=intent["idempotency_key"],
+                channel_id=int(intent["create_channel_id"]),
+                message_id=int(intent["create_msg_id"]),
+                symbol=str(intent["symbol"]),
+                side=str(intent["side"]),
+                entry_mode=entry_mode,
+                requested_quote=quote_amount,
+                entry_price=entry_price,
+                trigger_offset_ticks=offset,
+                trigger_price=trigger_price,
+                tp1_price=tp1_price,
+                tp2_price=tp2_price,
+                tp1_allocation_pct=Decimal(str(self.cfg.tp1_allocation_pct_of_acquired)),
+                tp2_allocation_pct=Decimal(str(self.cfg.tp2_allocation_pct_of_remaining)),
+                sl_price=sl_price,
+                entry_intent_id=intent["intent_id"],
+            )
+        except Exception as exc:
+            # Per-symbol concurrency at trade INSERT — fail closed, reject signal
+            from tg_signal_ingest.trading.store import SymbolConflictError as _SCE
+            if isinstance(exc, _SCE):
+                self._reject_trade_intent(intent, str(exc))
+                try:
+                    self.store.db.conn.execute(
+                        "UPDATE signals SET status='rejected', rejection_reason=?, updated_at=? WHERE signal_id=?",
+                        (str(exc), self._ts(), intent["signal_id"]),
+                    )
+                    self.store.db.conn.commit()
+                except Exception:
+                    pass
+                self.store.audit(intent["signal_id"], "lifecycle", "rejected_symbol_conflict", str(exc))
+                return None
+            raise
 
     def _compute_trigger(self, entry_price: Decimal, ticks: int, tick_size: Decimal) -> Decimal | None:
         """Trigger = entry_price - ticks * tick_size, quantized down to tick size."""
@@ -791,14 +827,27 @@ class TradeManager:
             # A late fill can arrive after this row was created.  It was never
             # sent, so base the submitted quantity on current fills rather than
             # the stale row.
-            qty = min(requested, target_capacity, self._remaining_base(trade))
+            remaining = self._remaining_base(trade)
+            if remaining is None:
+                detail = f"{target} sellable unknown — cannot rebase pending quantity; needs_reconciliation"
+                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self.store.audit(trade["trade_id"], "risk", "oco_invariant_unknown", detail[:2000])
+                return
+            qty = min(requested, target_capacity, remaining)
             qty = self._quantize_qty(trade, qty)
             if qty <= 0:
                 self.store.transition_trade_order(
                     order["trade_order_id"], "canceled",
                     note="not sent; no remaining quantity",
                 )
-                if self._remaining_base(trade) <= 0:
+                remaining2 = self._remaining_base(trade)
+                if remaining2 is None:
+                    detail = f"{target} sellable unknown after rebase; needs_reconciliation"
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    return
+                if remaining2 <= 0:
                     self._finalize_trade(trade)
                 else:
                     self._record_residual(
@@ -857,7 +906,14 @@ class TradeManager:
                     )
                 trade = self._refresh(trade)
             qty = max(Decimal("0"), allocated - self._sold_for_kind(trade, target))
-            qty = min(qty, self._compute_available(trade))
+            avail = self._compute_available(trade)
+            if avail is None:
+                detail = f"{target} sellable unknown — cannot compute available quantity; needs_reconciliation"
+                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self.store.audit(trade["trade_id"], "risk", "oco_invariant_unknown", detail[:2000])
+                return
+            qty = min(qty, avail)
             qty = self._quantize_qty(trade, qty)
             price = self._tp_price(trade, target)
 
@@ -917,9 +973,11 @@ class TradeManager:
             for order in self.store.list_trade_orders(trade["trade_id"], kind=target)
         )
 
-    def _compute_available(self, trade: dict[str, Any]) -> Decimal:
-        """Bot-owned base quantity available to sell right now (fee-aware)."""
+    def _compute_available(self, trade: dict[str, Any]) -> Decimal | None:
+        """Bot-owned base quantity available to sell right now (fee-aware), or None if unknown."""
         base_sellable = self._sellable_quantity(trade)
+        if base_sellable is None:
+            return None
         outstanding = Decimal("0")
         for order in self.store.list_trade_orders(trade["trade_id"]):
             if order["state"] in UNCONFIRMED_ORDER_STATES:
@@ -1175,6 +1233,7 @@ class TradeManager:
             return
 
         results: dict[str, str] = {}
+        invariant_blocked = False
         for kind, (qty, price) in required.items():
             # 3-4. Hypothetical combined reservation check BEFORE submitting this leg.
             # Existing reservations for both OCOs, accounting for reuse.
@@ -1205,6 +1264,7 @@ class TradeManager:
                 self._notify_trade(trade, "OCO_INVARIANT_WOULD_VIOLATE", detail)
                 self.store.audit(trade["trade_id"], "risk", "oco_invariant_would_violate", detail[:2000])
                 results[kind] = "failed"
+                invariant_blocked = True
                 continue
             # 5. Only then call the exchange submission method.
             results[kind] = self._ensure_oco_leg(trade, kind, qty, price, sl_price)
@@ -1237,6 +1297,14 @@ class TradeManager:
             if new_state != previous_state:
                 self._notify_trade(trade, event_key, text)
 
+        if invariant_blocked:
+            # Any leg blocked due to would-violate invariant means the allocation
+            # plan is inconsistent with verified sellable — position is unprotected
+            # and requires reconciliation, even if other legs are already confirmed.
+            refreshed = self._refresh(trade)
+            if refreshed is not None and refreshed.get("trade_state") != "needs_reconciliation":
+                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000] if 'detail' in locals() else "OCO invariant would-violate blocked submission")
+            return
         if len(completed) == len(required):
             self._finalize_trade(trade)
             return
@@ -1247,7 +1315,11 @@ class TradeManager:
              if order["state"] in ("open", "partially_filled")),
             Decimal("0"),
         )
-        if len(confirmed) == len(required) and coverage >= self._remaining_base(trade):
+        remaining_cov = self._remaining_base(trade)
+        if remaining_cov is None:
+            # Unknown sellable → cannot prove full coverage; treat as not fully covered
+            remaining_cov = Decimal("0")  # will fail coverage check and go to partial, but also already handled via invariant
+        if len(confirmed) == len(required) and coverage >= remaining_cov:
             _publish(
                 "oco_active",
                 "remaining position covered by working OCO allocations",
@@ -1316,7 +1388,14 @@ class TradeManager:
         if len(rejected) >= cap:
             return "failed"
 
-        qty = self._quantize_qty(trade, min(wanted_qty, self._remaining_base(trade)))
+        remaining_oco = self._remaining_base(trade)
+        if remaining_oco is None:
+            detail = f"{kind} sellable unknown — cannot size OCO; needs_reconciliation"
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self.store.audit(trade["trade_id"], "risk", "oco_invariant_unknown", detail[:2000])
+            return "failed"
+        qty = self._quantize_qty(trade, min(wanted_qty, remaining_oco))
         price_q = self._quantize_price(trade, price)
         if qty <= 0:
             self._record_residual(trade, kind, wanted_qty, f"{kind} remainder below lot size")
@@ -1521,60 +1600,115 @@ class TradeManager:
         except Exception:
             return None
 
-    def _total_base_fees(self, trade: dict[str, Any]) -> Decimal:
+    def _total_base_fees(self, trade: dict[str, Any]) -> Decimal | None:
         """Sum commissions paid in the base asset across entry + exit fills.
 
-        Entry, TP1, TP2 and (if any remaining authorized) exit fills can all
-        incur base-asset commissions that reduce remaining base inventory.
+        Strictly fail-closed: a confirmed absence of applicable fills may
+        contribute zero, but any failed DB query, unavailable order history,
+        incomplete fill synchronization, malformed fee record, or otherwise
+        uncertain result must NOT be interpreted as zero.  Returns None
+        (unknown) when fees cannot be proven, propagating via _sellable_quantity
+        to block OCO submission and any exact-inventory operation.
         Quote-asset fees do not reduce base sellable; third-token fees are
-        preserved as unvalued.  Uses exchange fill IDs for idempotent
-        accounting (no double-count).
+        preserved as unvalued.  Idempotency is via exchange trade IDs; missing
+        IDs for base-asset fees make the result unprovable.
         """
         base_asset = self._base_asset_for_trade(trade)
         if not base_asset:
-            return Decimal("0")
+            # Cannot determine base asset → cannot prove fee asset match
+            return None
+        # Incomplete fill sync → fee data incomplete
+        intent_id = trade.get("entry_intent_id")
+        if intent_id:
+            try:
+                intent = self.store.get_intent(intent_id)
+            except Exception:
+                return None
+            if intent is not None and int(intent.get("fill_sync_required") or 0) == 1:
+                return None
         seen: set[str] = set()
         total = Decimal("0")
         # Entry fills
-        intent_id = trade.get("entry_intent_id")
         if intent_id:
-            intent = self.store.get_intent(intent_id)
+            try:
+                intent = self.store.get_intent(intent_id)
+            except Exception:
+                return None
             exch_id = (intent or {}).get("exchange_order_id") if intent else None
             if exch_id:
-                for fill in self.store.fills_for_order(exch_id):
-                    tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
-                    if tid and tid in seen:
-                        continue
-                    if tid:
+                try:
+                    fills = self.store.fills_for_order(exch_id)
+                except Exception:
+                    return None
+                for fill in fills:
+                    fee_asset = str(fill.get("fee_asset") or "").upper()
+                    if fee_asset == base_asset:
+                        # Base-asset fee must have a parseable amount and a dedup ID
+                        fee_raw = fill.get("fee_amount")
+                        if fee_raw is None or fee_raw == "":
+                            return None
+                        dec_fee = _dec(fee_raw)
+                        if dec_fee is None:
+                            return None
+                        tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
+                        if not tid:
+                            return None
+                        if tid in seen:
+                            continue
                         seen.add(tid)
-                    if str(fill.get("fee_asset") or "").upper() == base_asset:
-                        total += _dec(fill.get("fee_amount")) or Decimal("0")
-        # Exit fills (TP1/TP2/stop_loss OCO legs) — base-asset commissions
-        # on SELL fills also reduce remaining inventory.
-        for order in self.store.list_trade_orders(trade["trade_id"]):
+                        total += dec_fee
+                    else:
+                        # Track non-base fills for idempotency but don't add
+                        tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
+                        if tid:
+                            if tid in seen:
+                                continue
+                            seen.add(tid)
+                        # confirmed absence of base fee → 0, no uncertainty
+                # confirmed absence (no fills) → 0 is valid, already handled
+        # Exit fills (TP1/TP2/stop_loss OCO legs) — base-asset commissions on SELL
+        try:
+            orders = self.store.list_trade_orders(trade["trade_id"])
+        except Exception:
+            return None
+        for order in orders:
             exch_id = order.get("exchange_order_id")
             if not exch_id:
-                continue
+                continue  # never sent → confirmed zero
             try:
                 fills = self.store.fills_for_order(exch_id)
             except Exception:
-                continue
+                return None
             for fill in fills:
-                tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
-                if tid and tid in seen:
-                    continue
-                if tid:
+                fee_asset = str(fill.get("fee_asset") or "").upper()
+                if fee_asset == base_asset:
+                    fee_raw = fill.get("fee_amount")
+                    if fee_raw is None or fee_raw == "":
+                        return None
+                    dec_fee = _dec(fee_raw)
+                    if dec_fee is None:
+                        return None
+                    tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
+                    if not tid:
+                        return None
+                    if tid in seen:
+                        continue
                     seen.add(tid)
-                if str(fill.get("fee_asset") or "").upper() == base_asset:
-                    total += _dec(fill.get("fee_amount")) or Decimal("0")
+                    total += dec_fee
+                else:
+                    tid = str(fill.get("exchange_trade_id") or fill.get("trade_id") or "")
+                    if tid:
+                        if tid in seen:
+                            continue
+                        seen.add(tid)
         return total
 
     def _sellable_quantity(self, trade: dict[str, Any]) -> Decimal | None:
         """Bot-owned base quantity actually available to allocate/sell.
 
         Returns None when sellable cannot be proven (e.g., acquired not yet
-        recorded, or fill sync pending) — caller must treat as unknown and
-        not submit.
+        recorded, fill sync pending, fee query failed, malformed fee record) —
+        caller must treat as unknown, persist needs_reconciliation, and NOT submit.
         """
         raw_acquired = trade.get("acquired_base_qty")
         if raw_acquired is None or raw_acquired == "":
@@ -1582,7 +1716,21 @@ class TradeManager:
         acquired = _dec(raw_acquired)
         if acquired is None:
             return None
+        # Check for incomplete fill sync at intent level (authoritative)
+        intent_id = trade.get("entry_intent_id")
+        if intent_id:
+            try:
+                intent = self.store.get_intent(intent_id)
+                if intent is not None and int(intent.get("fill_sync_required") or 0) == 1:
+                    return None
+            except Exception:
+                return None
         base_fees = self._total_base_fees(trade)
+        if base_fees is None:
+            return None
+        # _sold_for_kind is durable derived from trade_orders.sold_qty, but if
+        # any order's sold_qty is unknown due to reconciliation, sellable remains
+        # calculable from known sold; fee unknown already handled above.
         sold = (
             self._sold_for_kind(trade, "tp1")
             + self._sold_for_kind(trade, "tp2")
@@ -1634,9 +1782,9 @@ class TradeManager:
         self.store.audit(trade["trade_id"], "risk", "oco_invariant_violated", detail[:2000])
         return False, detail
 
-    def _remaining_base(self, trade: dict[str, Any]) -> Decimal:
-        v = self._sellable_quantity(trade)
-        return v if v is not None else Decimal("0")
+    def _remaining_base(self, trade: dict[str, Any]) -> Decimal | None:
+        """Sellable remaining base, or None if unknown (fail-closed)."""
+        return self._sellable_quantity(trade)
 
     def _finalize_trade(
         self,
@@ -1648,6 +1796,13 @@ class TradeManager:
         if residual > 0:
             self._record_residual(trade, "stop_loss", residual, reason or "unsellable remainder")
         remaining = self._remaining_base(trade)
+        if remaining is None:
+            # Unknown inventory → cannot prove fully exited; fail closed
+            detail = f"close refused: sellable unknown for {trade.get('trade_id')} — fee or fill data unprovable"
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+            self._notify_trade(trade, "TRADE_CLOSE_REFUSED_UNKNOWN", detail)
+            self.store.audit(trade["trade_id"], "risk", "close_refused_unknown", detail[:2000])
+            return
         if remaining > 0 and residual <= 0:
             # Never silently close a trade that still owns base quantity.
             self.store.update_trade_state(
@@ -1793,11 +1948,66 @@ class TradeManager:
             )
             self._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", "legacy Market Sell state encountered after disablement — no Market Sell submitted")
             return
-        if state == "needs_reconciliation":
-            # Only refresh facts; never auto-submit a new order from this state.
+        if state == RECONCILIATION_REQUIRED_STATE:
+            # Safe read-only reconciliation only — never auto-submit BUY/SELL/
+            # OCO/replacement.  Must not auto-transition back to ordinary active
+            # trading.  If still unknown, retain needs_reconciliation with reason;
+            # if conclusively closed, use explicit auditable transition to closed.
             self._reconcile_entry_fills(trade)
             self._reconcile_trade_orders(trade)
-            return
+            refreshed = self._refresh(trade)
+            if refreshed is None:
+                return
+            # Determine if conclusively established as closed:
+            #  - no unknown order states, no unknown intent, sellable is known
+            #  - all orders terminal and remaining base is 0
+            try:
+                orders = self._list_trade_orders(refreshed["trade_id"])
+                has_unknown = any(
+                    o["state"] in ("unknown_requires_reconciliation", "submitting", "cancel_requested")
+                    for o in orders
+                )
+                intent_id = refreshed.get("entry_intent_id")
+                intent = store.get_intent(intent_id) if intent_id else None
+                intent_unknown = False
+                if intent is not None:
+                    if intent.get("state") in ("unknown_requires_reconciliation", "reconciling"):
+                        intent_unknown = True
+                    elif int(intent.get("fill_sync_required") or 0) == 1:
+                        intent_unknown = True
+                sellable = self._sellable_quantity(refreshed)
+                # Unknown evidence → retain
+                if has_unknown or intent_unknown or sellable is None:
+                    # Record revisit without duplicating user notifications
+                    # (initial entry already notified SL_UNPROTECTED_CRITICAL /
+                    # OCO_INVARIANT_*).  Use audit only, idempotent.
+                    self.store.audit(
+                        trade_id, "reconcile", "needs_reconciliation_revisited",
+                        f"read-only reconciliation; still unresolved (has_unknown={has_unknown} intent_unknown={intent_unknown} sellable={sellable})",
+                    )
+                    return
+                all_terminal = all(o["state"] in TERMINAL_ORDER_STATES for o in orders) if orders else True
+                # Conclusive close: sellable 0 and all orders terminal
+                if all_terminal and sellable == Decimal("0"):
+                    # Explicit auditable transition — not an automatic active resumption
+                    self.store.update_trade_state(
+                        trade_id, "closed",
+                        note="reconciliation: exchange outcome conclusively established; position fully exited (remaining 0, all orders terminal)",
+                        sl_state="completed",
+                    )
+                    refreshed2 = self._refresh(refreshed)
+                    self._notify_trade(refreshed2 or refreshed, "TRADE_CLOSED_RECONCILED", "trade conclusively closed via read-only reconciliation")
+                    self.store.audit(trade_id, "lifecycle", "closed_via_reconciliation", "all orders terminal, sellable 0")
+                    return
+                # Otherwise retain needs_reconciliation — do not auto-transition to active
+                self.store.audit(
+                    trade_id, "reconcile", "needs_reconciliation_retained",
+                    f"sellable={sellable} all_terminal={all_terminal} orders={len(orders)} — manual review still required",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - never block reconciliation on audit
+                log.warning("needs_reconciliation post-reconcile check failed for %s: %s", trade_id, exc)
+                return
 
         self._reconcile_entry_fills(trade)
         self._reconcile_trade_orders(trade)
@@ -1844,12 +2054,17 @@ class TradeManager:
                 self._enter_tp2(trade)
             return
         if state == "tp2_active":
-            if self._tp_done(trade, "tp2") and self._remaining_base(trade) <= 0:
+            remaining_chk = self._remaining_base(trade)
+            if remaining_chk is None:
+                # Unknown sellable → cannot decide to finalize; retain and audit
+                self.store.audit(trade["trade_id"], "reconcile", "tp2_remaining_unknown", "sellable unknown; needs_reconciliation retained")
+                return
+            if self._tp_done(trade, "tp2") and remaining_chk <= 0:
                 self._finalize_trade(trade)
             elif self._tp_done(trade, "tp2") and acquired > 0:
                 # Allocated target sold but a residual remains (for example a
                 # TP2 allocation that deliberately left a dust balance).
-                remaining = self._remaining_base(trade)
+                remaining = remaining_chk
                 qty = self._quantize_qty(trade, remaining)
                 if qty <= 0 and remaining > 0:
                     self._finalize_trade(
@@ -1997,6 +2212,9 @@ class TradeManager:
             return
         if state == "tp2_active" and self._tp_done(trade, "tp2"):
             remaining = self._remaining_base(trade)
+            if remaining is None:
+                self.store.audit(trade["trade_id"], "reconcile", "tp2_remaining_unknown_advance", "sellable unknown; cannot finalize")
+                return
             if remaining <= 0:
                 self._finalize_trade(trade)
             else:

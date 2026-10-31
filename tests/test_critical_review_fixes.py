@@ -130,60 +130,114 @@ def test_oco_pre_submit_existing_exceeds_sellable_never_submits(cfg, repo):
 
 
 def test_oco_pre_submit_proposed_oco1_would_exceed_sellable_blocked(cfg, repo):
+    """Existing 0.06 reserved + proposed 0.05 exceeds verified 0.10 → rejected before exchange."""
     engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
     calls = []
     def spy_submit(trade, cid, price, qty, stop_price, kind=None, **kw):
-        calls.append(kind)
+        calls.append((kind, qty))
         return {"orderId": "ex-1", "status": "NEW", "executed_qty": Decimal("0")}
     engine.submit_oco_sell = spy_submit  # type: ignore
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=101, edit_version=0)
-    store.create_intent(signal=parsed, signal_id=sid, channel_id=100, message_id=101, edit_version=0, idempotency_key="k101", client_order_id="tsi-k101", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.1"), limit_price=Decimal("100"))
+    store.create_intent(signal=parsed, signal_id=sid, channel_id=100, message_id=101, edit_version=0, idempotency_key="k101", client_order_id="tsi-k101", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.10"), limit_price=Decimal("100"))
     iid = repo.db.conn.execute("SELECT intent_id FROM order_intents WHERE client_order_id='tsi-k101'").fetchone()["intent_id"]
     repo.db.conn.execute("UPDATE order_intents SET exchange_order_id='ex-101', state='filled' WHERE intent_id=?", (iid,))
-    repo.db.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-101","BTCUSDT","100","0.06","6","","","t-101",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
-    trade = store.create_trade(trade_id="tr-oco-pre2", signal_id=sid, idempotency_key="k101", channel_id=100, message_id=101, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("6"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("50"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid)
-    store.update_trade_fields("tr-oco-pre2", acquired_base_qty=Decimal("0.06"), acquired_quote_spent=Decimal("6"), avg_entry_price=Decimal("100"))
-    # Try to place OCOs where TP1 would be 0.04 and TP2 0.02 → but sellable 0.06, OCO1 0.04 would already exceed if OCO2 also needed? Actually 0.04+0.02=0.06 fits, but we will test proposed OCO1 alone would exceed if sellable is 0.03
-    # So create existing OCO2 already 0.04, then proposed OCO1 0.03 would exceed 0.05 sellable
-    store.create_trade_order(trade_order_id="to-pre2-tp2", trade_id="tr-oco-pre2", kind="tp2", client_order_id="t2-pre2", symbol="BTCUSDT", side="sell", order_type="OCO_STOP_LIMIT_ORDER", price=Decimal("120"), quantity=Decimal("0.04"), allocated_qty=Decimal("0.04"))
+    repo.db.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-101","BTCUSDT","100","0.10","10","","","t-101",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
+    store.create_trade(trade_id="tr-oco-pre2", signal_id=sid, idempotency_key="k101", channel_id=100, message_id=101, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("10"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("50"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid)
+    store.update_trade_fields("tr-oco-pre2", acquired_base_qty=Decimal("0.10"), acquired_quote_spent=Decimal("10"), avg_entry_price=Decimal("100"))
+    # Existing OCO2 consumes 0.06 of verified sellable 0.10
+    store.create_trade_order(trade_order_id="to-pre2-tp2", trade_id="tr-oco-pre2", kind="tp2", client_order_id="t2-pre2", symbol="BTCUSDT", side="sell", order_type="OCO_STOP_LIMIT_ORDER", price=Decimal("120"), quantity=Decimal("0.06"), allocated_qty=Decimal("0.06"))
     store.transition_trade_order("to-pre2-tp2", "open", exchange_order_id="ex-pre2-tp2")
-    # Now placing OCO1 with qty 0.03 would make combined 0.07 > sellable 0.06 → blocked
+    # proposed OCO1 = 0.05 (50% of 0.10) → combined 0.11 > 0.10 → must be blocked
     trade = store.get_trade("tr-oco-pre2")
-    # Monkey patch _ensure_oco_leg to return confirmed but we want pre-check to block before call
-    # Reset to force re-allocation path with our sellable 0.06
-    # Simpler: set tp1_allocated 0 so it will compute 0.03 (50% of 0.06) and try to submit
+    existing_reserved = tm._oco_reserved_quantity(trade, "tp2")
+    assert existing_reserved == Decimal("0.06"), f"existing should be 0.06, got {existing_reserved}"
+    sellable = tm._sellable_quantity(trade)
+    assert sellable == Decimal("0.10"), f"sellable should be 0.10, got {sellable}"
+    # Force allocation path: tp1 will be 0.05, tp2 already exists 0.06
     store.update_trade_fields("tr-oco-pre2", tp1_allocated_qty=Decimal("0"), tp2_allocated_qty=Decimal("0"))
     trade = store.get_trade("tr-oco-pre2")
     tm._place_oco_exits(trade)
-    # Because existing OCO2 0.04 + proposed OCO1 0.03 =0.07 >0.06, OCO1 submission must be blocked
-    # Our spy should not have been called for tp1 (or if called, it would be unsafe)
-    # In current implementation, tp2 already exists, so existing_other for tp1 is 0.04
-    assert "tp1" not in calls or len(calls) == 0, f"OCO1 should have been blocked, calls={calls}"
+    # Must be blocked before exchange call
+    assert calls == [], f"OCO1 proposal 0.05 + existing 0.06 > sellable 0.10 must be rejected with zero exchange writes, got calls={calls}"
+    t2 = store.get_trade("tr-oco-pre2")
+    assert t2["trade_state"] == "needs_reconciliation"
+    # Audit/notification evidence
+    audits = store.db.conn.execute("SELECT * FROM audit_events WHERE correlation=? AND event='oco_invariant_would_violate'", (t2["trade_id"],)).fetchall()
+    assert len(audits) >= 1, "expected audit oco_invariant_would_violate"
+    # Verify exact quantities in audit detail
+    detail = audits[0]["detail"]
+    assert "0.06" in detail and "0.05" in detail and "0.10" in detail
+    # Invariant after blocking still holds (existing 0.06 <= sellable 0.10) but trade is flagged needs_reconciliation for would-violate
+    ok, reason = tm._verify_oco_invariant(store.get_trade("tr-oco-pre2"))
+    assert ok, f"existing 0.06 <= sellable 0.10 should still be invariant ok, got {reason}"
+
 
 
 def test_oco_pre_submit_proposed_oco2_would_exceed_sellable_blocked(cfg, repo):
+    """Boundary: existing 0.04 + proposed 0.06 == sellable 0.10 → allowed; 0.06+0.05>0.10 → blocked."""
+    # First, verify boundary exact equality is allowed
     engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
     calls = []
-    engine.submit_oco_sell = lambda trade, cid, price, qty, stop_price, kind=None, **kw: (calls.append(kind), {"orderId": "ex-1", "status": "NEW", "executed_qty": Decimal("0")})[1]
+    engine.submit_oco_sell = lambda trade, cid, price, qty, stop_price, kind=None, **kw: (calls.append((kind, qty)), {"orderId": "ex-1", "status": "NEW", "executed_qty": Decimal("0")})[1]
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=102, edit_version=0)
-    store.create_intent(signal=parsed, signal_id=sid, channel_id=100, message_id=102, edit_version=0, idempotency_key="k102", client_order_id="tsi-k102", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.05"), limit_price=Decimal("100"))
+    store.create_intent(signal=parsed, signal_id=sid, channel_id=100, message_id=102, edit_version=0, idempotency_key="k102", client_order_id="tsi-k102", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.10"), limit_price=Decimal("100"))
     iid = repo.db.conn.execute("SELECT intent_id FROM order_intents WHERE client_order_id='tsi-k102'").fetchone()["intent_id"]
     repo.db.conn.execute("UPDATE order_intents SET exchange_order_id='ex-102', state='filled' WHERE intent_id=?", (iid,))
-    repo.db.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-102","BTCUSDT","100","0.05","5","","","t-102",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
-    trade = store.create_trade(trade_id="tr-oco-pre3", signal_id=sid, idempotency_key="k102", channel_id=100, message_id=102, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("5"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("50"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid)
-    store.update_trade_fields("tr-oco-pre3", acquired_base_qty=Decimal("0.05"), acquired_quote_spent=Decimal("5"), avg_entry_price=Decimal("100"))
-    store.create_trade_order(trade_order_id="to-pre3-tp1", trade_id="tr-oco-pre3", kind="tp1", client_order_id="t1-pre3", symbol="BTCUSDT", side="sell", order_type="OCO_STOP_LIMIT_ORDER", price=Decimal("110"), quantity=Decimal("0.03"), allocated_qty=Decimal("0.03"))
+    repo.db.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-102","BTCUSDT","100","0.10","10","","","t-102",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
+    store.create_trade(trade_id="tr-oco-pre3", signal_id=sid, idempotency_key="k102", channel_id=100, message_id=102, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("10"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("40"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid)
+    store.update_trade_fields("tr-oco-pre3", acquired_base_qty=Decimal("0.10"), acquired_quote_spent=Decimal("10"), avg_entry_price=Decimal("100"))
+    # Existing 0.04, proposed 0.06 → combined 0.10 == sellable 0.10 → allowed
+    store.create_trade_order(trade_order_id="to-pre3-tp1", trade_id="tr-oco-pre3", kind="tp1", client_order_id="t1-pre3", symbol="BTCUSDT", side="sell", order_type="OCO_STOP_LIMIT_ORDER", price=Decimal("110"), quantity=Decimal("0.04"), allocated_qty=Decimal("0.04"))
     store.transition_trade_order("to-pre3-tp1", "open", exchange_order_id="ex-pre3-tp1")
     trade = store.get_trade("tr-oco-pre3")
-    store.update_trade_fields("tr-oco-pre3", tp1_allocated_qty=Decimal("0.03"), tp2_allocated_qty=Decimal("0"))
+    assert tm._sellable_quantity(trade) == Decimal("0.10")
+    assert tm._oco_reserved_quantity(trade, "tp1") == Decimal("0.04")
     tm._place_oco_exits(trade)
-    # OCO2 proposed would be ~0.02 (remaining 0.02) but existing 0.03 + 0.02 =0.05 fits, but if we had larger proposed it would block
-    # To force exceed, we set sellable smaller by adding fee
-    # Instead verify that OCO2 was not double-counted unsafe
-    # For this test we just ensure no unsafe exceed — if OCO1 already 0.03, OCO2 0.02 should be allowed
-    assert len(calls) <= 1
+    # Should have submitted tp2 with 0.06 (remaining pool) and not exceed
+    tp2_calls = [c for c in calls if c[0] == "tp2"]
+    assert len(tp2_calls) == 1, f"boundary case should be allowed, got calls={calls}"
+    assert tp2_calls[0][1] == Decimal("0.06") or tp2_calls[0][1] == Decimal("0.06000000")
+    assert store.get_trade("tr-oco-pre3")["trade_state"] != "needs_reconciliation"
+    # Now test exceed: create new trade in isolated DB where existing 0.07 + proposed 0.04 =0.11 >0.10 → blocked
+    # Use a fresh tmp_path to avoid per-symbol conflict with previous trade in same DB (atomic admission)
+    import tempfile
+    from pathlib import Path
+    from tg_signal_ingest.config import AppConfig as _AppCfg
+    from tg_signal_ingest.db import Database as _DB
+    from tg_signal_ingest.repository import Repository as _Repo
+    tmp2 = Path(tempfile.mkdtemp())
+    cfg2 = _AppCfg(api_id=12345, api_hash="a"*32, data_dir=tmp2/"data", db_path=tmp2/"data"/"test2.sqlite3", session_path=tmp2/"config"/"session")
+    cfg2.ensure_dirs()
+    cfg2.trading.mode="live"
+    cfg2.trading.live_enabled_token="I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+    db2 = _DB(cfg2.db_path); db2.migrate()
+    repo2 = _Repo(db2)
+    from tg_signal_ingest.trading.trade_store import TradeStore as _TS
+    from tg_signal_ingest.trading.trade_manager import TradeManager as _TM
+    store2 = _TS(db2, cfg2.trading, now=lambda: NOW)
+    tm2 = _TM(cfg2.trading, store2, now=lambda: NOW)
+    from tg_signal_ingest.trading.engine import TradingEngine as _TE
+    engine2 = _TE(cfg2, repo2, client=SpyMexc(), now=lambda: NOW, trade_manager=tm2)
+    tm2.engine=engine2; engine2.store=store2
+    store2.set_app_state_once("trading.activation_boundary_message_id", "0")
+    calls2 = []
+    engine2.submit_oco_sell = lambda trade, cid, price, qty, stop_price, kind=None, **kw: (calls2.append((kind, qty)), {"orderId": "ex-2", "status": "NEW", "executed_qty": Decimal("0")})[1]
+    parsed2 = SignalParser().parse(COMPLETE)
+    sid2, _ = store2.record_signal(parsed2, channel_id=100, message_id=1030, edit_version=0)
+    store2.create_intent(signal=parsed2, signal_id=sid2, channel_id=100, message_id=1030, edit_version=0, idempotency_key="k102b", client_order_id="tsi-k102b", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.10"), limit_price=Decimal("100"))
+    iid2 = db2.conn.execute("SELECT intent_id FROM order_intents WHERE client_order_id='tsi-k102b'").fetchone()["intent_id"]
+    db2.conn.execute("UPDATE order_intents SET exchange_order_id='ex-102b', state='filled' WHERE intent_id=?", (iid2,))
+    db2.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-102b","BTCUSDT","100","0.10","10","","","t-102b",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
+    store2.create_trade(trade_id="tr-oco-pre3b", signal_id=sid2, idempotency_key="k102b", channel_id=100, message_id=1030, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("10"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("40"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid2)
+    store2.update_trade_fields("tr-oco-pre3b", acquired_base_qty=Decimal("0.10"), acquired_quote_spent=Decimal("10"), avg_entry_price=Decimal("100"))
+    store2.create_trade_order(trade_order_id="to-pre3b-tp1", trade_id="tr-oco-pre3b", kind="tp1", client_order_id="t1-pre3b", symbol="BTCUSDT", side="sell", order_type="OCO_STOP_LIMIT_ORDER", price=Decimal("110"), quantity=Decimal("0.07"), allocated_qty=Decimal("0.07"))
+    store2.transition_trade_order("to-pre3b-tp1", "open", exchange_order_id="ex-pre3b-tp1")
+    tm2._place_oco_exits(store2.get_trade("tr-oco-pre3b"))
+    assert calls2 == [], f"existing 0.07 + proposed 0.04 >0.10 must be blocked, got {calls2}"
+    assert store2.get_trade("tr-oco-pre3b")["trade_state"] == "needs_reconciliation"
+    db2.close()
 
 
 def test_oco_pre_submit_reuse_not_double_counted(cfg, repo):
@@ -409,49 +463,68 @@ def test_no_market_sell_restart_missing_protection(cfg, repo):
 # ── §4 Per-symbol atomicity ───────────────────────────────────────────────
 
 def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
-    # Two independent Engine instances sharing same DB file (same repo.db connection via same Database)
-    # They attempt same symbol concurrently via threads.
+    """Genuine contention: two engines share same DB, both try first trade for BTCUSDT via barrier.
+    SQLite BEGIN IMMEDIATE + TradingStore CONFLICTING_TRADE_STATES provides the guarantee;
+    Python RLock alone does not (two DB connections have separate locks)."""
+    import threading
+    barrier = threading.Barrier(2)
     results = []
-    def attempt(mid):
-        cfg2 = AppConfig(api_id=12345, api_hash="a"*32, data_dir=cfg.data_dir, db_path=cfg.db_path, session_path=cfg.session_path)
-        cfg2.trading.mode = "live"
-        cfg2.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
-        # Use a separate Repository but same underlying DB file (new connection)
-        db2 = Database(cfg2.db_path)
-        repo2 = Repository(db2)
-        # Do not re-migrate (already migrated), but ensure connection
-        client = SpyMexc()
-        # Reuse same trade check via TradeStore
-        store2 = TradeStore(db2, cfg2.trading, now=lambda: NOW)
-        tm2 = TradeManager(cfg2.trading, store2, now=lambda: NOW)
-        engine2 = TradingEngine(cfg2, repo2, client=client, now=lambda: NOW, trade_manager=tm2)
-        tm2.engine = engine2
-        engine2.store = store2
-        rec = _store(repo2, mid, COMPLETE, source="live")
-        item = _item(100, mid)
-        # First signal already has trade via main thread — create it directly via main store
-        res = engine2.process_item(item, rec)
-        results.append((mid, res is not None, res["state"] if res else None, res.get("reject_reason") if res else None))
-        db2.close()
-    # Create first trade via main engine to occupy symbol
-    main_engine, main_tm, main_store = _engine_with_tm(cfg, repo, SpyMexc())
-    main_engine.client = SpyMexc()
-    # Create first trade directly
-    parsed = SignalParser().parse(COMPLETE)
-    sid, _ = main_store.record_signal(parsed, channel_id=100, message_id=200, edit_version=0)
-    main_store.create_intent(signal=parsed, signal_id=sid, channel_id=100, message_id=200, edit_version=0, idempotency_key="k200", client_order_id="tsi-k200", mode="live", order_type="limit", quote_amount=Decimal("10"), base_quantity=Decimal("0.1"), limit_price=Decimal("100"))
-    iid = repo.db.conn.execute("SELECT intent_id FROM order_intents WHERE client_order_id='tsi-k200'").fetchone()["intent_id"]
-    repo.db.conn.execute("UPDATE order_intents SET exchange_order_id='ex-200', state='filled' WHERE intent_id=?", (iid,))
-    repo.db.conn.execute("INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("ex-200","BTCUSDT","100","0.1","10","","","t-200",1,0,1,"reconciliation","2026-01-01T00:00:00Z","2026-01-01T00:00:00Z"))
-    main_store.create_trade(trade_id="tr-conc-main", signal_id=sid, idempotency_key="k200", channel_id=100, message_id=200, symbol="BTCUSDT", side="buy", entry_mode="immediate", requested_quote=Decimal("10"), entry_price=Decimal("100"), trigger_offset_ticks=None, trigger_price=None, tp1_price=Decimal("110"), tp2_price=Decimal("120"), tp1_allocation_pct=Decimal("50"), tp2_allocation_pct=Decimal("100"), sl_price=Decimal("90"), entry_intent_id=iid)
-    main_store.update_trade_fields("tr-conc-main", acquired_base_qty=Decimal("0.1"), acquired_quote_spent=Decimal("10"), avg_entry_price=Decimal("100"))
-    # Now two concurrent attempts for same BTCUSDT should both be rejected (active trade exists)
-    t1 = threading.Thread(target=attempt, args=(201,))
-    t2 = threading.Thread(target=attempt, args=(202,))
-    t1.start(); t2.start(); t1.join(); t2.join()
-    # At most one could be admitted — but since main already occupies, both should be rejected
-    admitted = [r for r in results if r[1] and r[2] != "rejected"]
-    assert len(admitted) == 0, f"both concurrent same-symbol should be rejected when active trade exists, got {results}"
+    errors = []
+    def attempt(mid, delay=0):
+        try:
+            cfg2 = AppConfig(api_id=12345, api_hash="a"*32, data_dir=cfg.data_dir, db_path=cfg.db_path, session_path=cfg.session_path)
+            cfg2.trading.mode = "live"
+            cfg2.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+            db2 = Database(cfg2.db_path)
+            repo2 = Repository(db2)
+            client = SpyMexc()
+            store2 = TradeStore(db2, cfg2.trading, now=lambda: NOW)
+            store2.set_app_state_once("trading.activation_boundary_message_id", "0")
+            tm2 = TradeManager(cfg2.trading, store2, now=lambda: NOW)
+            engine2 = TradingEngine(cfg2, repo2, client=client, now=lambda: NOW, trade_manager=tm2)
+            tm2.engine = engine2
+            engine2.store = store2
+            barrier.wait(timeout=5)
+            if delay:
+                import time as _t; _t.sleep(delay)
+            rec = _store(repo2, mid, COMPLETE, source="live")
+            item = _item(100, mid)
+            res = engine2.process_item(item, rec)
+            results.append((mid, res))
+            db2.close()
+        except Exception as e:
+            errors.append((mid, repr(e)))
+    t1 = threading.Thread(target=attempt, args=(201, 0))
+    t2 = threading.Thread(target=attempt, args=(202, 0.01))
+    t1.start(); t2.start(); t1.join(timeout=10); t2.join(timeout=10)
+    assert not errors, f"concurrency threads raised: {errors}"
+    assert len(results) == 2, f"expected 2 results, got {results} errors {errors}"
+    all_trades = repo.db.conn.execute("SELECT count(*) as c FROM trades WHERE symbol='BTCUSDT'").fetchone()["c"]
+    rows = list(repo.db.conn.execute("SELECT trade_id, trade_state FROM trades WHERE symbol='BTCUSDT'").fetchall())
+    assert all_trades == 1, f"exactly one BTCUSDT trade should be persisted, got {all_trades} trades: {rows}"
+    sigs = list(repo.db.conn.execute("SELECT message_id, status, rejection_reason FROM signals WHERE channel_id=100 AND message_id IN (201,202) ORDER BY message_id").fetchall())
+    rejected_sigs = [s for s in sigs if s["status"] == "rejected"]
+    assert len(rejected_sigs) == 1, f"exactly one concurrent signal should be rejected for conflict, got sigs={sigs} results={results}"
+    assert "conflict" in rejected_sigs[0]["rejection_reason"].lower() or "already has an active trade" in rejected_sigs[0]["rejection_reason"].lower()
+    assert repo.db.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal", "DB must be in WAL mode for concurrent BEGIN IMMEDIATE"
+    engine3, _, store3 = _engine_with_tm(cfg, repo, SpyMexc())
+    rec3 = _store(repo, 203, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120", source="live")
+    res3 = engine3.process_item(_item(100, 203), rec3)
+    assert res3 is not None, f"different symbol should be admitted, got {res3}"
+    store_fail = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
+    orig = store_fail.has_active_trade_for_symbol
+    def failing(sym):
+        raise RuntimeError("simulated DB failure")
+    store_fail.has_active_trade_for_symbol = failing  # type: ignore
+    engine_fail = TradingEngine(cfg, repo, client=SpyMexc(), now=lambda: NOW, trade_manager=TradeManager(cfg.trading, store_fail, now=lambda: NOW))
+    engine_fail.store = store_fail
+    rec_fail = _store(repo, 204, COMPLETE, source="live")
+    res_fail = engine_fail.process_item(_item(100, 204), rec_fail)
+    assert res_fail is None, "DB failure must fail closed (no BUY)"
+    sig_fail = repo.db.conn.execute("SELECT status FROM signals WHERE channel_id=100 AND message_id=204").fetchone()
+    assert sig_fail["status"] == "rejected"
+    store_fail.has_active_trade_for_symbol = orig
+
 
 
 def test_per_symbol_different_symbols_proceed_independently(cfg, repo):
