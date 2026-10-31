@@ -93,12 +93,14 @@ journalctl -u tg-ingest.service -f
   reconciled, never blindly resubmitted.
 - Live mode requires `mode = "live"` plus `live_enabled_token`; the default is
   `sim`. See `docs/operations.md`.
-- The optional single-owner Telegram control bot defaults to human approval.
-  It authenticates the personal session, verifies MEXC permissions, selects the
-  channel, teaches from five confirmed examples, and presents nonce-bound,
-  expiring approvals. It never enables trading, withdrawals, futures, or
-  automatic mode by itself. Automatic mode requires a two-step confirmation and
-  is cleared on every process restart. See `docs/CONTROL_BOT_FA.md`.
+- The optional Telegram control bot defaults to human approval. It authenticates
+  the personal session, verifies MEXC permissions, selects the channel, teaches
+  from five confirmed examples, and presents nonce-bound, expiring approvals.
+  Both the configured owner and the configured developer have owner-equivalent
+  access to every control-bot command and administrative action. It never enables
+  trading, withdrawals, futures, or automatic mode by itself. Automatic mode
+  requires a two-step confirmation and is cleared on every process restart. See
+  `docs/CONTROL_BOT_FA.md`.
 - The `manage` bot authorizes exactly two numeric operators (owner and
   developer), lists channels, and previews the latest ten messages read-only.
   It can also store one bounded sample of 10/25/50 messages after a developer

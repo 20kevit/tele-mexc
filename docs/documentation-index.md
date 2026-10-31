@@ -29,7 +29,7 @@ When a document contradicts executable code, the code wins; fix the document.
 | Document | Audience | Covers | Status |
 | --- | --- | --- | --- |
 | `docs/SIGNAL_ANALYSIS.md` | Operators, developers | Offline replay, parser candidates, human review, corpus checks (no trading) | Current; non-trading pipeline |
-| `docs/CONTROL_BOT_FA.md` | Owner (Persian) | Legacy single-owner `control` bot, MEXC key storage, safe run | Current; bot is separate from `serve` |
+| `docs/CONTROL_BOT_FA.md` | Owner and developer (Persian) | Legacy single-owner `control` bot, MEXC key storage, safe run | Current; bot is separate from `serve` |
 | `docs/MANAGEMENT_BOT_FA.md` | Owner and developer (Persian) | Two-operator `manage` bot, channel preview, bounded validation sample | Current; data-only |
 | `docs/LIVE_VERIFICATION.md` | Owner | Manual one-time Telegram integration check with real credentials | Manual procedure, not automated |
 | `docs/OPERATIONS.md` | — | Compatibility redirect to `docs/operations.md` | Redirect only; do not extend |

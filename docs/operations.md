@@ -202,8 +202,10 @@ MEXC client, risk engine, or orders. UI details:
 This owner controller is **not embedded in `serve`**. `serve` reuses only its Bot
 API client to deliver trading notifications. `control run` runs the controller
 alone, takes `<db>.control.lock`, and performs no ingestion/backfill. Do not run
-it alongside `serve` in normal operation. Owner guide:
-`docs/CONTROL_BOT_FA.md`.
+it alongside `serve` in normal operation. Authorization covers both the configured
+owner (`CONTROL_OWNER_USER_ID`) and the configured developer
+(`CONTROL_DEVELOPER_USER_ID`) with owner-equivalent access to every control-bot
+command and administrative action. Owner guide: `docs/CONTROL_BOT_FA.md`.
 
 ### Offline analysis
 

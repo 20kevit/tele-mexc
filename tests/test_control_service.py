@@ -10,6 +10,8 @@ from tg_signal_ingest.control.store import ControlStore
 from tg_signal_ingest.normalize import message_to_record
 
 OWNER = 4242
+DEVELOPER = 7777
+STRANGER = 999
 CHANNEL = -1001234567890
 
 
@@ -623,3 +625,92 @@ async def test_auto_mode_is_refused_without_owner_fixed_amount(cfg, repo):
     await control.handle_update(_callback(100, "m:auto"))
     assert store.setup()["execution_mode"] == "approval"
     assert "مبلغ" in fake.sent[-1]["text"]
+
+
+def _bot_with_developer(cfg, repo, probe=("valid", "Owner")) -> tuple[ControlBot, FakeBot, FakeEngine]:
+    cfg.control.owner_user_id = OWNER
+    cfg.control.developer_user_id = DEVELOPER
+    cfg.control.secret_key = "test-control-secret"
+    fake = FakeBot()
+    control = ControlBot(cfg, repo, fake, probe_override=lambda: probe)
+    engine = FakeEngine(repo)
+    control.attach_engine(engine)
+    return control, fake, engine
+
+
+async def test_developer_receives_owner_equivalent_start_and_version(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+
+    # Developer /start is accepted (not rejected) and shows system status.
+    await control.handle_update(_message(1, "/start", user=DEVELOPER))
+    text = fake.sent[-1]["text"]
+    assert "دسترسی مجاز نیست" not in text
+    assert "وضعیت سیستم" in text
+
+    # Developer /version is accepted and returns runtime info.
+    await control.handle_update(_message(2, "/version", user=DEVELOPER))
+    text = fake.sent[-1]["text"]
+    assert "دسترسی مجاز نیست" not in text
+    assert "نسخه اجرا" in text
+
+
+async def test_developer_can_pause_and_resume(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+
+    # Developer can pause execution.
+    await control.handle_update(_callback(100, "m:pause", user=DEVELOPER))
+    assert int(store.setup()["paused"]) == 1
+    assert store.setup()["execution_mode"] == "approval"
+
+    # Developer can resume execution.
+    await control.handle_update(_callback(101, "m:resume", user=DEVELOPER))
+    assert int(store.setup()["paused"]) == 0
+
+
+async def test_stranger_remains_blocked_for_all_control_commands(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+
+    for command in ("/start", "/status", "/version", "/pause", "/resume", "/help"):
+        await control.handle_update(_message(10, command, user=STRANGER))
+        assert "دسترسی مجاز نیست" in fake.sent[-1]["text"], command
+
+    # Stranger callbacks are rejected too: answered but no status message sent.
+    before = len(fake.sent)
+    await control.handle_update(_callback(20, "m:status", user=STRANGER))
+    assert fake.answered[-1] == "cb-20"
+    assert len(fake.sent) == before  # no state-changing response to a stranger
+
+
+async def test_owner_still_authorized_after_developer_added(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+
+    # Owner access is preserved alongside the developer.
+    await control.handle_update(_message(1, "/start", user=OWNER))
+    assert "دسترسی مجاز نیست" not in fake.sent[-1]["text"]
+    assert "وضعیت سیستم" in fake.sent[-1]["text"]
+
+    await control.handle_update(_callback(2, "m:pause", user=OWNER))
+    assert int(store.setup()["paused"]) == 1
+
+
+async def test_developer_is_blocked_when_not_configured(cfg, repo):
+    """If CONTROL_DEVELOPER_USER_ID is not set, only the owner is authorized."""
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)  # owner only, developer not set
+
+    await control.handle_update(_message(1, "/start", user=DEVELOPER))
+    assert "دسترسی مجاز نیست" in fake.sent[-1]["text"]
