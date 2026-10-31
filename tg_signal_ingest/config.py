@@ -79,7 +79,10 @@ class TradingConfig:
     allowlist_mode: str = "deny"  # "deny" until user sets explicit allowlist
     max_signal_age_s: float = 900.0  # reject signals older than this
     max_price_deviation_pct: float = 1.0  # vs reference price at decision time
-    require_stop_loss: bool = True  # reject alerts without an explicit SL
+    require_stop_loss: bool = True  # mandatory SL enforced at risk boundary per 2026-10-31 owner strategy
+    require_tp1: bool = True  # mandatory TP1 enforced at risk boundary
+    require_tp2: bool = True  # mandatory TP2 enforced at risk boundary
+    enforce_price_relationship: bool = True  # enforce SL < Entry < TP1 <= TP2 for LONG
     order_type_policy: str = "limit"  # "limit" | "market"; market requires explicit config
     remaining_balance_reserve_pct: float = 20.0  # reserve when spending an asset
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
@@ -122,6 +125,9 @@ class TradingConfig:
             "max_signal_age_s": self.max_signal_age_s,
             "max_price_deviation_pct": self.max_price_deviation_pct,
             "require_stop_loss": self.require_stop_loss,
+            "require_tp1": self.require_tp1,
+            "require_tp2": self.require_tp2,
+            "enforce_price_relationship": self.enforce_price_relationship,
             "order_type_policy": self.order_type_policy,
             "remaining_balance_reserve_pct": self.remaining_balance_reserve_pct,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,

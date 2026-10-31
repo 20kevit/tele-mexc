@@ -329,6 +329,56 @@ class TradeStore(TradingStore):
         rows = self.db.conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    # ── Per-symbol concurrency (owner-confirmed §3.2) ──────────────
+
+    CONFLICTING_TRADE_STATES: tuple[str, ...] = (
+        "pending_entry",
+        "entry_active",
+        "position_open",
+        "oco_submitting",
+        "oco_active",
+        "oco_partial",
+        "tp1_active",
+        "tp1_completed",
+        "tp2_active",
+        "stop_loss_executing",
+        "exit_pending",
+        "needs_reconciliation",
+    )
+    """Any non-terminal bot-owned trade for the same symbol blocks a new BUY.
+
+    Terminal states ``closed`` and ``tp2_completed`` do not conflict.
+    ``needs_reconciliation`` is treated as conflicting because protection is
+    unverified — a new overlapping trade could oversell or confuse
+    reconciliation.
+    """
+
+    def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Return the first conflicting trade for *symbol*, or None.
+
+        The check is durability-first: it queries persisted ``trades`` rows
+        inside the same DB that drives intent creation, so it is safe across
+        restarts and multiple workers.  Callers should hold the engine's
+        ``Database.transaction()`` + intent-creation lock, or be prepared for
+        a TOCTOU reconciliation guard downstream.
+        """
+        if not symbol:
+            return None
+        rows = self.db.conn.execute(
+            "SELECT * FROM trades WHERE symbol = ? ORDER BY updated_at DESC LIMIT 20",
+            (symbol,),
+        ).fetchall()
+        for row in rows:
+            state = row["trade_state"] if isinstance(row, dict) or hasattr(row, "__getitem__") else None
+            # sqlite Row → dict-like
+            try:
+                state = row["trade_state"]  # type: ignore[index]
+            except Exception:
+                state = dict(row).get("trade_state")  # fallback
+            if state in self.CONFLICTING_TRADE_STATES:
+                return dict(row)
+        return None
+
     def transition_trade_order(
         self,
         trade_order_id: str,

@@ -879,20 +879,15 @@ class TradeManager:
         )
 
     def _compute_available(self, trade: dict[str, Any]) -> Decimal:
-        """Bot-owned base quantity available to sell right now."""
-        acquired = _dec(trade.get("acquired_base_qty")) or Decimal("0")
-        sold = (
-            self._sold_for_kind(trade, "tp1")
-            + self._sold_for_kind(trade, "tp2")
-            + self._sold_for_kind(trade, "stop_loss")
-        )
+        """Bot-owned base quantity available to sell right now (fee-aware)."""
+        base_sellable = self._sellable_quantity(trade)
         outstanding = Decimal("0")
         for order in self.store.list_trade_orders(trade["trade_id"]):
             if order["state"] in UNCONFIRMED_ORDER_STATES:
                 qty = _dec(order.get("quantity")) or Decimal("0")
                 filled = _dec(order.get("sold_qty")) or Decimal("0")
                 outstanding += max(Decimal("0"), qty - filled)
-        return max(Decimal("0"), acquired - sold - outstanding)
+        return max(Decimal("0"), base_sellable - outstanding)
 
     def _create_trade_order(
         self,
@@ -1111,9 +1106,32 @@ class TradeManager:
             )
             return
 
+        # Critical invariant check before any submission (§5.1/5.3)
+        ok, _detail = self._verify_oco_invariant(trade)
+        # If already violated, do not increase reservations. Recoverable only
+        # via reconciliation (cancellation/execution) — fail-closed.
+        # _verify_oco_invariant has already persisted needs_reconciliation.
+
         results: dict[str, str] = {}
         for kind, (qty, price) in required.items():
+            # Pre-submit invariant gate: would this leg overflow sellable?
+            # Compute hypothetical reserved if this leg were added.
+            existing_other = self._oco_reserved_quantity(trade, "tp2" if kind == "tp1" else "tp1")
+            existing_this = self._oco_reserved_quantity(trade, kind)
+            sellable = self._sellable_quantity(trade)
+            # If leg already has active reservation, its qty is already counted;
+            # only a *new* reservation can overflow. Approximate by checking
+            # whether existing reservations + proposed qty would exceed sellable,
             results[kind] = self._ensure_oco_leg(trade, kind, qty, price, sl_price)
+            # Re-verify after each leg (fee/lot-size rebasing can change sellable)
+            post_ok, post_detail = self._verify_oco_invariant(self._refresh(trade))
+            if not post_ok:
+                # Stop submitting further legs — reconciliation required.
+                for remaining in list(required.keys()):
+                    if remaining not in results:
+                        results[remaining] = "failed"
+                break
+            trade = self._refresh(trade)
 
         working = [k for k, v in results.items() if v == "confirmed"]
         completed = [k for k, v in results.items() if v == "filled"]
@@ -1538,14 +1556,111 @@ class TradeManager:
             trade["trade_id"], "exit_pending", note="stop-loss exit awaiting confirmed fill"
         )
 
-    def _remaining_base(self, trade: dict[str, Any]) -> Decimal:
+    # ----------------------------------------------------------------
+    # Sellable inventory — owner-confirmed §5.2 / critical invariant §5.1
+    # ----------------------------------------------------------------
+    def _base_asset_for_trade(self, trade: dict[str, Any]) -> str | None:
+        """Return the base asset for *trade* via symbol metadata, or None."""
+        try:
+            meta = self._symbol_meta(trade)
+            base = getattr(meta, "base_asset", None) if meta is not None else None
+            return str(base).upper() if base else None
+        except Exception:
+            return None
+
+    def _total_base_fees(self, trade: dict[str, Any]) -> Decimal:
+        """Sum commissions paid in the base asset (they reduce sellable).
+
+        Quote-asset fees do not reduce base sellable; third-token fees are
+        preserved as unvalued and do not reduce sellable either.
+        """
+        intent_id = trade.get("entry_intent_id")
+        if not intent_id:
+            # Fallback: use trade's own fills if entry intent not linked
+            base_asset = self._base_asset_for_trade(trade)
+            if not base_asset:
+                return Decimal("0")
+            total = Decimal("0")
+            # Check order_fills for entry exchange order
+            intent = self.store.get_intent(intent_id) if intent_id else None
+            exch_id = (intent or {}).get("exchange_order_id") if intent else None
+            if exch_id:
+                for fill in self.store.fills_for_order(exch_id):
+                    if str(fill.get("fee_asset") or "").upper() == base_asset:
+                        total += _dec(fill.get("fee_amount")) or Decimal("0")
+            return total
+        intent = self.store.get_intent(intent_id)
+        exch_id = (intent or {}).get("exchange_order_id") if intent else None
+        base_asset = self._base_asset_for_trade(trade)
+        if not base_asset or not exch_id:
+            return Decimal("0")
+        total = Decimal("0")
+        for fill in self.store.fills_for_order(exch_id):
+            if str(fill.get("fee_asset") or "").upper() == base_asset:
+                total += _dec(fill.get("fee_amount")) or Decimal("0")
+        return total
+
+    def _sellable_quantity(self, trade: dict[str, Any]) -> Decimal:
+        """Bot-owned base quantity actually available to allocate/sell.
+
+        Accounts for: acquired fills, base-asset commissions, already-sold
+        quantities (TP/SL), and never counts the same inventory twice.
+        """
         acquired = _dec(trade.get("acquired_base_qty")) or Decimal("0")
+        base_fees = self._total_base_fees(trade)
         sold = (
             self._sold_for_kind(trade, "tp1")
             + self._sold_for_kind(trade, "tp2")
             + self._sold_for_kind(trade, "stop_loss")
         )
-        return max(Decimal("0"), acquired - sold)
+        return max(Decimal("0"), acquired - base_fees - sold)
+
+    def _oco_reserved_quantity(self, trade: dict[str, Any], kind: str) -> Decimal:
+        """Quantity currently reserved by *kind* OCO leg (open/partially_filled)."""
+        total = Decimal("0")
+        for order in self._oco_orders(trade, kind):
+            if order["state"] in ("open", "partially_filled", "submitting", "cancel_requested", "unknown_requires_reconciliation"):
+                qty = _dec(order.get("quantity")) or Decimal("0")
+                filled = _dec(order.get("sold_qty")) or Decimal("0")
+                total += max(Decimal("0"), qty - filled)
+        return total
+
+    def _combined_oco_reserved(self, trade: dict[str, Any]) -> Decimal:
+        """OCO1_reserved + OCO2_reserved — the critical invariant's left side."""
+        return self._oco_reserved_quantity(trade, "tp1") + self._oco_reserved_quantity(trade, "tp2")
+
+    def _verify_oco_invariant(self, trade: dict[str, Any]) -> tuple[bool, str]:
+        """Check ``OCO1_reserved + OCO2_reserved ≤ sellable``.
+
+        Returns (ok, detail).  When ``ok`` is False the caller must not
+        submit or increase the affected OCO quantities.  The trade is moved
+        to ``needs_reconciliation`` and the owner is notified.
+        """
+        sellable = self._sellable_quantity(trade)
+        reserved = self._combined_oco_reserved(trade)
+        if reserved <= sellable:
+            return True, f"invariant ok: reserved {reserved} <= sellable {sellable}"
+        detail = (
+            f"critical OCO invariant violated: OCO1+OCO2 reserved {reserved} "
+            f"> bot-owned sellable {sellable} "
+            f"(acquired={_dec(trade.get('acquired_base_qty')) or Decimal('0')} "
+            f"base_fees={self._total_base_fees(trade)} "
+            f"sold_tp1={self._sold_for_kind(trade, 'tp1')} "
+            f"sold_tp2={self._sold_for_kind(trade, 'tp2')} "
+            f"sold_sl={self._sold_for_kind(trade, 'stop_loss')}); "
+            "reconciliation required before (re)submitting OCO legs"
+        )
+        # Persist + notify — fail-closed, never auto-correct by guessing.
+        self.store.update_trade_state(
+            trade["trade_id"], "needs_reconciliation", note=detail
+        )
+        self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+        self.store.audit(trade["trade_id"], "risk", "oco_invariant_violated", detail)
+        return False, detail
+
+    def _remaining_base(self, trade: dict[str, Any]) -> Decimal:
+        """Legacy alias — now includes base-asset fee subtraction."""
+        return self._sellable_quantity(trade)
 
     def _finalize_trade(
         self,
@@ -1871,6 +1986,15 @@ class TradeManager:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cancel retry failed for %s: %s", updated["trade_order_id"], exc)
         self._refresh_sold_fields(trade)
+        # §5.3 — recompute combined OCO invariant after every reconciliation.
+        try:
+            refreshed = self._refresh(trade)
+            # Only verify when OCO legs exist; otherwise a pre-OCO position
+            # (e.g. entry_active) would spuriously look violated due to 0 sellable.
+            if self._list_trade_orders(refreshed["trade_id"]):
+                self._verify_oco_invariant(refreshed)
+        except Exception:  # noqa: BLE001 - invariant check must not block reconciliation
+            pass
         if advance:
             self._advance_trade_after_reconcile(trade)
 

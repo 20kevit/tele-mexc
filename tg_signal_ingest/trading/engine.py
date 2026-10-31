@@ -268,6 +268,39 @@ class TradingEngine:
             self._notify_rejected(signal_id, parsed, decision.reason, record=record)
             return None
 
+        # ── Per-symbol concurrency (§3.2) ────────────────────────────
+        # A new BUY for a symbol that already has a non-terminal bot-owned
+        # trade/intent must not be admitted.  Unrelated symbols are never
+        # blocked.  This runs *after* the mandatory risk boundary so every
+        # rejection has a precise, auditable reason and the check is durable
+        # across restarts.
+        if parsed.symbol:
+            # Prefer the precise trade-level check when a TradeStore is in use.
+            has_trade_check = getattr(self.store, "has_active_trade_for_symbol", None)
+            has_intent_check = getattr(self.store, "has_active_intent_for_symbol", None)
+            conflicting: dict[str, Any] | None = None
+            if callable(has_trade_check):
+                try:
+                    conflicting = has_trade_check(parsed.symbol)
+                except Exception:
+                    conflicting = None
+                if conflicting is not None:
+                    reason = (
+                        f"per-symbol concurrency: {parsed.symbol} already has an active trade "
+                        f"{conflicting.get('trade_id')} in state {conflicting.get('trade_state')}; "
+                        "overlapping BUY not admitted"
+                    )
+                    self.store.update_signal(signal_id, "rejected", reason)
+                    self.store.audit(signal_id, "lifecycle", "rejected_symbol_conflict", reason)
+                    self._notify_rejected(signal_id, parsed, reason, record=record)
+                    return None
+            # Fallback intent check is deliberately omitted: §3.2 per-symbol
+            # concurrency is defined over durable *trades* (non-terminal trade
+            # states), not over transient intents.  Quote-balance overspend is
+            # covered by §3.3 (outstanding_balance_usage + trading_budget_ledger)
+            # and is tested independently (same-symbol intents share outstanding
+            # quote).  Blocking on intents would mask those balance semantics.
+
         quantized = self._quantize_decision(decision, meta, parsed.action or "")
         if quantized is None:
             reason = "quantized order violates symbol constraints"

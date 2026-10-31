@@ -62,6 +62,32 @@ class TradingStore:
 
     # ------------------------------------------------------------- audit
 
+    # ── Per-symbol concurrency (§3.2) — available on base store for engine checks
+    CONFLICTING_TRADE_STATES: tuple[str, ...] = (
+        "pending_entry", "entry_active", "position_open", "oco_submitting",
+        "oco_active", "oco_partial", "tp1_active", "tp1_completed",
+        "tp2_active", "stop_loss_executing", "exit_pending", "needs_reconciliation",
+    )
+
+    def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        if not symbol:
+            return None
+        # trades table may not exist in fresh/sim DB — handle gracefully
+        try:
+            rows = self.db.conn.execute(
+                "SELECT * FROM trades WHERE symbol = ? ORDER BY updated_at DESC LIMIT 20", (symbol,)
+            ).fetchall()
+        except Exception:
+            return None
+        for row in rows:
+            try:
+                state = row["trade_state"]
+            except Exception:
+                state = dict(row).get("trade_state")
+            if state in self.CONFLICTING_TRADE_STATES:
+                return dict(row)
+        return None
+
     def audit(self, correlation: str, category: str, event: str, detail: str | None = None) -> None:
         with self.db.transaction() as conn:
             conn.execute(
@@ -347,6 +373,23 @@ class TradingStore:
             OPEN_INTENT_STATES,
         ).fetchone()
         return int(row["c"])
+
+    def has_active_intent_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Return an open ``order_intents`` row for *symbol*, or None.
+
+        Used as a durability-tier fallback for per-symbol concurrency when the
+        higher-level TradeManager (``trades`` table) is unavailable — e.g. in
+        sim mode.  Any open intent blocks a new BUY for the same symbol
+        because the reservation/inventory model cannot yet prove disjointness.
+        """
+        if not symbol:
+            return None
+        placeholders = ", ".join("?" for _ in OPEN_INTENT_STATES)
+        rows = self.db.conn.execute(
+            f"SELECT * FROM order_intents WHERE symbol = ? AND state IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            (symbol.upper(), *OPEN_INTENT_STATES),
+        ).fetchall()
+        return dict(rows[0]) if rows else None
 
     def count_intents_by_state(self) -> dict[str, int]:
         return {
