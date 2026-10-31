@@ -386,10 +386,42 @@ class MexcSpotClient:
         """Execute one REST call; returns parsed JSON. Sync; run via to_thread."""
 
         method = method.upper()
+        if method == "DELETE" and bucket != "order":
+            # Cancellations always belong to the shared order bucket.
+            bucket = "order"
         out_params = {k: v for k, v in dict(params or {}).items() if v is not None}
-
         if signed:
             self._require_credentials()
+
+        # Wait for any Retry-After backoff and the shared rate bucket *before*
+        # stamping the request.  The gate can legitimately sleep for a full
+        # 10-second window; a timestamp taken earlier would then be outside
+        # recvWindow (700003) even though the host clock is correct.
+        self._await_backoff()
+        if bucket == "order":
+            # Official POST/DELETE order bucket: 12 requests/second per UID.
+            self.order_gate.acquire(1)
+        else:
+            limit_kind, weight = ENDPOINT_RULES.get(
+                (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
+            )
+            try:
+                if limit_kind == "uid":
+                    self.uid_gate.acquire(weight)
+                else:
+                    self.general_gate.acquire(weight)
+                    if signed:
+                        # Signed endpoints are also account-scoped; tracking the
+                        # separate UID budget is conservative against the docs'
+                        # per-endpoint IP/UID wording change.
+                        self.uid_gate.acquire(1)
+            except ValueError as exc:
+                raise MexcConfigError(
+                    f"configured rate budget is too small for {method} {path} "
+                    f"(weight {weight}): {exc}"
+                ) from exc
+
+        if signed:
             out_params.setdefault("recvWindow", self.recv_window_ms)
             out_params["timestamp"] = self._clock()
 
@@ -417,30 +449,6 @@ class MexcSpotClient:
         if body is not None:
             # Official docs: raw key=value&... body, not a JSON object.
             headers["Content-Type"] = "application/json"
-
-        self._await_backoff()
-        if bucket == "order":
-            # Official POST/DELETE order bucket: 12 requests/second per UID.
-            self.order_gate.acquire(1)
-        else:
-            limit_kind, weight = ENDPOINT_RULES.get(
-                (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
-            )
-            try:
-                if limit_kind == "uid":
-                    self.uid_gate.acquire(weight)
-                else:
-                    self.general_gate.acquire(weight)
-                    if signed:
-                        # Signed endpoints are also account-scoped; tracking the
-                        # separate UID budget is conservative against the docs'
-                        # per-endpoint IP/UID wording change.
-                        self.uid_gate.acquire(1)
-            except ValueError as exc:
-                raise MexcConfigError(
-                    f"configured rate budget is too small for {method} {path} "
-                    f"(weight {weight}): {exc}"
-                ) from exc
 
         started = time.monotonic()
         timeout = (timeout_override or self.request_timeout_s) + self.connect_timeout_s

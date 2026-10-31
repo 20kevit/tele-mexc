@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from decimal import Decimal
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -13,6 +14,7 @@ from tg_signal_ingest.mexc import (
     MexcOrderNotFound,
     MexcRateLimitError,
     MexcSpotClient,
+    MexcTimestampError,
     MexcWafError,
     SharedWeightedRateGate,
     WeightedRateGate,
@@ -90,6 +92,54 @@ def test_signed_post_body_uses_raw_parameter_string():
     assert call["body"] == expected
     assert call["headers"]["Content-Type"] == "application/json"
     assert b"{" not in call["body"]
+
+
+def test_timestamp_error_is_classified_and_not_retried_by_the_client():
+    transport = Transport(
+        status=400,
+        payload={"code": 700003, "msg": "Timestamp for this request is outside of the recvWindow"},
+    )
+
+    with pytest.raises(MexcTimestampError) as excinfo:
+        _client(transport).account()
+
+    assert excinfo.value.code == 700003
+    assert len(transport.calls) == 1  # retry policy belongs to the caller
+
+
+def test_signed_timestamp_is_stamped_after_the_rate_gate_wait():
+    now = [1_700_000_000.0]
+
+    class DelayingGate(WeightedRateGate):
+        def __init__(self):
+            super().__init__(1000, 10.0, sleep=lambda _s: None)
+
+        def acquire(self, weight: int = 1) -> None:
+            now[0] += 9.0  # simulate a nearly full 10-second shared window
+
+    transport = Transport(payload={})
+    client = MexcSpotClient(
+        API_KEY,
+        API_SECRET,
+        transport=transport,
+        clock=lambda: int(now[0] * 1000),
+        general_gate=DelayingGate(),
+        uid_gate=WeightedRateGate(1000, 10.0, sleep=lambda _s: None),
+    )
+
+    client.account()
+
+    query = parse_qs(urlparse(transport.calls[0]["url"]).query)
+    stamped = int(query["timestamp"][0])
+    assert stamped == int(now[0] * 1000)
+    assert stamped >= CLOCK_MS + 9_000
+    # The transmitted signature still covers the fresh timestamp.
+    unsigned = "&".join(
+        f"{key}={value[0]}"
+        for key, value in sorted(query.items())
+        if key != "signature"
+    )
+    assert query["signature"] == [_sig(unsigned)]
 
 
 def test_429_retry_after_is_exposed_never_retried():
