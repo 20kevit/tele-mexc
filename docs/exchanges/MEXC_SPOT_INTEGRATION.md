@@ -84,7 +84,7 @@ validates:
    leave an untracked submission.
 
 There is no daily/open-order cap, signal-age limit, price-deviation rejection,
-mandatory stop-loss check, or manual symbol allowlist.
+mandatory stop-loss check. No operator-maintained symbol allowlist is used; MEXC market metadata and exchange filters still validate each symbol.
 
 ## 5. Order-lifecycle state reconciliation
 
@@ -107,7 +107,7 @@ open/filled/canceled_local/rejected/failed/unknown_requires_reconciliation`
 | Duplicate source | Prevention |
 | --- | --- |
 | Re-ingested/edited same message | Intent uniqueness on the message-identity key (`intent_by_idempotency`) |
-| Repeated approval clicks | Intent state must be `planned`; execution is single-transition |
+| Duplicate/replayed deliveries | Intent state must be `planned`; atomic submission claim is single-transition |
 | Resubmission after timeout | Forbidden: ambiguous outcomes never re-submit, they reconcile |
 | Parallel processes | SQLite transitions + unique exchange-order upsert keys |
 
@@ -126,7 +126,7 @@ silent drops are possible because intents are write-ahead.
 
 ## 8. Sync vs worker responsibilities
 
-- **Synchronous** (short, human-paced): intent creation, approval + execution
+- **Synchronous** (short): intent creation and submission claim
   (single REST call), cancel, single reconcile.
 - **Worker/polling** (`serve` loop): reconciliation of
   `unknown/open/reconciling` intents every `recon_interval_s` (≥ 5 s,

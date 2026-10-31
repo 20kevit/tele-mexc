@@ -104,12 +104,9 @@ class FakeEngine:
             "cumulative_quote": "10",
         }
 
-    def execute_approved_intent(self, intent_id):
+    def execute_intent(self, intent_id):
         self.executed.append(intent_id)
         return dict(self.result)
-
-    def balance_check(self, _intent):
-        return None
 
 
 def _message(update_id: int, text: str, *, user: int = OWNER, message_id: int | None = None):
@@ -147,7 +144,6 @@ def _full_setup(store: ControlStore, *, completed: bool = True) -> None:
         selected_channel_title="Signals",
         learning_state="completed" if completed else "in_progress",
         learning_streak=5 if completed else 0,
-        execution_mode="approval",
     )
     store.refresh_setup_state()
 
@@ -308,7 +304,7 @@ async def test_chat_login_is_disabled_and_stale_challenge_is_discarded(cfg, repo
     assert "12345" not in persisted
 
 
-async def test_learning_requires_five_valid_examples_and_never_enables_trading(cfg, repo):
+async def test_learning_requires_five_valid_examples_before_ready_state(cfg, repo):
     _add_channel(repo)
     for index in range(1, 6):
         repo.upsert_message(
@@ -330,85 +326,22 @@ async def test_learning_requires_five_valid_examples_and_never_enables_trading(c
     setup = store.setup()
     assert setup["learning_streak"] == 5
     assert setup["learning_state"] == "completed"
-    assert setup["execution_mode"] == "approval"
-    assert control.should_require_approval({}) is True
+    assert setup["effective_state"] == "automatic"
 
 
-async def test_no_signal_approval_prompt_is_created(cfg, repo):
-    """Eligible signals are evaluated automatically; tick() must not create
-    per-signal approval prompts."""
+async def test_legacy_order_approval_callback_is_inert_and_tick_is_safe(cfg, repo):
+    """Legacy order-approval callbacks cannot execute orders; tick stays inert."""
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
     _add_intent(repo)
     control, fake, engine = _bot(cfg, repo)
 
+    await control.handle_update(_callback(100, "ap:y:legacy-id:legacy-nonce"))
+    assert engine.executed == []
+    assert store.setup()["effective_state"] == "automatic"
     await control.tick()
-    # No new approval prompt is created for the planned intent.
-    assert store.list_approvals("pending", 1) == []
     assert engine.executed == []
-    assert not any(btn["callback_data"].startswith("ap:y:") for btn in fake.last_buttons())
-
-
-async def test_approval_expiration_does_not_cancel_or_resubmit_intent(cfg, repo):
-    """An expired approval record must never cancel or resubmit an intent.
-    The trading engine owns the intent lifecycle."""
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store)
-    _add_intent(repo)
-    control, fake, engine = _bot(cfg, repo)
-
-    # Manually create a legacy pending approval, then set it to expired.
-    approval, _created = store.create_approval(
-        intent_id="intent-1", signal_id="sig-1",
-        intent_version="v1",
-    )
-    now = datetime.now(UTC)
-    with repo.db.transaction() as conn:
-        conn.execute(
-            "UPDATE control_approvals SET expires_at = ? WHERE approval_id = ?",
-            (
-                (now - timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                approval["approval_id"],
-            ),
-        )
-    await control.tick()  # expire_approvals marks it expired, does not touch intent
-    assert store.get_approval(approval["approval_id"])["status"] == "expired"
-    # Intent state is unchanged: no cancellation, no resubmission.
-    assert engine.store.get_intent("intent-1")["state"] == "planned"
-    assert engine.executed == []
-
-
-async def test_legacy_approval_callback_is_rejected(cfg, repo):
-    """Legacy ap:y:/ap:n: callbacks no longer execute any order."""
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store)
-    _add_intent(repo)
-    control, fake, engine = _bot(cfg, repo)
-
-    await control.handle_update(_callback(100, "ap:y:dummy-approval-id:dummy-nonce"))
-    assert "حذف شد" in fake.sent[-1]["text"] or "حذف است" in fake.sent[-1]["text"]
-    assert engine.executed == []
-
-
-async def test_tick_does_not_create_signal_approval_or_send_timeout(cfg, repo):
-    """The control bot's tick() must not create per-signal approval prompts
-    or send approval-timeout messages.  Signals are auto-executed by the
-    trading engine."""
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store)
-    _add_intent(repo)
-    control, fake, engine = _bot(cfg, repo)
-
-    before_sent = len(fake.sent)
-    await control.tick()
-    # No new messages (no approval prompt, no timeout).
-    assert len(fake.sent) == before_sent
-    # No approval records created.
-    assert store.list_approvals("pending", 1) == []
 
 
 async def test_version_command_reports_runtime_info(cfg, repo):
@@ -443,66 +376,17 @@ async def test_version_command_is_owner_only(cfg, repo):
     assert "دسترسی مجاز نیست" in fake.sent[-1]["text"]
 
 
-async def test_auto_mode_toggle_is_administrative_control(cfg, repo):
-    """Auto-mode enable/disable remains a genuine administrative control,
-    separate from per-signal approval."""
-    cfg.trading.order_quote_amount = 10.0
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store)
-    control, fake, engine = _bot(cfg, repo)
-
-    assert store.setup()["execution_mode"] == "approval"
-    assert control.should_require_approval({}) is True
-
-    await control.handle_update(_callback(100, "m:auto"))
-    await control.handle_update(_callback(101, "m:auto2"))
-    assert store.setup()["execution_mode"] == "auto"
-    assert control.should_require_approval({}) is False
-
-    await control.handle_update(_callback(102, "m:manual"))
-    assert store.setup()["execution_mode"] == "approval"
-
-
-async def test_auto_mode_requires_two_steps_and_restart_clears_it(cfg, repo):
-    cfg.trading.order_quote_amount = 10.0
+async def test_pause_and_resume_are_administrative_controls(cfg, repo):
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
     control, _fake, _engine = _bot(cfg, repo)
 
-    await control.handle_update(_callback(100, "m:auto"))
-    assert store.setup()["execution_mode"] == "approval"
-    assert control.should_require_approval({}) is True
-
-    await control.handle_update(_callback(101, "m:auto2"))
-    assert store.setup()["execution_mode"] == "auto"
-    assert control.should_require_approval({}) is False
-
-    await control.handle_update(_callback(102, "m:pause"))
-    assert store.setup()["execution_mode"] == "approval"
-    assert int(store.setup()["paused"]) == 1
-    assert control.should_require_approval({}) is True
-    await control.handle_update(_callback(103, "m:auto2"))
-    assert store.setup()["execution_mode"] == "approval"
-
-    store.update_setup(paused=0, execution_mode="auto")
-    store.refresh_setup_state()
-    restarted, _fake2, _engine2 = _bot(cfg, repo)
-    assert store.setup()["execution_mode"] == "approval"
-    assert restarted.should_require_approval({}) is True
-
-
-async def test_auto_mode_is_refused_until_learning_and_mexc_are_ready(cfg, repo):
-    cfg.trading.order_quote_amount = 10.0
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store, completed=False)
-    control, fake, _engine = _bot(cfg, repo)
-
-    await control.handle_update(_callback(100, "m:auto"))
-    assert store.setup()["execution_mode"] == "approval"
-    assert "پنج نمونه" in fake.sent[-1]["text"]
+    assert store.setup()["effective_state"] == "automatic"
+    await control.handle_update(_callback(100, "m:pause"))
+    assert store.setup()["effective_state"] == "paused"
+    await control.handle_update(_callback(101, "m:resume"))
+    assert store.setup()["effective_state"] == "automatic"
 
 
 def test_control_status_cli_is_offline_and_redacts_secrets(cfg, repo, monkeypatch, capsys):
@@ -517,10 +401,11 @@ def test_control_status_cli_is_offline_and_redacts_secrets(cfg, repo, monkeypatc
 
     assert main_module.cmd_control_status(None) == 0
     out = capsys.readouterr().out
-    assert "state: ready" in out
+    assert "state: automatic" in out
     assert f"owner user id: {OWNER}" in out
     assert "bot token: set" in out
-    assert "pending approvals: 0" in out
+    assert "execution paused: False" in out
+    assert "valid signals execute automatically" in out
     assert "very-secret-token" not in out
     assert "control-encryption-secret" not in out
 
@@ -598,7 +483,6 @@ async def test_disconnect_requires_explicit_second_confirmation(cfg, repo, monke
     await control.handle_update(_callback(101, "au:disconnect2"))
     assert calls == [1]
     assert store.setup()["telegram_state"] == "unauthenticated"
-    assert store.setup()["execution_mode"] == "approval"
 
 
 def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo):
@@ -613,18 +497,6 @@ def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo):
     assert bot._engine is engine
     assert not hasattr(engine, "approval_gate")
     assert not hasattr(engine, "sizing_provider")
-
-
-async def test_auto_mode_is_refused_without_owner_fixed_amount(cfg, repo):
-    _add_channel(repo)
-    store = ControlStore(repo.db)
-    _full_setup(store)
-    cfg.trading.order_quote_amount = None
-    control, fake, _engine = _bot(cfg, repo)
-
-    await control.handle_update(_callback(100, "m:auto"))
-    assert store.setup()["execution_mode"] == "approval"
-    assert "مبلغ" in fake.sent[-1]["text"]
 
 
 def _bot_with_developer(cfg, repo, probe=("valid", "Owner")) -> tuple[ControlBot, FakeBot, FakeEngine]:
@@ -666,7 +538,7 @@ async def test_developer_can_pause_and_resume(cfg, repo):
     # Developer can pause execution.
     await control.handle_update(_callback(100, "m:pause", user=DEVELOPER))
     assert int(store.setup()["paused"]) == 1
-    assert store.setup()["execution_mode"] == "approval"
+    assert store.setup()["effective_state"] == "paused"
 
     # Developer can resume execution.
     await control.handle_update(_callback(101, "m:resume", user=DEVELOPER))

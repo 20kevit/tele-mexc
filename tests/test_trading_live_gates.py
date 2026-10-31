@@ -217,7 +217,7 @@ def test_emergency_stop_blocks_intent_creation_and_existing_execution(cfg, repo,
     planned = engine2.process_item(_item(100, 2), _store_message(repo, 2))
     assert planned is not None and planned["state"] == "planned"
     cfg.trading.emergency_stop = True
-    rejected = engine2.execute_approved_intent(planned["intent_id"])
+    rejected = engine2.execute_intent(planned["intent_id"])
     assert rejected["state"] == "rejected"
     assert "emergency stop" in (rejected.get("reject_reason") or "")
     assert fake.place_calls == 0 and fake.test_calls == 0

@@ -1,9 +1,8 @@
 """Single-owner Persian control bot for the ingestion/trading process.
 
-The bot is a *controller*, not a trading shortcut: every order still goes
-through the existing intent, risk, balance-preflight, execution and
-reconciliation pipeline. Human approval is the default and is consumed
-atomically.
+The bot manages authentication, channel setup, learning, sizing, notifications,
+and administrative pause/resume. Trading decisions remain in the existing
+intent, risk, balance-preflight, execution, and reconciliation pipeline.
 """
 
 from __future__ import annotations
@@ -99,7 +98,6 @@ class ControlBot:
         self._pending_mexc_started = 0.0
         self._last_tick = 0.0
         self._load_stored_mexc()
-        self._enforce_restart_safety()
 
     def _load_stored_mexc(self) -> None:
         """Restore encrypted MEXC credentials after a restart.
@@ -121,30 +119,10 @@ class ControlBot:
             self.cfg.mexc.api_secret = secret
             self.store.audit("mexc_credentials_loaded", "decrypted from the local control store")
 
-    def _enforce_restart_safety(self) -> None:
-        """Automatic mode never survives a process restart without re-confirmation."""
-
-        setup = self.store.setup()
-        if setup.get("execution_mode") == "auto":
-            self.store.update_setup(execution_mode="approval", auto_enabled_at=None)
-            self.store.audit(
-                "automatic_mode_cleared_on_restart",
-                "automatic mode requires explicit two-step confirmation in each process lifetime",
-            )
-            self.store.refresh_setup_state()
-
     # ------------------------------------------------------------- wiring
 
     def attach_engine(self, engine: Any) -> None:
         self._engine = engine
-
-    def should_require_approval(self, _intent: dict[str, Any]) -> bool:
-        setup = self.store.setup()
-        if int(setup.get("paused") or 0):
-            return True
-        if setup.get("execution_mode") != "auto":
-            return True
-        return setup.get("effective_state") != "automatic"
 
     def apply_sizing(
         self, signal: ParsedSignal, decision: Any, meta: Any, client: Any
@@ -308,7 +286,7 @@ class ControlBot:
 
         Both operators have owner-equivalent access to every control-bot command
         and administrative action (start/status, pause/resume, version, MEXC
-        setup, channel selection, learning, sizing, execution mode, notifications,
+        setup, channel selection, learning, sizing, notifications,
         disconnect, adopt). Usernames are never used for authorization. The owner
         account and its permissions are preserved; the developer is added as an
         additional explicitly configured numeric Telegram user id.
@@ -347,11 +325,6 @@ class ControlBot:
             await self._channel_action(chat_id, parts)
         elif head == "lr":
             await self._learning_action(chat_id, parts)
-        elif head == "ap":
-            # Signal-level approval prompts are intentionally removed.  Legacy
-            # ``ap:y:``/``ap:n:`` callbacks no longer execute any order.
-            await self._send(chat_id, "تأیید سیگنال‌های در انتظار حذف شد؛ سیگنال‌ها به‌صورت اتوماتیک اجرا می‌شوند. /start")
-            return
         elif head == "au":
             await self._auth_action(chat_id, parts)
         elif head == "mx":
@@ -382,8 +355,6 @@ class ControlBot:
                 rows.append([_btn("📚 ادامه یادگیری سیگنال", "m:learn")])
             else:
                 rows.append([_btn("📏 اندازه سفارش", "m:sizing")])
-                rows.append([_btn("⚙️ حالت اجرا", "m:mode")])
-                rows.append([_btn("📝 در انتظار تأیید", "m:pending")])
                 rows.append([_btn("🔔 تنظیمات اعلان‌ها", "n:settings")])
                 if int(s.get("paused") or 0):
                     rows.append([_btn("▶️ ادامه اجرا", "m:resume")])
@@ -426,9 +397,6 @@ class ControlBot:
         target = self.store.get_int_setting("learning_target", 5)
         streak = int(s.get("learning_streak") or 0)
         channel = s.get("selected_channel_title") or "انتخاب نشده"
-        mode = "خودکار" if s.get("execution_mode") == "auto" else "تأیید انسانی"
-        if int(s.get("paused") or 0):
-            mode += " (متوقف)"
         auth_word = "متصل" if probe_status == "valid" else (
             "نامشخص" if probe_status == "unreachable" else "نیاز به ورود"
         )
@@ -439,8 +407,7 @@ class ControlBot:
             f"• کانال: {channel}",
             f"• یادگیری: {streak} از {target} نمونه متوالی"
             + (" — تکمیل شده" if s["learning_state"] == "completed" else ""),
-            f"• حالت اجرا: {mode}",
-            f"• در انتظار تأیید: {len(self.store.list_approvals('pending', 50))}",
+            f"• وضعیت اجرا: {'متوقف' if int(s.get('paused') or 0) else 'فعال'}",
         ]
         if discrepancy == "session_valid_db_unauthenticated":
             lines += [
@@ -483,9 +450,9 @@ class ControlBot:
         if state == "learning_in_progress":
             return "یادگیری نیمه‌کاره است؛ از همان نمونه فعلی ادامه دهید."
         if state == "ready":
-            return "همه‌چیز آماده است. حالت پیش‌فرض، تأیید انسانی هر سفارش است."
+            return "همه‌چیز آماده است؛ سیگنال‌های معتبر به‌صورت خودکار پردازش می‌شوند."
         if state == "automatic":
-            return "حالت خودکار فعال است. هر لحظه می‌توانید آن را متوقف کنید."
+            return "اجرا آماده است. برای توقف اجرای سفارش‌های جدید از /pause استفاده کنید."
         if state == "paused":
             return "اجرای سفارش متوقف است. تنظیمات، کانال، یادگیری و تاریخچه حفظ شده‌اند."
         return "از منوی زیر ادامه دهید."
@@ -501,8 +468,7 @@ class ControlBot:
             "امنیت: ورود تلگرام فقط از ترمینال امن SSH انجام می‌شود؛ شماره، کد ورود "
             "و رمز دو مرحله‌ای را در هیچ چت تلگرامی نفرستید. کلید و رمز MEXC نیز "
             "نباید در چت یا لاگ نوشته شوند.\n\n"
-            "یادگیری فقط درستی استخراج را تأیید می‌کند و مجوز معامله نیست. "
-            "در حالت پیش‌فرض هر سفارش نیاز به تأیید انسانی دارد."
+            "یادگیری فقط درستی استخراج را تأیید می‌کند و جایگزین کنترل‌های ریسک معامله نیست."
         )
         await self._send(chat_id, text, _kb([[_btn("بازگشت", "m:status")]]))
 
@@ -539,16 +505,6 @@ class ControlBot:
             )
         elif action == "sizing":
             await self._show_sizing(chat_id)
-        elif action == "mode":
-            await self._show_mode(chat_id)
-        elif action == "auto":
-            await self._confirm_auto(chat_id, 0)
-        elif action == "auto2":
-            await self._enable_auto(chat_id)
-        elif action == "manual":
-            await self._disable_auto(chat_id)
-        elif action == "pending":
-            await self._show_pending(chat_id)
         elif action == "pause":
             await self._pause(chat_id)
         elif action == "resume":
@@ -635,7 +591,7 @@ class ControlBot:
             "⚠️ قطع اتصال حساب تلگرام\n"
             "این عمل نشست را در تلگرام باطل و فایل نشست محلی را حذف می‌کند. "
             "کانال، تنظیمات MEXC، نمونه‌های یادگیری و تاریخچه سفارش‌ها حفظ می‌شوند. "
-            "اجرای خودکار در همان لحظه غیرفعال می‌شود.\n\n"
+            "پس از قطع اتصال، اجرای سیگنال‌ها متوقف می‌شود.\n\n"
             "برای ادامه دکمه تأیید را بزنید. این عمل از /start هرگز اجرا نمی‌شود."
         )
         await self._send(
@@ -646,7 +602,6 @@ class ControlBot:
     async def _disconnect_telegram(self, chat_id: int) -> None:
         from ..telethon import logout_and_delete_session
 
-        self.store.update_setup(execution_mode="approval", auto_enabled_at=None)
         try:
             await logout_and_delete_session(self.cfg)
         except Exception as exc:  # noqa: BLE001 - never leak session contents
@@ -754,7 +709,7 @@ class ControlBot:
             self.store.put_secret("mexc_api_secret", self._pending_mexc_secret, self.box)
         self.cfg.mexc.api_key = self._pending_mexc_key or self.cfg.mexc.api_key
         self.cfg.mexc.api_secret = getattr(self, "_pending_mexc_secret", None) or self.cfg.mexc.api_secret
-        if self._engine is not None and self.cfg.trading.mode in ("testonly", "live"):
+        if self._engine is not None:
             self._engine.client = client
             self._engine.registry = SymbolRegistry(client)
         self.store.update_setup(
@@ -1071,9 +1026,10 @@ class ControlBot:
         if s["learning_state"] == "completed":
             await self._send(
                 chat_id,
-                "🎓 یادگیری تکمیل شد. توجه: یادگیری فقط درستی استخراج را تأیید می‌کند و "
-                "مجوز معامله نیست. حالت پیش‌فرض همچنان تأیید انسانی است.",
-                _kb([[_btn("اندازه سفارش", "m:sizing")], [_btn("حالت اجرا", "m:mode")], [_btn("بازگشت", "m:status")]]),
+                "🎓 یادگیری تکمیل شد. یادگیری فقط درستی استخراج را تأیید می‌کند و "
+                "جایگزین اعتبارسنجی بازار و کنترل‌های ریسک نیست. پردازش خودکار "
+                "سیگنال‌های معتبر فعال است.",
+                _kb([[_btn("اندازه سفارش", "m:sizing")], [_btn("بازگشت", "m:status")]]),
             )
         else:
             await self._send(
@@ -1204,101 +1160,6 @@ class ControlBot:
             return
         await self._send(chat_id, "عملیات اعلان نامعتبر است.", self._menu_kb())
 
-    # -------------------------------------------------------------- modes
-
-    def _ready_for_auto(self) -> tuple[bool, str]:
-        s = self.store.setup()
-        if s["telegram_state"] != "authenticated":
-            return False, "ابتدا ورود تلگرام را کامل کنید."
-        if s["mexc_state"] != "verified":
-            return False, "ابتدا MEXC را تأیید کنید."
-        if not s.get("selected_channel_id"):
-            return False, "ابتدا کانال سیگنال را انتخاب کنید."
-        if s["learning_state"] != "completed":
-            return False, "ابتدا حداقل پنج نمونه معتبر متوالی را تأیید کنید."
-        if self.cfg.trading.order_quote_amount is None:
-            return False, "مبلغ ثابت سفارش توسط مالک تنظیم نشده است."
-        if self.cfg.trading.emergency_stop:
-            return False, "توقف اضطراری فعال است."
-        if int(s.get("paused") or 0):
-            return False, "حالت توقف فعال است؛ ابتدا /resume را بزنید."
-        return True, ""
-
-    async def _show_mode(self, chat_id: int) -> None:
-        s = self.store.setup()
-        auto = s.get("execution_mode") == "auto"
-        text = (
-            "⚙️ حالت اجرا\n"
-            f"حالت فعلی: {'خودکار' if auto else 'تأیید انسانی'}\n\n"
-            "تأیید انسانی (پیش‌فرض): هر سفارش تا زمان تأیید شما اجرا نمی‌شود.\n"
-            "خودکار: سیگنال‌های واجد شرایط بدون تأیید جداگانه ارسال می‌شوند. "
-            "همه بررسی‌های ریسک، اندازه، موجودی، سن سیگنال و تطبیق همچنان اعمال می‌شوند.\n"
-            "حالت خودکار پس از ری‌استارت به‌صورت خودکار فعال نمی‌شود مگر همان‌جا ذخیره شده باشد."
-        )
-        rows = []
-        if auto:
-            rows.append([_btn("تغییر به تأیید انسانی", "m:manual")])
-        else:
-            rows.append([_btn("فعال‌سازی حالت خودکار", "m:auto")])
-        rows.append([_btn("بازگشت", "m:status")])
-        await self._send(chat_id, text, _kb(rows))
-
-    async def _confirm_auto(self, chat_id: int, _step: int) -> None:
-        ok, reason = self._ready_for_auto()
-        if not ok:
-            await self._send(chat_id, f"⚠️ {reason}")
-            return
-        text = (
-            "⚠️ هشدار حالت خودکار\n"
-            "با فعال‌سازی، سیگنال‌های واجد شرایط آینده ممکن است بدون تأیید جداگانه شما "
-            "سفارش ثبت کنند. مسئولیت ریسک با شماست.\n\n"
-            "همه محدودیت‌ها و بررسی موجودی باقی می‌مانند، اما تأیید انسانی حذف می‌شود.\n"
-            "برای فعال‌سازی، دکمه زیر را بزنید. این تصمیم در تاریخچه ثبت می‌شود."
-        )
-        await self._send(
-            chat_id, text,
-            _kb([[_btn("می‌فهمم؛ حالت خودکار را فعال کن", "m:auto2")], [_btn("انصراف", "m:mode")]]),
-        )
-
-    async def _enable_auto(self, chat_id: int) -> None:
-        ok, reason = self._ready_for_auto()
-        if not ok:
-            await self._send(chat_id, f"⚠️ {reason}")
-            return
-        self.store.update_setup(
-            execution_mode="auto",
-            auto_enabled_at=datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
-            paused=0,
-        )
-        self.store.refresh_setup_state()
-        self.store.audit("automatic_mode_enabled", "owner confirmed the second warning")
-        await self._send(chat_id, "✅ حالت خودکار فعال شد. برای توقف فوری /pause یا دکمه توقف را بزنید.")
-        await self._show_mode(chat_id)
-
-    async def _disable_auto(self, chat_id: int) -> None:
-        self.store.update_setup(execution_mode="approval", auto_enabled_at=None)
-        self.store.refresh_setup_state()
-        self.store.audit("automatic_mode_disabled", "owner switched back to human approval")
-        await self._send(chat_id, "حالت تأیید انسانی فعال شد. هیچ سفارش جدیدی بدون تأیید اجرا نمی‌شود.")
-        await self._show_mode(chat_id)
-
-    async def _pause(self, chat_id: int) -> None:
-        self.store.update_setup(
-            paused=1, execution_mode="approval", auto_enabled_at=None,
-            pause_reason="owner paused execution",
-        )
-        self.store.refresh_setup_state()
-        self.store.audit("paused", "owner paused new order execution")
-        await self._send(chat_id, "⏸ اجرای سفارش‌های جدید متوقف شد. حالت خودکار نیز غیرفعال شد.")
-        await self._show_start(chat_id)
-
-    async def _resume(self, chat_id: int) -> None:
-        self.store.update_setup(paused=0, pause_reason=None)
-        self.store.refresh_setup_state()
-        self.store.audit("resumed", "owner resumed execution in human-approval mode")
-        await self._send(chat_id, "▶️ اجرا ادامه یافت؛ حالت تأیید انسانی فعال است.")
-        await self._show_start(chat_id)
-
     async def _show_version(self, chat_id: int) -> None:
         """Read-only runtime version report (owner only, no state changes)."""
 
@@ -1311,45 +1172,22 @@ class ControlBot:
         )
         await self._send(chat_id, format_version_text(info))
 
-    async def _edit_approval_message(self, approval: dict[str, Any], text: str) -> None:
-        chat_id = approval.get("chat_id")
-        message_id = approval.get("message_id")
-        if chat_id and message_id:
-            await self._edit(int(chat_id), int(message_id), text, None)
+    async def _pause(self, chat_id: int) -> None:
+        self.store.update_setup(paused=1, pause_reason="owner paused execution")
+        self.store.refresh_setup_state()
+        self.store.audit("paused", "owner paused new order execution")
+        await self._send(chat_id, "⏸ اجرای سفارش‌های جدید متوقف شد.")
+        await self._show_start(chat_id)
 
-    # ----------------------------------------------------------- approvals (legacy, read-only)
-
-    async def _show_pending(self, chat_id: int) -> None:
-        """Read-only view of legacy pending approvals. No new signal approvals
-        are created: eligible signals are executed automatically by the trading
-        engine.  This menu exists only to inspect pre-existing records."""
-        rows = self.store.list_approvals("pending", 20)
-        if not rows:
-            await self._send(chat_id, "در حال حاضر تأیید در انتظاری وجود ندارد.", _kb([[_btn("بازگشت", "m:status")]]))
-            return
-        lines = ["📝 تأییدهای قدیمی در انتظار (بدون اجرا):"]
-        for row in rows:
-            lines.append(f"• {row['approval_id']} — سفارش {row['intent_id']} — انقضا {row['expires_at']}")
-        lines.append("\nحالت اجرای سیگنال‌ها اتوماتیک است؛ تأیید مالک برای هر سیگنال لازم نیست.")
-        await self._send(chat_id, "\n".join(lines), _kb([[_btn("بازگشت", "m:status")]]))
-
-    async def _sync_approvals(self) -> None:
-        """Signal-level approval prompts are intentionally disabled.
-
-        Eligible new signals are evaluated and executed automatically by the
-        trading engine without asking the owner to approve or reject each
-        signal.  The control bot preserves only administrative authorizations
-        (auto-mode enablement, emergency stop, session disconnect, ...).
-        Keeping a per-signal approval prompt here was a defect: it raced with
-        the engine's auto-execution and its timeout/expiration could misleadingly
-        suggest that an order was held when it was already submitted.  This
-        method is retained as a no-op so the ``control_approvals`` table and any
-        legacy rows remain intact; no new signal approvals are created.
-        """
-        return
+    async def _resume(self, chat_id: int) -> None:
+        self.store.update_setup(paused=0, pause_reason=None)
+        self.store.refresh_setup_state()
+        self.store.audit("resumed", "owner resumed automatic signal execution")
+        await self._send(chat_id, "▶️ اجرای خودکار ادامه یافت.")
+        await self._show_start(chat_id)
 
     async def _sync_auto_notices(self) -> None:
-        if self._engine is None or self.store.setup().get("execution_mode") != "auto":
+        if self._engine is None or self.store.setup().get("effective_state") not in ("ready", "automatic"):
             return
         cutoff = (datetime.now(UTC).timestamp() - 6 * 3600)
         cutoff_iso = datetime.fromtimestamp(cutoff, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1395,13 +1233,6 @@ class ControlBot:
                     notifier.flush(limit=50)
                 except Exception:  # noqa: BLE001 - notifications never block control
                     log.warning("notification flush failed", exc_info=True)
-        for row in self.store.expire_approvals():
-            # Expired signal approvals are recorded as expired in the control
-            # store only.  They are NOT transitioned to canceled_local here:
-            # the trading engine owns the intent lifecycle, and an approval
-            # timeout must never cancel or resubmit a tradeable intent.
-            await self._edit_approval_message(row, "⏰ مهلت تأیید به پایان رسید؛ سفارش اجرا نشد.")
-        await self._sync_approvals()
         await self._sync_auto_notices()
 
     # --------------------------------------------------------------- loop

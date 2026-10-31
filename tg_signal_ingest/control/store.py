@@ -1,14 +1,11 @@
 """Durable state for the single-owner control bot.
 
-All state transitions are transactional. Approval callbacks are consumed
-atomically so duplicate or replayed Telegram updates can never execute an
-order twice. No plaintext phone number, login code, two-step password, bot
-token, or exchange secret is stored here.
+All state transitions are transactional. No plaintext phone number, login
+code, two-step password, bot token, or exchange secret is stored here.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -29,7 +26,6 @@ SENSITIVE_PAYLOAD_KEYS = {
 DEFAULT_SETTINGS: dict[str, str] = {
     "buy_quote_usd": "10",
     "sell_pct_free": "25",
-    "approval_ttl_s": "300",
     "learning_target": "5",
     "sensitive_cleanup_s": "0",
     "channel_page_size": "10",
@@ -54,8 +50,7 @@ SETUP_FIELDS = {
     "setup_state", "telegram_state", "telegram_authorized_at",
     "telegram_account_label", "mexc_state", "mexc_verified_at", "mexc_label",
     "selected_channel_id", "selected_channel_title", "learning_state",
-    "learning_streak", "learning_completed_at", "execution_mode",
-    "auto_enabled_at", "paused", "pause_reason",
+    "learning_streak", "learning_completed_at", "paused", "pause_reason",
 }
 
 
@@ -120,7 +115,7 @@ class ControlStore:
         if s.get("learning_state") == "in_progress":
             return "learning_in_progress"
         if s.get("learning_state") == "completed":
-            return "automatic" if s.get("execution_mode") == "auto" else "ready"
+            return "automatic"
         return "channel_selected"
 
     def refresh_setup_state(self) -> str:
@@ -162,7 +157,6 @@ class ControlStore:
         return {
             "buy_quote_usd": self.get_float_setting("buy_quote_usd", 10.0),
             "sell_pct_free": self.get_float_setting("sell_pct_free", 25.0),
-            "approval_ttl_s": self.get_int_setting("approval_ttl_s", 300),
             "learning_target": max(1, self.get_int_setting("learning_target", 5)),
             "sensitive_cleanup_s": max(0, self.get_int_setting("sensitive_cleanup_s", 0)),
             "channel_page_size": min(10, max(1, self.get_int_setting("channel_page_size", 10))),
@@ -414,138 +408,6 @@ class ControlStore:
         )
         self.audit("learning_reset", "owner explicitly restarted the learning phase")
         self.refresh_setup_state()
-
-    # ------------------------------------------------------------ approvals
-
-    def create_approval(
-        self, *, intent_id: str, signal_id: str, intent_version: str, ttl_s: int | None = None
-    ) -> tuple[dict[str, Any], bool]:
-        ttl = ttl_s or self.get_int_setting("approval_ttl_s", 300)
-        now = self._now()
-        approval_id = f"ap-{secrets.token_hex(8)}"
-        nonce = secrets.token_urlsafe(9)
-        with self.db.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM control_approvals WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
-            if existing is not None:
-                return dict(existing), False
-            conn.execute(
-                """
-                INSERT INTO control_approvals
-                    (approval_id, intent_id, signal_id, intent_version, nonce, status,
-                     created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-                """,
-                (
-                    approval_id, intent_id, signal_id, intent_version[:64], nonce,
-                    _iso(now), _iso(now + timedelta(seconds=ttl)),
-                ),
-            )
-        row = self.get_approval(approval_id)
-        assert row is not None
-        return row, True
-
-    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT * FROM control_approvals WHERE approval_id = ?", (approval_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def approval_for_intent(self, intent_id: str) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT * FROM control_approvals WHERE intent_id = ?", (intent_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_approvals(self, status: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
-        if status:
-            rows = self.db.conn.execute(
-                "SELECT * FROM control_approvals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        else:
-            rows = self.db.conn.execute(
-                "SELECT * FROM control_approvals ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def set_approval_message(self, approval_id: str, chat_id: int, message_id: int) -> None:
-        with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE control_approvals SET chat_id = ?, message_id = ? WHERE approval_id = ?",
-                (chat_id, message_id, approval_id),
-            )
-
-    def expire_approvals(self) -> list[dict[str, Any]]:
-        now = self._now()
-        expired: list[dict[str, Any]] = []
-        with self.db.transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM control_approvals WHERE status = 'pending'"
-            ).fetchall()
-            for row in rows:
-                expires = _parse(row["expires_at"])
-                if expires is not None and expires <= now:
-                    conn.execute(
-                        "UPDATE control_approvals SET status = 'expired', decided_at = ? "
-                        "WHERE approval_id = ? AND status = 'pending'",
-                        (_iso(now), row["approval_id"]),
-                    )
-                    expired.append(dict(row))
-        return expired
-
-    def consume_approval(
-        self, approval_id: str, nonce: str, decision: str
-    ) -> tuple[str, dict[str, Any] | None]:
-        """Atomically consume a pending approval.
-
-        Returns (outcome, row) where outcome is ok/missing/stale/already/expired.
-        """
-
-        if decision not in ("approved", "rejected"):
-            raise ValueError("invalid approval decision")
-        now = self._now()
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM control_approvals WHERE approval_id = ?", (approval_id,)
-            ).fetchone()
-            if row is None:
-                return "missing", None
-            if row["status"] != "pending":
-                return "already", dict(row)
-            if not secrets.compare_digest(str(row["nonce"]), str(nonce)):
-                return "stale", dict(row)
-            expires = _parse(row["expires_at"])
-            if expires is None or expires <= now:
-                conn.execute(
-                    "UPDATE control_approvals SET status = 'expired', decided_at = ? "
-                    "WHERE approval_id = ? AND status = 'pending'",
-                    (_iso(now), approval_id),
-                )
-                return "expired", dict(row)
-            cur = conn.execute(
-                "UPDATE control_approvals SET status = ?, decided_at = ?, consumed_at = ? "
-                "WHERE approval_id = ? AND status = 'pending'",
-                (decision, _iso(now), _iso(now), approval_id),
-            )
-            if cur.rowcount != 1:  # pragma: no cover - defensive under concurrency
-                return "already", dict(row)
-        self.audit(f"approval_{decision}", f"{approval_id} intent={row['intent_id']}")
-        consumed = self.get_approval(approval_id)
-        return "ok", consumed
-
-    def mark_approval_result(self, approval_id: str, detail: str) -> None:
-        with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE control_approvals SET result_detail = ? WHERE approval_id = ?",
-                (detail[:2000], approval_id),
-            )
-
-    @staticmethod
-    def intent_version(intent: dict[str, Any]) -> str:
-        material = f"{intent.get('intent_id')}:{intent.get('updated_at')}:{intent.get('state')}"
-        return hashlib.sha256(material.encode()).hexdigest()[:32]
 
     # -------------------------------------------------------------- notices
 

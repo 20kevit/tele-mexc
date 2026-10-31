@@ -57,9 +57,7 @@ def test_setup_state_machine_requires_every_step(repo):
     store.update_setup(learning_state="in_progress")
     assert store.effective_state() == "learning_in_progress"
 
-    store.update_setup(learning_state="completed", execution_mode="approval")
-    assert store.effective_state() == "ready"
-    store.update_setup(execution_mode="auto")
+    store.update_setup(learning_state="completed")
     assert store.effective_state() == "automatic"
 
     store.update_setup(paused=1, pause_reason="owner pause")
@@ -105,49 +103,6 @@ def test_invalid_or_duplicate_learning_examples_cannot_inflate_progress(repo):
     with pytest.raises(ValueError, match="already decided"):
         store.decide_learning_sample(sample["sample_id"], True)
         store.decide_learning_sample(sample["sample_id"], True)
-
-
-def test_approval_consumption_is_nonce_bound_one_time_and_versioned(repo):
-    store, clock = _store(repo)
-    approval, created = store.create_approval(
-        intent_id="intent-1", signal_id="sig-1", intent_version="v1", ttl_s=60
-    )
-    assert created is True
-    duplicate, created_again = store.create_approval(
-        intent_id="intent-1", signal_id="sig-1", intent_version="v1", ttl_s=60
-    )
-    assert created_again is False
-    assert duplicate["approval_id"] == approval["approval_id"]
-
-    assert store.consume_approval(approval["approval_id"], "wrong", "approved")[0] == "stale"
-    outcome, consumed = store.consume_approval(
-        approval["approval_id"], approval["nonce"], "approved"
-    )
-    assert outcome == "ok"
-    assert consumed is not None
-    assert consumed["status"] == "approved"
-    assert consumed["intent_version"] == "v1"
-
-    replay, _ = store.consume_approval(approval["approval_id"], approval["nonce"], "approved")
-    assert replay == "already"
-
-    expiring, _ = store.create_approval(
-        intent_id="intent-2", signal_id="sig-2", intent_version="v2", ttl_s=30
-    )
-    clock.now += timedelta(seconds=31)
-    assert store.consume_approval(expiring["approval_id"], expiring["nonce"], "approved")[0] == "expired"
-
-
-def test_expire_approvals_marks_only_pending_rows(repo):
-    store, clock = _store(repo)
-    approval, _ = store.create_approval(
-        intent_id="intent-1", signal_id="sig-1", intent_version="v1", ttl_s=30
-    )
-    clock.now += timedelta(seconds=30)
-    expired = store.expire_approvals()
-    assert [row["approval_id"] for row in expired] == [approval["approval_id"]]
-    assert store.get_approval(approval["approval_id"])["status"] == "expired"
-    assert store.expire_approvals() == []
 
 
 def test_update_dedupe_and_flow_ttl_never_store_sensitive_payload(repo):

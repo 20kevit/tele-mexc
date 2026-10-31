@@ -181,8 +181,7 @@ def test_removed_arbitrary_restriction_keys_are_ignored(tmp_path):
     # hard mandatory invariants.  Attempting to set them via TOML must be rejected.
     root = _root_with(
         "[trading]\norder_quote_amount = 10\ndaily_max_orders = 2\nmax_open_orders = 2\n"
-        "max_signal_age_s = 900\nmax_price_deviation_pct = 1\nrequire_stop_loss = true\n"
-        "allowed_symbols = ['BTCUSDT']",
+        "max_signal_age_s = 900\nmax_price_deviation_pct = 1\nrequire_stop_loss = true",
         tmp_path=tmp_path,
     )
     with pytest.raises(ConfigError, match="not configurable"):
@@ -190,8 +189,7 @@ def test_removed_arbitrary_restriction_keys_are_ignored(tmp_path):
     # Without the forbidden keys, config loads successfully.
     root2 = _root_with(
         "[trading]\norder_quote_amount = 10\ndaily_max_orders = 2\nmax_open_orders = 2\n"
-        "max_signal_age_s = 900\nmax_price_deviation_pct = 1\n"
-        "allowed_symbols = ['BTCUSDT']",
+        "max_signal_age_s = 900\nmax_price_deviation_pct = 1",
         tmp_path=tmp_path,
     )
     t = load_config(root=root2, environ={}, require_credentials=False).trading
@@ -200,4 +198,14 @@ def test_removed_arbitrary_restriction_keys_are_ignored(tmp_path):
     assert t.max_open_orders == 2
     assert t.max_signal_age_s == 900.0
     assert t.max_price_deviation_pct == 1.0
-    assert t.allowed_symbols == ["BTCUSDT"]
+    assert not hasattr(t, "allowed_symbols")
+
+
+def test_legacy_allowlist_configuration_is_ignored(tmp_path):
+    root = _root_with(
+        "[trading]\nallowed_symbols = ['BTCUSDT']\nallowlist_mode = 'explicit_allowlist'",
+        tmp_path=tmp_path,
+    )
+    cfg = load_config(root=root, environ={}, require_credentials=False)
+    assert not hasattr(cfg.trading, "allowed_symbols")
+    assert not hasattr(cfg.trading, "allowlist_mode")

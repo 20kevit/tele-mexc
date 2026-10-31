@@ -81,7 +81,6 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 # Credentials belong in .env (MEXC_API_KEY / MEXC_API_SECRET), never here.
 [trading]
 mode = "sim"          # "sim" | "testonly" | "live" (live also needs live_enabled_token)
-# allowed_symbols = ["BTCUSDT"]   # EMPTY allowlist rejects every signal (fail closed)
 # max_quote_per_order = 10
 # daily_max_orders = 2
 # max_open_orders = 2
@@ -95,7 +94,6 @@ mode = "sim"          # "sim" | "testonly" | "live" (live also needs live_enable
 
 [control]
 # Optional owner control-bot timing (token/keys belong in .env, never here).
-# approval_ttl_s = 300
 """
 
 def _load_or_exit(require_credentials: bool = True):
@@ -251,9 +249,8 @@ def cmd_config_check(_args) -> int:
     print(f"  database: {cfg.db_path}")
     print(f"  session:  {cfg.session_path}.session")
     print(f"  backfill: scope={cfg.backfill_scope} since={cfg.backfill_since}")
-    symbols = ", ".join(cfg.trading.allowed_symbols) if cfg.trading.allowed_symbols else "not enforced"
     mexc_state = "configured" if cfg.mexc.api_key and cfg.mexc.api_secret else "missing"
-    print(f"  trading: mode={cfg.trading.mode} symbol allowlist={symbols} MEXC credentials={mexc_state}")
+    print(f"  trading: mode={cfg.trading.mode} MEXC credentials={mexc_state}")
     cli_write_state = (
         "armed (--yes)" if cfg.mexc.cli_confirm_noninteractive_writes else "fail-closed (no --yes)"
     )
@@ -839,11 +836,8 @@ def cmd_control_status(_args) -> int:
             f"  learning: {setup['learning_state']} "
             f"({int(setup['learning_streak'] or 0)}/{store.get_int_setting('learning_target', 5)})"
         )
-        print(
-            f"  execution: {setup['execution_mode']}  paused={bool(int(setup['paused'] or 0))}"
-        )
-        print(f"  pending approvals: {len(store.list_approvals('pending', 100))}")
-        print("  trading remains disabled until separately configured; the control bot never forces it on.")
+        print(f"  execution paused: {bool(int(setup['paused'] or 0))}")
+        print("  valid signals execute automatically when setup is ready and execution is not paused.")
     finally:
         db.close()
     return 0

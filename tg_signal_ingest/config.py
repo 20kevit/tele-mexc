@@ -75,8 +75,6 @@ class TradingConfig:
     max_quote_per_order: float = 10.0
     daily_max_orders: int = 2
     max_open_orders: int = 2
-    allowed_symbols: list[str] = field(default_factory=list)  # uppercase; empty = none allowed
-    allowlist_mode: str = "deny"  # "deny" until user sets explicit allowlist
     max_signal_age_s: float = 900.0  # reject signals older than this
     max_price_deviation_pct: float = 1.0  # vs reference price at decision time
     # Owner-confirmed invariants — hard requirements, not configurable.
@@ -131,8 +129,6 @@ class TradingConfig:
             "max_quote_per_order": self.max_quote_per_order,
             "daily_max_orders": self.daily_max_orders,
             "max_open_orders": self.max_open_orders,
-            "allowed_symbols": sorted(self.allowed_symbols),
-            "allowlist_mode": self.allowlist_mode,
             "max_signal_age_s": self.max_signal_age_s,
             "max_price_deviation_pct": self.max_price_deviation_pct,
             "order_type_policy": self.order_type_policy,
@@ -173,7 +169,6 @@ class ControlConfig:
     developer_user_id: int | None = None
     secret_key: str | None = None  # encrypts MEXC credentials at rest
     api_base: str = "https://api.telegram.org"
-    approval_ttl_s: int = 300
     poll_timeout_s: int = 25
 
     @property
@@ -488,15 +483,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
             raise ConfigError(f"trading.{name} must be a whole number.")
         setattr(t, name, cast(val))
 
-    symbols = tr_raw.get("allowed_symbols")
-    if isinstance(symbols, list):
-        bad = [s for s in symbols if not isinstance(s, str)]
-        if bad:
-            raise ConfigError("trading.allowed_symbols entries must be strings.")
-        t.allowed_symbols = [s.strip().upper() for s in symbols if str(s).strip()]
-        if t.allowed_symbols:
-            t.allowlist_mode = "explicit_allowlist"
-
     # Mandatory invariants cannot be disabled via configuration.
     for forbidden in ("require_stop_loss", "require_tp1", "require_tp2", "enforce_price_relationship"):
         if forbidden in tr_raw:
@@ -754,14 +740,6 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
         if not base.startswith("https://"):
             raise ConfigError("CONTROL_API_BASE must use https://")
         c.api_base = base.rstrip("/")
-    ttl = section.get("approval_ttl_s", c.approval_ttl_s)
-    try:
-        ttl_i = int(str(ttl))
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("control.approval_ttl_s must be an integer.") from exc
-    if not 30 <= ttl_i <= 86400:
-        raise ConfigError("control.approval_ttl_s must be between 30 and 86400 seconds.")
-    c.approval_ttl_s = ttl_i
     if c.owner_user_id is not None and c.owner_user_id <= 0:
         raise ConfigError("CONTROL_OWNER_USER_ID must be a positive numeric Telegram user id.")
     if c.developer_user_id is not None and c.developer_user_id <= 0:
