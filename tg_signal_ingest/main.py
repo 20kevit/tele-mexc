@@ -1034,7 +1034,12 @@ def cmd_diag_clock(args) -> int:
         CLOCK_SKEW_STALE_MS,
         CLOCK_SKEW_UNHEALTHY_MS,
     )
-    from .mexc.client import MexcSpotClient, WeightedRateGate
+
+    from .mexc.client import (
+        MAX_RECV_WINDOW_MS,
+        MexcSpotClient,
+        WeightedRateGate,
+    )
 
     sync = repo.sync_status()
     counts = repo.message_counts(sync.channel_id or 0)
@@ -1043,7 +1048,7 @@ def cmd_diag_clock(args) -> int:
     lines.append("clock health diagnostics")
     lines.append("  VPS clock sync: NTP enabled (drift possible after startup)")
     lines.append(f"  recvWindow default: {cfg.mexc.recv_window_ms} ms")
-    lines.append(f"  recvWindow maximum: {MexcSpotClient.MAX_RECV_WINDOW_MS} ms")
+    lines.append(f"  recvWindow maximum: {MAX_RECV_WINDOW_MS} ms")
     lines.append("")
     lines.append("  clock health thresholds:")
     lines.append(f"    fresh: < {CLOCK_SKEW_FRESH_MS} ms")
