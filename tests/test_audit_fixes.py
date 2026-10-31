@@ -114,18 +114,25 @@ class TestTaskReaping:
             def run_until_disconnected(self):
                 async def _run():
                     await asyncio.sleep(0.01)  # cycle ends almost immediately
+
                 return _run()
 
         client = FastDisconnectingClient()
-        svc = IngestService(cfg, repo, client=client, backfill_runner=runner)
+        from tests.test_service import FakeTrading
+
+        svc = IngestService(
+            cfg,
+            repo,
+            client=client,
+            backfill_runner=runner,
+            trading_engine=FakeTrading(repo, cfg),
+        )
         task = asyncio.ensure_future(svc.run())
         await asyncio.sleep(0.3)
         svc.request_stop()
         await asyncio.wait_for(task, timeout=10)
 
-        assert runner.max_active == 1, (
-            f"backfill workers overlapped across connection cycles: {runner.max_active}"
-        )
+        assert runner.max_active == 1, f"backfill workers overlapped across connection cycles: {runner.max_active}"
         assert svc._backfill_task is None
         assert svc._queue_task is None
         assert client.disconnect_count >= 1

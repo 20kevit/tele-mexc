@@ -20,6 +20,7 @@ from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..mexc.errors import MexcError
 from ..repository import Repository
 from ..trading.balance import BalanceError, parse_account
+from ..trading.gate import GateTimeout, SubmissionGate
 from ..trading.parser import ParsedSignal
 from ..trading.sizing import SizingError, apply_sizing
 from ..version import format_version_text, get_version_info
@@ -124,9 +125,7 @@ class ControlBot:
     def attach_engine(self, engine: Any) -> None:
         self._engine = engine
 
-    def apply_sizing(
-        self, signal: ParsedSignal, decision: Any, meta: Any, client: Any
-    ) -> Any:
+    def apply_sizing(self, signal: ParsedSignal, decision: Any, meta: Any, client: Any) -> Any:
         settings = self.store.settings()
         free_base: Decimal | None = None
         if signal.action == "sell":
@@ -137,9 +136,7 @@ class ControlBot:
                 asset = snapshot.balances.get(str(meta.base_asset).upper())
                 free_base = asset.spendable if asset is not None else Decimal(0)
             except (BalanceError, MexcError) as exc:
-                raise SizingError(
-                    f"موجودی آزاد پایه در دسترس نیست ({exc.__class__.__name__})"
-                ) from None
+                raise SizingError(f"موجودی آزاد پایه در دسترس نیست ({exc.__class__.__name__})") from None
         return apply_sizing(
             side=str(signal.action),
             decision=decision,
@@ -153,15 +150,11 @@ class ControlBot:
     # -------------------------------------------------------- bot transport
 
     async def _send(self, chat_id: int, text: str, kb: dict[str, Any] | None = None) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self.bot.send_message, chat_id, text, reply_markup=kb
-        )
+        return await asyncio.to_thread(self.bot.send_message, chat_id, text, reply_markup=kb)
 
     async def _edit(self, chat_id: int, message_id: int, text: str, kb: dict[str, Any] | None = None) -> None:
         with contextlib.suppress(BotApiError, Exception):
-            await asyncio.to_thread(
-                self.bot.edit_message_text, chat_id, message_id, text, reply_markup=kb
-            )
+            await asyncio.to_thread(self.bot.edit_message_text, chat_id, message_id, text, reply_markup=kb)
 
     async def _answer(self, callback_id: str, text: str | None = None) -> None:
         with contextlib.suppress(Exception):
@@ -397,8 +390,8 @@ class ControlBot:
         target = self.store.get_int_setting("learning_target", 5)
         streak = int(s.get("learning_streak") or 0)
         channel = s.get("selected_channel_title") or "انتخاب نشده"
-        auth_word = "متصل" if probe_status == "valid" else (
-            "نامشخص" if probe_status == "unreachable" else "نیاز به ورود"
+        auth_word = (
+            "متصل" if probe_status == "valid" else ("نامشخص" if probe_status == "unreachable" else "نیاز به ورود")
         )
         lines = [
             "📊 وضعیت سیستم",
@@ -430,15 +423,9 @@ class ControlBot:
             return "برای ادامه، ورود تلگرام را ترمیم کنید."
         state = s["effective_state"]
         if state == "not_configured":
-            return (
-                "برای شروع، ورود حساب تلگرام را از ترمینال امن SSH انجام دهید "
-                "(.venv/bin/tg-ingest auth login)."
-            )
+            return "برای شروع، ورود حساب تلگرام را از ترمینال امن SSH انجام دهید (.venv/bin/tg-ingest auth login)."
         if state == "telegram_auth_pending":
-            return (
-                "ورود نیمه‌کاره ذخیره شده است؛ ورود از چت غیرفعال است. "
-                "از ترمینال امن SSH استفاده کنید."
-            )
+            return "ورود نیمه‌کاره ذخیره شده است؛ ورود از چت غیرفعال است. از ترمینال امن SSH استفاده کنید."
         if state == "telegram_authenticated":
             return "تلگرام متصل است. اکنون MEXC را تنظیم و تأیید کنید."
         if state == "mexc_config_pending":
@@ -531,10 +518,12 @@ class ControlBot:
                 chat_id,
                 f"✅ نشست تلگرام معتبر است{f' — {label}' if label else ''}. "
                 "ورود دوباره لازم نیست و هیچ‌چیز بازنشانی نمی‌شود.",
-                _kb([
-                    [_btn("قطع اتصال حساب تلگرام", "au:disconnect")],
-                    [_btn("بازگشت", "m:status")],
-                ]),
+                _kb(
+                    [
+                        [_btn("قطع اتصال حساب تلگرام", "au:disconnect")],
+                        [_btn("بازگشت", "m:status")],
+                    ]
+                ),
             )
             return
         if status == "unreachable":
@@ -595,7 +584,8 @@ class ControlBot:
             "برای ادامه دکمه تأیید را بزنید. این عمل از /start هرگز اجرا نمی‌شود."
         )
         await self._send(
-            chat_id, text,
+            chat_id,
+            text,
             _kb([[_btn("تأیید قطع اتصال", "au:disconnect2")], [_btn("انصراف", "m:status")]]),
         )
 
@@ -607,8 +597,7 @@ class ControlBot:
         except Exception as exc:  # noqa: BLE001 - never leak session contents
             await self._send(
                 chat_id,
-                f"قطع اتصال با خطا مواجه شد ({exc.__class__.__name__}). "
-                "هیچ تغییر دیگری اعمال نشد.",
+                f"قطع اتصال با خطا مواجه شد ({exc.__class__.__name__}). هیچ تغییر دیگری اعمال نشد.",
             )
             return
         self.store.update_setup(telegram_state="unauthenticated", telegram_account_label=None)
@@ -616,8 +605,7 @@ class ControlBot:
         self.store.audit("telegram_disconnected", "owner explicitly confirmed session revocation")
         await self._send(
             chat_id,
-            "حساب تلگرام قطع شد. برای ورود دوباره از ترمینال امن SSH استفاده کنید: "
-            ".venv/bin/tg-ingest auth login",
+            "حساب تلگرام قطع شد. برای ورود دوباره از ترمینال امن SSH استفاده کنید: .venv/bin/tg-ingest auth login",
         )
 
     # -------------------------------------------------------------- MEXC
@@ -670,7 +658,9 @@ class ControlBot:
         state_dir = self.cfg.data_dir
         state_dir.mkdir(parents=True, exist_ok=True)
         return MexcSpotClient(
-            key, secret, base_url=self.cfg.mexc.base_url,
+            key,
+            secret,
+            base_url=self.cfg.mexc.base_url,
             recv_window_ms=self.cfg.mexc.recv_window_ms,
             connect_timeout_s=self.cfg.mexc.connect_timeout_s,
             request_timeout_s=self.cfg.mexc.request_timeout_s,
@@ -713,7 +703,8 @@ class ControlBot:
             self._engine.client = client
             self._engine.registry = SymbolRegistry(client)
         self.store.update_setup(
-            mexc_state="verified", mexc_label=check.detail,
+            mexc_state="verified",
+            mexc_label=check.detail,
             mexc_verified_at=datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         )
         self.store.clear_flow()
@@ -728,8 +719,7 @@ class ControlBot:
         if not self.box.available:
             await self._send(
                 chat_id,
-                "ذخیره امن کلید ممکن نیست: CONTROL_SECRET_KEY تنظیم نشده است. "
-                "کلیدها را در حافظه ذخیره نمی‌کنیم.",
+                "ذخیره امن کلید ممکن نیست: CONTROL_SECRET_KEY تنظیم نشده است. کلیدها را در حافظه ذخیره نمی‌کنیم.",
             )
             return
         self._pending_mexc_key = None
@@ -785,7 +775,9 @@ class ControlBot:
             return
         try:
             choices, more = await fetch_channels(
-                client, offset=offset, limit=self.store.get_int_setting("channel_page_size", 10),
+                client,
+                offset=offset,
+                limit=self.store.get_int_setting("channel_page_size", 10),
                 query=query,
             )
         finally:
@@ -799,10 +791,7 @@ class ControlBot:
                 _kb([[_btn("به‌روزرسانی", f"ch:r:{offset}")], [_btn("جستجو", "ch:s")], [_btn("بازگشت", "m:status")]]),
             )
             return
-        rows = [
-            [_btn(f"{c.kind}: {c.title}"[:60], f"ch:p:{c.channel_id}:{offset}")]
-            for c in choices
-        ]
+        rows = [[_btn(f"{c.kind}: {c.title}"[:60], f"ch:p:{c.channel_id}:{offset}")] for c in choices]
         nav: list[dict[str, str]] = []
         if offset > 0:
             nav.append(_btn("قبلی", f"ch:g:{max(0, offset - 10)}"))
@@ -872,7 +861,8 @@ class ControlBot:
         self.repo.ensure_channel(choice.channel_id, choice.access_hash, choice.username, choice.title)
         self.repo.select_channel(choice.channel_id)
         self.store.update_setup(
-            selected_channel_id=choice.channel_id, selected_channel_title=choice.title,
+            selected_channel_id=choice.channel_id,
+            selected_channel_title=choice.title,
         )
         self.store.refresh_setup_state()
         self.store.audit("channel_selected", f"id={choice.channel_id}")
@@ -902,12 +892,15 @@ class ControlBot:
                 f"نمونه‌های تأییدشده اخیر: {len(examples)} مورد"
             )
             await self._send(
-                chat_id, text,
-                _kb([
-                    [_btn("نمونه‌های تأییدشده", "m:learn_next")],
-                    [_btn("شروع دوباره یادگیری", "l:restart")],
-                    [_btn("بازگشت", "m:status")],
-                ]),
+                chat_id,
+                text,
+                _kb(
+                    [
+                        [_btn("نمونه‌های تأییدشده", "m:learn_next")],
+                        [_btn("شروع دوباره یادگیری", "l:restart")],
+                        [_btn("بازگشت", "m:status")],
+                    ]
+                ),
             )
             return
         await self._send(
@@ -916,11 +909,13 @@ class ControlBot:
             f"پیشرفت: {streak} از {target} نمونه معتبر متوالی.\n"
             "برای هر پیام، متن اصلی و فیلدهای استخراج‌شده را می‌بینید و تأیید یا رد می‌کنید. "
             "رد یک نمونه معتبر، شمارنده را بازنشانی می‌کند. نمونه نامعتبر قابل تأیید نیست.",
-            _kb([
-                [_btn("نمونه بعدی", "m:learn_next")],
-                [_btn("شروع دوباره", "l:restart")],
-                [_btn("بازگشت", "m:status")],
-            ]),
+            _kb(
+                [
+                    [_btn("نمونه بعدی", "m:learn_next")],
+                    [_btn("شروع دوباره", "l:restart")],
+                    [_btn("بازگشت", "m:status")],
+                ]
+            ),
         )
 
     async def _learning_menu_action(self, chat_id: int, parts: list[str]) -> None:
@@ -1053,12 +1048,15 @@ class ControlBot:
             "محاسبه نهایی در زمان تأیید/ارسال دوباره انجام می‌شود."
         )
         await self._send(
-            chat_id, text,
-            _kb([
-                [_btn("تغییر مبلغ خرید (دلار)", "m:buy")],
-                [_btn("تغییر درصد فروش", "m:sell")],
-                [_btn("بازگشت", "m:status")],
-            ]),
+            chat_id,
+            text,
+            _kb(
+                [
+                    [_btn("تغییر مبلغ خرید (دلار)", "m:buy")],
+                    [_btn("تغییر درصد فروش", "m:sell")],
+                    [_btn("بازگشت", "m:status")],
+                ]
+            ),
         )
 
     async def _input_buy_amount(self, chat_id: int, text: str) -> None:
@@ -1107,10 +1105,12 @@ class ControlBot:
                 else:
                     disabled_categories.append(cat)
             label = "مالک" if role == "owner" else "توسعه‌دهنده"
-            rows.append([
-                _btn(f"{label}: فعال ({len(enabled_categories)})", f"n:{role}:on"),
-                _btn(f"{label}: غیرفعال ({len(disabled_categories)})", f"n:{role}:off"),
-            ])
+            rows.append(
+                [
+                    _btn(f"{label}: فعال ({len(enabled_categories)})", f"n:{role}:on"),
+                    _btn(f"{label}: غیرفعال ({len(disabled_categories)})", f"n:{role}:off"),
+                ]
+            )
             # Show a few representative toggle buttons for the role.
             for cat in (
                 "signal_decision",
@@ -1163,33 +1163,62 @@ class ControlBot:
     async def _show_version(self, chat_id: int) -> None:
         """Read-only runtime version report (owner only, no state changes)."""
 
-        info = get_version_info(
-            trading_mode=self.cfg.trading.mode,
-            live_authorized=bool(
-                self.cfg.trading.mode == "live"
-                and self.cfg.trading.live_enabled_token == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
-            ),
-        )
+        info = get_version_info()
         await self._send(chat_id, format_version_text(info))
 
     async def _pause(self, chat_id: int) -> None:
-        self.store.update_setup(paused=1, pause_reason="owner paused execution")
-        self.store.refresh_setup_state()
-        self.store.audit("paused", "owner paused new order execution")
+        gate = getattr(self._engine, "submission_gate", None) if self._engine else None
+        if gate is None:
+            gate = SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
+        try:
+            # Exclusive lock waits for already-claimed submissions, then sets
+            # the durable pause state.  The acknowledgement is sent only after
+            # this point, so no new exchange submission can start afterwards.
+            with gate.exclusive(timeout_s=45.0):
+                self.store.update_setup(paused=1, pause_reason="owner paused execution")
+                self.store.refresh_setup_state()
+                self.store.audit("paused", "owner paused new order execution")
+        except GateTimeout:
+            self.store.audit(
+                "pause_not_acknowledged",
+                "in-flight submissions did not drain; pause was not acknowledged",
+            )
+            await self._send(
+                chat_id,
+                "⏸ درخواست توقف ثبت شد اما سفارش در حال ارسال تمام نشد. وضعیت توقف تأیید نشد؛ لطفاً دوباره تلاش کنید.",
+            )
+            return
         await self._send(chat_id, "⏸ اجرای سفارش‌های جدید متوقف شد.")
         await self._show_start(chat_id)
 
     async def _resume(self, chat_id: int) -> None:
-        self.store.update_setup(paused=0, pause_reason=None)
-        self.store.refresh_setup_state()
-        self.store.audit("resumed", "owner resumed automatic signal execution")
+        gate = getattr(self._engine, "submission_gate", None) if self._engine else None
+        if gate is None:
+            gate = SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
+        # Resume must not paper over incomplete readiness or an emergency state.
+        blocker = gate.resume_blocker()
+        if blocker:
+            self.store.audit("resume_refused", blocker)
+            await self._send(
+                chat_id,
+                f"▶️ ادامه اجرا ممکن نیست تا زمانی که شرایط آماده‌سازی کامل شود:\n{blocker}",
+            )
+            return
+        with gate.exclusive(timeout_s=45.0):
+            self.store.update_setup(paused=0, pause_reason=None)
+            self.store.refresh_setup_state()
+            self.store.audit("resumed", "owner resumed automatic signal execution")
+        resume = getattr(self._engine, "resume_planned_intents", None)
+        if callable(resume):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(resume)
         await self._send(chat_id, "▶️ اجرای خودکار ادامه یافت.")
         await self._show_start(chat_id)
 
     async def _sync_auto_notices(self) -> None:
         if self._engine is None or self.store.setup().get("effective_state") not in ("ready", "automatic"):
             return
-        cutoff = (datetime.now(UTC).timestamp() - 6 * 3600)
+        cutoff = datetime.now(UTC).timestamp() - 6 * 3600
         cutoff_iso = datetime.fromtimestamp(cutoff, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         rows = self.repo.db.conn.execute(
             """

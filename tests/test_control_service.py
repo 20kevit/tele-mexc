@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from tg_signal_ingest.control.service import ControlBot
@@ -28,9 +28,7 @@ class FakeBot:
         return {"message_id": len(self.sent)}
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
-        self.edited.append(
-            {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup}
-        )
+        self.edited.append({"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup})
         return {}
 
     def answer_callback_query(self, callback_id, text=None):
@@ -357,8 +355,8 @@ async def test_version_command_reports_runtime_info(cfg, repo):
     assert "نسخه برنامه:" in text
     assert "commit SHA:" in text
     assert "شاخه:" in text
-    assert "حالت معامله:" in text
-    assert "مجوز لایو:" in text
+    assert "حالت معامله:" not in text
+    assert "مجوز لایو:" not in text
     # No secrets leaked.
     assert "api_key" not in text.lower()
     assert "secret" not in text.lower()
@@ -485,14 +483,18 @@ async def test_disconnect_requires_explicit_second_confirmation(cfg, repo, monke
     assert store.setup()["telegram_state"] == "unauthenticated"
 
 
-def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo):
+def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo, monkeypatch):
     from tg_signal_ingest import main as main_module
 
     cfg.control.bot_token = "123:test-token"
     cfg.control.owner_user_id = OWNER
     cfg.control.secret_key = "test-control-secret"
     cfg.control.enabled = True
-    cfg.trading.mode = "sim"
+
+    def _fake_builder(_cfg, _repo):
+        return FakeEngine(_repo)
+
+    monkeypatch.setattr("tg_signal_ingest.trading.build_trading_engine", _fake_builder)
     bot, engine = main_module._build_control_runtime(cfg, repo)
     assert bot._engine is engine
     assert not hasattr(engine, "approval_gate")

@@ -5,10 +5,14 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
 
 ## Safety posture
 
-- Default `trading.mode = "sim"`: no exchange calls.
-- `testonly` sends only to the official order-test endpoint.
-- `live` requires an explicit token and a positive fixed `order_quote_amount`.
-- No withdrawals, futures, leverage, short selling, or per-signal approval gate.
+- One automatic MEXC Spot behaviour: no SIM/TESTONLY/LIVE product-mode split.
+- Pipeline construction requires the exact owner acknowledgement, MEXC Spot
+  credentials, a healthy MEXC CLI write backend, and a positive fixed
+  `order_quote_amount`.
+- No withdrawals, futures, leverage, short selling, symbol allowlist, or
+  per-signal approval gate.
+- `/pause` is enforced at the exchange-submission boundary; `/resume` rechecks
+  readiness and cannot bypass emergency stop or reconciliation blockers.
 - The service opens no inbound ports and exposes no HTTP API.
 - Telegram and MEXC use direct outbound TLS. Legacy Telegram proxy settings
   are rejected; service units unset ambient proxy variables.
@@ -58,8 +62,8 @@ Validate without contacting anything:
 .venv/bin/tg-ingest config check
 ```
 
-It prints paths, mode, credential presence, and the effective fixed amount — not
-secret values.
+It prints paths, credential presence, the acknowledgement state, and the
+effective fixed amount — not secret values.
 
 ## Telegram login and channel selection
 
@@ -241,8 +245,8 @@ permission must be disabled.
 .venv/bin/tg-ingest trading verify      # read-only apiKeyInfo; no order
 ```
 
-Verification changes nothing: trading stays in whatever mode the config says.
-Changed `.env`/config values require a process restart.
+Verification changes nothing and places no order. Changed `.env`/config values
+require a process restart.
 
 ### Official CLI profile and preflight
 
@@ -263,10 +267,10 @@ mexc profile list              # no credentials needed
 `--network` fails without running the signed read when the CLI `doctor` reports a
 problem, when the configured CLI profile is missing, or when the CLI profile and
 the REST key read different Spot account balances. Live mode additionally
-rejects `[mexc_cli] enabled = false` at config load. The minimum version is
-`0.0.22`. Live mode arms non-interactive CLI writes (`--yes`) automatically when
-`mexc_cli.confirm_noninteractive_writes` is absent; an explicit `false` remains a
-fail-closed override and makes every live write reject locally.
+rejects `[mexc_cli] enabled = false` when the trading pipeline is built. The
+minimum version is `0.0.22`. Non-interactive CLI writes (`--yes`) are armed by
+default; an explicit `false` remains a fail-closed override and makes every
+write reject locally.
 
 ## Recovery
 
@@ -296,11 +300,11 @@ retried automatically.
 .venv/bin/tg-ingest trading reconcile
 ```
 
-`trading reconcile` inspects live intents (and terminal fills that still need
-synchronization). It queries MEXC only when a MEXC client can be built, so run it
-with the live/testonly credentials configured. In `sim` it is a local no-op for
-live rows. Repeat after network recovery. Do not cancel or resubmit based only on
-a local guess; inspect the exchange order id/status.
+`trading reconcile` inspects non-terminal intents (and terminal fills that still
+need synchronization). It builds the configured MEXC client, so credentials and
+the CLI backend must be available. Legacy `sim`/`testonly` rows are ignored.
+Repeat after network recovery. Do not cancel or resubmit based only on a local
+guess; inspect the exchange order id/status.
 
 ```bash
 .venv/bin/tg-ingest trading notifications       # pending/failed outbox rows

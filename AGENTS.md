@@ -14,9 +14,14 @@ a durable MEXC Spot order-intent pipeline. One Python package, one CLI:
 - Telegram and MEXC traffic is direct; proxy configuration is rejected.
 - No web server, no public network listener, no withdrawals, no futures,
   no short selling.
-- Default trading mode is `sim`; `testonly` uses the official order-test
-  endpoint; `live` requires an explicit token, a fixed order amount, and MEXC
-  credentials restricted to Spot.
+- MEXC Spot only, automatic execution of valid signals; there is no
+  SIM/TESTONLY/LIVE product-mode split, no symbol allowlist, and no per-signal
+  approval. Construction requires the exact owner acknowledgement, a fixed
+  quote amount, and MEXC credentials plus the CLI write backend restricted to
+  Spot.
+- Pause is enforced by a kernel file lock at the order-submission boundary;
+  readiness (Telegram, MEXC, channel, learning, emergency stop, reconciliation)
+  is checked in the same transaction as the submission claim.
 
 ## Source-of-truth order
 
@@ -33,8 +38,8 @@ Do not silently change behavior to match an old doc.
 
 - Never place, cancel, test, or reconcile a real exchange order.
 - Never run `tg-ingest auth login`, `auth logout`, `serve`, `manage run`,
-  `control run`, `diagnostics telegram`, `trading verify`, `trading test-order`,
-  or `trading reconcile` unless the user explicitly asks and understands the
+  `control run`, `diagnostics telegram`, `trading verify`, or
+  `trading reconcile` unless the user explicitly asks and understands the
   side effects.
 - Never read, print, copy, or commit `.env`, `config/config.toml` values,
   Telegram session files, the SQLite database, or message contents. Use the
@@ -76,8 +81,8 @@ Do not silently change behavior to match an old doc.
 - The activation boundary is persisted in
   `app_state['trading.activation_boundary_message_id']` and advances forward at
   every `serve` start. Messages at/below it, and every `source='backfill'`
-  message, are stored and audited but never traded in `testonly`/`live`.
-- `testonly`/`live` intents reserve their full quote notional plus the fee
+  message, are stored and audited but never traded.
+- Every intent reserves its full quote notional plus the fee
   buffer in `trading_budget_ledger` inside the intent-creation transaction. The
   aggregate budget is a configurable reference value (default 50 USDT) and is
   not hard-capped at 50; the owner chooses the value. The ledger is never reset

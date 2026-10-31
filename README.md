@@ -6,16 +6,21 @@ edits, deletions, replies, forwards, albums) in a local SQLite database, parses
 Spot signals, applies risk controls, and drives a durable order-intent state
 machine against the official MEXC Spot API.
 
-**Live trading is disabled by default.** Default mode is `sim` (no exchange
-calls). `testonly` uses the official `/api/v3/order/test` endpoint;
-`live` additionally requires an explicit acknowledgement token in the private
-config. No withdrawals, no futures, no unofficial endpoints.
+**Automatic MEXC Spot execution.** The product has one execution behaviour:
+valid BUY signals from the selected channel are executed automatically with the
+owner's fixed quote amount. There is no SIM/TESTONLY/LIVE product-mode split, no
+symbol allowlist, and no per-signal approval. The pipeline refuses to build
+without the exact owner acknowledgement, MEXC Spot credentials, and the MEXC CLI
+write backend. No withdrawals, no futures, no unofficial endpoints.
+
+- Pause/resume and readiness are enforced at the submission boundary with a
+  kernel file lock and a transactional check, not only in the UI.
 
 - Runtime: Python 3.12 + Telethon (MTProto) with direct Telegram networking.
 - Storage: SQLite with reproducible migrations.
 - Config: `.env` (secrets) + private `config.toml` (runtime paths/options).
 - CLI: `tg-ingest` (setup, auth, channels, backfill, serve, status, diagnostics,
-  trading status/signals/intents/parse/reconcile/repair-signals/test-order,
+  trading status/signals/intents/parse/reconcile/repair-signals,
   offline `analyze` replay/summary/list/show/review/failures/corpus-check, owner
   control bot, and a two-operator `manage run`/`manage status` bot with developer
   self-authorized bounded validation).
@@ -87,20 +92,20 @@ journalctl -u tg-ingest.service -f
   never retried blindly. Reconciliation queries the exchange by order/client id.
 - Spot BUY only: SHORT/SELL instructions, emergency stop, ambiguous/invalid
   signals, and unsupported symbols, precision, or notionals fail closed. There
-  is no symbol allowlist, signal-age limit, price-deviation threshold,
-  daily/open-order cap, or mandatory stop-loss rule.
+  is no symbol allowlist, signal-age limit, price-deviation threshold, or
+  daily/open-order cap. SL, TP1 and TP2 are mandatory and cannot be disabled.
 - Confirmed fills get two native OCO SELL exits (TP1 and TP2, each with the
   stop-loss); partial or uncertain protection is reported honestly and
   reconciled, never blindly resubmitted.
-- Live mode requires `mode = "live"` plus `live_enabled_token`; the default is
-  `sim`. See `docs/operations.md`.
-- The optional Telegram control bot defaults to human approval. It authenticates
-  the personal session, verifies MEXC permissions, selects the channel, teaches
-  from five confirmed examples, and presents nonce-bound, expiring approvals.
+- The pipeline refuses to build without the exact owner acknowledgement,
+  MEXC Spot credentials, and a healthy MEXC CLI write backend. There is no
+  fallback to a simulated or test-only mode.
+- The optional Telegram control bot authenticates the personal session, verifies
+  MEXC permissions, selects the channel, and completes the learning examples.
   Both the configured owner and the configured developer have owner-equivalent
-  access to every control-bot command and administrative action. It never enables
-  trading, withdrawals, futures, or automatic mode by itself. Automatic mode
-  requires a two-step confirmation and is cleared on every process restart. See
+  access to every control-bot command and administrative action. Its
+  `/pause` and `/resume` controls are enforced at the order-submission boundary
+  with a kernel file lock and a transactional readiness check. See
   `docs/CONTROL_BOT_FA.md`.
 - The `manage` bot authorizes exactly two numeric operators (owner and
   developer), lists channels, and previews the latest ten messages read-only.

@@ -32,8 +32,6 @@ SYMBOL = "BTCUSDT"
 
 @pytest.fixture()
 def env(cfg: AppConfig, repo: Repository):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     cfg.trading.entry_trigger_offset_ticks = 2  # enable on_tick evaluation
     store = TradeStore(repo.db, cfg.trading)
     client = FakeClient()
@@ -45,10 +43,18 @@ def env(cfg: AppConfig, repo: Repository):
 
 def _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL) -> ParsedSignal:
     return ParsedSignal(
-        kind="alert", action="buy", symbol=SYMBOL,
-        entry_price=entry, entry_low_price=None, entry_high_price=None,
-        target_prices=(tp1, tp2), stop_loss=sl, order_type="limit",
-        amount_text=None, raw_text="buy", normalized_text="buy",
+        kind="alert",
+        action="buy",
+        symbol=SYMBOL,
+        entry_price=entry,
+        entry_low_price=None,
+        entry_high_price=None,
+        target_prices=(tp1, tp2),
+        stop_loss=sl,
+        order_type="limit",
+        amount_text=None,
+        raw_text="buy",
+        normalized_text="buy",
         fingerprint_sha256="abc",
     )
 
@@ -63,9 +69,14 @@ def _insert_signal(store: TradeStore, signal_id: str = "sig-1") -> None:
         )
 
 
-def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
-                   client_order_id: str = "tsi-1", entry: Decimal = ENTRY,
-                   quote: Decimal = Decimal("10")) -> dict:
+def _insert_intent(
+    store: TradeStore,
+    *,
+    signal_id: str = "sig-1",
+    client_order_id: str = "tsi-1",
+    entry: Decimal = ENTRY,
+    quote: Decimal = Decimal("10"),
+) -> dict:
     _insert_signal(store, signal_id)
     iid = f"intent-{client_order_id}"
     with store.db.transaction() as conn:
@@ -75,8 +86,24 @@ def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
              order_type, quote_amount, base_quantity, limit_price, mode, state,
              create_msg_id, create_channel_id, planned_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (iid, signal_id, f"idem-{client_order_id}", client_order_id, SYMBOL, "buy",
-             "limit", str(quote), "0.1", str(entry), "live", "planned", 1, 100, "now", "now"),
+            (
+                iid,
+                signal_id,
+                f"idem-{client_order_id}",
+                client_order_id,
+                SYMBOL,
+                "buy",
+                "limit",
+                str(quote),
+                "0.1",
+                str(entry),
+                "live",
+                "planned",
+                1,
+                100,
+                "now",
+                "now",
+            ),
         )
     return store.get_intent(iid)
 
@@ -107,13 +134,20 @@ def _setup_direct_entry(env, entry=ENTRY, fill_qty=Decimal("0")):
     assert trade["trade_state"] == "entry_active", trade
     # Credit an entry fill so there is a position to manage.
     if fill_qty > 0:
-        client.fill_order(intent["exchange_order_id"], fill_qty,
-                          fill_qty * entry, entry)
+        client.fill_order(intent["exchange_order_id"], fill_qty, fill_qty * entry, entry)
         store.add_fill(
-            exchange_order_id=intent["exchange_order_id"], symbol=SYMBOL,
-            raw={"price": str(entry), "qty": str(fill_qty),
-                 "quoteQty": str(fill_qty * entry), "commission": "0",
-                 "commissionAsset": "USDT", "isBuyer": 1, "isMaker": 0, "time": 1},
+            exchange_order_id=intent["exchange_order_id"],
+            symbol=SYMBOL,
+            raw={
+                "price": str(entry),
+                "qty": str(fill_qty),
+                "quoteQty": str(fill_qty * entry),
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "isBuyer": 1,
+                "isMaker": 0,
+                "time": 1,
+            },
         )
         # A partial fill leaves the entry order working.  Cancel the unfilled
         # remainder so the entry is terminal; OCO exits are only placed once
@@ -131,6 +165,7 @@ def _setup_direct_entry(env, entry=ENTRY, fill_qty=Decimal("0")):
 # --------------------------------------------------------------------------
 # OCO exit placement at entry fill
 # --------------------------------------------------------------------------
+
 
 def test_oco_exits_placed_on_entry_fill(env):
     cfg, store, engine, client, notifier, tm = env
@@ -166,18 +201,26 @@ def test_oco_partial_quantities(env):
 # OCO fills advance the trade
 # --------------------------------------------------------------------------
 
+
 def test_oco_tp1_fill_advances_to_tp2(env):
     cfg, store, engine, client, notifier, tm = env
     trade, intent = _setup_direct_entry(env, fill_qty=Decimal("0.1"))
     tp1_order = _oco_orders(store, trade, "tp1")[0]
     # Credit TP1 OCO fill.
-    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP1, TP1)
+    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP1, TP1)
     store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP1), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP1),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
@@ -192,21 +235,35 @@ def test_oco_both_filled_closes_trade(env):
     tp1_order = _oco_orders(store, trade, "tp1")[0]
     tp2_order = _oco_orders(store, trade, "tp2")[0]
     # Fill both OCOs.
-    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP1, TP1)
+    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP1, TP1)
     store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP1), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP1),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
-    client.fill_order(tp2_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP2, TP2)
+    client.fill_order(tp2_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP2, TP2)
     store.add_fill(
-        exchange_order_id=tp2_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP2), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP2),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 3},
+        exchange_order_id=tp2_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP2),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP2),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 3,
+        },
     )
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
@@ -216,6 +273,7 @@ def test_oco_both_filled_closes_trade(env):
 # --------------------------------------------------------------------------
 # Stop-loss via OCO stop-limit legs (no separate market sell)
 # --------------------------------------------------------------------------
+
 
 def test_oco_stop_loss_leg_exits_position(env):
     cfg, store, engine, client, notifier, tm = env
@@ -246,14 +304,14 @@ def test_oco_no_separate_market_sell(env):
 # Restart safety
 # --------------------------------------------------------------------------
 
+
 def test_oco_position_recovers_after_restart(env):
     cfg, store, engine, client, notifier, tm = env
     trade, intent = _setup_direct_entry(env, fill_qty=Decimal("0.1"))
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active"
     # New manager over the same DB (simulated restart).
-    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client,
-                       notifier=FakeNotifier())
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     t = store.get_trade(trade["trade_id"])
     assert t["trade_state"] == "oco_active", t
@@ -264,9 +322,7 @@ def test_oco_waits_for_terminal_entry_with_partial_fill(env):
     cfg, store, engine, client, notifier, tm = env
     tm._clock = lambda: 5000.0
     intent = _insert_intent(store)
-    trade = tm.on_intent_planned(
-        intent, _parsed(), reference_price=Decimal("100")
-    ).trade
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100")).trade
     engine._execute_intent(intent["intent_id"])
     intent = engine.store.get_intent(intent["intent_id"])
     tm.on_intent_executed(intent)
@@ -275,10 +331,18 @@ def test_oco_waits_for_terminal_entry_with_partial_fill(env):
     # Partial fill, entry remainder still open.
     client.fill_order(intent["exchange_order_id"], Decimal("0.06"), Decimal("6"), ENTRY)
     store.add_fill(
-        exchange_order_id=intent["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(ENTRY), "qty": "0.06", "quoteQty": "6",
-             "commission": "0", "commissionAsset": "USDT",
-             "isBuyer": 1, "isMaker": 0, "time": 1},
+        exchange_order_id=intent["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(ENTRY),
+            "qty": "0.06",
+            "quoteQty": "6",
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 1,
+            "isMaker": 0,
+            "time": 1,
+        },
     )
     tm._reconcile_entry_fills(trade)
     trade = store.get_trade(trade["trade_id"])
@@ -369,9 +433,7 @@ def test_restart_recovers_partial_oco_protection(env):
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_partial"
 
-    tm2 = TradeManager(
-        cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier()
-    )
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active", trade
@@ -381,6 +443,7 @@ def test_restart_recovers_partial_oco_protection(env):
 # --------------------------------------------------------------------------
 # Safety: no orders for non-tradeable / other symbols
 # --------------------------------------------------------------------------
+
 
 def test_ignores_other_symbol(env):
     cfg, store, engine, client, notifier, tm = env

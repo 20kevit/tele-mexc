@@ -25,22 +25,20 @@ class FlakyBot:
 
 
 def _notifier(engine, bot):
-    n = TradingNotifier(
-        engine.store, bot, owner_id=OWNER, developer_id=DEVELOPER
-    )
+    n = TradingNotifier(engine.store, bot, owner_id=OWNER, developer_id=DEVELOPER)
     engine.notifier = n
     return n
 
 
 def test_both_owner_and_developer_receive_trading_notifications(cfg, repo):
     client = FakeMexc()
-    engine = _engine(cfg, repo, client, mode="testonly")
+    engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     _notifier(engine, bot)
 
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert intent is not None
-    assert client.test_calls == 1
+    assert client.place_calls == 1
 
     recipients = {chat for chat, _ in bot.sent}
     assert recipients == {OWNER, DEVELOPER}
@@ -52,14 +50,14 @@ def test_both_owner_and_developer_receive_trading_notifications(cfg, repo):
 
 def test_failed_notification_retries_without_resubmitting_the_order(cfg, repo):
     client = FakeMexc()
-    engine = _engine(cfg, repo, client, mode="testonly")
+    engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     bot.fail_chats = {DEVELOPER}
     notifier = _notifier(engine, bot)
 
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert intent is not None
-    assert client.test_calls == 1
+    assert client.place_calls == 1
     assert any(chat == OWNER for chat, _ in bot.sent)
     assert notifier.pending_count() > 0
 
@@ -67,23 +65,23 @@ def test_failed_notification_retries_without_resubmitting_the_order(cfg, repo):
     notifier.flush()
     assert notifier.pending_count() == 0
     assert any(chat == DEVELOPER for chat, _ in bot.sent)
-    assert client.test_calls == 1  # notification retry never touches the exchange
+    assert client.place_calls == 1  # notification retry never touches the exchange
 
 
 def test_notification_failure_never_blocks_trading(cfg, repo):
     client = FakeMexc()
-    engine = _engine(cfg, repo, client, mode="testonly")
+    engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     bot.fail_chats = {OWNER, DEVELOPER}
     _notifier(engine, bot)
 
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert intent is not None
-    assert client.test_calls == 1
+    assert client.place_calls == 1
 
 
 def test_notification_events_are_idempotent(cfg, repo):
-    engine = _engine(cfg, repo, mode="testonly")
+    engine = _engine(cfg, repo)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
     # signal_accepted is delivered to both owner and developer; repeating the

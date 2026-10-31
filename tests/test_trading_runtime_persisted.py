@@ -108,9 +108,8 @@ def test_build_engine_applies_persisted_amount(cfg, repo):
     """The production builder must apply the stored amount before sizing."""
 
     _store(repo).set_setting("order_quote_amount", "6.5")
-    cfg.trading.mode = "sim"
 
-    engine = build_trading_engine(cfg, repo)
+    engine = build_trading_engine(cfg, repo, client=object())
 
     assert engine.cfg.trading.order_quote_amount == pytest.approx(6.5)
     assert engine.cfg.trading.order_quote_amount_source == "database (Telegram menu)"

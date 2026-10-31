@@ -72,8 +72,6 @@ def _load_deploy_meta() -> dict[str, Any]:
 
 def get_version_info(
     *,
-    trading_mode: str | None = None,
-    live_authorized: bool | None = None,
     expected_commit_sha: str | None = None,
 ) -> dict[str, Any]:
     """Return a dictionary of version/runtime information for ``/version``.
@@ -115,8 +113,6 @@ def get_version_info(
         "built_at": built_at or "unknown",
         "deployed_at": deployed_at or "unknown",
         "uptime": uptime,
-        "trading_mode": trading_mode or "unknown",
-        "live_authorized": live_authorized if live_authorized is not None else "unknown",
         "matches_expected_revision": match,
     }
 
@@ -133,8 +129,6 @@ def format_version_text(info: dict[str, Any]) -> str:
         f"• زمان ساخت: {info['built_at']}",
         f"• زمان استقرار: {info['deployed_at']}",
         f"• زمان اجرا (uptime): {info['uptime']}",
-        f"• حالت معامله: {info['trading_mode']}",
-        f"• مجوز لایو: {_bool_persian(info['live_authorized'])}",
         f"• تطبیق با نسخه انتظاردهی: {info['matches_expected_revision']}",
     ]
     return "\n".join(lines)

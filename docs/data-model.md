@@ -173,7 +173,7 @@ with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable.
 | `signals.signal_kind` | `alert`, `update`, `cancel`, `result`, `info`, `ambiguous` |
 | `signals.status` | `parsed`, `rejected`, `validated`, `planned`, `superseded`, `canceled`, `deleted` |
 | `order_intents.state` | `planned`, `submitting`, `submitted`, `reconciling`, `open`, `filled`, `canceled`, `failed`, `rejected`, `unknown_requires_reconciliation`, `canceled_local` |
-| `order_intents.mode` | `sim`, `testonly`, `live` |
+| `order_intents.mode` | historical compatibility: `sim`, `testonly`, `live`; new rows are `live`, legacy non-live rows are never executable |
 | `exchange_orders.status` | `NEW`, `FILLED`, `PARTIALLY_FILLED`, `CANCELED`, `PARTIALLY_CANCELED`, `UNKNOWN` |
 | `order_fills.source` | `reconciliation`, `rest_query` |
 | `audit_events.category` | `telegram`, `parse`, `validate`, `risk`, `mexc_request`, `lifecycle`, `reconcile`, `config`, `emergency` |
@@ -192,8 +192,7 @@ with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable.
    submission.
 5. Every intent state change appends history; reconciliation outcomes and audit
    events are append-only.
-6. Budget reservation is inserted in the same transaction as the intent for
-   `testonly`/`live`.
+6. Budget reservation is inserted in the same transaction as the intent.
 7. Fills are idempotent by exchange trade id. `fill_sync_required` keeps terminal
    intents in the reconciliation set until fills match executed quantity.
 8. Notifications are idempotent by `(event_key, role)` and never gate execution.

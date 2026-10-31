@@ -103,6 +103,8 @@ def cfg(tmp_path: Path) -> AppConfig:
         db_path=tmp_path / "data" / "test.sqlite3",
         session_path=tmp_path / "config" / "session",
     )
+    # The product has one automatic Spot behaviour; tests use fake exchanges.
+    c.trading.execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     c.ensure_dirs()
     return c
 

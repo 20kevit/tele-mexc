@@ -31,12 +31,14 @@ class SymbolRegistry:                       # ttl cache over exchangeInfo
 
 Construction is centralized in `trading/runtime.py`:
 
-- `sim` (default): no client is constructed at all — `build_trading_engine`
-  returns an engine with `client=None`; processing never touches networking.
-- `testonly`: client built; submissions go to the official
-  `POST /api/v3/order/test` (validation only).
-- `live`: client built AND the acknowledgement token must match; otherwise
-  `_execute_live` raises `AccidentalOrderRiskError` before any call.
+Construction is fail-closed and there is one execution behaviour:
+
+- the exact owner acknowledgement must match, otherwise `ConfigError`;
+- MEXC credentials and the CLI write backend (`[mexc_cli] enabled = true`) are
+  required, and CLI health is checked before returning the client;
+- every write path checks pause/readiness at the submission boundary;
+- a wrong or missing acknowledgement raises `AccidentalOrderRiskError` before
+  any exchange call.
 
 ## 2. From a reviewed signal to an exchange order intent
 
@@ -177,7 +179,7 @@ inside the CLI process cannot be counted by the application limiter.
    spendable quote balance for that exact order.
 5. Manifest *policy* confirmation: automated-trading acceptance and region —
    cannot be verified by code (`MEXC_SPOT_RISKS.md` §8 checklist).
-6. Only then `trading.mode = "live"` plus the acknowledgement token.
+6. Only then set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` and build the pipeline.
 
 Health checks at every stage (ping/time/account/keyInfo) are read-only and
 place no orders.

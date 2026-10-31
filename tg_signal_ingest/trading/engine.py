@@ -6,8 +6,9 @@ Safety invariants:
   edit version), so editing a signal can never place a second order.
 * A submit whose outcome is uncertain becomes
   ``unknown_requires_reconciliation`` and is *never* retried automatically.
-* Live mode is explicit; simulation and official test-order modes never call
-  the matching engine.
+* Every exchange write is gated by pause/readiness at the submission boundary.
+* An uncertain outcome becomes ``unknown_requires_reconciliation`` and is
+  *never* retried automatically.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from ..config import AppConfig
+from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig
 from ..mexc.errors import (
     AccidentalOrderRiskError,
     MexcDuplicateOrder,
@@ -41,6 +42,7 @@ from ..repository import QueueItem, Repository
 from .audit import normalize_event_type
 from .balance import BalanceError, parse_account, validate_balance
 from .evidence import ExchangeEvidence
+from .gate import ENTRY, PROTECTION, SubmissionBlocked, SubmissionGate
 from .parser import ParsedSignal, SignalParser
 from .risk import RiskDecision, RiskManager
 from .store import (
@@ -53,7 +55,6 @@ from .store import (
 
 log = logging.getLogger("ingest.trading")
 
-LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 EXCHANGE_TERMINAL = {"FILLED", "CANCELED", "PARTIALLY_CANCELED"}
 
 # Central notification routing.  Genuine signals go to both recipients; only
@@ -86,6 +87,7 @@ class TradingEngine:
         monotonic: Any | None = None,
         notifier: Any | None = None,
         trade_manager: Any | None = None,
+        submission_gate: SubmissionGate | None = None,
     ):
         self.cfg = cfg
         self.repo = repo
@@ -103,18 +105,24 @@ class TradingEngine:
             self.store = _TradeStore(repo.db, cfg.trading, now=self._now)
         # Durable exchange evidence.  Every order/account call is recorded
         # before it is sent, so an ambiguous write is never guessed later.
-        self.evidence = ExchangeEvidence(
-            self.store, clock_health=lambda: getattr(self, "_clock_health", None)
-        )
+        self.evidence = ExchangeEvidence(self.store, clock_health=lambda: getattr(self, "_clock_health", None))
         self.parser = parser or SignalParser()
         self.risk = RiskManager(cfg.trading, self.store)
         self.client = client
         self.registry = registry
         self._price_provider = price_provider
+        # Every exchange WRITE goes through this gate.  Production wiring passes
+        # a gate that also requires complete owner setup; a direct construction
+        # (CLI/tests) still enforces pause, acknowledgement and emergency stop.
+        self.submission_gate = submission_gate or SubmissionGate(repo.db, cfg)
+        # Runtime readiness callbacks can be installed by the service after it
+        # has verified the Telegram session and resolved the selected channel.
+        self._runtime_ready: dict[str, Any] = {}
+        self._mexc_verified = False
         # Durable owner/developer reporting; never a prerequisite for an order.
         self.notifier = notifier
-        # Trade lifecycle coordinator (conditional entry, TP1/TP2, SL).  When
-        # present and mode is live it owns entry submission for live intents.
+        # Trade lifecycle coordinator (conditional entry, TP1/TP2, SL).  It
+        # owns entry submission for every intent.
         self.trade_manager = trade_manager
         # If a TradeManager was supplied after Engine creation, wire its store
         # to the same instance for coherence (Engine is the source of truth
@@ -125,14 +133,70 @@ class TradingEngine:
             # TradeStore on the same repo.db: they share the same SQLite file,
             # but sharing the Python object eliminates any future divergence of
             # in-memory caches and makes atomicity reasoning trivial.
-            try:
-                self.trade_manager.store = self.store  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                self.trade_manager.store = self.store
         # The processing queue is normally single-consumer, but concurrent
         # delivery/retry can call this from more than one thread. Serializing
         # the whole decision keeps the DB reservation and execution atomic.
         self._process_lock = threading.RLock()
+
+    # ----------------------------------------------------- execution readiness
+
+    def set_runtime_readiness(self, **callbacks: Any) -> None:
+        """Install live process checks (Telegram connected, channel resolved)."""
+
+        for name, callback in callbacks.items():
+            if callback is None:
+                self._runtime_ready.pop(name, None)
+            else:
+                self._runtime_ready[name] = callback
+        self.submission_gate.runtime.update(self._runtime_ready)
+
+    def mark_mexc_verified(self, verified: bool = True) -> None:
+        self._mexc_verified = bool(verified)
+        if verified:
+            self.submission_gate.runtime["mexc"] = lambda: self._mexc_verified
+        else:
+            self.submission_gate.runtime.pop("mexc", None)
+
+    def verify_mexc_readiness(self) -> bool:
+        """Read-only account check used once at service startup.
+
+        The submission gate still reads the durable setup state on every order;
+        this callback only proves the account currently grants Spot trading.
+        """
+
+        if self.client is None:
+            self.mark_mexc_verified(False)
+            return False
+        try:
+            parse_account(self.client.account(), fetched_at=self._monotonic())
+        except Exception as exc:  # noqa: BLE001 - unreadable credentials fail closed
+            log.error("MEXC account readiness check failed (%s)", exc.__class__.__name__)
+            self.mark_mexc_verified(False)
+            return False
+        self.mark_mexc_verified(True)
+        return True
+
+    def _submission_blocker(self, conn: Any, purpose: str) -> str | None:
+        if self.client is None:
+            return "no MEXC client is configured"
+        try:
+            return self.submission_gate.precheck(conn, purpose=purpose)
+        except Exception as exc:  # noqa: BLE001 - unreadable state fails closed
+            return f"readiness check failed ({exc.__class__.__name__}); failing closed"
+
+    @contextlib.contextmanager
+    def _submission(self, purpose: str) -> Any:
+        with self.submission_gate.shared():
+            try:
+                with self.repo.db.transaction() as conn:
+                    reason = self._submission_blocker(conn, purpose)
+            except Exception as exc:  # noqa: BLE001
+                raise SubmissionBlocked(f"readiness check failed ({exc.__class__.__name__}); failing closed") from exc
+            if reason:
+                raise SubmissionBlocked(reason)
+            yield
 
     # ------------------------------------------------------------ ingestion
 
@@ -142,9 +206,7 @@ class TradingEngine:
         with self._process_lock:
             return self._process_item(item, record)
 
-    def _process_item(
-        self, item: QueueItem, record: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    def _process_item(self, item: QueueItem, record: dict[str, Any]) -> dict[str, Any] | None:
         if item.item_type == "delete" or int(record.get("deleted") or 0):
             self.handle_delete(item.channel_id, item.message_id)
             return None
@@ -198,10 +260,7 @@ class TradingEngine:
                 return None
             if parsed.kind == "cancel":
                 self.store.update_signal(signal_id, "parsed", "cancel signal")
-                if (
-                    self.cfg.trading.mode in ("testonly", "live")
-                    and record.get("source") == "backfill"
-                ):
+                if record.get("source") == "backfill":
                     reason = "historical cancel imported by backfill; not applied to live orders"
                     self.store.update_signal(signal_id, "rejected", reason)
                     self.store.audit(signal_id, "lifecycle", "cancel_ignored_backfill", reason)
@@ -227,20 +286,13 @@ class TradingEngine:
         # activation boundary is never tradeable.  This is an identity/replay
         # guard, not an age-based rejection.
         replay_reason: str | None = None
-        if (
-            self.cfg.trading.mode in ("testonly", "live")
-            and record.get("source") == "backfill"
-        ):
+        if record.get("source") == "backfill":
             replay_reason = "historical backfill message; only new Telegram messages can trade"
-        elif (
-            self.cfg.trading.mode in ("testonly", "live")
-            and record.get("source") == "recovery"
-        ):
+        elif record.get("source") == "recovery":
             replay_reason = (
-                "message recovered while bridging an outage; only messages "
-                "delivered live after startup can trade"
+                "message recovered while bridging an outage; only messages delivered live after startup can trade"
             )
-        elif self.cfg.trading.mode in ("testonly", "live"):
+        else:
             boundary = self.store.activation_boundary()
             if boundary is None:
                 replay_reason = "trading activation boundary is not set; refusing to trade"
@@ -284,7 +336,7 @@ class TradingEngine:
 
         reference = self._reference_price(parsed)
         meta = self._symbol_meta(parsed.symbol)
-        if self.cfg.trading.mode in ("testonly", "live") and meta is None:
+        if meta is None:
             reason = "symbol metadata unavailable; refusing to trade without exchange constraints"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "validate", "rejected", reason)
@@ -366,7 +418,7 @@ class TradingEngine:
                 edit_version=version,
                 idempotency_key=idempotency_key,
                 client_order_id=client_order_id,
-                mode=self.cfg.trading.mode,
+                mode="live",
                 order_type=decision.order_type,
                 quote_amount=decision.quote_amount or Decimal(0),
                 base_quantity=decision.base_quantity,
@@ -411,7 +463,6 @@ class TradingEngine:
 
         self.store.audit(signal_id, "lifecycle", "intent_planned", intent["intent_id"])
         # Trade lifecycle coordinator: conditional entry, TP1/TP2, SL.
-        # Only intervenes in live mode; sim/testonly keep their existing path.
         defer = False
         if self.trade_manager is not None:
             trade_decision = self.trade_manager.on_intent_planned(intent, parsed, reference)
@@ -421,7 +472,9 @@ class TradingEngine:
             if trade_decision.deferred and trade_decision.trade is not None:
                 defer = True
                 self.store.audit(
-                    signal_id, "lifecycle", "conditional_entry_waiting",
+                    signal_id,
+                    "lifecycle",
+                    "conditional_entry_waiting",
                     f"trade {trade_decision.trade['trade_id']} waiting for upward trigger "
                     f"at {trade_decision.trade['trigger_price']}",
                 )
@@ -463,7 +516,9 @@ class TradingEngine:
         if current.get("state") != "planned":
             return current
         self.store.audit(
-            current["intent_id"], "lifecycle", "planned_intent_resumed",
+            current["intent_id"],
+            "lifecycle",
+            "planned_intent_resumed",
             "retry/duplicate delivery resumed a planned intent that was never submitted",
         )
         if self.trade_manager is not None:
@@ -472,7 +527,9 @@ class TradingEngine:
                 return current
             if decision.deferred:
                 self.store.audit(
-                    current["intent_id"], "lifecycle", "conditional_entry_waiting",
+                    current["intent_id"],
+                    "lifecycle",
+                    "conditional_entry_waiting",
                     "resumed intent remains a conditional entry waiting for its trigger",
                 )
                 return current
@@ -481,19 +538,46 @@ class TradingEngine:
             self.trade_manager.on_intent_executed(result)
         return result
 
+    def resume_planned_intents(self, limit: int = 100) -> int:
+        """Resume intents left ``planned`` by pause/crash, never test rows.
+
+        Only intents that already own a trade row are resumed.  A conditional
+        entry remains deferred to its price trigger.  Anything else is left for
+        operator review rather than submitted without lifecycle protection.
+        """
+
+        resumed = 0
+        if self.trade_manager is None:
+            return 0
+        for intent in self.store.list_planned_intents(limit=limit):
+            if intent.get("mode") != "live":
+                continue
+            trade = self.store.get_trade_by_intent(intent["intent_id"])
+            if trade is None:
+                self.store.audit(
+                    intent["intent_id"],
+                    "lifecycle",
+                    "planned_resume_skipped",
+                    "no trade lifecycle row; refusing to submit without protection",
+                )
+                continue
+            if trade.get("entry_mode") == "conditional" and trade.get("trade_state") == "pending_entry":
+                continue
+            result = self.execute_intent(intent["intent_id"])
+            if result is None or result.get("state") not in ("submitting", "submitted", "open", "filled"):
+                continue
+            resumed += 1
+            self.trade_manager.on_intent_executed(result)
+        return resumed
+
     def _is_at_or_below_boundary(self, item: QueueItem) -> bool:
-        if self.cfg.trading.mode not in ("testonly", "live"):
-            return False
         boundary = self.store.activation_boundary()
         return boundary is None or item.message_id <= boundary
 
     def _is_historical(self, item: QueueItem, record: dict[str, Any]) -> bool:
         """True for backfill/recovery or any message at/below the boundary."""
 
-        return (
-            record.get("source") in ("backfill", "recovery")
-            or self._is_at_or_below_boundary(item)
-        )
+        return record.get("source") in ("backfill", "recovery") or self._is_at_or_below_boundary(item)
 
     @staticmethod
     def idempotency_key(channel_id: int, message_id: int, signal: ParsedSignal) -> str:
@@ -506,8 +590,6 @@ class TradingEngine:
                 return Decimal(str(self._price_provider(signal.symbol)))
             except (InvalidOperation, TypeError, ValueError, MexcError):
                 return None
-        if self.cfg.trading.mode == "sim":
-            return signal.entry_price
         if self.client is None or not signal.symbol:
             return None
         return self.fetch_market_price(signal.symbol)
@@ -564,7 +646,7 @@ class TradingEngine:
         return out
 
     def _symbol_meta(self, symbol: str | None) -> Any | None:
-        if self.cfg.trading.mode == "sim" or not symbol:
+        if not symbol:
             return None
         registry = self.registry or getattr(self.client, "symbols", None)
         if registry is None:
@@ -680,9 +762,7 @@ class TradingEngine:
         if record is None:
             if intent is not None:
                 try:
-                    record = self.store.get_message(
-                        int(intent["create_channel_id"]), int(intent["create_msg_id"])
-                    )
+                    record = self.store.get_message(int(intent["create_channel_id"]), int(intent["create_msg_id"]))
                 except (KeyError, TypeError, ValueError):
                     record = None
             elif signal_id:
@@ -731,9 +811,7 @@ class TradingEngine:
         if classification:
             lines.append(f"classification: {classification}")
         lines.append(f"decision: {reason}")
-        lines.append(
-            f"exchange submission attempted: {'yes' if submission_attempted else 'no'}"
-        )
+        lines.append(f"exchange submission attempted: {'yes' if submission_attempted else 'no'}")
         if diagnostics:
             lines.append(f"diagnostics: {diagnostics}")
         lines.append("original message:")
@@ -794,8 +872,7 @@ class TradingEngine:
             status = "IGNORED_SELL_SPOT_BUY_ONLY"
             headline = "سیگنال فروش نادیده گرفته می‌شود❌ — این ربات فقط Spot BUY است"
             detail = (
-                "intentionally ignored: this bot executes Spot BUY only; "
-                "no exchange order was submitted. " + reason
+                "intentionally ignored: this bot executes Spot BUY only; no exchange order was submitted. " + reason
             )
         else:
             status = "REJECTED_LOCALLY"
@@ -876,9 +953,7 @@ class TradingEngine:
             "ACCEPTED_OPEN": "✅ سفارش واقعی در MEXC ثبت شد (پر نشده)",
             "CANCELED_WITH_PARTIAL_FILL": "⚠️ سفارش در MEXC لغو شد — پر شده به‌صورت جزئی",
             "CANCELED": "⚠️ سفارش در MEXC لغو/بسته شد",
-            "UNCERTAIN_AWAITING_RECONCILIATION": (
-                "⚠️ وضعیت سفارش نامشخص است — نیاز به تطبیق دستی"
-            ),
+            "UNCERTAIN_AWAITING_RECONCILIATION": ("⚠️ وضعیت سفارش نامشخص است — نیاز به تطبیق دستی"),
             "SUBMISSION_REJECTED": "❌ سفارش در MEXC رد شد — ارسال موفقیت‌آمیز تایید نشد",
         }
         return headlines.get(status, f"وضعیت سفارش: {status}")
@@ -915,9 +990,7 @@ class TradingEngine:
             requested = Decimal(str(intent.get("base_quantity") or "0"))
             executed = Decimal(str(intent.get("executed_qty") or "0"))
             if requested > 0:
-                lines.append(
-                    f"remaining quantity: {format(max(Decimal(0), requested - executed), 'f')}"
-                )
+                lines.append(f"remaining quantity: {format(max(Decimal(0), requested - executed), 'f')}")
         except (InvalidOperation, ValueError):
             pass
         fills = []
@@ -975,18 +1048,14 @@ class TradingEngine:
             return intent
         signal = self.store.get_signal(intent["signal_id"])
         if signal is None or signal["status"] not in ("planned", "validated"):
-            return self._reject_before_submit(
-                intent, "signal is no longer active for this order"
-            )
+            return self._reject_before_submit(intent, "signal is no longer active for this order")
         if signal.get("symbol") != intent.get("symbol") or signal.get("action") != intent.get("side"):
-            return self._reject_before_submit(
-                intent, "signal fields changed after the intent was planned"
-            )
+            return self._reject_before_submit(intent, "signal fields changed after the intent was planned")
         if self.cfg.trading.emergency_stop:
             return self._reject_before_submit(intent, "emergency stop is active")
         symbol = str(intent.get("symbol") or "")
         meta = self._symbol_meta(symbol)
-        if self.cfg.trading.mode in ("testonly", "live") and meta is None:
+        if meta is None:
             return self._reject_before_submit(intent, "symbol metadata is unavailable")
         if meta is not None:
             try:
@@ -1003,8 +1072,11 @@ class TradingEngine:
 
     def _reject_before_submit(self, intent: dict[str, Any], reason: str) -> dict[str, Any]:
         self.store.transition_intent(
-            intent["intent_id"], "rejected", note=f"pre-submit revalidation failed: {reason}",
-            reject_reason=reason, category="risk",
+            intent["intent_id"],
+            "rejected",
+            note=f"pre-submit revalidation failed: {reason}",
+            reject_reason=reason,
+            category="risk",
         )
         self.store.update_signal(intent["signal_id"], "rejected", reason)
         self.store.audit(intent["intent_id"], "risk", "pre_submit_revalidation_rejected", reason)
@@ -1023,67 +1095,76 @@ class TradingEngine:
             raise RuntimeError(f"intent {intent_id} disappeared")
         if intent["state"] != "planned":
             return intent
-        # Exactly one delivery may turn a planned intent into a submission.
-        # A crash between planning and submission leaves the row ``planned`` and
-        # a retried queue item can safely resume it; a duplicate delivery that
-        # arrives after the claim can only observe the existing state.
-        if not self.store.claim_intent_for_submission(
-            intent_id, note="submission claimed by this delivery"
-        ):
+        # Legacy sim/testonly rows are historical evidence only.  They must
+        # never become a real order merely because the pipeline now executes
+        # Spot automatically.
+        if intent.get("mode") != "live":
+            self.store.transition_intent(
+                intent_id,
+                "rejected",
+                note=f"legacy {intent.get('mode')!r} intent is not executable; only new Spot intents may trade",
+                reject_reason="legacy non-executable intent",
+                category="risk",
+            )
             result = self.store.get_intent(intent_id)
             assert result is not None
             return result
-
-        mode = intent["mode"]
+        # Pause/readiness are checked inside the same transaction that flips
+        # planned -> submitting, while the shared gate prevents pause from
+        # acknowledging until this submission leaves the boundary.
         try:
-            if mode == "sim":
-                return self._execute_sim(intent)
-            if mode == "testonly":
-                return self._execute_testonly(intent)
-            if mode == "live":
-                return self._execute_live(intent)
-        except AccidentalOrderRiskError as exc:
-            self.store.transition_intent(
-                intent_id, "rejected", note=f"live gate blocked submission: {exc}",
-                reject_reason=str(exc), category="risk",
+            with self._submission(ENTRY):
+                claimed, blocked = self.store.claim_intent_for_submission(
+                    intent_id,
+                    note="submission claimed by this delivery",
+                    precheck=lambda conn: self._submission_blocker(conn, ENTRY),
+                )
+                if not claimed:
+                    result = self.store.get_intent(intent_id)
+                    assert result is not None
+                    if blocked:
+                        self.store.audit(
+                            intent_id,
+                            "risk",
+                            "submission_blocked",
+                            blocked,
+                            event_type="exchange.submission_blocked",
+                            outcome="blocked",
+                        )
+                        self._notify_intent_decision(
+                            result,
+                            status="SUBMISSION_BLOCKED",
+                            reason=f"submission blocked: {blocked}",
+                        )
+                    return result
+                try:
+                    return self._execute_live(intent)
+                except AccidentalOrderRiskError as exc:
+                    self.store.transition_intent(
+                        intent_id,
+                        "rejected",
+                        note=f"execution gate blocked submission: {exc}",
+                        reject_reason=str(exc),
+                        category="risk",
+                    )
+                    raise
+        except SubmissionBlocked as exc:
+            result = self.store.get_intent(intent_id)
+            assert result is not None
+            self.store.audit(
+                intent_id,
+                "risk",
+                "submission_blocked",
+                exc.reason,
+                event_type="exchange.submission_blocked",
+                outcome="blocked",
             )
-            raise
-        self.store.transition_intent(intent_id, "rejected", note=f"unknown mode {mode!r}")
-        result = self.store.get_intent(intent_id)
-        assert result is not None
-        return result
-
-    def _execute_sim(self, intent: dict[str, Any]) -> dict[str, Any]:
-        price = Decimal(intent["limit_price"]) if intent.get("limit_price") else None
-        qty = Decimal(intent["base_quantity"]) if intent.get("base_quantity") else None
-        quote = Decimal(intent["quote_amount"]) if intent.get("quote_amount") else Decimal(0)
-        if price is None and qty and qty > 0:
-            price = quote / qty
-        if qty is None and price and price > 0:
-            qty = quote / price
-        self.store.transition_intent(intent["intent_id"], "submitting", note="simulated submission")
-        self.store.transition_intent(
-            intent["intent_id"], "filled",
-            note="simulation only; no exchange order was sent",
-            exchange_order_id=f"sim-{intent['client_order_id']}",
-            exchange_status="SIMULATED_FILLED",
-            executed_qty=qty,
-            cumulative_quote=quote,
-        )
-        result = self.store.get_intent(intent["intent_id"])
-        assert result is not None
-        self._notify(
-            event_key=f"{intent['intent_id']}:result:SIMULATED",
-            signal_id=intent.get("signal_id"),
-            intent_id=intent["intent_id"],
-            text=self._intent_text(
+            self._notify_intent_decision(
                 result,
-                "SIMULATION ONLY — no exchange order was sent",
-                submission_attempted=False,
-                status_label="SIMULATED_FILLED (NO REAL ORDER)",
-            ),
-        )
-        return result
+                status="SUBMISSION_BLOCKED",
+                reason=f"submission blocked: {exc.reason}",
+            )
+            return result
 
     def _order_payload(self, intent: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -1105,9 +1186,7 @@ class TradingEngine:
 
     # -------------------------------------------------------- TP/SL protection
 
-    def _protection_prices(
-        self, intent: dict[str, Any]
-    ) -> tuple[Decimal | None, Decimal | None]:
+    def _protection_prices(self, intent: dict[str, Any]) -> tuple[Decimal | None, Decimal | None]:
         """Derive the first take-profit and stop-loss for an attached order.
 
         Only limit BUY entries on a backend that supports exchange-side
@@ -1140,15 +1219,15 @@ class TradingEngine:
         sl = _optional_decimal(signal.get("stop_loss"))
         if sl is not None and sl >= entry:
             self.store.audit(
-                intent["intent_id"], "lifecycle", "protection_sl_dropped",
+                intent["intent_id"],
+                "lifecycle",
+                "protection_sl_dropped",
                 f"stop-loss {sl} is not below the BUY entry {entry}",
             )
             sl = None
         return tp, sl
 
-    def _record_protection_intent(
-        self, intent: dict[str, Any], tp: Decimal | None, sl: Decimal | None
-    ) -> None:
+    def _record_protection_intent(self, intent: dict[str, Any], tp: Decimal | None, sl: Decimal | None) -> None:
         if tp is None and sl is None:
             return
         self.store.upsert_protection(
@@ -1174,7 +1253,8 @@ class TradingEngine:
         verify = getattr(self.client, "verify_protection", None)
         if verify is None:
             self.store.update_protection(
-                intent_id, status="unverified",
+                intent_id,
+                status="unverified",
                 last_error="execution backend cannot verify attached protection",
             )
             return
@@ -1182,19 +1262,22 @@ class TradingEngine:
             result = verify(symbol=protection["symbol"], order_id=str(order_id))
         except MexcError as exc:
             self.store.update_protection(
-                intent_id, status="unverified",
+                intent_id,
+                status="unverified",
                 last_error=f"protection verification failed: {exc}",
             )
             return
         except Exception as exc:  # noqa: BLE001 - verification must never undo a landed order
             self.store.update_protection(
-                intent_id, status="unverified",
+                intent_id,
+                status="unverified",
                 last_error=f"protection verification error ({exc.__class__.__name__})",
             )
             return
         if not result.get("verified"):
             self.store.update_protection(
-                intent_id, status="unverified",
+                intent_id,
+                status="unverified",
                 last_error="exchange detail did not echo the requested TP/SL",
             )
             return
@@ -1212,73 +1295,18 @@ class TradingEngine:
                 mismatches.append(f"{remote_key}: wanted {wanted}, observed {observed}")
         if mismatches:
             self.store.update_protection(
-                intent_id, status="unverified",
+                intent_id,
+                status="unverified",
                 last_error="; ".join(mismatches)[:500],
             )
             return
         self.store.update_protection(intent_id, status="active")
 
-
-    def _execute_testonly(self, intent: dict[str, Any]) -> dict[str, Any]:
-        if self.client is None:
-            self.store.transition_intent(intent["intent_id"], "failed", note="no MEXC client configured")
-            result = self.store.get_intent(intent["intent_id"])
-            assert result is not None
-            return result
-        self.store.transition_intent(intent["intent_id"], "submitting", note="test-order validation")
-        try:
-            with self.evidence.operation(
-                operation_type="place_test_order",
-                purpose="test_order_validation",
-                endpoint="/api/v3/order/test",
-                correlation_id=intent["intent_id"],
-                signal_id=intent.get("signal_id"),
-                intent_id=intent["intent_id"],
-                symbol=intent["symbol"],
-                client_order_id=intent["client_order_id"],
-                request_payload=self._order_payload(intent),
-            ) as op:
-                op.succeed(self.client.place_test_order(**self._order_payload(intent)))
-        except MexcError as exc:
-            self.store.transition_intent(
-                intent["intent_id"], "rejected", note=f"test order rejected: {exc}", reject_reason=str(exc)
-            )
-        else:
-            self.store.transition_intent(
-                intent["intent_id"], "submitted",
-                note="official order/test accepted; no real order placed",
-                exchange_status="TEST_ONLY_ACCEPTED",
-            )
-            self.store.transition_intent(
-                intent["intent_id"], "canceled_local",
-                note="test-only intent terminal (never reached the matching engine)",
-                exchange_status="TEST_ONLY_ACCEPTED",
-            )
-        result = self.store.get_intent(intent["intent_id"])
-        assert result is not None
-        status_label = (
-            "TEST_ONLY_REJECTED (NO REAL ORDER)"
-            if result["state"] == "rejected"
-            else "TEST_ONLY_ACCEPTED (NO REAL ORDER)"
-        )
-        self._notify(
-            event_key=f"{intent['intent_id']}:result:{status_label}",
-            signal_id=intent.get("signal_id"),
-            intent_id=intent["intent_id"],
-            text=self._intent_text(
-                result,
-                "OFFICIAL TEST ORDER ONLY — no matching-engine order",
-                submission_attempted=False,
-                status_label=status_label,
-            ),
-        )
-        return result
-
     def _execute_live(self, intent: dict[str, Any]) -> dict[str, Any]:
-        if self.cfg.trading.mode != "live" or self.cfg.trading.live_enabled_token != LIVE_TOKEN:
-            raise AccidentalOrderRiskError("live order blocked: live mode is not explicitly armed")
+        if self.cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
+            raise AccidentalOrderRiskError("Spot order blocked: execution acknowledgement is not configured")
         if self.client is None:
-            raise AccidentalOrderRiskError("live order blocked: no MEXC client configured")
+            raise AccidentalOrderRiskError("Spot order blocked: no MEXC client configured")
 
         intent_id = intent["intent_id"]
         # The trade manager persists a fail-closed block whenever any bot-owned
@@ -1293,9 +1321,7 @@ class TradingEngine:
                 except Exception as exc:  # noqa: BLE001 - an unreadable guard fails closed
                     block_reason = f"new-BUY safety state is unreadable: {exc}"
             if block_reason:
-                return self._reject_before_submit(
-                    intent, f"new BUYs are blocked: {block_reason}"
-                )
+                return self._reject_before_submit(intent, f"new BUYs are blocked: {block_reason}")
         # Spend tracking is informational only: it never caps the owner's
         # per-order amount.  Pre-migration/legacy rows get a ledger row before
         # any exchange call.
@@ -1358,59 +1384,70 @@ class TradingEngine:
                 op.succeed(response)
         except (
             MexcDuplicateOrder,
-            MexcNetworkError, MexcServerError, MexcUnexpectedResponse,
-            MexcRateLimitError, MexcWafError,
+            MexcNetworkError,
+            MexcServerError,
+            MexcUnexpectedResponse,
+            MexcRateLimitError,
+            MexcWafError,
             MexcTimestampError,  # timestamp drift -> uncertain; never auto-retry
         ) as exc:
             self.store.transition_intent(
-                intent_id, "unknown_requires_reconciliation",
+                intent_id,
+                "unknown_requires_reconciliation",
                 note=f"submission outcome uncertain ({exc.__class__.__name__}); no retry will be attempted",
                 reject_reason=str(exc),
                 category="mexc_request",
             )
             if protection_requested:
                 self.store.update_protection(
-                    intent_id, status="unknown_requires_reconciliation",
+                    intent_id,
+                    status="unknown_requires_reconciliation",
                     last_error=str(exc)[:500],
                 )
         except MexcError as exc:
             self.store.transition_intent(
-                intent_id, "rejected", note=f"submission rejected: {exc}", reject_reason=str(exc),
+                intent_id,
+                "rejected",
+                note=f"submission rejected: {exc}",
+                reject_reason=str(exc),
                 category="mexc_request",
             )
             if protection_requested:
-                self.store.update_protection(
-                    intent_id, status="rejected", last_error=str(exc)[:500]
-                )
+                self.store.update_protection(intent_id, status="rejected", last_error=str(exc)[:500])
         except Exception as exc:  # noqa: BLE001 - after submitting, assume uncertainty
             self.store.transition_intent(
-                intent_id, "unknown_requires_reconciliation",
+                intent_id,
+                "unknown_requires_reconciliation",
                 note=f"unexpected submit failure ({exc.__class__.__name__}); no retry will be attempted",
                 reject_reason=str(exc),
                 category="mexc_request",
             )
             if protection_requested:
                 self.store.update_protection(
-                    intent_id, status="unknown_requires_reconciliation",
+                    intent_id,
+                    status="unknown_requires_reconciliation",
                     last_error=str(exc)[:500],
                 )
         else:
             order_id = response.get("orderId")
             if order_id is None:
                 self.store.transition_intent(
-                    intent_id, "unknown_requires_reconciliation",
+                    intent_id,
+                    "unknown_requires_reconciliation",
                     note="order response had no orderId; reconciling by client order id",
                     category="mexc_request",
                 )
                 if protection_requested:
                     self.store.update_protection(
-                        intent_id, status="unknown_requires_reconciliation",
+                        intent_id,
+                        status="unknown_requires_reconciliation",
                         last_error="placement response had no order id",
                     )
             else:
                 self.store.upsert_exchange_order(intent_id=intent_id, raw=response, discovered_in="submit")
                 self.store.transition_intent(
-                    intent_id, "submitted",
+                    intent_id,
+                    "submitted",
                     note=f"exchange accepted order {order_id}",
                     exchange_order_id=str(order_id),
                     exchange_status=str(response.get("status") or "NEW"),
@@ -1478,9 +1515,7 @@ class TradingEngine:
                     # retried this read-only request once.  Do not stack a
                     # second retry on top of the centralized policy.
                     raise
-                log.warning(
-                    "MEXC balance query timestamp rejected; retrying once with a fresh signature"
-                )
+                log.warning("MEXC balance query timestamp rejected; retrying once with a fresh signature")
                 raw = client.account()
             op.succeed(raw)
             return raw
@@ -1501,21 +1536,15 @@ class TradingEngine:
         try:
             raw = self._account_for_preflight(client, intent)
             snapshot = parse_account(raw, fetched_at=self._monotonic())
-            outstanding = self.store.outstanding_balance_usage(
-                intent["symbol"], exclude_intent_id=intent["intent_id"]
-            )
+            outstanding = self.store.outstanding_balance_usage(intent["symbol"], exclude_intent_id=intent["intent_id"])
             validate_balance(
                 snapshot,
                 cfg=self.cfg.trading,
                 side=intent["side"],
                 base_asset=str(base_asset),
                 quote_asset=str(quote_asset),
-                base_quantity=(
-                    Decimal(intent["base_quantity"]) if intent.get("base_quantity") else None
-                ),
-                quote_amount=(
-                    Decimal(intent["quote_amount"]) if intent.get("quote_amount") else None
-                ),
+                base_quantity=(Decimal(intent["base_quantity"]) if intent.get("base_quantity") else None),
+                quote_amount=(Decimal(intent["quote_amount"]) if intent.get("quote_amount") else None),
                 outstanding_base=outstanding["base"],
                 outstanding_quote=outstanding["quote"],
                 now=self._monotonic(),
@@ -1529,11 +1558,11 @@ class TradingEngine:
     # ---------------------------------------------------------- cancellation
 
     def _live_client(self):
-        """Fail closed: live armed + client present. Returns the client."""
-        if self.cfg.trading.mode != "live" or self.cfg.trading.live_enabled_token != LIVE_TOKEN:
-            raise AccidentalOrderRiskError("live order blocked: live mode is not explicitly armed")
+        """Fail closed: acknowledged pipeline + client present. Returns the client."""
+        if self.cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
+            raise AccidentalOrderRiskError("Spot order blocked: execution acknowledgement is not configured")
         if self.client is None:
-            raise AccidentalOrderRiskError("live order blocked: no MEXC client configured")
+            raise AccidentalOrderRiskError("Spot order blocked: no MEXC client configured")
         return self.client
 
     def cancel_intent_order(self, intent: dict[str, Any]) -> None:
@@ -1545,22 +1574,25 @@ class TradingEngine:
         client = self._live_client()
         if intent.get("state") not in ("open", "partially_filled", "submitted"):
             return
-        with contextlib.suppress(MexcOrderNotFound), self.evidence.operation(
-            operation_type="cancel_order",
-            purpose="cancel_entry_intent",
-            endpoint="/api/v3/order",
-            correlation_id=intent["intent_id"],
-            signal_id=intent.get("signal_id"),
-            intent_id=intent["intent_id"],
-            symbol=intent["symbol"],
-            client_order_id=client_order_id,
-            exchange_order_id=exchange_id,
-            request_payload={
-                "symbol": intent["symbol"],
-                "order_id": exchange_id,
-                "orig_client_order_id": client_order_id if not exchange_id else None,
-            },
-        ) as op:
+        with (
+            contextlib.suppress(MexcOrderNotFound),
+            self.evidence.operation(
+                operation_type="cancel_order",
+                purpose="cancel_entry_intent",
+                endpoint="/api/v3/order",
+                correlation_id=intent["intent_id"],
+                signal_id=intent.get("signal_id"),
+                intent_id=intent["intent_id"],
+                symbol=intent["symbol"],
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_id,
+                request_payload={
+                    "symbol": intent["symbol"],
+                    "order_id": exchange_id,
+                    "orig_client_order_id": client_order_id if not exchange_id else None,
+                },
+            ) as op,
+        ):
             op.succeed(
                 client.cancel_order(
                     symbol=intent["symbol"],
@@ -1609,7 +1641,19 @@ class TradingEngine:
         kind: str | None = None,
         trade_order_id: str | None = None,
     ) -> dict[str, Any]:
-        """Submit a LIMIT sell for a TP target. Returns an exchange result dict."""
+        """Submit a LIMIT sell for a TP target through the submission gate."""
+        with self._submission(PROTECTION):
+            return self._submit_sell_limit_locked(trade, client_order_id, price, quantity, kind, trade_order_id)
+
+    def _submit_sell_limit_locked(
+        self,
+        trade: dict[str, Any],
+        client_order_id: str,
+        price: Decimal,
+        quantity: Decimal,
+        kind: str | None = None,
+        trade_order_id: str | None = None,
+    ) -> dict[str, Any]:
         client = self._live_client()
         with self.evidence.operation(
             operation_type="place_order",
@@ -1647,9 +1691,7 @@ class TradingEngine:
             "cumulative_quote": _optional_decimal(response.get("cumulativeQuoteQty")),
         }
 
-    def _compute_stop_loss_trigger(
-        self, trade: dict[str, Any], stop_price: Decimal
-    ) -> Decimal | None:
+    def _compute_stop_loss_trigger(self, trade: dict[str, Any], stop_price: Decimal) -> Decimal | None:
         """Return the stop-loss activation trigger for ``trade``'s symbol.
 
         ``trigger = stop_loss_exit_price + offset × symbol_tick_size``.  The
@@ -1658,9 +1700,7 @@ class TradingEngine:
         market falls.  Returns None (fail closed) when symbol metadata is
         unavailable, so no exit is placed without a verified trigger price.
         """
-        offset = int(
-            getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 3) or 3
-        )
+        offset = int(getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 3) or 3)
         if offset < 1:
             # Owner disabled the offset: trigger equals the exit price.
             return stop_price
@@ -1673,6 +1713,22 @@ class TradingEngine:
             return None
 
     def submit_oco_sell(
+        self,
+        trade: dict[str, Any],
+        client_order_id: str,
+        price: Decimal,
+        quantity: Decimal,
+        stop_price: Decimal,
+        kind: str | None = None,
+        trade_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit a native OCO SELL pair through the submission gate."""
+        with self._submission(PROTECTION):
+            return self._submit_oco_sell_locked(
+                trade, client_order_id, price, quantity, stop_price, kind, trade_order_id
+            )
+
+    def _submit_oco_sell_locked(
         self,
         trade: dict[str, Any],
         client_order_id: str,
@@ -1810,22 +1866,20 @@ class TradingEngine:
             "exchange_order_id": str(order_id) if order_id is not None else None,
         }
 
-    def _handle_cancel(
-        self, parsed: ParsedSignal, signal_id: str, channel_id: int, message_id: int
-    ) -> None:
+    def _handle_cancel(self, parsed: ParsedSignal, signal_id: str, channel_id: int, message_id: int) -> None:
         symbol = parsed.symbol
         reason = f"cancel signal {signal_id}"
         if symbol is None and "ALL" not in parsed.normalized_text:
             self.store.audit(
-                signal_id, "lifecycle", "cancel_ignored",
+                signal_id,
+                "lifecycle",
+                "cancel_ignored",
                 "cancel signal has no symbol and did not explicitly say ALL",
             )
             return
         # A queued/retried old cancel must never cancel an order created by a
         # newer Telegram message (message ids are monotonic per channel).
-        intents = self.store.cancel_signals(
-            symbol, reason, channel_id=channel_id, before_message_id=message_id
-        )
+        intents = self.store.cancel_signals(symbol, reason, channel_id=channel_id, before_message_id=message_id)
         self.store.audit(signal_id, "lifecycle", "cancel_received", f"symbol={symbol} intents={len(intents)}")
         for intent in intents:
             self._cancel_intent(intent, reason)
@@ -1842,8 +1896,8 @@ class TradingEngine:
         if state not in ("open", "submitted", "reconciling", "submitting", "unknown_requires_reconciliation"):
             self.store.transition_intent(intent_id, "canceled_local", note=reason)
             return
-        if self.cfg.trading.mode != "live" or self.client is None:
-            self.store.transition_intent(intent_id, "canceled_local", note=f"{reason} (no live exchange call)")
+        if intent.get("mode") != "live" or self.client is None:
+            self.store.transition_intent(intent_id, "canceled_local", note=f"{reason} (no exchange call)")
             return
         try:
             with self.evidence.operation(
@@ -1874,7 +1928,9 @@ class TradingEngine:
             return
         except MexcError as exc:
             self.store.audit(
-                intent_id, "mexc_request", "cancel_failed",
+                intent_id,
+                "mexc_request",
+                "cancel_failed",
                 f"{exc.__class__.__name__}: {exc}. Order state left unchanged for reconciliation.",
             )
             return
@@ -1888,16 +1944,16 @@ class TradingEngine:
             raise RuntimeError(f"intent {intent_id} not found")
         if intent["mode"] != "live" or self.client is None:
             self.store.record_reconciliation(
-                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-                local_state=intent["state"], exchange_state=None,
-                outcome="consistent", detail="not a live intent; nothing to reconcile",
+                intent_id=intent_id,
+                client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"],
+                exchange_state=None,
+                outcome="consistent",
+                detail="not a live intent; nothing to reconcile",
             )
             return intent
 
-        if (
-            intent["state"] in TERMINAL_INTENT_STATES
-            and int(intent.get("fill_sync_required") or 0) == 1
-        ):
+        if intent["state"] in TERMINAL_INTENT_STATES and int(intent.get("fill_sync_required") or 0) == 1:
             return self._resync_terminal_fills(intent, intent_id, notify=notify)
 
         try:
@@ -1939,12 +1995,17 @@ class TradingEngine:
                     "State remains uncertain and is NEVER retried automatically"
                 )
                 self.store.transition_intent(
-                    intent_id, "unknown_requires_reconciliation", note=note,
+                    intent_id,
+                    "unknown_requires_reconciliation",
+                    note=note,
                     category="reconcile",
                 )
             self.store.record_reconciliation(
-                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-                local_state=intent["state"], exchange_state=None, outcome=outcome,
+                intent_id=intent_id,
+                client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"],
+                exchange_state=None,
+                outcome=outcome,
                 detail="exchange returned -2011",
             )
             result = self.store.get_intent(intent_id)
@@ -1967,15 +2028,15 @@ class TradingEngine:
             self.store.transition_intent(
                 intent_id,
                 "unknown_requires_reconciliation",
-                note=(
-                    f"timestamp drift detected ({exc.__class__.__name__}); "
-                    f"clock sync needed"
-                ),
+                note=(f"timestamp drift detected ({exc.__class__.__name__}); clock sync needed"),
                 category="reconcile",
             )
             self.store.record_reconciliation(
-                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-                local_state=intent["state"], exchange_state=None, outcome=outcome,
+                intent_id=intent_id,
+                client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"],
+                exchange_state=None,
+                outcome=outcome,
                 detail=f"timestamp drift: {exc}",
             )
             result = self.store.get_intent(intent_id)
@@ -1988,16 +2049,18 @@ class TradingEngine:
                     intent_id=intent_id,
                     text=self._intent_text(
                         result,
-                        self._headline_for_status(status)
-                        + " — clock drift detected; reconcile after NTP sync",
+                        self._headline_for_status(status) + " — clock drift detected; reconcile after NTP sync",
                         submission_attempted=True,
                     ),
                 )
             return result
         except (MexcNetworkError, MexcUnexpectedResponse, MexcServerError) as exc:
             self.store.record_reconciliation(
-                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-                local_state=intent["state"], exchange_state=None, outcome="ambiguous",
+                intent_id=intent_id,
+                client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"],
+                exchange_state=None,
+                outcome="ambiguous",
                 detail=f"{exc.__class__.__name__}: {exc}",
             )
             result = self.store.get_intent(intent_id)
@@ -2010,14 +2073,9 @@ class TradingEngine:
                     intent_id=intent_id,
                     text=self._intent_text(
                         result,
-                        self._headline_for_status(status)
-                        + " — reconciliation query failed; status may change",
+                        self._headline_for_status(status) + " — reconciliation query failed; status may change",
                         submission_attempted=True,
-                        status_label=(
-                            "ACCEPTED_OPEN_RECONCILIATION_PENDING"
-                            if status == "ACCEPTED_OPEN"
-                            else status
-                        ),
+                        status_label=("ACCEPTED_OPEN_RECONCILIATION_PENDING" if status == "ACCEPTED_OPEN" else status),
                     ),
                 )
             return result
@@ -2033,7 +2091,8 @@ class TradingEngine:
             self.store.upsert_exchange_order(intent_id=intent_id, raw=raw, discovered_in="reconciliation")
             protection = self.store.get_protection(intent_id)
             if protection is not None and protection["status"] in (
-                "unverified", "unknown_requires_reconciliation",
+                "unverified",
+                "unknown_requires_reconciliation",
             ):
                 self._verify_protection(intent_id)
 
@@ -2043,7 +2102,9 @@ class TradingEngine:
             # the order terminal. If the process dies before fills are read,
             # reconciliation still knows the intent is not fully reconciled.
             self.store.transition_intent(
-                intent_id, new_state, note=note,
+                intent_id,
+                new_state,
+                note=note,
                 exchange_order_id=order_id or None,
                 exchange_status=exchange_status,
                 executed_qty=executed,
@@ -2052,16 +2113,12 @@ class TradingEngine:
                 fill_sync_required=fills_expected,
             )
         elif fills_expected and int(intent.get("fill_sync_required") or 0) == 0:
-            self.store.set_fill_sync_required(
-                intent_id, True, note="partial fills observed before terminal status"
-            )
+            self.store.set_fill_sync_required(intent_id, True, note="partial fills observed before terminal status")
 
         if order_id and fills_expected:
             fills_ok, fills_detail = self._record_fills(intent, order_id, executed)
             if fills_ok:
-                self.store.set_fill_sync_required(
-                    intent_id, False, note=f"fills synced: {fills_detail}"
-                )
+                self.store.set_fill_sync_required(intent_id, False, note=f"fills synced: {fills_detail}")
             else:
                 # The order state is known, but fill history is not: keep the
                 # intent in the reconciliation set and report ambiguity.
@@ -2069,8 +2126,12 @@ class TradingEngine:
                 note = f"{note}; fill sync pending: {fills_detail}"
 
         self.store.record_reconciliation(
-            intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-            local_state=local_state, exchange_state=exchange_status, outcome=outcome, detail=note,
+            intent_id=intent_id,
+            client_order_id=intent.get("client_order_id"),
+            local_state=local_state,
+            exchange_state=exchange_status,
+            outcome=outcome,
+            detail=note,
         )
         result = self.store.get_intent(intent_id)
         assert result is not None
@@ -2078,32 +2139,28 @@ class TradingEngine:
             fills = self.store.fills_for_order(str(order_id)) if order_id else []
             status = self._order_status_label(result)
             self._notify(
-                event_key=(
-                    f"{intent_id}:reconcile:{result['state']}:{exchange_status}:"
-                    f"{len(fills)}"
-                ),
+                event_key=(f"{intent_id}:reconcile:{result['state']}:{exchange_status}:{len(fills)}"),
                 signal_id=intent.get("signal_id"),
                 intent_id=intent_id,
                 text=self._intent_text(
                     result,
-                    self._headline_for_status(status)
-                    + f" — reconciled (local {local_state} -> {result['state']}, "
+                    self._headline_for_status(status) + f" — reconciled (local {local_state} -> {result['state']}, "
                     f"exchange {exchange_status}, outcome={outcome})",
                     submission_attempted=True,
                 ),
             )
         return result
 
-    def _resync_terminal_fills(
-        self, intent: dict[str, Any], intent_id: str, *, notify: bool = True
-    ) -> dict[str, Any]:
+    def _resync_terminal_fills(self, intent: dict[str, Any], intent_id: str, *, notify: bool = True) -> dict[str, Any]:
         """Recover fill history for a terminal order without touching state."""
 
         order_id = intent.get("exchange_order_id")
         if not order_id:
             self.store.record_reconciliation(
-                intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-                local_state=intent["state"], exchange_state=intent.get("exchange_status"),
+                intent_id=intent_id,
+                client_order_id=intent.get("client_order_id"),
+                local_state=intent["state"],
+                exchange_state=intent.get("exchange_status"),
                 outcome="ambiguous",
                 detail="fill sync required but no exchange order id is available",
             )
@@ -2111,16 +2168,17 @@ class TradingEngine:
         expected = _optional_decimal(intent.get("executed_qty"))
         fills_ok, fills_detail = self._record_fills(intent, str(order_id), expected)
         if fills_ok:
-            self.store.set_fill_sync_required(
-                intent_id, False, note=f"terminal fills recovered: {fills_detail}"
-            )
+            self.store.set_fill_sync_required(intent_id, False, note=f"terminal fills recovered: {fills_detail}")
             outcome = "resolved"
         else:
             outcome = "ambiguous"
         self.store.record_reconciliation(
-            intent_id=intent_id, client_order_id=intent.get("client_order_id"),
-            local_state=intent["state"], exchange_state=intent.get("exchange_status"),
-            outcome=outcome, detail=f"terminal fill resync: {fills_detail}",
+            intent_id=intent_id,
+            client_order_id=intent.get("client_order_id"),
+            local_state=intent["state"],
+            exchange_state=intent.get("exchange_status"),
+            outcome=outcome,
+            detail=f"terminal fill resync: {fills_detail}",
         )
         result = self.store.get_intent(intent_id)
         assert result is not None
@@ -2192,14 +2250,19 @@ class TradingEngine:
             return None, "ambiguous", f"unrecognised exchange status {exchange_status!r}; state left unchanged"
 
         if local_state == "filled" and mapped != "filled":
-            return "filled", "discrepancy", (
-                f"local state filled but exchange reports {exchange_status}; refusing to un-fill local record"
+            return (
+                "filled",
+                "discrepancy",
+                (f"local state filled but exchange reports {exchange_status}; refusing to un-fill local record"),
             )
         if local_state in ("failed", "rejected", "canceled", "canceled_local") and mapped not in (
-            "canceled", "filled",
+            "canceled",
+            "filled",
         ):
-            return mapped, "discrepancy", (
-                f"local terminal state {local_state} disagrees with exchange status {exchange_status}"
+            return (
+                mapped,
+                "discrepancy",
+                (f"local terminal state {local_state} disagrees with exchange status {exchange_status}"),
             )
         if local_state == mapped:
             return mapped, "consistent", f"exchange status {exchange_status} matches local state"
@@ -2214,16 +2277,18 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001 - one bad intent must not stop the sweep
                 stats.errors += 1
                 self.store.record_reconciliation(
-                    intent_id=intent["intent_id"], client_order_id=intent.get("client_order_id"),
-                    local_state=intent.get("state"), exchange_state=None, outcome="ambiguous",
+                    intent_id=intent["intent_id"],
+                    client_order_id=intent.get("client_order_id"),
+                    local_state=intent.get("state"),
+                    exchange_state=None,
+                    outcome="ambiguous",
                     detail=f"reconciliation crashed: {exc.__class__.__name__}: {exc}",
                 )
                 continue
             outcomes = [
                 r["outcome"]
                 for r in self.repo.db.conn.execute(
-                    "SELECT outcome FROM reconciliation_results WHERE intent_id = ? "
-                    "ORDER BY recon_id DESC LIMIT 1",
+                    "SELECT outcome FROM reconciliation_results WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 1",
                     (intent["intent_id"],),
                 )
             ]

@@ -56,8 +56,6 @@ class RiskManager:
 
         if cfg.emergency_stop:
             reasons.append("emergency stop is active")
-        if cfg.mode not in ("sim", "testonly", "live"):
-            reasons.append(f"invalid trading mode {cfg.mode!r}")
         if signal.kind not in ("alert", "update"):
             reasons.append(f"signal kind {signal.kind!r} is not executable")
         if signal.action is None:
@@ -120,12 +118,11 @@ class RiskManager:
             tp1 = signal.target_prices[0]
             tp2 = signal.target_prices[1]
             # Only validate when all are positive
-            if all(v is not None and v > 0 for v in (sl, entry, tp1, tp2)):
-                if not (sl < entry < tp1 <= tp2):
-                    reasons.append(
-                        f"invalid LONG price relationship: required SL < Entry < TP1 <= TP2 "
-                        f"(got SL={sl} Entry={entry} TP1={tp1} TP2={tp2})"
-                    )
+            if all(v is not None and v > 0 for v in (sl, entry, tp1, tp2)) and not (sl < entry < tp1 <= tp2):
+                reasons.append(
+                    f"invalid LONG price relationship: required SL < Entry < TP1 <= TP2 "
+                    f"(got SL={sl} Entry={entry} TP1={tp1} TP2={tp2})"
+                )
 
         if reference_price is not None and reference_price <= 0:
             reference_price = None

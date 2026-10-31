@@ -3,7 +3,8 @@
 Tests for:
 - needs_reconciliation lifecycle (startup, periodic, no writes, unresolved remains, conclusive close, idempotent)
 - base-fee accounting strictly fail-closed (10 cases)
-- OCO invariant with exact quantities and audit evidence already fixed in test_critical_review_fixes.py; this file adds fee-unknown blocking
+- OCO invariant with exact quantities and audit evidence already fixed in
+  test_critical_review_fixes.py; this file adds fee-unknown blocking
 """
 
 from __future__ import annotations
@@ -59,8 +60,6 @@ def _item(ch, mid):
 
 
 def _engine_with_tm(cfg, repo, client):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
     tm = TradeManager(cfg.trading, store, now=lambda: NOW, clock=lambda: time.monotonic())
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, trade_manager=tm)
@@ -148,7 +147,12 @@ def _make_needs_rec_trade(cfg, repo, trade_id="tr-needs-rec", symbol="BTCUSDT", 
         "UPDATE order_intents SET exchange_order_id='ex-needs-rec', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-needs-rec",
             symbol,
@@ -166,7 +170,7 @@ def _make_needs_rec_trade(cfg, repo, trade_id="tr-needs-rec", symbol="BTCUSDT", 
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id=trade_id,
         signal_id=sid,
         idempotency_key="k-needs-rec",
@@ -192,7 +196,6 @@ def _make_needs_rec_trade(cfg, repo, trade_id="tr-needs-rec", symbol="BTCUSDT", 
         acquired_quote_spent=Decimal("10"),
         avg_entry_price=Decimal("100"),
     )
-    trade = store.get_trade(trade_id)
     # Force into needs_reconciliation with a reason
     store.update_trade_state(trade_id, "needs_reconciliation", note="test setup: needs_reconciliation")
     # Add an OCO order in unknown state to make it unresolved (unless caller controls)
@@ -333,7 +336,12 @@ def test_conclusively_closed_handled_correctly_and_idempotently(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-closed', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-closed",
             "BTCUSDT",
@@ -408,11 +416,6 @@ def test_conclusively_closed_handled_correctly_and_idempotently(cfg, repo):
     tm._reconcile_trade(trade_id)
     assert store.get_trade(trade_id)["trade_state"] == "closed"
     # Idempotent: second reconcile should not reopen or duplicate
-    notif_before = len(
-        store.db.conn.execute(
-            "SELECT * FROM trading_notifications WHERE event_key='TRADE_CLOSED_RECONCILED'"
-        ).fetchall()
-    )
     audit_before = len(
         store.db.conn.execute(
             "SELECT * FROM audit_events WHERE correlation=? AND event='closed_via_reconciliation'", (trade_id,)
@@ -494,7 +497,12 @@ def _create_trade_with_fee(
     # Fills with fee
     fee_amt_val = None if fee_missing else (fee_amount if not fee_malformed else "not-a-decimal")
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             f"ex-{trade_id}",
             "BTCUSDT",
@@ -564,7 +572,12 @@ def test_tp1_base_fee(cfg, repo):
     )
     store.transition_trade_order("to-tp1-fee", "filled", exchange_order_id="ex-tp1-fee", sold_qty=Decimal("0.05"))
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-tp1-fee",
             "BTCUSDT",
@@ -602,7 +615,12 @@ def test_tp2_base_fee(cfg, repo):
     )
     store.transition_trade_order("to-tp2-fee1", "filled", exchange_order_id="ex-tp2-fee1", sold_qty=Decimal("0.05"))
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-tp2-fee1",
             "BTCUSDT",
@@ -634,7 +652,12 @@ def test_tp2_base_fee(cfg, repo):
     )
     store.transition_trade_order("to-tp2-fee2", "filled", exchange_order_id="ex-tp2-fee2", sold_qty=Decimal("0.05"))
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-tp2-fee2",
             "BTCUSDT",
@@ -673,7 +696,12 @@ def test_sl_base_fee(cfg, repo):
     )
     store.transition_trade_order("to-sl-fee", "filled", exchange_order_id="ex-sl-fee", sold_qty=Decimal("0.10"))
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-sl-fee",
             "BTCUSDT",
@@ -700,7 +728,10 @@ def test_duplicate_exchange_trade_ids(cfg, repo):
     )
     # Insert duplicate fill with same exchange_trade_id (should be idempotent)
     repo.db.conn.execute(
-        "INSERT OR IGNORE INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO order_fills (exchange_order_id, symbol, price, "
+        "quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, "
+        "is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "ex-tr-dup-fee",
             "BTCUSDT",
@@ -720,7 +751,12 @@ def test_duplicate_exchange_trade_ids(cfg, repo):
     )
     # Also add a second fill with different ID but same order (should count separately if base fee)
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-tr-dup-fee",
             "BTCUSDT",

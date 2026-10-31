@@ -62,8 +62,6 @@ def _item(ch, mid):
 
 
 def _engine_with_tm(cfg, repo, client):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
     tm = TradeManager(cfg.trading, store, now=lambda: NOW)
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, trade_manager=tm)
@@ -83,13 +81,17 @@ class SpyMexc:
         self.market_sell_calls = []
         self.place_error = place_error
         self.place_oco_result = place_oco_result or {"orderId": "oco-1", "status": "NEW"}
-        # minimal registry
-        import importlib.util
+        # minimal registry with the tick-size metadata the exit gate requires
+        from tests._trading_fakes import FakeMeta
 
-        spec = importlib.util.spec_from_file_location("et", "tests/test_trading_engine.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        self.symbols = mod.FakeRegistry()
+        class AnySymbolRegistry:
+            def __init__(self):
+                self.meta = FakeMeta(tick_size="0.01")
+
+            def get(self, symbol):
+                return self.meta
+
+        self.symbols = AnySymbolRegistry()
         self.ticker_calls = 0
 
     def place_order(self, **kwargs):
@@ -134,7 +136,6 @@ def test_oco_pre_submit_existing_exceeds_sellable_never_submits(cfg, repo):
     engine.client = SpyMexc()
     # Count submit_oco_sell calls via engine
     calls = []
-    orig = engine.submit_oco_sell if hasattr(engine, "submit_oco_sell") else None
 
     def spy_submit(trade, cid, price, qty, stop_price, kind=None, **kw):
         calls.append((kind, qty))
@@ -165,7 +166,12 @@ def test_oco_pre_submit_existing_exceeds_sellable_never_submits(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-entry-100', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-entry-100",
             "BTCUSDT",
@@ -183,7 +189,7 @@ def test_oco_pre_submit_existing_exceeds_sellable_never_submits(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-oco-pre1",
         signal_id=sid,
         idempotency_key="k100",
@@ -275,7 +281,12 @@ def test_oco_pre_submit_proposed_oco1_would_exceed_sellable_blocked(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-101', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-101",
             "BTCUSDT",
@@ -345,19 +356,22 @@ def test_oco_pre_submit_proposed_oco1_would_exceed_sellable_blocked(cfg, repo):
     tm._place_oco_exits(trade)
     # Must be blocked before exchange call
     assert calls == [], (
-        f"OCO1 proposal 0.05 + existing 0.06 > sellable 0.10 must be rejected with zero exchange writes, got calls={calls}"
+        "OCO1 proposal 0.05 + existing 0.06 > sellable 0.10 must be rejected "
+        f"with zero exchange writes, got calls={calls}"
     )
     t2 = store.get_trade("tr-oco-pre2")
     assert t2["trade_state"] == "needs_reconciliation"
     # Audit/notification evidence
     audits = store.db.conn.execute(
-        "SELECT * FROM audit_events WHERE correlation=? AND event='oco_invariant_would_violate'", (t2["trade_id"],)
+        "SELECT * FROM audit_events WHERE correlation=? AND event='oco_invariant_would_violate'",
+        (t2["trade_id"],),
     ).fetchall()
     assert len(audits) >= 1, "expected audit oco_invariant_would_violate"
     # Verify exact quantities in audit detail
     detail = audits[0]["detail"]
     assert "0.06" in detail and "0.05" in detail and "0.10" in detail
-    # Invariant after blocking still holds (existing 0.06 <= sellable 0.10) but trade is flagged needs_reconciliation for would-violate
+    # Invariant after blocking still holds (0.06 <= 0.10) but the trade is
+    # flagged needs_reconciliation for the would-violate proposal.
     ok, reason = tm._verify_oco_invariant(store.get_trade("tr-oco-pre2"))
     assert ok, f"existing 0.06 <= sellable 0.10 should still be invariant ok, got {reason}"
 
@@ -394,7 +408,12 @@ def test_oco_pre_submit_proposed_oco2_would_exceed_sellable_blocked(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-102', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-102",
             "BTCUSDT",
@@ -479,8 +498,6 @@ def test_oco_pre_submit_proposed_oco2_would_exceed_sellable_blocked(cfg, repo):
         session_path=tmp2 / "config" / "session",
     )
     cfg2.ensure_dirs()
-    cfg2.trading.mode = "live"
-    cfg2.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     db2 = _DB(cfg2.db_path)
     db2.migrate()
     repo2 = _Repo(db2)
@@ -521,7 +538,12 @@ def test_oco_pre_submit_proposed_oco2_would_exceed_sellable_blocked(cfg, repo):
     ]
     db2.conn.execute("UPDATE order_intents SET exchange_order_id='ex-102b', state='filled' WHERE intent_id=?", (iid2,))
     db2.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-102b",
             "BTCUSDT",
@@ -616,7 +638,12 @@ def test_oco_pre_submit_reuse_not_double_counted(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-103', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-103",
             "BTCUSDT",
@@ -634,7 +661,7 @@ def test_oco_pre_submit_reuse_not_double_counted(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-oco-reuse",
         signal_id=sid,
         idempotency_key="k103",
@@ -708,7 +735,7 @@ def test_oco_sellable_unknown_blocks_submission(cfg, repo):
         "intent_id"
     ]
     # Intent has no exchange_order_id and no fills → acquired is None → sellable unknown
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-oco-unknown",
         signal_id=sid,
         idempotency_key="k104",
@@ -768,7 +795,12 @@ def test_oco_ambiguous_result_never_resubmitted(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-105', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-105",
             "BTCUSDT",
@@ -786,7 +818,7 @@ def test_oco_ambiguous_result_never_resubmitted(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-oco-ambig",
         signal_id=sid,
         idempotency_key="k105",
@@ -860,7 +892,12 @@ def test_allocation_uses_net_sellable_with_base_fee(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-110', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-110",
             "BTCUSDT",
@@ -878,7 +915,7 @@ def test_allocation_uses_net_sellable_with_base_fee(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-alloc-fee",
         signal_id=sid,
         idempotency_key="k110",
@@ -951,7 +988,12 @@ def test_no_market_sell_when_sl_crossed_both_ocos_active(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-120', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-120",
             "BTCUSDT",
@@ -969,7 +1011,7 @@ def test_no_market_sell_when_sl_crossed_both_ocos_active(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-sl-both",
         signal_id=sid,
         idempotency_key="k120",
@@ -1058,7 +1100,12 @@ def _assert_no_market_sell_on_missing_oco(cfg, repo, missing_kind):
         "UPDATE order_intents SET exchange_order_id='ex-121', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-121",
             "BTCUSDT",
@@ -1076,7 +1123,7 @@ def _assert_no_market_sell_on_missing_oco(cfg, repo, missing_kind):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id=f"tr-sl-missing-{missing_kind}",
         signal_id=sid,
         idempotency_key="k121",
@@ -1187,7 +1234,12 @@ def test_no_market_sell_oco_rejection(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-122', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-122",
             "BTCUSDT",
@@ -1205,7 +1257,7 @@ def test_no_market_sell_oco_rejection(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-sl-reject",
         signal_id=sid,
         idempotency_key="k122",
@@ -1275,7 +1327,12 @@ def test_no_market_sell_oco_cancellation(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-123', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-123",
             "BTCUSDT",
@@ -1293,7 +1350,7 @@ def test_no_market_sell_oco_cancellation(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-sl-cancel",
         signal_id=sid,
         idempotency_key="k123",
@@ -1363,7 +1420,12 @@ def test_no_market_sell_restart_missing_protection(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-124', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-124",
             "BTCUSDT",
@@ -1381,7 +1443,7 @@ def test_no_market_sell_restart_missing_protection(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-sl-restart",
         signal_id=sid,
         idempotency_key="k124",
@@ -1441,8 +1503,7 @@ def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
                 db_path=cfg.db_path,
                 session_path=cfg.session_path,
             )
-            cfg2.trading.mode = "live"
-            cfg2.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+            cfg2.trading.execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
             db2 = Database(cfg2.db_path)
             repo2 = Repository(db2)
             client = SpyMexc()
@@ -1478,7 +1539,8 @@ def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
     assert all_trades == 1, f"exactly one BTCUSDT trade should be persisted, got {all_trades} trades: {rows}"
     sigs = list(
         repo.db.conn.execute(
-            "SELECT message_id, status, rejection_reason FROM signals WHERE channel_id=100 AND message_id IN (201,202) ORDER BY message_id"
+            "SELECT message_id, status, rejection_reason FROM signals "
+            "WHERE channel_id=100 AND message_id IN (201,202) ORDER BY message_id"
         ).fetchall()
     )
     rejected_sigs = [s for s in sigs if s["status"] == "rejected"]
@@ -1572,7 +1634,12 @@ def test_per_symbol_terminal_states_not_blocking(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-220', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-220",
             "BTCUSDT",
@@ -1590,7 +1657,7 @@ def test_per_symbol_terminal_states_not_blocking(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-term",
         signal_id=sid,
         idempotency_key="k220",
@@ -1703,7 +1770,12 @@ def test_sell_base_fee_reduces_sellable(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-130', state='filled' WHERE intent_id=?", (iid,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-130",
             "BTCUSDT",
@@ -1721,7 +1793,7 @@ def test_sell_base_fee_reduces_sellable(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-fee-both",
         signal_id=sid,
         idempotency_key="k130",
@@ -1762,7 +1834,12 @@ def test_sell_base_fee_reduces_sellable(cfg, repo):
     )
     store.transition_trade_order("to-fee-tp1", "filled", exchange_order_id="ex-fee-tp1", sold_qty=Decimal("0.05"))
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-fee-tp1",
             "BTCUSDT",

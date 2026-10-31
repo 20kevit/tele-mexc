@@ -23,16 +23,29 @@ otherwise healthy sibling means partial, not full, protection.
 - No blind retry after an uncertain submission.
 - Historical, backfilled, and at/below-boundary messages never trade.
 
-## Modes
+## Execution model
 
-| Mode | Behavior | Requirements |
-| --- | --- | --- |
-| `sim` (default) | Parse, risk-check, plan, then immediately mark the intent filled locally with `sim-...` | No MEXC credentials or network |
-| `testonly` | Call official `POST /api/v3/order/test`; never reaches the matching engine | Credentials + positive `order_quote_amount` |
-| `live` | Submit a real Spot BUY; reconcile and record fills | Credentials + positive amount + exact live token |
+There is one execution behaviour: automatic MEXC Spot BUY on a valid signal.
+There is no simulated, test-only, or live product mode and no per-signal
+approval.
 
-`live_enabled_token` must be exactly
-`I_UNDERSTAND_REAL_MONEY_AND_RISKS`; anything else prevents startup in live mode.
+| Requirement | Behavior |
+| --- | --- |
+| Owner acknowledgement | `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` is required to construct the pipeline |
+| MEXC CLI backend | `[mexc_cli] enabled = true` and a healthy CLI profile are required for Spot writes |
+| Sizing | One fixed `order_quote_amount` chosen by the owner; signal text never changes it |
+| Submission boundary | Pause, emergency stop, Telegram/MEXC/channel/learning readiness and reconciliation blockers are checked atomically with the `planned -> submitting` claim |
+
+`control_setup.paused` is authoritative. `/pause` takes an exclusive kernel
+`flock`, waits for any in-flight submission to finish, writes the pause state,
+and only then acknowledges. `/resume` checks readiness again (including
+emergency stop and unresolved reconciliation) and refuses to clear the pause
+when any prerequisite is missing. The shared lock is
+`<db_path>.submission.lock`; the kernel releases it on a crash.
+
+`order_intents.mode` remains a historical database column. New intents are
+written as `live`; legacy `sim`/`testonly` rows are never executable and are
+rejected locally if a stale queue item tries to resume them.
 
 ## Execution backends (REST reads + CLI writes)
 
@@ -42,7 +55,9 @@ Two transports are used deliberately, not as competing integrations:
 | --- | --- | --- |
 | Exchange metadata, balances, single-order query and fills | REST `MexcSpotClient` | Spot v3 read and accounting implementation |
 | Live BUY/SELL and OCO placement, cancellation | `@mexc-ai/cli` adapter | Live write backend |
-| `testonly` validation | REST `POST /api/v3/order/test` | Official validation endpoint; no matching-engine order |
+
+The low-level REST `POST /api/v3/order/test` primitive remains available for
+contract tests, but it is not a product mode and has no CLI command.
 
 The CLI adapter (`mexc/cli.py`) is argv-only, bounded by a timeout, and never
 starts a shell. It uses the CLI's own encrypted profile
@@ -53,12 +68,12 @@ Reads remain on REST so there is one market-data/account implementation.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | live mode refuses `false`; a missing binary fails closed |
+| `enabled` | `true` | required for the automatic Spot pipeline; a missing binary fails closed |
 | `binary` | auto | explicit path; else `MEXC_CLI_BINARY`, the known per-platform path, then `PATH` |
 | `profile` | active profile | optional profile name passed as `--profile` |
 | `timeout_s` | `5.0` | subprocess timeout in `(0, 60]` |
 | `min_version` | `0.0.22` | minimum accepted CLI version |
-| `confirm_noninteractive_writes` | auto | live mode arms `--yes` when absent; explicit `false` keeps live writes fail-closed; non-live modes default `false` |
+| `confirm_noninteractive_writes` | `true` | arms the CLI `--yes`; explicit `false` keeps writes fail-closed |
 
 Writes always pass `--no-retry`; the adapter never retries a placement. The
 `clientOrderId` is reused verbatim. A CLI `duplicate` response means the earlier
@@ -66,12 +81,10 @@ attempt landed, so it becomes `unknown_requires_reconciliation` and is
 reconciled, never resubmitted. A CLI write without explicit confirmation is
 rejected locally and no request reaches the exchange.
 
-Live mode is already an explicit owner authorization: the service cannot answer
-the CLI's terminal prompt, so when `confirm_noninteractive_writes` is absent the
-loader arms `--yes` for live writes. Setting it to `false` is honored as a
-fail-closed override, but then every live write is rejected locally. Set it to
-`false` only when intentionally disabling live writes; otherwise leave it unset
-or set `true`.
+Automatic execution is the product behaviour: the service cannot answer the
+CLI's terminal prompt, so non-interactive writes are armed by default. Setting
+`confirm_noninteractive_writes` to `false` is honored as a fail-closed override;
+every write is then rejected locally. Leave it unset or set it to `true`.
 
 ### CLI credential profile (owner-only)
 
@@ -103,21 +116,20 @@ permission failures and require the key's Spot permissions to be corrected.
 
 ## Configuration (`[trading]` in `config/config.toml`)
 
-Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
+Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
 `TRADING_ORDER_QUOTE_AMOUNT`, `TRADING_AGGREGATE_BUDGET`,
 `MEXC_CLI_BINARY`, `MEXC_CLI_PROFILE`.
 
 | Key | Default | Validation / meaning |
 | --- | --- | --- |
-| `mode` | `sim` | `sim`, `testonly`, or `live` |
-| `live_enabled_token` | unset | exact acknowledgement token for live |
+| `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
 | `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
 | `aggregate_budget_quote` | `50.0` | cumulative spend reference for reporting; must be >0; never caps per-order size and is not enforced as a ceiling |
 | `order_type_policy` | `limit` | `limit` or `market`; explicit signal semantics still apply |
 | `remaining_balance_reserve_pct` | `20.0` | `0 ≤ value < 100` |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5` |
 | `balance_max_age_s` | `5.0` | `(0, 300]`; stale account snapshots fail closed |
-| `recon_interval_s` | `30.0` | live reconciliation period, minimum 5 s |
+| `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
 | `entry_trigger_offset_ticks` | unset | unset = direct entry; otherwise integer ≥1 enables conditional entry |
 | `entry_trigger_stale_threshold_s` | `60.0` | positive; older price ticks are ignored |
@@ -129,9 +141,13 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `monitor_max_retries` | `5` | integer ≥1 |
 | `monitor_backoff_base_s` | `1.0` | positive |
 
+Legacy `mode`, `live_enabled_token`, `max_quote_per_order`, daily/open-order
+caps, signal-age/price-deviation caps, `allowed_symbols`, and `allowlist_mode`
+are rejected at load time. They are not silently ignored because that would
+change financial behaviour.
+
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
-threshold or mandatory stop-loss rule. Valid symbols are not restricted by an
-operator-maintained allowlist; MEXC market metadata and order filters remain
+threshold, or symbol allowlist. MEXC market metadata and order filters remain
 enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 
 ## Parsing and executable signals
@@ -181,7 +197,7 @@ At each `serve` start, **before live handlers are registered**, the engine
 snapshots the selected channel's newest stored message id and persists
 `max(existing boundary, snapshot)`. The boundary is forward-only.
 
-In `testonly`/`live`:
+Always:
 
 - a message at or below the boundary is rejected as historical;
 - `source='backfill'` and `source='recovery'` rows are non-tradeable regardless
@@ -305,8 +321,7 @@ Market polling:
 
 ## Budget ledger
 
-For `testonly`/`live`, intent creation and budget reservation are one atomic
-transaction. The reserved amount is:
+Intent creation and budget reservation are one atomic transaction. The reserved amount is:
 
 ```
 quote_amount * (1 + balance_fee_buffer_pct / 100)
@@ -327,16 +342,12 @@ quote_amount * (1 + balance_fee_buffer_pct / 100)
 - Rejected/failed/canceled-locally: release.
 - The summary is `limit - active_reserved - settled_spend`; restart never
   resets the ledger.
-- `testonly` creates and then releases a reservation around the test order, so
-  it does not consume the live budget.
 
 ## Execution
 
-| Mode | Flow |
-| --- | --- |
-| `sim` | `planned → submitting → filled`, exchange id `sim-<client_order_id>`, no network |
-| `testonly` | `planned → submitting → submitted → canceled_local`, exchange status `TEST_ONLY_ACCEPTED` |
-| `live` | Budget ensure → fresh balance preflight → `submitting` → exchange → `submitted`/uncertain/rejected → reconciliation |
+Flow: budget ensure → fresh balance preflight → `submitting` → exchange →
+`submitted`/uncertain/rejected → reconciliation. Pause/readiness are checked in
+the same transaction as `planned → submitting`.
 
 Live balance preflight:
 
@@ -697,11 +708,9 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 .venv/bin/tg-ingest trading trade <trade-id>
 .venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
 .venv/bin/tg-ingest trading verify
-.venv/bin/tg-ingest trading test-order --symbol BTCUSDT --side BUY --quote 10
 ```
 
-`verify`, `test-order`, and `reconcile` touch MEXC. `test-order` is refused
-unless mode is `testonly` or `live`. Never run them without explicit
+`verify` and `reconcile` touch MEXC. Never run them without explicit
 authorization. `preflight` performs local binary/version/schema and CLI-profile
 checks; with `--network` it also runs the CLI doctor, one signed read-only
 `current-orders` query, a signed `spot asset account` read, REST key validation,
@@ -735,11 +744,11 @@ modifies an order.
    withdrawal permission.
 3. Set `order_quote_amount` to an owner-approved positive value.
 4. Set `aggregate_budget_quote` to an owner-approved positive value (default 50 USDT; no hard ceiling).
-5. Run with `testonly` first; inspect intents, balances, precision, and logs.
-6. Set `mode = "live"` and the exact `live_enabled_token`.
-7. Leave `mexc_cli.confirm_noninteractive_writes` unset (live arms `--yes`) or
-   set it to `true`; never leave an explicit `false` when live writes are
-   intended.
+5. Set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`.
+6. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
+   set it to `true`; never leave an explicit `false` when writes are intended.
+7. Complete owner setup: Telegram authenticated, MEXC verified, channel
+   selected, learning completed, and not paused.
 8. Restart once; confirm the activation boundary advanced.
 9. Submit one minimal test signal only after a separate explicit approval.
 10. Monitor `trading status`, `trading intents`, and the notification outbox.

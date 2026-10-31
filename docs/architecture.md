@@ -13,7 +13,7 @@ Telegram (MTProto, direct TLS)
         │                 │                                      │
         │                 └── offline analysis (manual)          ▼
         │                                                MEXC Spot v3 REST
-        └── notification Bot API ──► owner/developer      (sim/testonly/live)
+        └── notification Bot API ──► owner/developer      (automatic MEXC Spot)
 ```
 
 One Telegram account and one selected channel. SQLite is the only durable
@@ -118,7 +118,8 @@ raw message text
   → replay/activation-boundary guard
   → RiskManager (BUY only, fixed quote amount, symbol constraints)
   → order_intents row + atomic budget reservation
-  → sim / testonly / live execution
+  → submission gate (pause + readiness)
+  → MEXC Spot execution
   → exchange_orders, order_status_history, order_fills
   → reconciliation and durable notifications
   → optional TradeManager lifecycle (conditional entry, TP1/TP2, SL)

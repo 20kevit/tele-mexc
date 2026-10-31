@@ -47,13 +47,15 @@ def _store(repo: Repository, mid: int, text: str, source="live"):
     return repo.get_message_raw(100, mid)
 
 
-def _engine(cfg: AppConfig, repo: Repository, client=None, mode="sim"):
-    cfg.trading.mode = mode
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+def _engine(cfg: AppConfig, repo: Repository, client=None, mode=None):
+    del mode  # one automatic Spot behaviour; tests use a fake exchange
     cfg.trading.order_quote_amount = 10.0
-    engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW)
-    if mode in ("testonly", "live"):
-        engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
+    if client is None:
+        client, registry = _fake_mexc_with_registry()
+    else:
+        registry = getattr(client, "symbols", None)
+    engine = TradingEngine(cfg, repo, client=client, registry=registry, now=lambda: NOW)
+    engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
     return engine
 
 
@@ -64,7 +66,7 @@ def _fake_mexc_with_registry():
     spec = importlib.util.spec_from_file_location("engine_test", "tests/test_trading_engine.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.FakeMexc(), mod.FakeRegistry
+    return mod.FakeMexc(), mod.FakeRegistry()
 
 
 # ── §4 Mandatory validation at execution boundary ────────────────────────
@@ -267,7 +269,8 @@ def test_valid_long_passes(cfg, repo):
         rec,
     )
     assert intent is not None
-    assert intent["state"] == "filled"
+    assert intent["state"] in ("submitted", "open")
+    assert intent["exchange_order_id"]
 
 
 # ── §3 Independent execution ──────────────────────────────────────────────
@@ -356,8 +359,6 @@ def test_per_symbol_concurrency_blocks_same_symbol_via_trade(cfg, repo):
             }
         ],
     )
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
     tm = TradeManager(cfg.trading, store, now=lambda: NOW)
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, trade_manager=tm)
@@ -424,9 +425,8 @@ def test_combined_oco_invariant_holds_for_valid_allocation(cfg, repo):
         limit_price=Decimal("100"),
     )
     # simulate fill
-    intent = store.get_intent(intent_id)
     # directly create trade
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-test-oco-ok",
         signal_id=signal_id,
         idempotency_key="k30",
@@ -510,7 +510,7 @@ def test_combined_oco_invariant_violation_persists_needs_reconciliation(cfg, rep
         base_quantity=Decimal("0.1"),
         limit_price=Decimal("100"),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-test-oco-bad",
         signal_id=signal_id,
         idempotency_key="k31",
@@ -608,7 +608,12 @@ def test_base_fee_reduces_sellable(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-fee', state='filled' WHERE intent_id=?", (iid2,)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-fee",
             "BTCUSDT",
@@ -626,7 +631,7 @@ def test_base_fee_reduces_sellable(cfg, repo):
             "2026-01-01T00:00:00Z",
         ),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-test-fee",
         signal_id=signal_id,
         idempotency_key="k32",
@@ -690,7 +695,7 @@ def test_no_auto_market_sell_on_oco_fail(cfg, repo):
         base_quantity=Decimal("0.1"),
         limit_price=Decimal("100"),
     )
-    trade = store.create_trade(
+    store.create_trade(
         trade_id="tr-test-nomarket",
         signal_id=signal_id,
         idempotency_key="k33",
@@ -746,7 +751,12 @@ def test_fill_level_pnl_decimal_safe(cfg, repo):
         "UPDATE order_intents SET exchange_order_id='ex-pnl', state='filled' WHERE intent_id=?", (intent["intent_id"],)
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-pnl",
             "BTCUSDT",
@@ -765,7 +775,12 @@ def test_fill_level_pnl_decimal_safe(cfg, repo):
         ),
     )
     repo.db.conn.execute(
-        "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, is_maker, trade_time_ms, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "INSERT INTO order_fills (exchange_order_id, symbol, price, quantity, "
+            "quote_amount, fee_asset, fee_amount, exchange_trade_id, is_buyer, "
+            "is_maker, trade_time_ms, source, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ),
         (
             "ex-pnl",
             "BTCUSDT",

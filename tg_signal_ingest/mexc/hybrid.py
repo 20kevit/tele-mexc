@@ -118,7 +118,7 @@ class HybridMexcClient:
         )
 
     def place_test_order(self, **kwargs: Any) -> bool:
-        """``testonly`` keeps using the official REST /order/test endpoint."""
+        """Low-level official REST /order/test primitive (never a product mode)."""
 
         return self.rest.place_test_order(**kwargs)
 

@@ -26,8 +26,8 @@ from .parser import PARSER_VERSION, ParsedSignal
 _APPLICATION_VERSION = "0.1.0"
 
 # Clock health state thresholds (seconds)
-CLOCK_SKEW_FRESH_MS: int = 1000    # within 1s of exchange: fresh
-CLOCK_SKEW_STALE_MS: int = 2000    # 1-2s drift: degraded
+CLOCK_SKEW_FRESH_MS: int = 1000  # within 1s of exchange: fresh
+CLOCK_SKEW_STALE_MS: int = 2000  # 1-2s drift: degraded
 CLOCK_SKEW_UNHEALTHY_MS: int = 5000  # >2s drift: unhealthy (exceeds recvWindow default)
 
 
@@ -46,9 +46,15 @@ def clock_health_state(skew_ms: int) -> str:
 def now_iso_utc() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+
 ACTIVE_SIGNAL_STATES = ("parsed", "validated", "planned")
 OPEN_INTENT_STATES = (
-    "planned", "submitting", "submitted", "reconciling", "open", "unknown_requires_reconciliation",
+    "planned",
+    "submitting",
+    "submitted",
+    "reconciling",
+    "open",
+    "unknown_requires_reconciliation",
 )
 RECONCILABLE_INTENT_STATES = tuple(s for s in OPEN_INTENT_STATES if s != "planned")
 TERMINAL_INTENT_STATES = ("filled", "canceled", "failed", "rejected", "canceled_local")
@@ -141,9 +147,18 @@ class TradingStore:
 
     # ── Per-symbol concurrency (§3.2) — available on base store for engine checks
     CONFLICTING_TRADE_STATES: tuple[str, ...] = (
-        "pending_entry", "entry_active", "position_open", "oco_submitting",
-        "oco_active", "oco_partial", "tp1_active", "tp1_completed",
-        "tp2_active", "stop_loss_executing", "exit_pending", "needs_reconciliation",
+        "pending_entry",
+        "entry_active",
+        "position_open",
+        "oco_submitting",
+        "oco_active",
+        "oco_partial",
+        "tp1_active",
+        "tp1_completed",
+        "tp2_active",
+        "stop_loss_executing",
+        "exit_pending",
+        "needs_reconciliation",
     )
 
     def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
@@ -155,7 +170,8 @@ class TradingStore:
         try:
             placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
             rows = self.db.conn.execute(
-                f"SELECT * FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+                "SELECT * FROM trades WHERE symbol = ? AND trade_state IN "
+                f"({placeholders}) ORDER BY updated_at DESC LIMIT 1",
                 (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
             ).fetchall()
         except Exception:
@@ -324,12 +340,29 @@ class TradingStore:
         now = self._ts()
         payload_json = redact_payload(request_payload)
         values = (
-            operation_id, correlation_id, causation_id, intent_id, trade_id,
-            trade_order_id, signal_id, str(symbol).upper() if symbol else None,
-            str(operation_type)[:120], operation_class, purpose, transport,
-            endpoint, client_order_id, exchange_order_id, payload_json, now,
+            operation_id,
+            correlation_id,
+            causation_id,
+            intent_id,
+            trade_id,
+            trade_order_id,
+            signal_id,
+            str(symbol).upper() if symbol else None,
+            str(operation_type)[:120],
+            operation_class,
+            purpose,
+            transport,
+            endpoint,
+            client_order_id,
+            exchange_order_id,
+            payload_json,
+            now,
             1 if write_attempted or operation_class == "write" else 0,
-            clock_health, evidence_source, redact_text(evidence_limitations), now, now,
+            clock_health,
+            evidence_source,
+            redact_text(evidence_limitations),
+            now,
+            now,
         )
 
         def _insert(target: sqlite3.Connection) -> None:
@@ -385,18 +418,26 @@ class TradingStore:
                     updated_at = ?
                 WHERE operation_id = ?""",
                 (
-                    now, 1 if success else 0, response_classification,
-                    redact_text(response_status, limit=80), exchange_code, http_status,
-                    redact_payload(response_payload), error_class,
-                    redact_text(error_message), rate_limit_wait_ms,
-                    uncertainty, recovery_attempts, observed_at,
-                    redact_text(evidence_limitations), now, operation_id,
+                    now,
+                    1 if success else 0,
+                    response_classification,
+                    redact_text(response_status, limit=80),
+                    exchange_code,
+                    http_status,
+                    redact_payload(response_payload),
+                    error_class,
+                    redact_text(error_message),
+                    rate_limit_wait_ms,
+                    uncertainty,
+                    recovery_attempts,
+                    observed_at,
+                    redact_text(evidence_limitations),
+                    now,
+                    operation_id,
                 ),
             )
 
-    def mark_operation_uncertain(
-        self, operation_id: str, *, reason: str, uncertainty: str = "uncertain"
-    ) -> None:
+    def mark_operation_uncertain(self, operation_id: str, *, reason: str, uncertainty: str = "uncertain") -> None:
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE exchange_operations SET uncertainty = ?, error_message = ?, "
@@ -472,13 +513,26 @@ class TradingStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'spot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    signal_id, channel_id, message_id, edit_version, PARSER_VERSION,
-                    parsed.kind, parsed.symbol, parsed.action,
-                    dec_str(parsed.entry_price), dec_str(parsed.entry_low_price),
+                    signal_id,
+                    channel_id,
+                    message_id,
+                    edit_version,
+                    PARSER_VERSION,
+                    parsed.kind,
+                    parsed.symbol,
+                    parsed.action,
+                    dec_str(parsed.entry_price),
+                    dec_str(parsed.entry_low_price),
                     dec_str(parsed.entry_high_price),
                     ",".join(format(p, "f") for p in parsed.target_prices) or None,
-                    dec_str(parsed.stop_loss), parsed.order_type, parsed.amount_text,
-                    parsed.fingerprint_sha256, status, rejection_reason, now, now,
+                    dec_str(parsed.stop_loss),
+                    parsed.order_type,
+                    parsed.amount_text,
+                    parsed.fingerprint_sha256,
+                    status,
+                    rejection_reason,
+                    now,
+                    now,
                 ),
             )
             inserted = cur.rowcount > 0
@@ -493,9 +547,7 @@ class TradingStore:
             )
 
     def get_signal(self, signal_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone())
 
     def list_signals(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.conn.execute(
@@ -521,9 +573,7 @@ class TradingStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def repair_inconsistent_terminal_signals(
-        self, *, limit: int = 50, apply: bool = False
-    ) -> list[dict[str, Any]]:
+    def repair_inconsistent_terminal_signals(self, *, limit: int = 50, apply: bool = False) -> list[dict[str, Any]]:
         """Explicitly reconcile old terminal-intent/signal mismatches.
 
         Dry-run by default.  Only active signal statuses are changed; newer
@@ -538,9 +588,7 @@ class TradingStore:
         now = self._ts()
         with self.db.transaction() as conn:
             for row in rows:
-                reason = row.get("reject_reason") or (
-                    f"terminal intent state is {row['intent_state']}"
-                )
+                reason = row.get("reject_reason") or (f"terminal intent state is {row['intent_state']}")
                 conn.execute(
                     "UPDATE signals SET status = 'rejected', "
                     "rejection_reason = COALESCE(rejection_reason, ?), updated_at = ? "
@@ -611,8 +659,7 @@ class TradingStore:
             ).fetchall()
         else:
             rows = self.db.conn.execute(
-                "SELECT * FROM signals WHERE status IN ('validated', 'planned') "
-                "ORDER BY created_at DESC"
+                "SELECT * FROM signals WHERE status IN ('validated', 'planned') ORDER BY created_at DESC"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -657,8 +704,7 @@ class TradingStore:
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    "UPDATE signals SET status = 'canceled', rejection_reason = ?, updated_at = ? "
-                    "WHERE signal_id = ?",
+                    "UPDATE signals SET status = 'canceled', rejection_reason = ?, updated_at = ? WHERE signal_id = ?",
                     (reason, now, row["signal_id"]),
                 )
 
@@ -720,15 +766,16 @@ class TradingStore:
         """Return an open ``order_intents`` row for *symbol*, or None.
 
         Used as a durability-tier fallback for per-symbol concurrency when the
-        higher-level TradeManager (``trades`` table) is unavailable — e.g. in
-        sim mode.  Any open intent blocks a new BUY for the same symbol
-        because the reservation/inventory model cannot yet prove disjointness.
+        higher-level TradeManager (``trades`` table) is unavailable.  Any open
+        intent blocks a new BUY for the same symbol because the
+        reservation/inventory model cannot yet prove disjointness.
         """
         if not symbol:
             return None
         placeholders = ", ".join("?" for _ in OPEN_INTENT_STATES)
         rows = self.db.conn.execute(
-            f"SELECT * FROM order_intents WHERE symbol = ? AND state IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM order_intents WHERE symbol = ? AND state IN "
+            f"({placeholders}) ORDER BY created_at DESC LIMIT 1",
             (symbol.upper(), *OPEN_INTENT_STATES),
         ).fetchall()
         return dict(rows[0]) if rows else None
@@ -736,9 +783,7 @@ class TradingStore:
     def count_intents_by_state(self) -> dict[str, int]:
         return {
             str(r["state"]): int(r["c"])
-            for r in self.db.conn.execute(
-                "SELECT state, COUNT(*) AS c FROM order_intents GROUP BY state"
-            )
+            for r in self.db.conn.execute("SELECT state, COUNT(*) AS c FROM order_intents GROUP BY state")
         }
 
     # ------------------------------------------------------- budget ledger
@@ -790,16 +835,14 @@ class TradingStore:
         """Create a missing reservation for a planned pre-migration intent."""
 
         with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
+            row = conn.execute("SELECT 1 FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)).fetchone()
             if row is not None:
                 return
             intent = conn.execute(
                 "SELECT quote_amount, mode, state FROM order_intents WHERE intent_id = ?",
                 (intent_id,),
             ).fetchone()
-            if intent is None or intent["mode"] not in ("testonly", "live"):
+            if intent is None or intent["mode"] != "live":
                 return
             if intent["state"] in TERMINAL_INTENT_STATES:
                 return
@@ -831,8 +874,7 @@ class TradingStore:
         if not exchange_order_id:
             return Decimal("0"), Decimal("0")
         rows = conn.execute(
-            "SELECT price, quantity, quote_amount, fee_asset, fee_amount "
-            "FROM order_fills WHERE exchange_order_id = ?",
+            "SELECT price, quantity, quote_amount, fee_asset, fee_amount FROM order_fills WHERE exchange_order_id = ?",
             (str(exchange_order_id),),
         ).fetchall()
         quote_total = Decimal("0")
@@ -867,9 +909,7 @@ class TradingStore:
     ) -> None:
         """Release or settle the reservation for a state transition."""
 
-        row = conn.execute(
-            "SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)).fetchone()
         intent = conn.execute(
             "SELECT symbol, quote_amount FROM order_intents WHERE intent_id = ?", (intent_id,)
         ).fetchone()
@@ -879,9 +919,7 @@ class TradingStore:
         if new_state == "unknown_requires_reconciliation":
             if row is None:
                 self._reserve_budget(conn, intent_id, quote_amount, now)
-                row = conn.execute(
-                    "SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)
-                ).fetchone()
+                row = conn.execute("SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)).fetchone()
             conn.execute(
                 "UPDATE trading_budget_ledger SET state = 'uncertain', active = 1, note = ?, "
                 "updated_at = ? WHERE intent_id = ?",
@@ -892,9 +930,7 @@ class TradingStore:
         if row is None:
             # Intent created before the ledger migration: account for it now.
             self._reserve_budget(conn, intent_id, quote_amount, now)
-            row = conn.execute(
-                "SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM trading_budget_ledger WHERE intent_id = ?", (intent_id,)).fetchone()
         if row is None:
             return
 
@@ -930,8 +966,7 @@ class TradingStore:
         else:
             # planned/submitting/submitted/open/... keep the reservation.
             conn.execute(
-                "UPDATE trading_budget_ledger SET state = 'reserved', active = 1, updated_at = ? "
-                "WHERE intent_id = ?",
+                "UPDATE trading_budget_ledger SET state = 'reserved', active = 1, updated_at = ? WHERE intent_id = ?",
                 (now, intent_id),
             )
 
@@ -993,7 +1028,8 @@ class TradingStore:
                 try:
                     placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
                     conflict = conn.execute(
-                        f"SELECT trade_id, trade_state FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) LIMIT 1",
+                        "SELECT trade_id, trade_state FROM trades WHERE symbol = ? "
+                        f"AND trade_state IN ({placeholders}) LIMIT 1",
                         (signal.symbol.upper(), *self.CONFLICTING_TRADE_STATES),
                     ).fetchone()
                     if conflict is not None:
@@ -1010,7 +1046,7 @@ class TradingStore:
                     raise TradingError(f"per-symbol concurrency check failed: {exc}") from exc
 
             intent_id = f"intent-{client_order_id}"
-            if mode in ("testonly", "live"):
+            if mode == "live":
                 if quote_amount is None or quote_amount <= 0:
                     raise RiskLimitExceeded("order has no positive quote amount to reserve")
                 self._reserve_budget(conn, intent_id, quote_amount, now)
@@ -1036,15 +1072,25 @@ class TradingStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
                 """,
                 (
-                    f"intent-{client_order_id}", signal_id, idempotency_key, client_order_id,
-                    signal.symbol, signal.action, order_type, dec_str(quote_amount),
-                    dec_str(base_quantity), dec_str(limit_price), mode, message_id, channel_id,
-                    now, now,
+                    f"intent-{client_order_id}",
+                    signal_id,
+                    idempotency_key,
+                    client_order_id,
+                    signal.symbol,
+                    signal.action,
+                    order_type,
+                    dec_str(quote_amount),
+                    dec_str(base_quantity),
+                    dec_str(limit_price),
+                    mode,
+                    message_id,
+                    channel_id,
+                    now,
+                    now,
                 ),
             )
             conn.execute(
-                "UPDATE trading_daily_spend SET quote_spent = ?, order_count = ?, updated_at = ? "
-                "WHERE day_key = ?",
+                "UPDATE trading_daily_spend SET quote_spent = ?, order_count = ?, updated_at = ? WHERE day_key = ?",
                 (dec_str(spent + quote_amount), count + 1, now, day_key),
             )
             conn.execute(
@@ -1060,9 +1106,7 @@ class TradingStore:
             # Read the row inside the same serialized transaction: the shared
             # sqlite connection must never be read outside the DB lock while
             # another thread owns an open transaction.
-            inserted_row = conn.execute(
-                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
+            inserted_row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
             assert inserted_row is not None
         return dict(inserted_row), True
 
@@ -1086,22 +1130,23 @@ class TradingStore:
         )
 
     def get_intent(self, intent_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute(
-                "SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone())
 
     def intent_by_idempotency(self, key: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute(
-                "SELECT * FROM order_intents WHERE idempotency_key = ?", (key,)
-            ).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM order_intents WHERE idempotency_key = ?", (key,)).fetchone())
 
     def list_intents(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.conn.execute(
             "SELECT * FROM order_intents ORDER BY planned_at DESC, intent_id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_planned_intents(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Planned intents that were never claimed for exchange submission."""
+
+        rows = self.db.conn.execute(
+            "SELECT * FROM order_intents WHERE state = 'planned' ORDER BY planned_at, intent_id LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1155,28 +1200,32 @@ class TradingStore:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    intent_id, client_order_id, symbol.upper(), entry_order_id,
-                    dec_str(take_profit_price), dec_str(stop_loss_price),
-                    protection_mode, status, last_error, now, now,
+                    intent_id,
+                    client_order_id,
+                    symbol.upper(),
+                    entry_order_id,
+                    dec_str(take_profit_price),
+                    dec_str(stop_loss_price),
+                    protection_mode,
+                    status,
+                    last_error,
+                    now,
+                    now,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM order_protection WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM order_protection WHERE intent_id = ?", (intent_id,)).fetchone()
             assert row is not None
             result = dict(row)
         self.audit(
-            intent_id, "lifecycle", f"protection_{status}",
+            intent_id,
+            "lifecycle",
+            f"protection_{status}",
             f"tp={dec_str(take_profit_price)} sl={dec_str(stop_loss_price)}",
         )
         return result
 
     def get_protection(self, intent_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute(
-                "SELECT * FROM order_protection WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM order_protection WHERE intent_id = ?", (intent_id,)).fetchone())
 
     def update_protection(
         self,
@@ -1203,8 +1252,13 @@ class TradingStore:
                 WHERE intent_id = ?
                 """,
                 (
-                    status, last_error, exchange_tp_order_id, exchange_sl_order_id,
-                    verified, now, intent_id,
+                    status,
+                    last_error,
+                    exchange_tp_order_id,
+                    exchange_sl_order_id,
+                    verified,
+                    now,
+                    intent_id,
                 ),
             )
         self.audit(intent_id, "lifecycle", f"protection_{status}", last_error)
@@ -1218,9 +1272,7 @@ class TradingStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def outstanding_balance_usage(
-        self, symbol: str, *, exclude_intent_id: str | None = None
-    ) -> dict[str, Decimal]:
+    def outstanding_balance_usage(self, symbol: str, *, exclude_intent_id: str | None = None) -> dict[str, Decimal]:
         """Sum live non-terminal intents on ``symbol`` for balance reservation.
 
         Exchange ``free`` balances already exclude funds locked by open exchange
@@ -1272,28 +1324,42 @@ class TradingStore:
                     (intent_id, "fills_pending" if required else "fills_synced", note[:2000], now),
                 )
 
-    def claim_intent_for_submission(self, intent_id: str, *, note: str) -> bool:
+    def claim_intent_for_submission(
+        self,
+        intent_id: str,
+        *,
+        note: str,
+        precheck: Any | None = None,
+    ) -> tuple[bool, str | None]:
         """Atomically move ``planned`` -> ``submitting``.
 
-        Returns True only for the caller that won the claim.  Exactly one
-        delivery (queue retry, duplicate message, conditional trigger) can ever
-        submit an entry order for an intent.
+        Returns ``(True, None)`` only for the caller that won the claim.  The
+        optional ``precheck(conn)`` runs *inside the same transaction* and may
+        return a blocker reason.  A blocker leaves the intent ``planned`` and
+        persists an audit row, so pause/readiness cannot race the claim.
         """
 
         now = self._ts()
         with self.db.transaction() as conn:
-            current = conn.execute(
-                "SELECT state FROM order_intents WHERE intent_id = ?", (intent_id,)
-            ).fetchone()
+            current = conn.execute("SELECT state FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
             if current is None:
                 raise TradingError(f"intent {intent_id} not found")
+            if precheck is not None:
+                reason = precheck(conn)
+                if reason:
+                    conn.execute(
+                        "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
+                        "VALUES (?, 'risk', 'submission_blocked', ?, ?)",
+                        (intent_id, str(reason)[:2000], now),
+                    )
+                    return False, str(reason)
             cursor = conn.execute(
                 "UPDATE order_intents SET state = 'submitting', updated_at = ? "
                 "WHERE intent_id = ? AND state = 'planned'",
                 (now, intent_id),
             )
             if cursor.rowcount == 0:
-                return False
+                return False, None
             conn.execute(
                 "INSERT INTO order_status_history "
                 "(intent_id, exchange_order_id, previous_state, new_state, note, changed_at) "
@@ -1305,7 +1371,7 @@ class TradingStore:
                 "VALUES (?, 'lifecycle', 'submission_claimed', ?, ?)",
                 (intent_id, note[:2000], now),
             )
-        return True
+        return True, None
 
     def transition_intent(
         self,
@@ -1378,8 +1444,7 @@ class TradingStore:
                 (intent_id, exchange_order_id, current["state"], new_state, note[:1000], now),
             )
             conn.execute(
-                "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO audit_events (correlation, category, event, detail, created_at) VALUES (?, ?, ?, ?, ?)",
                 (intent_id, category, new_state, note[:2000], now),
             )
             current_after = conn.execute(
@@ -1441,12 +1506,22 @@ class TradingStore:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    str(order_id), raw.get("clientOrderId") or raw.get("origClientOrderId"),
-                    intent_id, symbol, side, order_type,
-                    raw.get("price"), raw.get("origQty") or raw.get("Qty"),
-                    raw.get("executedQty"), raw.get("cumulativeQuoteQty"),
-                    _exchange_status(raw.get("status")), raw.get("timeInForce"),
-                    raw.get("time"), discovered_in, now, now,
+                    str(order_id),
+                    raw.get("clientOrderId") or raw.get("origClientOrderId"),
+                    intent_id,
+                    symbol,
+                    side,
+                    order_type,
+                    raw.get("price"),
+                    raw.get("origQty") or raw.get("Qty"),
+                    raw.get("executedQty"),
+                    raw.get("cumulativeQuoteQty"),
+                    _exchange_status(raw.get("status")),
+                    raw.get("timeInForce"),
+                    raw.get("time"),
+                    discovered_in,
+                    now,
+                    now,
                 ),
             )
 
@@ -1469,13 +1544,20 @@ class TradingStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    exchange_order_id, symbol, str(raw.get("price")), str(raw.get("qty")),
+                    exchange_order_id,
+                    symbol,
+                    str(raw.get("price")),
+                    str(raw.get("qty")),
                     str(raw.get("quoteQty")) if raw.get("quoteQty") is not None else None,
                     raw.get("commissionAsset"),
                     str(raw.get("commission")) if raw.get("commission") is not None else None,
                     _trade_identity(raw, exchange_order_id),
-                    1 if raw.get("isBuyer") else 0, 1 if raw.get("isMaker") else 0,
-                    raw.get("time"), source, now, now,
+                    1 if raw.get("isBuyer") else 0,
+                    1 if raw.get("isMaker") else 0,
+                    raw.get("time"),
+                    source,
+                    now,
+                    now,
                 ),
             )
             inserted = cur.rowcount > 0
@@ -1544,7 +1626,9 @@ class TradingStore:
             )
             if emit_audit and intent_id:
                 self.audit(
-                    intent_id, "reconcile", f"reconcile_{outcome}",
+                    intent_id,
+                    "reconcile",
+                    f"reconcile_{outcome}",
                     detail[:2000],
                     event_type="reconcile.outcome",
                     trade_id=None,
@@ -1559,9 +1643,7 @@ class TradingStore:
     def reconciliation_counts(self) -> dict[str, int]:
         return {
             str(r["outcome"]): int(r["c"])
-            for r in self.db.conn.execute(
-                "SELECT outcome, COUNT(*) AS c FROM reconciliation_results GROUP BY outcome"
-            )
+            for r in self.db.conn.execute("SELECT outcome, COUNT(*) AS c FROM reconciliation_results GROUP BY outcome")
         }
 
     def fills_count(self) -> int:
@@ -1576,9 +1658,7 @@ class TradingStore:
     # built-in default when no explicit config source is present.
 
     def get_setting(self, key: str) -> str | None:
-        row = self.db.conn.execute(
-            "SELECT value FROM control_settings WHERE key = ?", (key,)
-        ).fetchone()
+        row = self.db.conn.execute("SELECT value FROM control_settings WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row is not None else None
 
     def set_setting(self, key: str, value: str) -> None:
@@ -1598,9 +1678,7 @@ class TradingStore:
     # ------------------------------------------------------- activation state
 
     def get_app_state(self, key: str) -> str | None:
-        row = self.db.conn.execute(
-            "SELECT value FROM app_state WHERE key = ?", (key,)
-        ).fetchone()
+        row = self.db.conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row is not None else None
 
     def set_app_state(self, key: str, value: str) -> None:
@@ -1707,9 +1785,7 @@ class TradingStore:
                 (channel_id,),
             ).fetchone()
             boundary = int(row["m"] or 0)
-        effective = self.set_app_state_once(
-            "trading.activation_boundary_message_id", str(boundary)
-        )
+        effective = self.set_app_state_once("trading.activation_boundary_message_id", str(boundary))
         return int(effective)
 
     # -------------------------------------------------------- notifications
@@ -1736,9 +1812,7 @@ class TradingStore:
 
     def notification_preferences(self, role: str | None = None) -> list[dict[str, Any]]:
         if role is None:
-            rows = self.db.conn.execute(
-                "SELECT * FROM notification_preferences ORDER BY role, category"
-            ).fetchall()
+            rows = self.db.conn.execute("SELECT * FROM notification_preferences ORDER BY role, category").fetchall()
         else:
             rows = self.db.conn.execute(
                 "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
@@ -1768,9 +1842,18 @@ class TradingStore:
                 "text, compact_text, expanded_text, status, attempts, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
                 (
-                    event_key[:300], signal_id, intent_id, category[:80], event_type[:120],
-                    role, chat_id, text[:4000], redact_text(compact_text),
-                    redact_text(expanded_text), now, now,
+                    event_key[:300],
+                    signal_id,
+                    intent_id,
+                    category[:80],
+                    event_type[:120],
+                    role,
+                    chat_id,
+                    text[:4000],
+                    redact_text(compact_text),
+                    redact_text(expanded_text),
+                    now,
+                    now,
                 ),
             )
             return cur.rowcount > 0
@@ -1812,9 +1895,9 @@ class TradingStore:
         the owner/developer can inspect and explicitly re-queue them.
         """
 
-        cutoff = (self._now() - timedelta(seconds=max(1, older_than_s))).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
+        cutoff = (
+            (self._now() - timedelta(seconds=max(1, older_than_s))).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
         with self.db.transaction() as conn:
             cur = conn.execute(
                 "UPDATE trading_notifications SET status = 'ambiguous', "
@@ -1843,8 +1926,10 @@ class TradingStore:
         next_attempt: str | None = None
         if outcome == "retry" and retry_after_s:
             next_attempt = (
-                now_dt + timedelta(seconds=max(1, int(retry_after_s)))
-            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                (now_dt + timedelta(seconds=max(1, int(retry_after_s))))
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
         with self.db.transaction() as conn:
             row = conn.execute(
                 "SELECT attempts, role FROM trading_notifications WHERE notification_id = ?",
@@ -1858,8 +1943,14 @@ class TradingStore:
                 "(notification_id, attempt_no, attempted_at, outcome, error, "
                 "telegram_message_id, retry_after_s, ambiguous) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    notification_id, attempt, now, outcome, redact_text(error),
-                    telegram_message_id, retry_after_s, 1 if ambiguous else 0,
+                    notification_id,
+                    attempt,
+                    now,
+                    outcome,
+                    redact_text(error),
+                    telegram_message_id,
+                    retry_after_s,
+                    1 if ambiguous else 0,
                 ),
             )
             if outcome == "sent":
@@ -1884,20 +1975,15 @@ class TradingStore:
                     (status, attempt, redact_text(error, limit=500), now, notification_id),
                 )
 
-    def mark_notification_sent(
-        self, notification_id: int, *, telegram_message_id: int | None = None
-    ) -> None:
-        self.finish_notification(
-            notification_id, outcome="sent", telegram_message_id=telegram_message_id
-        )
+    def mark_notification_sent(self, notification_id: int, *, telegram_message_id: int | None = None) -> None:
+        self.finish_notification(notification_id, outcome="sent", telegram_message_id=telegram_message_id)
 
     def mark_notification_failed(self, notification_id: int, error: str) -> None:
         self.finish_notification(notification_id, outcome="failed", error=error)
 
     def notification_attempts(self, notification_id: int) -> list[dict[str, Any]]:
         rows = self.db.conn.execute(
-            "SELECT * FROM notification_delivery_attempts WHERE notification_id = ? "
-            "ORDER BY attempt_no",
+            "SELECT * FROM notification_delivery_attempts WHERE notification_id = ? ORDER BY attempt_no",
             (notification_id,),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -1914,9 +2000,7 @@ class TradingStore:
     ) -> str:
         token = secrets.token_urlsafe(18)
         now_dt = self._now()
-        expires = (now_dt + timedelta(seconds=ttl_s)).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
+        expires = (now_dt + timedelta(seconds=ttl_s)).isoformat(timespec="seconds").replace("+00:00", "Z")
         with self.db.transaction() as conn:
             conn.execute(
                 "INSERT INTO notification_callbacks "
@@ -1927,9 +2011,7 @@ class TradingStore:
         return token
 
     def notification_callback(self, token: str) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT * FROM notification_callbacks WHERE token = ?", (token,)
-        ).fetchone()
+        row = self.db.conn.execute("SELECT * FROM notification_callbacks WHERE token = ?", (token,)).fetchone()
         if row is None:
             return None
         data = dict(row)
@@ -1944,8 +2026,7 @@ class TradingStore:
             return None
         with self.db.transaction() as conn:
             conn.execute(
-                "UPDATE notification_callbacks SET use_count = use_count + 1, used_at = ? "
-                "WHERE token = ?",
+                "UPDATE notification_callbacks SET use_count = use_count + 1, used_at = ? WHERE token = ?",
                 (self._ts(), token),
             )
         return data
@@ -1957,9 +2038,7 @@ def _trade_identity(raw: dict[str, Any], exchange_order_id: str) -> str:
     raw_id = raw.get("id")
     if raw_id is not None and str(raw_id).strip() != "":
         return str(raw_id)
-    material = "|".join(
-        str(raw.get(key)) for key in ("time", "price", "qty", "quoteQty", "commission", "isBuyer")
-    )
+    material = "|".join(str(raw.get(key)) for key in ("time", "price", "qty", "quoteQty", "commission", "isBuyer"))
     digest = hashlib.sha256(f"{exchange_order_id}|{material}".encode()).hexdigest()
     return f"synth-{digest[:32]}"
 

@@ -98,7 +98,6 @@ async def _wait_for(predicate, timeout=3.0):
 
 
 async def test_market_worker_subscribes_and_dispatches_ticks(cfg, repo):
-    cfg.trading.mode = "live"
     trades = [
         {"symbol": "btcusdt", "trade_state": "entry_active"},
         {"symbol": "ETHUSDT", "trade_state": "open"},
@@ -128,7 +127,6 @@ async def test_market_worker_subscribes_and_dispatches_ticks(cfg, repo):
 
 
 async def test_reconciliation_worker_recovers_before_sweeping(cfg, repo):
-    cfg.trading.mode = "live"
     trading = FakeTrading([])
     monitor = FakeMonitor()
     svc = _service(cfg, repo, trading, monitor)
@@ -144,7 +142,6 @@ async def test_reconciliation_worker_recovers_before_sweeping(cfg, repo):
 
 
 async def test_live_mode_schedules_monitor_and_reconciliation(cfg, repo):
-    cfg.trading.mode = "live"
     trading = FakeTrading([])
     monitor = FakeMonitor()
     svc = _service(cfg, repo, trading, monitor)
@@ -165,23 +162,27 @@ async def test_live_mode_schedules_monitor_and_reconciliation(cfg, repo):
         await svc._reap_background_tasks()
 
 
-async def test_non_live_mode_does_not_start_monitor(cfg, repo):
-    cfg.trading.mode = "sim"
+async def test_background_work_always_starts_monitor_and_reconciliation(cfg, repo):
     trading = FakeTrading([])
     monitor = FakeMonitor()
     svc = _service(cfg, repo, trading, monitor)
     svc._selected_channel_id = 100
 
+    async def _noop_worker():
+        await asyncio.Event().wait()
+
+    svc._market_worker = _noop_worker  # type: ignore[method-assign]
+    svc._reconciliation_worker = _noop_worker  # type: ignore[method-assign]
+
     svc._start_background_work()
     try:
-        assert svc._monitor_task is None
-        assert svc._recon_task is None
+        assert svc._monitor_task is not None
+        assert svc._recon_task is not None
     finally:
         await svc._reap_background_tasks()
 
 
 async def test_market_worker_skips_without_trade_manager(cfg, repo):
-    cfg.trading.mode = "live"
     trading = FakeTrading([])
     trading.trade_manager = None
     monitor = FakeMonitor()
@@ -192,7 +193,6 @@ async def test_market_worker_skips_without_trade_manager(cfg, repo):
 
 
 async def test_market_worker_stops_cleanly_when_monitor_start_fails(cfg, repo):
-    cfg.trading.mode = "live"
     trading = FakeTrading([])
 
     class BrokenMonitor(FakeMonitor):

@@ -61,8 +61,7 @@ class TradeSim:
 
     def start(self, app_cfg: AppConfig | None = None) -> TradeSim:
         app_cfg = app_cfg or _app_config()
-        app_cfg.trading.mode = "live"
-        app_cfg.trading.live_enabled_token = LIVE_TOKEN
+        app_cfg.trading.execution_acknowledgement = LIVE_TOKEN
         app_cfg.trading.entry_trigger_offset_ticks = self.cfg.offset_ticks
         app_cfg.trading.entry_trigger_stale_threshold_s = self.cfg.stale_threshold_s
 
@@ -72,8 +71,9 @@ class TradeSim:
         self.client = FakeClient(registry=FakeRegistry(meta=FakeMeta(tick_size=self.cfg.tick_size)))
         self.engine = FakeEngine(app_cfg, self.store, client=self.client)
         self.notifier = FakeNotifier()
-        self.tm = TradeManager(app_cfg.trading, self.store, engine=self.engine,
-                               client=self.client, notifier=self.notifier)
+        self.tm = TradeManager(
+            app_cfg.trading, self.store, engine=self.engine, client=self.client, notifier=self.notifier
+        )
         self.events.clear()
         return self
 
@@ -87,11 +87,18 @@ class TradeSim:
         decision = self.tm.on_intent_planned(
             self.intent,
             ParsedSignal(
-                kind="alert", action="buy", symbol=self.cfg.symbol,
-                entry_price=self.cfg.entry, entry_low_price=None,
-                entry_high_price=None, target_prices=(self.cfg.tp1, self.cfg.tp2),
-                stop_loss=self.cfg.sl, order_type="limit",
-                amount_text=None, raw_text="buy", normalized_text="buy",
+                kind="alert",
+                action="buy",
+                symbol=self.cfg.symbol,
+                entry_price=self.cfg.entry,
+                entry_low_price=None,
+                entry_high_price=None,
+                target_prices=(self.cfg.tp1, self.cfg.tp2),
+                stop_loss=self.cfg.sl,
+                order_type="limit",
+                amount_text=None,
+                raw_text="buy",
+                normalized_text="buy",
                 fingerprint_sha256="sim",
             ),
             reference_price=reference_price,
@@ -130,10 +137,18 @@ class TradeSim:
         oid = self.intent["exchange_order_id"]
         self.client.fill_order(oid, qty, qty * self.cfg.entry, self.cfg.entry)
         self.store.add_fill(
-            exchange_order_id=oid, symbol=self.cfg.symbol,
-            raw={"price": str(self.cfg.entry), "qty": str(qty),
-                 "quoteQty": str(qty * self.cfg.entry), "commission": "0",
-                 "commissionAsset": "USDT", "isBuyer": 1, "isMaker": 0, "time": 1},
+            exchange_order_id=oid,
+            symbol=self.cfg.symbol,
+            raw={
+                "price": str(self.cfg.entry),
+                "qty": str(qty),
+                "quoteQty": str(qty * self.cfg.entry),
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "isBuyer": 1,
+                "isMaker": 0,
+                "time": 1,
+            },
         )
         self.tm._reconcile_entry_fills(self.trade)
         self.trade = self.store.get_trade(self.trade["trade_id"])
@@ -184,9 +199,24 @@ class TradeSim:
                  order_type, quote_amount, base_quantity, limit_price, mode, state,
                  create_msg_id, create_channel_id, planned_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (iid, sid, f"idem-{cid}", cid, self.cfg.symbol, "buy", "limit",
-                 str(self.cfg.quote_amount), str(self.cfg.base_quantity),
-                 str(self.cfg.entry), "live", "planned", 1, 100, "now", "now"),
+                (
+                    iid,
+                    sid,
+                    f"idem-{cid}",
+                    cid,
+                    self.cfg.symbol,
+                    "buy",
+                    "limit",
+                    str(self.cfg.quote_amount),
+                    str(self.cfg.base_quantity),
+                    str(self.cfg.entry),
+                    "live",
+                    "planned",
+                    1,
+                    100,
+                    "now",
+                    "now",
+                ),
             )
         self.intent = self.store.get_intent(iid)
 
@@ -199,8 +229,10 @@ def _app_config() -> AppConfig:
 
     base = Path("/tmp/tsim-data")
     cfg = AppConfig(
-        api_id=1, api_hash="a" * 32,
-        data_dir=base, db_path=base / "t.sqlite3",
+        api_id=1,
+        api_hash="a" * 32,
+        data_dir=base,
+        db_path=base / "t.sqlite3",
         session_path=base / "session",
     )
     cfg.ensure_dirs()
@@ -220,26 +252,48 @@ def scenario_full_tp_sl() -> TradeSim:
     sim.fill_entry()
     sim.tick(sim.cfg.symbol, sim.cfg.tp1)
     tp1_order = sim.store.list_trade_orders(sim.trade["trade_id"], kind="tp1")[0]
-    sim.client.fill_order(tp1_order["exchange_order_id"], sim.cfg.base_quantity / 2,
-                          (sim.cfg.base_quantity / 2) * sim.cfg.tp1, sim.cfg.tp1)
+    sim.client.fill_order(
+        tp1_order["exchange_order_id"],
+        sim.cfg.base_quantity / 2,
+        (sim.cfg.base_quantity / 2) * sim.cfg.tp1,
+        sim.cfg.tp1,
+    )
     sim.store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=sim.cfg.symbol,
-        raw={"price": str(sim.cfg.tp1), "qty": str(sim.cfg.base_quantity / 2),
-             "quoteQty": str((sim.cfg.base_quantity / 2) * sim.cfg.tp1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=sim.cfg.symbol,
+        raw={
+            "price": str(sim.cfg.tp1),
+            "qty": str(sim.cfg.base_quantity / 2),
+            "quoteQty": str((sim.cfg.base_quantity / 2) * sim.cfg.tp1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
     sim.reconcile()  # tp1_active -> tp2_active
     sim.tick(sim.cfg.symbol, sim.cfg.tp2)
     tp2_order = sim.store.list_trade_orders(sim.trade["trade_id"], kind="tp2")[0]
-    sim.client.fill_order(tp2_order["exchange_order_id"], sim.cfg.base_quantity / 2,
-                          (sim.cfg.base_quantity / 2) * sim.cfg.tp2, sim.cfg.tp2)
+    sim.client.fill_order(
+        tp2_order["exchange_order_id"],
+        sim.cfg.base_quantity / 2,
+        (sim.cfg.base_quantity / 2) * sim.cfg.tp2,
+        sim.cfg.tp2,
+    )
     sim.store.add_fill(
-        exchange_order_id=tp2_order["exchange_order_id"], symbol=sim.cfg.symbol,
-        raw={"price": str(sim.cfg.tp2), "qty": str(sim.cfg.base_quantity / 2),
-             "quoteQty": str((sim.cfg.base_quantity / 2) * sim.cfg.tp2),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 3},
+        exchange_order_id=tp2_order["exchange_order_id"],
+        symbol=sim.cfg.symbol,
+        raw={
+            "price": str(sim.cfg.tp2),
+            "qty": str(sim.cfg.base_quantity / 2),
+            "quoteQty": str((sim.cfg.base_quantity / 2) * sim.cfg.tp2),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 3,
+        },
     )
     sim.reconcile()  # tp2_active -> closed
     assert sim.state() == "closed", sim.state()
@@ -254,7 +308,7 @@ def scenario_stop_loss() -> TradeSim:
     assert sim.trade is not None
     sim.fill_entry()
     sim.tick(sim.cfg.symbol, sim.cfg.tp1)  # arm TP1
-    sim.tick(sim.cfg.symbol, sim.cfg.sl)   # SL wins; entry+TP cancelled, market sell
+    sim.tick(sim.cfg.symbol, sim.cfg.sl)  # SL wins; entry+TP cancelled, market sell
     assert sim.state() in ("stop_loss_executing", "exit_pending", "closed"), sim.state()
     assert sim.engine.cancel_intent_calls
     assert sim.engine.cancel_trade_calls
