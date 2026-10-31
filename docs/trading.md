@@ -130,8 +130,9 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `monitor_backoff_base_s` | `1.0` | positive |
 
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
-threshold, mandatory stop-loss rule, or manual symbol allowlist. The
-`trading_daily_spend` table is maintained but no cap reads it.
+threshold or mandatory stop-loss rule. Valid symbols are not restricted by an
+operator-maintained allowlist; MEXC market metadata and order filters remain
+enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 
 ## Parsing and executable signals
 

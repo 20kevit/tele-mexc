@@ -960,17 +960,12 @@ class TradingEngine:
         except Exception:  # noqa: BLE001 - reporting must never break trading
             return None
 
-    def balance_check(self, intent: dict[str, Any]) -> str | None:
-        """Public fail-closed balance preflight used by the approval UI."""
+    def execute_intent(self, intent_id: str) -> dict[str, Any]:
+        """Revalidate a planned intent immediately before exchange submission.
 
-        return self._balance_preflight(intent)
-
-    def execute_approved_intent(self, intent_id: str) -> dict[str, Any]:
-        """Revalidate immediately before submission, then execute.
-
-        Approval is never treated as a bypass of risk, age, symbol, emergency
-        stop, or balance checks. Any failed revalidation leaves the intent
-        rejected and no exchange call is made.
+        Any failed revalidation leaves the intent rejected and makes no
+        exchange call. Execution always goes through risk, market, emergency
+        stop, precision, and balance checks.
         """
 
         intent = self.store.get_intent(intent_id)

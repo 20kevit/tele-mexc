@@ -9,7 +9,6 @@ description = "Telegram signal ingestion, risk controls and durable MEXC Spot ex
 requires-python = ">=3.12"
 dependencies = [
     "telethon>=1.36,<2",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]

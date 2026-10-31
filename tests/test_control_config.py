@@ -47,7 +47,7 @@ def test_control_can_be_explicitly_disabled(tmp_path):
     assert cfg.control.enabled is False
 
 
-def test_invalid_owner_id_and_ttl_fail_closed(tmp_path):
+def test_invalid_owner_id_fails_closed_and_legacy_approval_setting_is_ignored(tmp_path):
     with pytest.raises(ConfigError, match="numeric"):
         load_config(
             root=_root(tmp_path),
@@ -60,12 +60,12 @@ def test_invalid_owner_id_and_ttl_fail_closed(tmp_path):
             environ={"CONTROL_OWNER_USER_ID": "-1"},
             require_credentials=False,
         )
-    with pytest.raises(ConfigError, match="between 30 and 86400"):
-        load_config(
-            root=_root(tmp_path, "[control]\napproval_ttl_s = 5"),
-            environ={},
-            require_credentials=False,
-        )
+    legacy = load_config(
+        root=_root(tmp_path, "[control]\napproval_ttl_s = 5"),
+        environ={},
+        require_credentials=False,
+    )
+    assert not hasattr(legacy.control, "approval_ttl_s")
 
 
 def test_explicitly_enabled_but_incomplete_bot_is_rejected(tmp_path):
