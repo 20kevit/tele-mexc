@@ -165,7 +165,7 @@ class FakeMexc:
         return [{"orderId": "external-1", "symbol": "GOLD(XAUT)USDT", "status": "NEW"}]
 
 
-ALERT = "BUY BTCUSDT\nENTRY: 100\nTP1: 110\nSL: 95"
+ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
 
 
 def test_fetch_market_prices_uses_one_all_symbol_call(cfg, repo):
@@ -234,24 +234,30 @@ def test_repeated_identical_content_on_a_new_message_is_a_new_signal(cfg, repo):
 
 
 def test_alert_without_stop_loss_is_accepted(cfg, repo):
-    """A signal is not rejected merely because it omits a stop loss."""
+    """Owner-confirmed 2026-10-31: missing mandatory SL/TP1/TP2 rejects before BUY."""
 
     engine = _engine(cfg, repo)
+    # Missing SL + TP2 — rejected at execution boundary (RiskManager, no inference)
     record = _store_message(repo, 5, "BUY BTCUSDT\nENTRY 100\nTP1 110")
     intent = engine.process_item(_item(100, 5), record)
-    assert intent is not None
-    assert intent["state"] == "filled"
-    assert Decimal(intent["quote_amount"]) == Decimal("10")
+    assert intent is None
+    # Missing TP2 also rejected
+    record2 = _store_message(repo, 51, "BUY BTCUSDT\nENTRY 100\nSL 90\nTP1 110")
+    assert engine.process_item(_item(100, 51), record2) is None
 
 
 def test_no_arbitrary_daily_or_open_order_caps(cfg, repo):
+    # Per-symbol concurrency now blocks overlapping BUYs for same symbol;
+    # unrelated symbols must stay independent.  Verify the *cap* claim with
+    # distinct symbols and complete mandatory fields (SL/TP1/TP2).
     engine = _engine(cfg, repo)
-    for mid in (6, 7, 8):
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    for mid, sym in zip((6, 7, 8), symbols):
         intent = engine.process_item(
             _item(100, mid),
-            _store_message(repo, mid, f"BUY BTCUSDT\nENTRY {100 + mid}\nTP1 120"),
+            _store_message(repo, mid, f"BUY {sym}\nENTRY {100 + mid}\nSL 90\nTP1 120\nTP2 130"),
         )
-        assert intent is not None
+        assert intent is not None, f"{sym} should not be capped"
     assert len(engine.store.list_intents(limit=10)) == 3
 
 
@@ -761,7 +767,7 @@ def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
 
     # The ignored historical cancel must not block an older live message either.
     older = engine.process_item(
-        _item(100, 49), _store_message(repo, 49, "BUY BTCUSDT ENTRY 100 TP 111 SL 96")
+        _item(100, 49), _store_message(repo, 49, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
     )
     assert older is not None
 
@@ -863,11 +869,16 @@ def test_balance_preflight_counts_competing_local_intents(cfg, repo):
     )
 
     second = engine.process_item(
-        _item(100, 74), _store_message(repo, 74, "BUY BTCUSDT ENTRY 100 TP 111 SL 96")
+        _item(100, 74), _store_message(repo, 74, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
     )
+    # Per-symbol concurrency is not relevant here (different symbols), so
+    # rejection must be due to balance insufficiency (outstanding reservation).
+    # If per-symbol concurrency were to block, that would be a spec violation
+    # for cross-symbol independence — explicitly guard against it.
     assert second is not None and second["state"] == "rejected"
     assert client.place_calls == 0
-    assert "outstanding" in second["reject_reason"] or "insufficient" in second["reject_reason"]
+    rr = (second["reject_reason"] or "").lower()
+    assert "outstanding" in rr or "insufficient" in rr
 
 
 def test_balance_preflight_refetches_for_each_live_order(cfg, repo):
@@ -881,7 +892,7 @@ def test_balance_preflight_refetches_for_each_live_order(cfg, repo):
     engine = _engine(cfg, repo, client, mode="live")
     first = engine.process_item(_item(100, 75), _store_message(repo, 75, ALERT))
     second = engine.process_item(
-        _item(100, 76), _store_message(repo, 76, "BUY BTCUSDT ENTRY 100 TP 111 SL 96")
+        _item(100, 76), _store_message(repo, 76, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
     )
     assert first is not None and first["state"] == "open"
     assert second is not None and second["state"] == "open"

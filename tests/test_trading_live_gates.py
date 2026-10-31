@@ -26,7 +26,7 @@ from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import TradingEngine
 
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
-ALERT = "BUY BTCUSDT\nENTRY: 100\nTP1: 110\nSL: 95"
+ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
 LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 
 
@@ -224,7 +224,7 @@ def test_no_manual_allowlist_blocks_dynamic_symbol(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="testonly")
     result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, text="BUY ETHUSDT\nENTRY: 2000\nTP1: 2100")
+        _item(100, 1), _store_message(repo, 1, text="BUY ETHUSDT\nENTRY: 2000\nSL: 1900\nTP1: 2100\nTP2: 2200")
     )
     assert result is not None
     assert fake.test_calls == 1
@@ -239,7 +239,7 @@ def test_unknown_exchange_symbol_fails_closed(cfg, repo):
     cfg.trading.order_quote_amount = 10.0
     engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
     result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, text="BUY NOPEUSDT\nENTRY: 1\nTP1: 2")
+        _item(100, 1), _store_message(repo, 1, text="BUY NOPEUSDT\nENTRY: 1\nSL: 0.9\nTP1: 2\nTP2: 3")
     )
     assert result is None
     assert fake.test_calls == 0
@@ -262,7 +262,7 @@ def test_sim_with_attached_client_performs_zero_exchange_calls(cfg, repo):
 def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="testonly")
-    text = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nAMOUNT: $5000 USDT\nDEPOSIT 25%"
+    text = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120\nAMOUNT: $5000 USDT\nDEPOSIT 25%"
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, text=text))
     assert intent is not None
     assert Decimal(str(intent["quote_amount"])) == Decimal("10")

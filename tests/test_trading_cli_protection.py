@@ -16,7 +16,7 @@ from tg_signal_ingest.trading.trade_manager import TradeManager
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
 LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
-ALERT = "BUY BTCUSDT\nENTRY: 100\nTP1: 110\nSL: 95"
+ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
 
 
 def _item(mid: int) -> QueueItem:

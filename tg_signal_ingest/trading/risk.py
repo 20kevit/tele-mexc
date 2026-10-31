@@ -1,10 +1,10 @@
-"""Pre-trade risk controls.
+"""Pre-trade risk controls — execution-boundary mandatory validation.
 
-The policy is deliberately narrow: Spot BUY only, fixed owner-configured quote
-notional, exchange-native symbol validation.  There are no application-level
-daily/open-order caps, signal-age caps, price-deviation thresholds, mandatory
-stop-loss rules, or manually maintained symbol allowlists.  Genuinely invalid
-or unsupported signals still fail closed.
+Owner-confirmed strategy (2026-10-31):
+* Only complete LONG signals with symbol, valid entry (price or range), SL, TP1, TP2.
+* LONG invariant: SL < Entry < TP1 <= TP2. Missing/invalid = rejection before BUY.
+* Spot BUY only, fixed owner-configured quote notional, exchange-native symbol validation.
+* No inferred SL/TP, no SHORT execution, no leverage.
 
 Every check fails closed. Decimal is used for all financial arithmetic; no
 float reaches an exchange quantity or price.
@@ -66,16 +66,66 @@ class RiskManager:
             reasons.append("SHORT/SELL signals are not executed; this bot is Spot BUY only")
         if not signal.symbol:
             reasons.append("signal symbol is missing")
-        if signal.entry_price is not None and signal.entry_price <= 0:
+        # Mandatory field enforcement at execution boundary (owner-confirmed 2026-10-31):
+        # every eligible LONG must have symbol, LONG direction, entry, SL, TP1, TP2.
+        # No inference of missing values is permitted.
+        if signal.entry_price is None:
+            # Entry-range handling (owner-confirmed §1.3): parser may expose a
+            # low/high range without a canonical single entry price.  No
+            # midpoint or arbitrary derivation is authorized — range-only
+            # execution is explicitly unsupported and must be rejected with a
+            # clear documented reason.
+            if signal.entry_low_price is not None or signal.entry_high_price is not None:
+                reasons.append(
+                    "entry price is missing; entry range (e.g., 100-102) is not supported for automatic execution — "
+                    "provide a single entry price (unsupported range-only execution)"
+                )
+            else:
+                reasons.append("entry price is missing; rejected before BUY (mandatory SL/TP validation)")
+        elif signal.entry_price <= 0:
             reasons.append("entry price must be positive")
-        if signal.stop_loss is not None and signal.stop_loss <= 0:
-            reasons.append("stop loss must be positive when present")
+        # Entry range validation (when present)
         if (
             signal.entry_low_price is not None
             and signal.entry_high_price is not None
             and signal.entry_low_price > signal.entry_high_price
         ):
             reasons.append("entry range is inverted")
+        if signal.entry_low_price is not None and signal.entry_low_price <= 0:
+            reasons.append("entry low price must be positive")
+        if signal.entry_high_price is not None and signal.entry_high_price <= 0:
+            reasons.append("entry high price must be positive")
+        # Mandatory SL/TP validation — do not infer missing values
+        if signal.stop_loss is None:
+            reasons.append("stop loss (SL) is missing; rejected before BUY (mandatory field)")
+        elif signal.stop_loss <= 0:
+            reasons.append("stop loss must be positive when present")
+        if len(signal.target_prices) < 1 or signal.target_prices[0] is None:
+            reasons.append("take profit 1 (TP1) is missing; rejected before BUY (mandatory field)")
+        elif signal.target_prices[0] <= 0:
+            reasons.append("TP1 must be positive")
+        if len(signal.target_prices) < 2 or signal.target_prices[1] is None:
+            reasons.append("take profit 2 (TP2) is missing; rejected before BUY (mandatory field)")
+        elif signal.target_prices[1] <= 0:
+            reasons.append("TP2 must be positive")
+        # Price relationship for LONG: SL < Entry < TP1 <= TP2
+        if (
+            signal.stop_loss is not None
+            and signal.entry_price is not None
+            and signal.target_prices
+            and len(signal.target_prices) >= 2
+        ):
+            entry = signal.entry_price
+            sl = signal.stop_loss
+            tp1 = signal.target_prices[0]
+            tp2 = signal.target_prices[1]
+            # Only validate when all are positive
+            if all(v is not None and v > 0 for v in (sl, entry, tp1, tp2)):
+                if not (sl < entry < tp1 <= tp2):
+                    reasons.append(
+                        f"invalid LONG price relationship: required SL < Entry < TP1 <= TP2 "
+                        f"(got SL={sl} Entry={entry} TP1={tp1} TP2={tp2})"
+                    )
 
         if reference_price is not None and reference_price <= 0:
             reference_price = None
