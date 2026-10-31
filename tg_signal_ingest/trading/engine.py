@@ -1891,7 +1891,12 @@ class TradingEngine:
         except MexcTimestampError as exc:
             outcome = "not_found"
             self.store.transition_intent(
-                intent_id, "unknown_requires_reconciliation", note=f"timestamp drift detected ({exc.__class__.__name__}); clock sync needed",
+                intent_id,
+                "unknown_requires_reconciliation",
+                note=(
+                    f"timestamp drift detected ({exc.__class__.__name__}); "
+                    f"clock sync needed"
+                ),
                 category="reconcile",
             )
             self.store.record_reconciliation(

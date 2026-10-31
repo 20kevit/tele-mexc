@@ -1030,8 +1030,11 @@ def cmd_diag_clock(args) -> int:
     db, repo = _new_repo(cfg)
 
     # Check clock skew via MEXC client if available
-    from .mexc.client import MexcSpotClient
-    from tg_signal_ingest.trading.store import clock_health_state, CLOCK_SKEW_FRESH_MS, CLOCK_SKEW_STALE_MS, CLOCK_SKEW_UNHEALTHY_MS
+    from tg_signal_ingest.trading.store import (
+        CLOCK_SKEW_FRESH_MS,
+        CLOCK_SKEW_STALE_MS,
+        CLOCK_SKEW_UNHEALTHY_MS,
+    )
 
     # Read current database state for clock health tracking
     sync = repo.sync_status()
@@ -1039,12 +1042,15 @@ def cmd_diag_clock(args) -> int:
 
     lines: list[str] = []
     lines.append("clock health diagnostics")
-    lines.append(f"  VPS clock sync: NTP enabled (drift possible after startup)")
-    lines.append(f"  recvWindow default: {cfg.trading.mode} mode uses {cfg.mecv.recv_window_ms if hasattr(cfg.mecv, 'recv_window_ms') else 5000} ms")
+    lines.append("  VPS clock sync: NTP enabled (drift possible after startup)")
+    recv_window = getattr(cfg.mexc, "recv_window_ms", 5000)
+    lines.append(
+        f"  recvWindow default: {cfg.trading.mode} mode uses {recv_window} ms"
+    )
     # Note: actual skew measurement requires an active MEXC client with live/auth config
     lines.append("  (run with live credentials to measure actual skew)")
     lines.append("")
-    lines.append(f"  clock health thresholds:")
+    lines.append("  clock health thresholds:")
     lines.append(f"    fresh: < {CLOCK_SKEW_FRESH_MS} ms")
     lines.append(f"    degraded: {CLOCK_SKEW_FRESH_MS}-{CLOCK_SKEW_STALE_MS} ms")
     lines.append(f"    unhealthy: >= {CLOCK_SKEW_UNHEALTHY_MS} ms (exceeds default recvWindow)")
@@ -1067,7 +1073,6 @@ def cmd_diag_audit(args) -> int:
     total = repo.db.conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
     by_severity = {}
     by_category = {}
-    by_outcome = {}
 
     rows = repo.db.conn.execute(
         "SELECT severity, COUNT(*) FROM audit_events GROUP BY severity"
@@ -1134,7 +1139,7 @@ def cmd_diag_orders(args) -> int:
 
     lines: list[str] = []
     lines.append("order intent state diagnostics")
-    lines.append(f"  intents by state:")
+    lines.append("  intents by state:")
     for state, count in sorted(counts.items()):
         lines.append(f"    {state}: {count}")
     lines.append("")
@@ -1168,7 +1173,6 @@ def cmd_diag_reconcile(args) -> int:
     cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
 
-    from .trading.engine import TradeEngine
     from .trading.runtime import build_trading_engine
 
     # Build engine in sim mode (no client needed for read-only diagnostics)
