@@ -115,11 +115,19 @@ class SubmissionGate:
 
     # ----------------------------------------------------------- readiness
 
-    def _runtime_ok(self, name: str) -> bool | None:
+    def _dimension_ok(self, name: str, persisted_ok: bool) -> bool:
+        """Resolve one readiness dimension.
+
+        An installed runtime callback is authoritative in both directions: a
+        False result must not be overridden by stale persisted state.  The
+        callback's exception propagates to the caller's fail-closed handler.
+        Persisted state is used only when no callback is installed.
+        """
+
         callback = self.runtime.get(name)
-        if callback is None:
-            return None
-        return bool(callback())
+        if callback is not None:
+            return bool(callback())
+        return bool(persisted_ok)
 
     @staticmethod
     def _setup_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -163,16 +171,16 @@ class SubmissionGate:
             return "owner setup state is unavailable; failing closed"
 
         try:
-            mexc_ok = row["mexc_state"] == "verified" or bool(self._runtime_ok("mexc"))
+            mexc_ok = self._dimension_ok("mexc", row["mexc_state"] == "verified")
             if not mexc_ok:
                 return "MEXC credentials are not verified"
             if purpose == PROTECTION:
                 return None
 
-            telegram_ok = row["telegram_state"] == "authenticated" or bool(self._runtime_ok("telegram"))
+            telegram_ok = self._dimension_ok("telegram", row["telegram_state"] == "authenticated")
             if not telegram_ok:
                 return "Telegram session is not authenticated"
-            channel_ok = bool(row["selected_channel_id"]) or bool(self._runtime_ok("channel"))
+            channel_ok = self._dimension_ok("channel", bool(row["selected_channel_id"]))
             if not channel_ok:
                 return "no channel is selected"
             if row["learning_state"] != "completed":
@@ -197,6 +205,16 @@ class SubmissionGate:
         """Check inside an existing transaction (used by the atomic claim)."""
 
         return self.check(conn, purpose=purpose)
+
+    def resume_blocker_in_transaction(self, conn: sqlite3.Connection) -> str | None:
+        """Evaluate resume readiness on the caller's transaction/connection.
+
+        The caller must already hold the exclusive submission lock and must
+        keep using this connection for the unpause update.  Ignoring only the
+        paused flag preserves every other entry prerequisite.
+        """
+
+        return self.check(conn, purpose=ENTRY, ignore_pause=True)
 
     @contextlib.contextmanager
     def submission(self, *, purpose: str = ENTRY) -> Iterator[None]:

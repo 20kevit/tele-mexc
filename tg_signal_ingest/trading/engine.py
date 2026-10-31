@@ -154,10 +154,10 @@ class TradingEngine:
 
     def mark_mexc_verified(self, verified: bool = True) -> None:
         self._mexc_verified = bool(verified)
-        if verified:
-            self.submission_gate.runtime["mexc"] = lambda: self._mexc_verified
-        else:
-            self.submission_gate.runtime.pop("mexc", None)
+        # Always keep a callback installed.  Removing it on False would let a
+        # stale persisted ``mexc_state='verified'`` win, which is exactly the
+        # authority inversion this gate must prevent.
+        self.submission_gate.runtime["mexc"] = lambda: self._mexc_verified
 
     def verify_mexc_readiness(self) -> bool:
         """Read-only account check used once at service startup.

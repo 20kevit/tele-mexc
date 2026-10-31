@@ -1166,23 +1166,62 @@ class ControlBot:
         info = get_version_info()
         await self._send(chat_id, format_version_text(info))
 
-    async def _pause(self, chat_id: int) -> None:
+    def _submission_gate(self) -> SubmissionGate:
         gate = getattr(self._engine, "submission_gate", None) if self._engine else None
-        if gate is None:
-            gate = SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
+        if gate is not None:
+            return gate
+        return SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
+
+    def _pause_atomically(self) -> str | None:
+        """Set pause under the exclusive lock; return a failure reason or None."""
+
         try:
             # Exclusive lock waits for already-claimed submissions, then sets
             # the durable pause state.  The acknowledgement is sent only after
             # this point, so no new exchange submission can start afterwards.
-            with gate.exclusive(timeout_s=45.0):
+            with self._submission_gate().exclusive(timeout_s=45.0):
                 self.store.update_setup(paused=1, pause_reason="owner paused execution")
                 self.store.refresh_setup_state()
                 self.store.audit("paused", "owner paused new order execution")
         except GateTimeout:
-            self.store.audit(
-                "pause_not_acknowledged",
-                "in-flight submissions did not drain; pause was not acknowledged",
-            )
+            with contextlib.suppress(Exception):
+                self.store.audit(
+                    "pause_not_acknowledged",
+                    "in-flight submissions did not drain; pause was not acknowledged",
+                )
+            return "timed out waiting for in-flight submissions to drain"
+        return None
+
+    def _resume_atomically(self) -> tuple[str | None, str | None]:
+        """Evaluate readiness and unpause under one lock and transaction."""
+
+        gate = self._submission_gate()
+        blocker: str | None = None
+        try:
+            with gate.exclusive(timeout_s=45.0):
+                try:
+                    with self.repo.db.transaction() as conn:
+                        blocker = gate.resume_blocker_in_transaction(conn)
+                        if blocker:
+                            self.store.audit_in_conn(conn, "resume_refused", blocker)
+                        else:
+                            self.store.update_setup_in_conn(conn, paused=0, pause_reason=None)
+                            self.store.refresh_setup_state_in_conn(conn)
+                            self.store.audit_in_conn(
+                                conn,
+                                "resumed",
+                                "owner resumed automatic signal execution",
+                            )
+                except Exception as exc:  # noqa: BLE001 - transaction rolled back
+                    return None, f"resume transaction failed ({exc.__class__.__name__})"
+        except GateTimeout:
+            return None, "timed out waiting for in-flight submissions to drain"
+        return blocker, None
+
+    async def _pause(self, chat_id: int) -> None:
+        # Locks and SQLite are blocking; keep the control bot's event loop free.
+        failure = await asyncio.to_thread(self._pause_atomically)
+        if failure:
             await self._send(
                 chat_id,
                 "⏸ درخواست توقف ثبت شد اما سفارش در حال ارسال تمام نشد. وضعیت توقف تأیید نشد؛ لطفاً دوباره تلاش کنید.",
@@ -1192,22 +1231,23 @@ class ControlBot:
         await self._show_start(chat_id)
 
     async def _resume(self, chat_id: int) -> None:
-        gate = getattr(self._engine, "submission_gate", None) if self._engine else None
-        if gate is None:
-            gate = SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
-        # Resume must not paper over incomplete readiness or an emergency state.
-        blocker = gate.resume_blocker()
+        blocker, failure = await asyncio.to_thread(self._resume_atomically)
+
         if blocker:
-            self.store.audit("resume_refused", blocker)
             await self._send(
                 chat_id,
                 f"▶️ ادامه اجرا ممکن نیست تا زمانی که شرایط آماده‌سازی کامل شود:\n{blocker}",
             )
             return
-        with gate.exclusive(timeout_s=45.0):
-            self.store.update_setup(paused=0, pause_reason=None)
-            self.store.refresh_setup_state()
-            self.store.audit("resumed", "owner resumed automatic signal execution")
+        if failure:
+            with contextlib.suppress(Exception):
+                self.store.audit("resume_failed", failure)
+            await self._send(
+                chat_id,
+                f"▶️ ادامه اجرا انجام نشد و سیستم در حالت توقف باقی ماند. دلیل: {failure}",
+            )
+            return
+
         resume = getattr(self._engine, "resume_planned_intents", None)
         if callable(resume):
             with contextlib.suppress(Exception):

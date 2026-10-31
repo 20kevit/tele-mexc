@@ -16,11 +16,22 @@ from .secretbox import SecretBox, SecretBoxError
 
 FLOW_TTL_S = 900
 SENSITIVE_FLOW_STATES = {
-    "auth_phone", "auth_code", "auth_password", "mexc_key", "mexc_secret",
+    "auth_phone",
+    "auth_code",
+    "auth_password",
+    "mexc_key",
+    "mexc_secret",
 }
 SENSITIVE_PAYLOAD_KEYS = {
-    "phone", "phone_number", "code", "password", "two_step_password",
-    "api_key", "secret", "api_secret", "phone_code_hash",
+    "phone",
+    "phone_number",
+    "code",
+    "password",
+    "two_step_password",
+    "api_key",
+    "secret",
+    "api_secret",
+    "phone_code_hash",
 }
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -47,10 +58,20 @@ def _parse(value: str | None) -> datetime | None:
 
 
 SETUP_FIELDS = {
-    "setup_state", "telegram_state", "telegram_authorized_at",
-    "telegram_account_label", "mexc_state", "mexc_verified_at", "mexc_label",
-    "selected_channel_id", "selected_channel_title", "learning_state",
-    "learning_streak", "learning_completed_at", "paused", "pause_reason",
+    "setup_state",
+    "telegram_state",
+    "telegram_authorized_at",
+    "telegram_account_label",
+    "mexc_state",
+    "mexc_verified_at",
+    "mexc_label",
+    "selected_channel_id",
+    "selected_channel_title",
+    "learning_state",
+    "learning_streak",
+    "learning_completed_at",
+    "paused",
+    "pause_reason",
 }
 
 
@@ -67,9 +88,7 @@ class ControlStore:
     def _get_setup_row(self) -> dict[str, Any]:
         row = self.db.conn.execute("SELECT * FROM control_setup WHERE id = 1").fetchone()
         if row is None:  # migration always inserts it; defensive for old copies
-            self.db.conn.execute(
-                "INSERT OR IGNORE INTO control_setup (id, updated_at) VALUES (1, ?)", (self._ts(),)
-            )
+            self.db.conn.execute("INSERT OR IGNORE INTO control_setup (id, updated_at) VALUES (1, ?)", (self._ts(),))
             row = self.db.conn.execute("SELECT * FROM control_setup WHERE id = 1").fetchone()
         assert row is not None
         return dict(row)
@@ -85,6 +104,18 @@ class ControlStore:
             raise ValueError(f"unknown setup fields: {sorted(unknown)}")
         if not fields:
             return self.setup()
+        with self.db.transaction() as conn:
+            self.update_setup_in_conn(conn, **fields)
+        return self.setup()
+
+    def update_setup_in_conn(self, conn: Any, **fields: Any) -> None:
+        """Apply setup fields on a caller-owned transaction/connection."""
+
+        unknown = set(fields) - SETUP_FIELDS
+        if unknown:
+            raise ValueError(f"unknown setup fields: {sorted(unknown)}")
+        if not fields:
+            return
         sets = []
         params: list[Any] = []
         for key, value in fields.items():
@@ -94,9 +125,7 @@ class ControlStore:
             params.append(value)
         sets.append("updated_at = ?")
         params.append(self._ts())
-        with self.db.transaction() as conn:
-            conn.execute(f"UPDATE control_setup SET {', '.join(sets)} WHERE id = 1", params)
-        return self.setup()
+        conn.execute(f"UPDATE control_setup SET {', '.join(sets)} WHERE id = 1", params)
 
     def effective_state(self, setup: dict[str, Any] | None = None) -> str:
         s = setup or self._get_setup_row()
@@ -123,12 +152,18 @@ class ControlStore:
         self.update_setup(setup_state=state)
         return state
 
+    def refresh_setup_state_in_conn(self, conn: Any) -> str:
+        row = conn.execute("SELECT * FROM control_setup WHERE id = 1").fetchone()
+        if row is None:
+            raise ValueError("control_setup row is missing")
+        state = self.effective_state(dict(row))
+        self.update_setup_in_conn(conn, setup_state=state)
+        return state
+
     # ------------------------------------------------------------ settings
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
-        row = self.db.conn.execute(
-            "SELECT value FROM control_settings WHERE key = ?", (key,)
-        ).fetchone()
+        row = self.db.conn.execute("SELECT value FROM control_settings WHERE key = ?", (key,)).fetchone()
         if row is not None:
             return str(row["value"])
         return DEFAULT_SETTINGS.get(key, default)
@@ -189,9 +224,7 @@ class ControlStore:
 
     def list_notification_settings(self, role: str | None = None) -> list[dict[str, Any]]:
         if role is None:
-            rows = self.db.conn.execute(
-                "SELECT * FROM notification_preferences ORDER BY role, category"
-            ).fetchall()
+            rows = self.db.conn.execute("SELECT * FROM notification_preferences ORDER BY role, category").fetchall()
         else:
             rows = self.db.conn.execute(
                 "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
@@ -203,10 +236,7 @@ class ControlStore:
 
     def set_flow(self, state: str, payload: dict[str, Any] | None = None, ttl_s: int = FLOW_TTL_S) -> None:
         now = self._now()
-        clean = {
-            k: v for k, v in (payload or {}).items()
-            if k not in SENSITIVE_PAYLOAD_KEYS
-        }
+        clean = {k: v for k, v in (payload or {}).items() if k not in SENSITIVE_PAYLOAD_KEYS}
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE control_flow SET state = ?, payload = ?, updated_at = ?, expires_at = ? WHERE id = 1",
@@ -252,10 +282,13 @@ class ControlStore:
 
     def audit(self, event: str, detail: str = "") -> None:
         with self.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO control_audit (event, detail, created_at) VALUES (?, ?, ?)",
-                (event[:200], detail[:2000], self._ts()),
-            )
+            self.audit_in_conn(conn, event, detail)
+
+    def audit_in_conn(self, conn: Any, event: str, detail: str = "") -> None:
+        conn.execute(
+            "INSERT INTO control_audit (event, detail, created_at) VALUES (?, ?, ?)",
+            (event[:200], detail[:2000], self._ts()),
+        )
 
     # ------------------------------------------------------------ learning
 
@@ -285,9 +318,16 @@ class ControlStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
-                    sample_id, channel_id, message_id, edit_version, message_text,
+                    sample_id,
+                    channel_id,
+                    message_id,
+                    edit_version,
+                    message_text,
                     json.dumps(extracted, ensure_ascii=False, separators=(",", ":")),
-                    parser_kind, 1 if actionable else 0, sequence, now,
+                    parser_kind,
+                    1 if actionable else 0,
+                    sequence,
+                    now,
                 ),
             )
             if cur.rowcount == 0:
@@ -317,8 +357,7 @@ class ControlStore:
 
     def pending_learning_sample(self) -> dict[str, Any] | None:
         row = self.db.conn.execute(
-            "SELECT sample_id FROM control_learning_samples WHERE decision = 'pending' "
-            "ORDER BY sequence DESC LIMIT 1"
+            "SELECT sample_id FROM control_learning_samples WHERE decision = 'pending' ORDER BY sequence DESC LIMIT 1"
         ).fetchone()
         return self.get_learning_sample(str(row["sample_id"])) if row else None
 
@@ -330,8 +369,7 @@ class ControlStore:
 
     def learning_examples(self, limit: int = 5) -> list[dict[str, Any]]:
         rows = self.db.conn.execute(
-            "SELECT sample_id FROM control_learning_samples WHERE decision = 'approved' "
-            "ORDER BY sequence DESC LIMIT ?",
+            "SELECT sample_id FROM control_learning_samples WHERE decision = 'approved' ORDER BY sequence DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [s for r in rows if (s := self.get_learning_sample(str(r["sample_id"]))) is not None]
@@ -340,9 +378,7 @@ class ControlStore:
         now = self._ts()
         decision = "approved" if approved else "rejected"
         with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM control_learning_samples WHERE sample_id = ?", (sample_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM control_learning_samples WHERE sample_id = ?", (sample_id,)).fetchone()
             if row is None:
                 raise ValueError("learning sample not found")
             if row["decision"] != "pending":
@@ -404,7 +440,9 @@ class ControlStore:
         with self.db.transaction() as conn:
             conn.execute("DELETE FROM control_learning_samples")
         self.update_setup(
-            learning_state="in_progress", learning_streak=0, learning_completed_at=None,
+            learning_state="in_progress",
+            learning_streak=0,
+            learning_completed_at=None,
         )
         self.audit("learning_reset", "owner explicitly restarted the learning phase")
         self.refresh_setup_state()
@@ -438,8 +476,14 @@ class ControlStore:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    name, enc["alg"], enc["salt"], enc["nonce"], enc["ciphertext"],
-                    enc["mac"], now, now,
+                    name,
+                    enc["alg"],
+                    enc["salt"],
+                    enc["nonce"],
+                    enc["ciphertext"],
+                    enc["mac"],
+                    now,
+                    now,
                 ),
             )
 
