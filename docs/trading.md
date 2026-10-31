@@ -256,6 +256,31 @@ Local protection:
   The external CLI's internal requests cannot be observed by this limiter; that
   residual gap is documented in `docs/exchanges/MEXC_SPOT_INTEGRATION.md`.
 
+Server-clock synchronization and timestamp policy:
+
+- Official MEXC rule (verified): a signed request is accepted when
+  `timestamp < serverTime + 1000` and `serverTime - timestamp <= recvWindow`;
+  `recvWindow` defaults to `5000 ms` and may not exceed `60000 ms`.
+- A `ServerClock` anchors `GET /api/v3/time` to the process monotonic clock,
+  samples several low-RTT observations, and returns
+  `server_time_at_anchor + monotonic_elapsed`. A wall-clock jump after the
+  anchor cannot move the signed time.
+- Signed, read-only requests (`account`, `myTrades`, `openOrders`, `order`)
+  may refresh the clock and retry **once** after `700003`/`10073`. Writes are
+  never retried automatically; an ambiguous write outcome is reconciled, not
+  resent.
+- Signed writes refuse to leave the process without a recent, low-RTT sample
+  (`MexcClockUnavailable`). No order reaches the exchange on this path, so it
+  is treated as a safe local rejection, never an uncertain submission.
+- Production (`build_mexc_client` with no injected `clock`) uses the RTT-aware
+  `ServerClock` with defaults: `sample_count=3`, `min_samples_for_write=2`,
+  `max_rtt_ms=1500`, `read_max_age_s=30`, `write_max_age_s=10`.
+- Tests that inject `clock=lambda: ...` keep the legacy path exactly: no
+  server-time sampling, no retry, unchanged timestamps.
+- CLI writes (`HybridMexcClient`) are performed by an external process and
+  cannot use this client's timestamp; their outcomes remain reconcile-only,
+  exactly as before.
+
 Market polling:
 
 - `GET /api/v3/ticker/price` without a symbol returns all tickers for one
@@ -353,6 +378,7 @@ identifier. The states are:
 | `oco_submitting` | at least one leg's outcome is uncertain; reconcile, never resubmit |
 | `oco_partial` | one leg confirmed, the other uncertain or failed; position is only partly protected |
 | `oco_active` | all required OCO legs confirmed by the exchange |
+| `unprotected_critical` | position owns base quantity but no exit leg is exchange-confirmed; new BUYs are globally blocked until coverage is verified |
 | `needs_reconciliation` | no leg could be confirmed, or the exit ladder/allocation is invalid |
 
 While either OCO leg is live or uncertain, local TP1/TP2/SL ticks are
@@ -461,7 +487,7 @@ conditional entry defers the entry intent until a price trigger.
 Trade states: `pending_entry`, `entry_active`, `position_open`,
 `oco_submitting`, `oco_active`, `oco_partial`, `tp1_active`, `tp1_completed`,
 `tp2_active`, `tp2_completed`, `stop_loss_executing`, `exit_pending`, `closed`,
-`needs_reconciliation`.
+`needs_reconciliation`, `unprotected_critical`.
 
 Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
 `filled`, `cancel_requested`, `canceled`, `rejected`,
@@ -523,6 +549,41 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - All exit monitoring is active even when `entry_trigger_offset_ticks` is unset
   (conditional entry disabled). New trade symbols are subscribed to the monitor
   after startup, and the REST fallback fetches prices through the MEXC client.
+
+### Pre-BUY exit-protection gate and the new-BUY block
+
+A live BUY is rejected *before* any exchange submission unless it can be fully
+protected:
+
+- The signal must supply `entry_price`, `tp1_price`, `tp2_price`, and `sl_price`.
+- The ladder must be ordered: `stop_loss < entry_price < TP1 <= TP2`.
+- Symbol metadata must be available for quantization/validation.
+- The execution engine must offer a working OCO submission path.
+
+Any failure rejects the intent locally (`rejected`, category `risk`) with zero
+exchange calls and an owner/developer notification.
+
+After an entry fills, `TradeManager._place_oco_exits()` places two native OCO
+SELL orders (TP1 + stop-loss, TP2 + stop-loss) against the actual acquired base
+quantity. Protection is reported as active only when every required leg is
+exchange-confirmed. When no leg can be confirmed, the trade enters
+`unprotected_critical`: reconciliation keeps retrying protection idempotently
+(never blindly resubmitting an uncertain write), and a **durable global new-BUY
+block** is persisted in `app_state`.
+
+| Flag | Meaning |
+| --- | --- |
+| `trading.new_buys_blocked` | `"1"` while any bot-owned position lacks verified exit coverage |
+| `trading.new_buys_block_reason` | Human-readable reason naming the unprotected position(s) |
+
+The block is never cleared by time. It clears only when every open position is
+fully sold or has exchange-confirmed working coverage. On every restart,
+`recover_on_startup()` rebuilds the block from durable trade state, so a stale
+flag cannot hide an unprotected position. The live execution path re-checks the
+block immediately before submission, so a retried queue item is also covered.
+
+`BUY_BLOCK_ACTIVE` / `BUY_BLOCK_CLEARED` notifications are sent on state
+changes; audit events are written as `trading.buy_block`.
 
 ### Remaining limitations
 

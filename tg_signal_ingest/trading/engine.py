@@ -1200,6 +1200,21 @@ class TradingEngine:
             raise AccidentalOrderRiskError("live order blocked: no MEXC client configured")
 
         intent_id = intent["intent_id"]
+        # The trade manager persists a fail-closed block whenever any bot-owned
+        # position lacks verified exit protection.  Enforce it here as well so
+        # every live BUY path (including a retried queue item) is covered.
+        if str(intent.get("side") or "").lower() == "buy":
+            block_reason: str | None = None
+            getter = getattr(self.store, "buy_block_reason", None)
+            if getter is not None:
+                try:
+                    block_reason = getter()
+                except Exception as exc:  # noqa: BLE001 - an unreadable guard fails closed
+                    block_reason = f"new-BUY safety state is unreadable: {exc}"
+            if block_reason:
+                return self._reject_before_submit(
+                    intent, f"new BUYs are blocked: {block_reason}"
+                )
         # Spend tracking is informational only: it never caps the owner's
         # per-order amount.  Pre-migration/legacy rows get a ledger row before
         # any exchange call.
@@ -1377,6 +1392,11 @@ class TradingEngine:
             try:
                 raw = client.account()
             except MexcTimestampError:
+                if getattr(client, "retries_timestamp_reads", False):
+                    # The REST client already refreshed the server clock and
+                    # retried this read-only request once.  Do not stack a
+                    # second retry on top of the centralized policy.
+                    raise
                 log.warning(
                     "MEXC balance query timestamp rejected; retrying once with a fresh signature"
                 )

@@ -69,6 +69,11 @@ TERMINAL_TRADE_STATES = (
     "needs_reconciliation",
 )
 
+# A position with no verified exit coverage.  Unlike ``needs_reconciliation``
+# (manual review), this state is retried by reconciliation so the bot can
+# restore protection, while the global new-BUY block remains in force.
+UNPROTECTED_CRITICAL = "unprotected_critical"
+
 # Order states that still represent exposure on the exchange (or an unknown
 # outcome that must be resolved before placing another sell).
 UNCONFIRMED_ORDER_STATES = (
@@ -279,14 +284,20 @@ class TradeManager:
         are only queried — never resubmitted with a new client order id.
         """
         with self._lock:
-            for trade in self.store.list_trades():
-                if trade["trade_state"] in TERMINAL_TRADE_STATES:
-                    continue
-                try:
-                    self._reconcile_trade(trade["trade_id"])
-                except Exception as exc:  # noqa: BLE001 - never block recovery
-                    log.error("recovery reconcile failed for %s: %s", trade["trade_id"], exc)
-                    self._record_error(trade, f"recovery failed: {exc}", "reconciliation")
+            # Establish the fail-closed block from durable state before any
+            # reconciliation call can fail, then refresh it again afterwards.
+            self._refresh_buy_block()
+            try:
+                for trade in self.store.list_trades():
+                    if trade["trade_state"] in TERMINAL_TRADE_STATES:
+                        continue
+                    try:
+                        self._reconcile_trade(trade["trade_id"])
+                    except Exception as exc:  # noqa: BLE001 - never block recovery
+                        log.error("recovery reconcile failed for %s: %s", trade["trade_id"], exc)
+                        self._record_error(trade, f"recovery failed: {exc}", "reconciliation")
+            finally:
+                self._refresh_buy_block()
 
     # ===================================================================
     # Trade creation + entry decision
@@ -299,6 +310,16 @@ class TradeManager:
         entry_price = _dec(parsed.entry_price)
         if entry_price is None or entry_price <= 0:
             self._reject_trade_intent(intent, "signal has no valid entry price")
+            return None
+
+        # Fail closed before any BUY: an executed entry must have a complete,
+        # ordered exit ladder and a working OCO path.  Discovering a missing
+        # TP/SL only after the fill is what leaves a position unprotected.
+        block = self._buy_block_reason()
+        if block:
+            self._reject_trade_intent(
+                intent, f"new BUYs are blocked: {block}"
+            )
             return None
 
         tick_size = symbol_meta.price_step if symbol_meta else None
@@ -327,6 +348,13 @@ class TradeManager:
         tp1_price = _first(parsed.target_prices)
         tp2_price = _second(parsed.target_prices)
         sl_price = _dec(parsed.stop_loss)
+
+        problem = self._pre_buy_exit_problem(
+            entry_price, tp1_price, tp2_price, sl_price, symbol_meta
+        )
+        if problem is not None:
+            self._reject_trade_intent(intent, problem)
+            return None
 
         client_order_id = intent.get("client_order_id")
         trade_id = f"trade-{client_order_id}"
@@ -361,6 +389,185 @@ class TradeManager:
         except InvalidOperation:
             return None
 
+    # ===================================================================
+    # Exit-protection gate (before BUY and across restarts)
+    # ===================================================================
+
+    def _pre_buy_exit_problem(
+        self,
+        entry_price: Decimal,
+        tp1_price: Decimal | None,
+        tp2_price: Decimal | None,
+        sl_price: Decimal | None,
+        symbol_meta: Any | None,
+    ) -> str | None:
+        """Return why a live BUY must not be submitted, or None when safe.
+
+        The live strategy is a two-leg native OCO exit.  A BUY without a
+        complete, ordered ladder or without a working OCO submission path can
+        fill and then remain unprotected, so it is rejected *before* entry.
+        """
+
+        if self.engine is None:
+            return "no execution engine available for OCO exits"
+        if not callable(getattr(self.engine, "submit_oco_sell", None)):
+            return "execution engine cannot submit OCO exits"
+        if symbol_meta is None:
+            return "symbol metadata unavailable for exit-ladder validation"
+        if sl_price is None or sl_price <= 0:
+            return "signal has no stop-loss; live BUY requires verified exit protection"
+        if tp1_price is None or tp1_price <= 0:
+            return "signal has no TP1; native OCO exits require TP1 and TP2"
+        if tp2_price is None or tp2_price <= 0:
+            return "signal has no TP2; native OCO exits require TP1 and TP2"
+        if not (sl_price < entry_price < tp1_price <= tp2_price):
+            return (
+                f"invalid exit ladder: stop-loss {sl_price} < entry {entry_price} "
+                f"< TP1 {tp1_price} <= TP2 {tp2_price} is required"
+            )
+        return None
+
+    def _exit_ladder_problem(self, trade: dict[str, Any]) -> str | None:
+        """Return an invalid-ladder reason for an open position, or None."""
+
+        sl_price = _dec(trade.get("sl_price"))
+        tp1_price = _dec(trade.get("tp1_price"))
+        tp2_price = _dec(trade.get("tp2_price"))
+        entry_price = _dec(trade.get("entry_price")) or _dec(trade.get("avg_entry_price"))
+        if sl_price is None or sl_price <= 0:
+            return "no stop-loss price; OCO exit requires a stop-loss"
+        if tp1_price is None or tp1_price <= 0:
+            return "no TP1 price; OCO exit requires TP1"
+        if tp2_price is None or tp2_price <= 0:
+            return "no TP2 price; OCO exit requires TP2"
+        if entry_price is None or entry_price <= 0:
+            return "entry price is unknown; cannot order the exit ladder"
+        if not (sl_price < entry_price < tp1_price <= tp2_price):
+            return (
+                f"invalid exit ladder: stop-loss {sl_price} < entry {entry_price} < "
+                f"TP1 {tp1_price} <= TP2 {tp2_price} is required"
+            )
+        return None
+
+    def _buy_block_reason(self) -> str | None:
+        getter = getattr(self.store, "buy_block_reason", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception as exc:  # noqa: BLE001 - fail closed, never crash planning
+            log.error("could not read the new-BUY block; refusing new BUYs: %s", exc)
+            return "new-BUY safety state is unreadable"
+
+    def _open_trades_for_block(self) -> list[dict[str, Any]] | None:
+        """List trades that still need protection, or None when unreadable."""
+
+        lister = getattr(self.store, "list_non_terminal_trades", None)
+        if lister is not None:
+            try:
+                return list(lister())
+            except Exception as exc:  # noqa: BLE001
+                log.error("could not list open trades for the new-BUY block: %s", exc)
+                return None
+        try:
+            return list(self.store.list_trades(limit=1000))
+        except Exception as exc:  # noqa: BLE001
+            log.error("could not list trades for the new-BUY block: %s", exc)
+            return None
+
+    def _verified_exit_coverage(self, trade: dict[str, Any]) -> Decimal:
+        """Working, exchange-confirmed sell quantity covering the remainder."""
+
+        remaining = self._remaining_base(trade)
+        if remaining <= 0:
+            return Decimal("0")
+        if self._exchange_protection_active(trade):
+            return remaining
+        covered = Decimal("0")
+        for kind in ("tp1", "tp2", "stop_loss"):
+            for order in self._list_trade_orders(trade["trade_id"], kind=kind):
+                if order.get("state") not in ("open", "partially_filled"):
+                    continue
+                qty = _dec(order.get("quantity")) or Decimal("0")
+                sold = _dec(order.get("sold_qty")) or Decimal("0")
+                covered += max(Decimal("0"), qty - sold)
+        return covered
+
+    def _is_unprotected_critical(self, trade: dict[str, Any]) -> bool:
+        """True when this trade owns base quantity without verified exit cover."""
+
+        acquired = _dec(trade.get("acquired_base_qty")) or Decimal("0")
+        if acquired <= 0:
+            return False
+        remaining = self._remaining_base(trade)
+        if remaining <= 0:
+            return False
+        return self._verified_exit_coverage(trade) < remaining
+
+    def _refresh_buy_block(self) -> None:
+        """Persist the global new-BUY block from verified exit coverage.
+
+        The block is never cleared by time.  It clears only when every open
+        bot-owned position is fully sold or has exchange-confirmed working
+        coverage.  This is deliberately independent of the trade's exact state
+        so a restart cannot hide an unprotected position behind a stale label.
+        """
+
+        try:
+            trades = self._open_trades_for_block()
+        except Exception as exc:  # noqa: BLE001 - never crash a tick on the guard
+            log.error("new-BUY block evaluation failed: %s", exc)
+            return
+        if trades is None:
+            # A failed read must never clear an existing block.
+            return
+
+        unprotected = [trade for trade in trades if self._is_unprotected_critical(trade)]
+        if unprotected:
+            labels = ", ".join(
+                f"{trade.get('symbol')}:{trade.get('trade_id')}"
+                for trade in unprotected[:5]
+            )
+            if len(unprotected) > 5:
+                labels += f" (+{len(unprotected) - 5} more)"
+            reason: str | None = f"unprotected position(s): {labels}"
+        else:
+            reason = None
+
+        getter = getattr(self.store, "buy_block_reason", None)
+        previous: str | None = None
+        if getter is not None:
+            try:
+                previous = getter()
+            except Exception:  # noqa: BLE001
+                previous = None
+
+        setter = getattr(self.store, "set_buy_block", None)
+        if setter is not None:
+            try:
+                setter(reason)
+            except Exception as exc:  # noqa: BLE001 - keep the in-memory guard usable
+                log.error("could not persist the new-BUY block: %s", exc)
+
+        if reason and reason != previous:
+            self.store.audit(
+                "buy-block", "risk", "new_buys_blocked", reason,
+                event_type="trading.buy_block", outcome="blocked",
+                dedupe_key=f"buy-block:{reason}",
+            )
+            self._notify_trade(None, "BUY_BLOCK_ACTIVE", f"new BUYs blocked: {reason}")
+        elif not reason and previous:
+            self.store.audit(
+                "buy-block", "risk", "new_buys_unblocked",
+                "every open position has verified exit protection",
+                event_type="trading.buy_block", outcome="unblocked",
+                dedupe_key="buy-block:cleared",
+            )
+            self._notify_trade(
+                None, "BUY_BLOCK_CLEARED",
+                "new BUYs allowed: every open position has verified exit protection",
+            )
+
     def _reject_trade_intent(self, intent: dict[str, Any], reason: str) -> None:
         self.store.transition_intent(
             intent["intent_id"], "rejected", note=f"trade setup: {reason}",
@@ -390,6 +597,7 @@ class TradeManager:
             elif state in (
                 "stop_loss_executing", "exit_pending", "needs_reconciliation",
                 "oco_submitting", "oco_active", "oco_partial",
+                UNPROTECTED_CRITICAL,
             ):
                 self._reconcile_trade(trade["trade_id"])
         except Exception as exc:  # noqa: BLE001 - never let one tick kill the monitor
@@ -680,7 +888,7 @@ class TradeManager:
             state = row[0]
             if state in (
                 "tp2_completed", "closed", "needs_reconciliation",
-                "stop_loss_executing", "exit_pending",
+                "stop_loss_executing", "exit_pending", UNPROTECTED_CRITICAL,
             ):
                 return False
             if state not in allowed_from:
@@ -1034,6 +1242,7 @@ class TradeManager:
             "oco_active": "active",
             "oco_partial": "partial",
             "needs_reconciliation": "needs_review",
+            UNPROTECTED_CRITICAL: "needs_review",
             "tp1_completed": "triggered",
             "tp2_completed": "completed",
             "closed": "completed",
@@ -1130,6 +1339,7 @@ class TradeManager:
         """
         if self.engine is None:
             self._record_error(trade, "no engine available for OCO exits", "runtime")
+            self._refresh_buy_block()
             return
 
         previous_state = trade.get("trade_state")
@@ -1140,13 +1350,16 @@ class TradeManager:
             intent = self.store.get_intent(intent_id)
             if intent is not None:
                 if intent.get("state") not in TERMINAL_INTENT_STATES:
+                    self._refresh_buy_block()
                     return
                 if int(intent.get("fill_sync_required") or 0) == 1:
+                    self._refresh_buy_block()
                     return
 
         acquired = _dec(trade.get("acquired_base_qty")) or Decimal("0")
         if acquired <= 0:
             self._record_error(trade, "no acquired quantity; cannot place OCO exits", "runtime")
+            self._refresh_buy_block()
             return
 
         sl_price = _dec(trade.get("sl_price"))
@@ -1154,26 +1367,14 @@ class TradeManager:
         tp2_price = _dec(trade.get("tp2_price"))
         entry_price = _dec(trade.get("entry_price")) or _dec(trade.get("avg_entry_price"))
 
-        problem: str | None = None
-        if sl_price is None or sl_price <= 0:
-            problem = "no stop-loss price; OCO exit requires a stop-loss"
-        elif tp1_price is None or tp1_price <= 0:
-            problem = "no TP1 price; OCO exit requires TP1"
-        elif tp2_price is None or tp2_price <= 0:
-            problem = "no TP2 price; OCO exit requires TP2"
-        elif entry_price is None or entry_price <= 0:
-            problem = "entry price is unknown; cannot order the exit ladder"
-        elif not (sl_price < entry_price < tp1_price <= tp2_price):
-            problem = (
-                f"invalid exit ladder: stop-loss {sl_price} < entry {entry_price} < "
-                f"TP1 {tp1_price} <= TP2 {tp2_price} is required"
-            )
+        problem = self._exit_ladder_problem(trade)
         if problem is not None:
             self.store.update_trade_state(
                 trade["trade_id"], "needs_reconciliation",
                 note=f"OCO not placed: {problem}",
             )
             self._notify_trade(trade, "OCO_CONFIG_REJECTED", problem)
+            self._refresh_buy_block()
             return
 
         # The validation above guarantees a usable, ordered exit ladder.
@@ -1236,6 +1437,7 @@ class TradeManager:
                 trade, "OCO_ALLOCATION_TOO_SMALL",
                 "acquired quantity is below the lot size; no OCO exit could be placed",
             )
+            self._refresh_buy_block()
             return
 
         results: dict[str, str] = {}
@@ -1266,6 +1468,7 @@ class TradeManager:
 
         if len(completed) == len(required):
             self._finalize_trade(trade)
+            self._refresh_buy_block()
             return
         coverage = sum(
             (max(Decimal("0"), (_dec(order.get("quantity")) or Decimal("0"))
@@ -1290,20 +1493,21 @@ class TradeManager:
                 "OCO_PROTECTION_PARTIAL",
                 f"only {','.join(confirmed)} confirmed; incomplete protection",
             )
-        elif uncertain:
-            _publish(
-                "oco_submitting",
-                "OCO submission outcome uncertain; reconcile, never resubmit",
-                "OCO_PROTECTION_UNCERTAIN",
-                "OCO submission outcome uncertain; reconciliation required",
-            )
         else:
-            _publish(
-                "needs_reconciliation",
-                f"no OCO exit could be confirmed (failed={','.join(failed) or '-'})",
-                "OCO_PROTECTION_FAILED",
-                "no OCO exit could be confirmed; position is unprotected and needs review",
+            # No exchange-confirmed exit leg.  The position owns base quantity
+            # without verified protection, so mark it critical (reconciliation
+            # keeps retrying protection) and keep the global new-BUY block on.
+            detail = (
+                f"uncertain={','.join(uncertain) or '-'}; "
+                f"failed={','.join(failed) or '-'}"
             )
+            _publish(
+                UNPROTECTED_CRITICAL,
+                f"no OCO exit is confirmed; position is unprotected ({detail})",
+                "OCO_PROTECTION_UNVERIFIED",
+                "no OCO exit is confirmed; position is unprotected and new BUYs are blocked",
+            )
+        self._refresh_buy_block()
 
     def _ensure_oco_leg(
         self,
@@ -1707,6 +1911,7 @@ class TradeManager:
                 trade, "TRADE_CLOSE_REFUSED",
                 f"{remaining} base quantity remains; manual reconciliation required",
             )
+            self._refresh_buy_block()
             return
         self.store.update_trade_state(
             trade["trade_id"], "closed", note="position fully exited", sl_state="completed"
@@ -1720,6 +1925,7 @@ class TradeManager:
             intent_id=trade.get("entry_intent_id"), outcome="closed",
         )
         self._notify_trade(trade, "TRADE_CLOSED", "trade fully closed")
+        self._refresh_buy_block()
 
     # ===================================================================
     # Cancellation
@@ -1824,15 +2030,26 @@ class TradeManager:
     def reconcile_all_open(self) -> None:
         """Reconcile every non-terminal trade (called after reconnect/restart)."""
         with self._lock:
-            for trade in self.store.list_trades():
-                if trade["trade_state"] in TERMINAL_TRADE_STATES:
-                    continue
-                try:
-                    self._reconcile_trade(trade["trade_id"])
-                except Exception as exc:  # noqa: BLE001
-                    log.error("reconcile failed for %s: %s", trade["trade_id"], exc)
+            try:
+                for trade in self.store.list_trades():
+                    if trade["trade_state"] in TERMINAL_TRADE_STATES:
+                        continue
+                    try:
+                        self._reconcile_trade(trade["trade_id"])
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("reconcile failed for %s: %s", trade["trade_id"], exc)
+            finally:
+                self._refresh_buy_block()
 
     def _reconcile_trade(self, trade_id: str) -> None:
+        """Reconcile one trade and refresh the durable new-BUY block."""
+
+        try:
+            self._reconcile_trade_inner(trade_id)
+        finally:
+            self._refresh_buy_block()
+
+    def _reconcile_trade_inner(self, trade_id: str) -> None:
         """Sync fills from the exchange and advance the trade state machine."""
         store = self.store
         trade = store.get_trade(trade_id)
@@ -1854,6 +2071,18 @@ class TradeManager:
         if trade is None:
             return
         state = trade["trade_state"]
+
+        if state == UNPROTECTED_CRITICAL:
+            # A position owns base quantity without verified exit cover.  Keep
+            # retrying protection (idempotently, never blindly) and leave the
+            # global new-BUY block in force until coverage is confirmed.
+            self._sync_oco_legs(trade)
+            self._sync_oco_group_state(trade)
+            if self._remaining_base(trade) <= 0:
+                self._finalize_trade(trade)
+                return
+            self._place_oco_exits(trade)
+            return
 
         if state in ("pending_entry", "entry_active", "position_open"):
             intent = (

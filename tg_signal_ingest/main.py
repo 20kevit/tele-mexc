@@ -1029,31 +1029,63 @@ def cmd_diag_clock(args) -> int:
     cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
 
-    # Check clock skew via MEXC client if available
     from tg_signal_ingest.trading.store import (
         CLOCK_SKEW_FRESH_MS,
         CLOCK_SKEW_STALE_MS,
         CLOCK_SKEW_UNHEALTHY_MS,
     )
+    from .mexc.client import MexcSpotClient, WeightedRateGate
 
-    # Read current database state for clock health tracking
     sync = repo.sync_status()
     counts = repo.message_counts(sync.channel_id or 0)
 
     lines: list[str] = []
     lines.append("clock health diagnostics")
     lines.append("  VPS clock sync: NTP enabled (drift possible after startup)")
-    recv_window = getattr(cfg.mexc, "recv_window_ms", 5000)
-    lines.append(
-        f"  recvWindow default: {cfg.trading.mode} mode uses {recv_window} ms"
-    )
-    # Note: actual skew measurement requires an active MEXC client with live/auth config
-    lines.append("  (run with live credentials to measure actual skew)")
+    lines.append(f"  recvWindow default: {cfg.mexc.recv_window_ms} ms")
+    lines.append(f"  recvWindow maximum: {MexcSpotClient.MAX_RECV_WINDOW_MS} ms")
     lines.append("")
     lines.append("  clock health thresholds:")
     lines.append(f"    fresh: < {CLOCK_SKEW_FRESH_MS} ms")
     lines.append(f"    degraded: {CLOCK_SKEW_FRESH_MS}-{CLOCK_SKEW_STALE_MS} ms")
     lines.append(f"    unhealthy: >= {CLOCK_SKEW_UNHEALTHY_MS} ms (exceeds default recvWindow)")
+    lines.append("")
+
+    snapshot: dict[str, object] | None = None
+    if cfg.mexc.api_key and cfg.mexc.api_secret:
+        try:
+            client = MexcSpotClient(
+                cfg.mexc.api_key,
+                cfg.mexc.api_secret,
+                base_url=cfg.mexc.base_url,
+                recv_window_ms=cfg.mexc.recv_window_ms,
+                connect_timeout_s=cfg.mexc.connect_timeout_s,
+                request_timeout_s=cfg.mexc.request_timeout_s,
+                order_gate=WeightedRateGate(100, 1.0),
+                general_gate=WeightedRateGate(100, 1.0),
+            )
+            snapshot = client.clock_snapshot()
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not crash
+            lines.append(f"  server clock unavailable: {exc}")
+    else:
+        lines.append("  server clock: no live MEXC credentials configured (read-only)")
+
+    if snapshot is not None:
+        lines.append("  server clock snapshot:")
+        lines.append(f"    anchored_now_ms: {snapshot.get('anchored_now_ms')}")
+        lines.append(f"    offset_ms: {snapshot.get('offset_ms')}")
+        lines.append(f"    rtt_ms: {snapshot.get('rtt_ms')}")
+        lines.append(f"    samples: {snapshot.get('samples')} (low RTT: {snapshot.get('low_rtt_samples')})")
+        lines.append(f"    trusted: {snapshot.get('trusted')}")
+        lines.append(f"    age_s: {snapshot.get('age_s')}")
+        lines.append(f"    last_error: {snapshot.get('last_error')}")
+        lines.append(
+            "    thresholds: "
+            f"max_rtt_ms={snapshot.get('max_rtt_ms')}, "
+            f"read_max_age_s={snapshot.get('read_max_age_s')}, "
+            f"write_max_age_s={snapshot.get('write_max_age_s')}"
+        )
+
     lines.append("")
     lines.append(f"  channel: {sync.channel_title or '-'} (id={sync.channel_id})")
     lines.append(f"  backfill: {sync.backfill_status} (mode={sync.backfill_target_mode})")
@@ -1318,6 +1350,11 @@ def cmd_trading_status(_args) -> int:
     print(f"  intents by state: {counts or 'none'}")
     print(f"  reconciliation outcomes: {recon or 'none'}")
     print(f"  recorded fills: {store.fills_count()}")
+    block_reason = store.buy_block_reason()
+    if block_reason is not None:
+        print(f"  new-BUY block: ACTIVE — {block_reason}")
+    else:
+        print("  new-BUY block: cleared")
     db.close()
     return 0
 

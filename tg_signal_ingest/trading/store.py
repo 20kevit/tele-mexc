@@ -1532,6 +1532,58 @@ class TradingStore:
         ).fetchone()
         return str(row["value"]) if row is not None else None
 
+    def set_app_state(self, key: str, value: str) -> None:
+        """Upsert one runtime flag; used for the fail-closed BUY block."""
+
+        now = self._ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, str(value), now),
+            )
+
+    # ------------------------------------------------------- new-BUY safety
+
+    BUY_BLOCK_KEY = "trading.new_buys_blocked"
+    BUY_BLOCK_REASON_KEY = "trading.new_buys_block_reason"
+
+    def set_buy_block(self, reason: str | None) -> None:
+        """Persist or clear the global new-BUY block.
+
+        The block is intentionally independent of any single trade row: it
+        survives restarts and blocks every new BUY while any bot-owned position
+        lacks verified exit protection.  Clearing it requires a verified
+        protection state (or a fully closed position), not a timeout.
+        """
+
+        now = self._ts()
+        blocked = "1" if reason else "0"
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (self.BUY_BLOCK_KEY, blocked, now),
+            )
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (self.BUY_BLOCK_REASON_KEY, (reason or "")[:500], now),
+            )
+
+    def buy_block_reason(self) -> str | None:
+        """Return the active block reason, or None when new BUYs are allowed."""
+
+        if self.get_app_state(self.BUY_BLOCK_KEY) != "1":
+            return None
+        reason = self.get_app_state(self.BUY_BLOCK_REASON_KEY)
+        return reason or "an open position lacks verified exit protection"
+
     def set_app_state_once(self, key: str, value: str) -> str:
         """Set ``key`` only if absent; return the effective persisted value."""
 

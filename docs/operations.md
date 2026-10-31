@@ -326,7 +326,11 @@ still be processing unrelated messages.
 .venv/bin/tg-ingest diagnostics network    # DNS/TCP/TLS; no credentials
 .venv/bin/tg-ingest diagnostics bot        # Bot API getMe; read-only
 .venv/bin/tg-ingest diagnostics telegram   # network + real session + channel
+.venv/bin/tg-ingest diagnostics clock      # MEXC server-clock snapshot/skew (requires live credentials)
 ```
+
+Clock snapshot shows the anchored server time, RTT, sample count, trusted flag,
+and last error. Writes fail closed when `trusted` is false.
 
 | Symptom | Action |
 | --- | --- |
@@ -341,6 +345,8 @@ still be processing unrelated messages.
 | `database is locked` | Maintenance overlapped a long write; retry once |
 | Stale balance rejection | Check clock/account snapshot freshness and free balance |
 | Live order uncertain | Inspect intents, then `trading reconcile`; never guess/resubmit |
+| `BUY_BLOCK_ACTIVE` / new BUYs blocked | Inspect `trading status` and `app_state`; an open position lacks verified exit protection. Run `trading reconcile` to restore OCO coverage; the block clears only when every position is fully sold or has exchange-confirmed working coverage |
+| MEXC `700003` / `700005` timestamp | Read-only signed calls refresh the clock once and retry; writes never retry. Check `diagnostics clock` skew; a stale wall clock or rate-gate wait can push a write outside `recvWindow` |
 | MEXC `429`/`418` | Honor `Retry-After`; check the shared limiter files/logs; never hammer the API |
 | Terminal intent `rejected`, signal still active | Dry-run `trading repair-signals`, review the exact rows, then `--apply` |
 | No tradeable message after restart | Expected: the activation boundary advanced or the row is recovery/backfill-sourced |

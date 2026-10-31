@@ -138,6 +138,20 @@ class TradeStore(TradingStore):
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_non_terminal_trades(self) -> list[dict[str, Any]]:
+        """Every trade that still needs lifecycle attention.
+
+        Used by the global new-BUY block so a protection failure cannot be
+        missed just because the trade is older than the UI list limit.
+        """
+
+        rows = self.db.conn.execute(
+            "SELECT * FROM trades WHERE trade_state NOT IN "
+            "('closed', 'tp2_completed') "
+            "ORDER BY updated_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def update_trade_state(
         self,
         trade_id: str,

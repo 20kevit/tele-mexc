@@ -163,6 +163,19 @@ def test_live_signal_is_submitted_automatically_without_approval(cfg, repo):
     assert len(engine.store.list_intents(limit=5)) == 1
 
 
+def test_live_buy_is_blocked_when_exit_protection_flag_is_set(cfg, repo):
+    fake = FakeMexc()
+    engine = _engine(cfg, repo, fake, mode="live")
+    engine.store.set_buy_block("unprotected position(s): BTCUSDT:trade-1")
+
+    intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
+
+    assert intent is not None
+    assert intent["state"] == "rejected"
+    assert "new BUYs are blocked" in (intent.get("reject_reason") or "")
+    assert fake.place_calls == 0
+
+
 def test_live_replay_below_activation_boundary_is_rejected(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="live", boundary="1")
