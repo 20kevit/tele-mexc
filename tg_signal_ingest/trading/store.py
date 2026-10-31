@@ -112,6 +112,10 @@ class TradingError(Exception):
     """Base class for trading persistence errors (safe to display)."""
 
 
+class SymbolConflictError(TradingError):
+    """Per-symbol concurrency: a conflicting trade already exists for this symbol."""
+
+
 class RiskLimitExceeded(TradingError):
     """A limit changed between the risk check and the atomic reservation."""
 
@@ -134,6 +138,29 @@ class TradingStore:
         return self._now().isoformat(timespec="seconds").replace("+00:00", "Z")
 
     # ------------------------------------------------------------- audit
+
+    # ── Per-symbol concurrency (§3.2) — available on base store for engine checks
+    CONFLICTING_TRADE_STATES: tuple[str, ...] = (
+        "pending_entry", "entry_active", "position_open", "oco_submitting",
+        "oco_active", "oco_partial", "tp1_active", "tp1_completed",
+        "tp2_active", "stop_loss_executing", "exit_pending", "needs_reconciliation",
+    )
+
+    def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        if not symbol:
+            return None
+        # Consider *every* conflicting trade for the symbol — no LIMIT.
+        # Query is pushed to SQLite so an unbounded history cannot hide a
+        # conflict behind an arbitrary LIMIT 20 window.
+        try:
+            placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
+            rows = self.db.conn.execute(
+                f"SELECT * FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+                (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
+            ).fetchall()
+        except Exception:
+            return None
+        return dict(rows[0]) if rows else None
 
     def audit(
         self,
@@ -689,6 +716,23 @@ class TradingStore:
         ).fetchone()
         return int(row["c"])
 
+    def has_active_intent_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Return an open ``order_intents`` row for *symbol*, or None.
+
+        Used as a durability-tier fallback for per-symbol concurrency when the
+        higher-level TradeManager (``trades`` table) is unavailable — e.g. in
+        sim mode.  Any open intent blocks a new BUY for the same symbol
+        because the reservation/inventory model cannot yet prove disjointness.
+        """
+        if not symbol:
+            return None
+        placeholders = ", ".join("?" for _ in OPEN_INTENT_STATES)
+        rows = self.db.conn.execute(
+            f"SELECT * FROM order_intents WHERE symbol = ? AND state IN ({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            (symbol.upper(), *OPEN_INTENT_STATES),
+        ).fetchall()
+        return dict(rows[0]) if rows else None
+
     def count_intents_by_state(self) -> dict[str, int]:
         return {
             str(r["state"]): int(r["c"])
@@ -937,6 +981,33 @@ class TradingStore:
                             (now, signal_id),
                         )
                 return dict(existing), False
+
+            # ── Atomic per-symbol admission (§3.2/§4) ──────────────────
+            # This check runs *inside* the same DB transaction that inserts
+            # the intent, so two concurrent Engine instances sharing the same
+            # SQLite file cannot both pass the check (SQLite's
+            # Database.transaction() holds an exclusive lock).  It replaces
+            # the previous non-atomic pre-check and does not depend on
+            # threading.RLock (which only protects one process).
+            if signal.symbol:
+                try:
+                    placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
+                    conflict = conn.execute(
+                        f"SELECT trade_id, trade_state FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) LIMIT 1",
+                        (signal.symbol.upper(), *self.CONFLICTING_TRADE_STATES),
+                    ).fetchone()
+                    if conflict is not None:
+                        raise SymbolConflictError(
+                            f"per-symbol concurrency: {signal.symbol.upper()} already has an active trade "
+                            f"{conflict['trade_id']} in state {conflict['trade_state']}; "
+                            "overlapping BUY not admitted"
+                        )
+                except SymbolConflictError:
+                    raise
+                except Exception as exc:
+                    # DB error must never silently permit a BUY — fail closed
+                    # and surface to Engine for safe rejection + developer alert.
+                    raise TradingError(f"per-symbol concurrency check failed: {exc}") from exc
 
             intent_id = f"intent-{client_order_id}"
             if mode in ("testonly", "live"):

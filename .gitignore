@@ -54,6 +54,12 @@ tests/fixtures/channel_signal_corpus.jsonl
 data/
 var/
 
+# Local forensic/audit exports and repository recovery bundles (never publish)
+reports/signal_audit/
+reports/exchange_forensics/
+backups/
+*.bundle
+
 # Logs
 *.log
 logs/

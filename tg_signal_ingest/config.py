@@ -79,7 +79,10 @@ class TradingConfig:
     allowlist_mode: str = "deny"  # "deny" until user sets explicit allowlist
     max_signal_age_s: float = 900.0  # reject signals older than this
     max_price_deviation_pct: float = 1.0  # vs reference price at decision time
-    require_stop_loss: bool = True  # reject alerts without an explicit SL
+    # Owner-confirmed invariants — hard requirements, not configurable.
+    # SL, TP1, TP2 and SL < Entry < TP1 <= TP2 are mandatory and cannot be
+    # disabled via TOML or environment. These fields are intentionally absent
+    # from configuration to prevent bypass.
     order_type_policy: str = "limit"  # "limit" | "market"; market requires explicit config
     remaining_balance_reserve_pct: float = 20.0  # reserve when spending an asset
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
@@ -132,7 +135,6 @@ class TradingConfig:
             "allowlist_mode": self.allowlist_mode,
             "max_signal_age_s": self.max_signal_age_s,
             "max_price_deviation_pct": self.max_price_deviation_pct,
-            "require_stop_loss": self.require_stop_loss,
             "order_type_policy": self.order_type_policy,
             "remaining_balance_reserve_pct": self.remaining_balance_reserve_pct,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
@@ -495,9 +497,14 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         if t.allowed_symbols:
             t.allowlist_mode = "explicit_allowlist"
 
-    require_sl = tr_raw.get("require_stop_loss")
-    if isinstance(require_sl, bool):
-        t.require_stop_loss = require_sl
+    # Mandatory invariants cannot be disabled via configuration.
+    for forbidden in ("require_stop_loss", "require_tp1", "require_tp2", "enforce_price_relationship"):
+        if forbidden in tr_raw:
+            raise ConfigError(
+                f"trading.{forbidden} is not configurable — SL, TP1, TP2 and "
+                "SL < Entry < TP1 <= TP2 are hard mandatory invariants per owner-confirmed strategy. "
+                "Remove this key from config.toml."
+            )
 
     policy = tr_raw.get("order_type_policy")
     if isinstance(policy, str) and policy:

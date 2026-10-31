@@ -99,7 +99,7 @@ def test_uncertain_outcome_freezes_tracking_but_does_not_block_next_signal(cfg, 
     assert engine.store.budget_summary()["reserved"] == Decimal("10.02")
 
     second = engine.process_item(
-        _item(100, 2), _store_message(repo, 2, "BUY BTCUSDT\nENTRY: 100\nTP1: 111")
+        _item(100, 2), _store_message(repo, 2, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 111\nTP2: 120")
     )
     # The per-order amount is not capped by the aggregate reference: the second
     # signal reaches the exchange and fails on its own merits.

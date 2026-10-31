@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .audit import redact_payload
-from .store import TradingStore, _row, dec_str
+from .store import SymbolConflictError, TradingStore, _row, dec_str
 
 
 def _optional_decimal(value: Any) -> Decimal | None:
@@ -102,6 +102,22 @@ class TradeStore(TradingStore):
             ).fetchone()
             if existing is not None:
                 return dict(existing)
+            # Atomic per-symbol check inside same DB transaction as INSERT.
+            # Prevents two concurrent intents for same symbol (both passed their
+            # create_intent check before either trade existed) from both inserting
+            # trades. BEGIN IMMEDIATE ensures second transaction sees first commit.
+            if symbol:
+                placeholders_c = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
+                conflict = conn.execute(
+                    f"SELECT trade_id, trade_state FROM trades WHERE symbol = ? AND trade_state IN ({placeholders_c}) LIMIT 1",
+                    (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
+                ).fetchone()
+                if conflict is not None:
+                    raise SymbolConflictError(
+                        f"per-symbol concurrency: {symbol.upper()} already has an active trade "
+                        f"{conflict['trade_id']} in state {conflict['trade_state']}; "
+                        "overlapping BUY not admitted"
+                    )
             conn.execute(
                 f"INSERT INTO trades ({', '.join(cols)}) VALUES ({placeholders})", values
             )
@@ -360,6 +376,41 @@ class TradeStore(TradingStore):
         sql += " ORDER BY created_at DESC"
         rows = self.db.conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Per-symbol concurrency (owner-confirmed §3.2) ──────────────
+
+    CONFLICTING_TRADE_STATES: tuple[str, ...] = (
+        "pending_entry",
+        "entry_active",
+        "position_open",
+        "oco_submitting",
+        "oco_active",
+        "oco_partial",
+        "tp1_active",
+        "tp1_completed",
+        "tp2_active",
+        "stop_loss_executing",
+        "exit_pending",
+        "needs_reconciliation",
+    )
+    """Any non-terminal bot-owned trade for the same symbol blocks a new BUY.
+
+    Terminal states ``closed`` and ``tp2_completed`` do not conflict.
+    ``needs_reconciliation`` is treated as conflicting because protection is
+    unverified — a new overlapping trade could oversell or confuse
+    reconciliation.
+    """
+
+    def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Return the first conflicting trade for *symbol*, or None."""
+        if not symbol:
+            return None
+        placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
+        rows = self.db.conn.execute(
+            f"SELECT * FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+            (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
+        ).fetchall()
+        return dict(rows[0]) if rows else None
 
     def transition_trade_order(
         self,
