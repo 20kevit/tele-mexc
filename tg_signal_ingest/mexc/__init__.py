@@ -20,6 +20,7 @@ from .cli import (
     parse_version,
 )
 from .client import MexcSpotClient, SharedWeightedRateGate, WeightedRateGate
+from .clock import ClockSample, ServerClock
 from .credentials import (
     REQUIRED_SPOT_PERMISSIONS,
     WRITE_PERMISSION,
@@ -34,6 +35,8 @@ from .errors import (
     MexcCliError,
     MexcCliIncompatible,
     MexcCliUnavailable,
+    MexcClockError,
+    MexcClockUnavailable,
     MexcConfigError,
     MexcDuplicateOrder,
     MexcError,
@@ -70,6 +73,8 @@ __all__ = [
     "MexcSpotClient",
     "SharedWeightedRateGate",
     "WeightedRateGate",
+    "ServerClock",
+    "ClockSample",
     "MexcError",
     "MexcConfigError",
     "MexcAuthError",
@@ -78,6 +83,8 @@ __all__ = [
     "MexcPrecisionError",
     "MexcInsufficientBalance",
     "MexcTimestampError",
+    "MexcClockError",
+    "MexcClockUnavailable",
     "MexcNetworkError",
     "MexcRateLimitError",
     "MexcServerError",

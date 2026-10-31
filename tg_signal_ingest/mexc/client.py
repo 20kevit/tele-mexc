@@ -33,6 +33,7 @@ try:  # POSIX file locking for a limiter shared by serve/CLI/control processes
 except ImportError:  # pragma: no cover - Linux is the supported deployment
     fcntl = None  # type: ignore[assignment]
 
+from .clock import ServerClock
 from .errors import (
     _BALANCE_CODES,
     _CRED_CODES,
@@ -40,10 +41,12 @@ from .errors import (
     _PRECISION_CODES,
     _SYMBOL_CODES,
     _TIMESTAMP_CODES,
+    MexcClockError,
     MexcConfigError,
     MexcNetworkError,
     MexcRateLimitError,
     MexcServerError,
+    MexcTimestampError,
     MexcUnexpectedResponse,
     MexcWafError,
     credentials,
@@ -238,6 +241,8 @@ class MexcSpotClient:
         request_timeout_s: float = 10.0,
         transport: Transport | None = None,
         clock: Callable[[], int] | None = None,
+        server_clock: ServerClock | None = None,
+        clock_sync: bool | None = None,
         order_gate: WeightedRateGate | None = None,
         general_gate: WeightedRateGate | None = None,
         uid_gate: WeightedRateGate | None = None,
@@ -251,6 +256,8 @@ class MexcSpotClient:
         self.recv_window_ms = recv_window_ms
         self.connect_timeout_s = connect_timeout_s
         self.request_timeout_s = request_timeout_s
+        if recv_window_ms <= 0:
+            raise MexcConfigError("recvWindow must be a positive number of milliseconds")
         if recv_window_ms > MAX_RECV_WINDOW_MS:
             # Official docs: recvWindow "Max 60000" (POST /api/v3/order param
             # table); error 700005 rejects larger values. Reject locally so a
@@ -259,13 +266,28 @@ class MexcSpotClient:
                 f"recvWindow larger than the documented maximum {MAX_RECV_WINDOW_MS} ms"
             )
         self._transport = transport or self._default_transport
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or time.sleep
+        # ``clock`` is the legacy wall-clock injection used by deterministic
+        # tests.  When it is supplied without an explicit ``server_clock`` we
+        # preserve its exact behaviour and do not perform server-time sampling.
+        # Production (no injected clock) gets the RTT-aware ServerClock.
         self._clock = clock or (lambda: int(time.time() * 1000))
+        self._server_clock = server_clock
+        if self._server_clock is None and clock is None and clock_sync is not False:
+            self._server_clock = ServerClock(
+                self.server_time_ms,
+                wall_clock=self._clock,
+                monotonic=self._monotonic,
+            )
+        # Callers (notably the balance preflight) can use this to avoid a
+        # second, redundant timestamp retry: the client already performs the
+        # single documented read-only refresh.
+        self.retries_timestamp_reads = self._server_clock is not None
         self.order_gate = order_gate or WeightedRateGate(int(ORDER_PLACEMENT_RPS), 1.0)
         self.general_gate = general_gate or WeightedRateGate(60, 10.0)
         self.uid_gate = uid_gate or WeightedRateGate(100, 10.0)
         self.symbols = symbol_registry or SymbolRegistry(self)
-        self._monotonic = monotonic or time.monotonic
-        self._sleep = sleep or time.sleep
         self._blocked_until = 0.0
         self._block_lock = threading.Lock()
 
@@ -383,51 +405,116 @@ class MexcSpotClient:
         bucket: str = "general",  # "general" | "order"
         timeout_override: float | None = None,
     ) -> Any:
-        """Execute one REST call; returns parsed JSON. Sync; run via to_thread."""
+        """Execute one REST call; returns parsed JSON. Sync; run via to_thread.
+
+        Timestamp retry policy is centralized here:
+
+        * read-only signed requests may refresh the server clock and retry
+          exactly once after ``700003``/``10073``;
+        * writes are never retried automatically.  A write that receives a
+          timestamp error has an ambiguous outcome and must be reconciled by
+          the trading engine;
+        * a signed write refuses to leave the process without a recent,
+          low-RTT server-time sample (``MexcClockUnavailable``), so no order is
+          sent on an untrustworthy clock.
+        """
 
         method = method.upper()
         if method == "DELETE" and bucket != "order":
             # Cancellations always belong to the shared order bucket.
             bucket = "order"
-        out_params = {k: v for k, v in dict(params or {}).items() if v is not None}
         if signed:
             self._require_credentials()
 
-        # Wait for any Retry-After backoff and the shared rate bucket *before*
-        # stamping the request.  The gate can legitimately sleep for a full
-        # 10-second window; a timestamp taken earlier would then be outside
-        # recvWindow (700003) even though the host clock is correct.
-        self._await_backoff()
+        is_write = method in ("POST", "DELETE")
+        # Only signed, read-only calls get the single clock-refresh retry.
+        attempts = 2 if (signed and not is_write and self._server_clock is not None) else 1
+        last_timestamp_error: Exception | None = None
+        for attempt in range(attempts):
+            # Wait for any Retry-After backoff and the shared rate bucket
+            # *before* stamping the request.  The gate can legitimately sleep
+            # for a full 10-second window; a timestamp taken earlier would then
+            # be outside recvWindow (700003) even with a correct host clock.
+            self._await_backoff()
+            self._acquire_bucket(method, path, signed=signed, bucket=bucket)
+            try:
+                return self._send_once(
+                    method,
+                    path,
+                    params=params,
+                    signed=signed,
+                    is_write=is_write,
+                    timeout_override=timeout_override,
+                )
+            except MexcTimestampError as exc:
+                last_timestamp_error = exc
+                if attempt + 1 >= attempts or self._server_clock is None:
+                    raise
+                log.warning(
+                    "MEXC timestamp rejected on a read-only request; refreshing "
+                    "the server clock and retrying once"
+                )
+                try:
+                    self._server_clock.refresh(force=True)
+                except MexcClockError:
+                    # Keep the exchange's original diagnosis; the refresh
+                    # failure is recorded in the clock snapshot.
+                    raise exc from None
+        assert last_timestamp_error is not None
+        raise last_timestamp_error
+
+    def _acquire_bucket(
+        self, method: str, path: str, *, signed: bool, bucket: str
+    ) -> None:
         if bucket == "order":
             # Official POST/DELETE order bucket: 12 requests/second per UID.
             self.order_gate.acquire(1)
-        else:
-            limit_kind, weight = ENDPOINT_RULES.get(
-                (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
-            )
-            try:
-                if limit_kind == "uid":
-                    self.uid_gate.acquire(weight)
-                else:
-                    self.general_gate.acquire(weight)
-                    if signed:
-                        # Signed endpoints are also account-scoped; tracking the
-                        # separate UID budget is conservative against the docs'
-                        # per-endpoint IP/UID wording change.
-                        self.uid_gate.acquire(1)
-            except ValueError as exc:
-                raise MexcConfigError(
-                    f"configured rate budget is too small for {method} {path} "
-                    f"(weight {weight}): {exc}"
-                ) from exc
+            return
+        limit_kind, weight = ENDPOINT_RULES.get(
+            (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
+        )
+        try:
+            if limit_kind == "uid":
+                self.uid_gate.acquire(weight)
+            else:
+                self.general_gate.acquire(weight)
+                if signed:
+                    # Signed endpoints are also account-scoped; tracking the
+                    # separate UID budget is conservative against the docs'
+                    # per-endpoint IP/UID wording change.
+                    self.uid_gate.acquire(1)
+        except ValueError as exc:
+            raise MexcConfigError(
+                f"configured rate budget is too small for {method} {path} "
+                f"(weight {weight}): {exc}"
+            ) from exc
 
+    def _timestamp_for(self, *, is_write: bool) -> int:
+        if self._server_clock is not None:
+            return self._server_clock.now_ms(for_write=is_write)
+        return int(self._clock())
+
+    def _send_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None,
+        signed: bool,
+        is_write: bool,
+        timeout_override: float | None,
+    ) -> Any:
+        out_params = {k: v for k, v in dict(params or {}).items() if v is not None}
         if signed:
-            out_params.setdefault("recvWindow", self.recv_window_ms)
-            out_params["timestamp"] = self._clock()
+            recv_window = int(out_params.get("recvWindow", self.recv_window_ms))
+            if not 1 <= recv_window <= MAX_RECV_WINDOW_MS:
+                raise MexcConfigError(
+                    f"recvWindow must be between 1 and {MAX_RECV_WINDOW_MS} ms"
+                )
+            out_params["recvWindow"] = recv_window
+            out_params["timestamp"] = self._timestamp_for(is_write=is_write)
 
         if method in ("GET", "DELETE"):
-            if method == "DELETE" and bucket != "order":
-                bucket = "order"
             query = _encoded_pairs(out_params)
             if signed:
                 sig = self._sign(query)
@@ -494,7 +581,26 @@ class MexcSpotClient:
         return int(self.request("GET", "/api/v3/time")["serverTime"])
 
     def clock_skew_ms(self) -> int:
+        if self._server_clock is not None:
+            return self._server_clock.skew_ms()
         return int(self._clock() - self.server_time_ms())
+
+    def ensure_server_clock_fresh(self) -> None:
+        """Fail closed unless a recent, low-RTT server-time sample exists.
+
+        Live CLI writes are performed by an external process and cannot use
+        this client's timestamp, but callers can use this guard to refuse a
+        write while the shared host clock is demonstrably untrustworthy.
+        """
+
+        if self._server_clock is None:
+            return
+        self._server_clock.ensure_fresh_for_write()
+
+    def clock_snapshot(self) -> dict[str, Any] | None:
+        if self._server_clock is None:
+            return None
+        return self._server_clock.snapshot()
 
     def exchange_info(self, symbol: str | None = None, symbols: list[str] | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}

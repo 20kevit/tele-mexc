@@ -62,6 +62,20 @@ class MexcTimestampError(MexcError):
     """Timestamp outside recvWindow (700003/10073); needs clock check."""
 
 
+class MexcClockError(MexcError):
+    """Local exchange-clock synchronization problem.
+
+    Raised *before* a signed write is sent when no trustworthy fresh server
+    time sample is available.  No order reached the exchange on this path, so
+    callers may treat it as a safe local rejection rather than an uncertain
+    submission.
+    """
+
+
+class MexcClockUnavailable(MexcClockError):
+    """No recent, low-RTT server-time sample is available."""
+
+
 class MexcNetworkError(MexcError):
     """Timeout, DNS, connection reset — request MAY have been sent."""
 
