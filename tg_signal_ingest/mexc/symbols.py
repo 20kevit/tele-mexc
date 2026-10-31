@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from typing import Any
 
 from .errors import MexcSymbolError
@@ -187,6 +187,46 @@ class SymbolMeta:
                 )
         else:
             raise SymbolValidationError(f"unsupported order type {order_type!r}")
+
+
+def compute_stop_loss_trigger_price(
+    stop_loss_price: Decimal,
+    tick_size: Decimal,
+    offset_ticks: int,
+) -> Decimal:
+    """Stop-loss activation trigger for a SELL stop-loss on a LONG spot position.
+
+    ``trigger = stop_loss_exit_price + offset_ticks × tick_size``, rounded UP to
+    the symbol tick. Rounding up guarantees the trigger can never be rounded
+    down toward the exit price (which would delay activation); a higher trigger
+    activates *earlier* as the market falls, which is the protective direction.
+
+    The configured stop-loss *exit* price (the stop-limit execution price) is
+    intentionally left unchanged: only the activation trigger moves upward. For
+    example, with exit price ``0.1190``, tick size ``0.0001`` and five ticks,
+    the trigger is ``0.1195`` while the stop-limit order still executes at
+    ``0.1190``.
+
+    Raises :class:`SymbolValidationError` when any input is invalid so callers
+    fail closed instead of guessing a tick size.
+    """
+    if offset_ticks < 1:
+        raise SymbolValidationError("stop-loss trigger offset must be >= 1 tick")
+    if (
+        stop_loss_price is None
+        or not stop_loss_price.is_finite()
+        or stop_loss_price <= 0
+    ):
+        raise SymbolValidationError(
+            "stop-loss exit price must be a positive finite decimal"
+        )
+    if tick_size is None or not tick_size.is_finite() or tick_size <= 0:
+        raise SymbolValidationError("symbol tick size must be a positive finite decimal")
+    raw = stop_loss_price + (Decimal(offset_ticks) * tick_size)
+    try:
+        return raw.quantize(tick_size, rounding=ROUND_UP)
+    except InvalidOperation as exc:
+        raise SymbolValidationError("cannot quantize stop-loss trigger price") from exc
 
 
 class SymbolRegistry:

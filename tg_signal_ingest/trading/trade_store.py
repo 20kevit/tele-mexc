@@ -263,10 +263,15 @@ class TradeStore(TradingStore):
         price: Decimal | None,
         quantity: Decimal | None,
         allocated_qty: Decimal | None,
+        stop_trigger_price: Decimal | None = None,
     ) -> dict[str, Any]:
         """Insert a TP/SL order row in ``pending`` state.
 
         Idempotent on client_order_id: returns the existing row if present.
+        ``stop_trigger_price`` records the stop-loss activation trigger that
+        was transmitted to the exchange, distinct from ``price`` (the
+        take-profit limit price) and from the trade's configured stop-loss
+        exit price.
         """
         now = self._ts()
         with self.db.transaction() as conn:
@@ -275,19 +280,22 @@ class TradeStore(TradingStore):
             ).fetchone()
             if existing is not None:
                 return dict(existing)
+            cols = [
+                "trade_order_id", "trade_id", "kind", "client_order_id", "symbol",
+                "side", "order_type", "price", "quantity", "allocated_qty",
+                "sold_qty", "state", "exchange_order_id", "exchange_status",
+                "stop_trigger_price", "created_at", "updated_at",
+            ]
+            placeholders = ", ".join("?" for _ in cols)
+            values = (
+                trade_order_id, trade_id, kind, client_order_id, symbol, side,
+                order_type, dec_str(price), dec_str(quantity), dec_str(allocated_qty),
+                "0", "pending", None, None, dec_str(stop_trigger_price),
+                now, now,
+            )
             conn.execute(
-                """
-                INSERT INTO trade_orders
-                    (trade_order_id, trade_id, kind, client_order_id, symbol, side,
-                     order_type, price, quantity, allocated_qty, sold_qty, state,
-                     exchange_order_id, exchange_status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '0', 'pending', NULL, NULL, ?, ?)
-                """,
-                (
-                    trade_order_id, trade_id, kind, client_order_id, symbol, side,
-                    order_type, dec_str(price), dec_str(quantity), dec_str(allocated_qty),
-                    now, now,
-                ),
+                f"INSERT INTO trade_orders ({', '.join(cols)}) VALUES ({placeholders})",
+                values,
             )
             row = conn.execute("SELECT * FROM trade_orders WHERE trade_order_id = ?", (trade_order_id,)).fetchone()
             assert row is not None
@@ -339,6 +347,7 @@ class TradeStore(TradingStore):
         exchange_status: str | None = None,
         sold_qty: Decimal | None = None,
         allocated_qty: Decimal | None = None,
+        stop_trigger_price: Decimal | None = None,
     ) -> dict[str, Any] | None:
         now = self._ts()
         sets = ["state = ?", "updated_at = ?"]
@@ -355,6 +364,9 @@ class TradeStore(TradingStore):
         if allocated_qty is not None:
             sets.append("allocated_qty = ?")
             params.append(dec_str(allocated_qty))
+        if stop_trigger_price is not None:
+            sets.append("stop_trigger_price = ?")
+            params.append(dec_str(stop_trigger_price))
         params.append(trade_order_id)
         with self.db.transaction() as conn:
             conn.execute(

@@ -126,6 +126,7 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `stop_loss_policy` | `market_sell` | only accepted value |
 | `stop_loss_max_retries` | `3` | parsed, currently unused |
 | `stop_loss_retry_backoff_base_s` | `1.0` | positive; parsed, currently unused |
+| `stop_loss_trigger_offset_ticks` | `5` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
 | `monitor_poll_interval_s` | `2.0` | positive |
 | `monitor_max_retries` | `5` | integer ≥1 |
 | `monitor_backoff_base_s` | `1.0` | positive |
@@ -329,12 +330,20 @@ take-profit/stop-loss triggers. Instead, once the entry intent is terminal and
 `fill_sync_required` is clear, `TradeManager._place_oco_exits()` places two
 native MEXC OCO SELL orders against the **actual acquired base quantity**:
 
-- OCO 1: `tp1_allocation_pct` (default 50%) at TP1, with a stop-limit leg at the
-  configured stop-loss.
-- OCO 2: the remaining allocation at TP2, with the same stop-loss trigger.
+- OCO 1: `tp1_allocation_pct` (default 50%) at TP1, with a stop-limit leg whose
+  *execution price* is the configured stop-loss and whose *activation trigger*
+  is `stop_loss + (stop_loss_trigger_offset_ticks × symbol_tick_size)` (default
+  five ticks above the exit price), so the stop can activate earlier as the
+  market falls.
+- OCO 2: the remaining allocation at TP2, with the same split between the
+  stop-limit execution price (configured stop-loss, unchanged) and the
+  activation trigger (five ticks above it).
 - Each OCO is one exchange order with two linked legs; when one leg activates,
   the exchange cancels the other leg inside that OCO. The two OCO orders do not
   cancel each other.
+- The activation trigger and the stop-limit execution price are distinct
+  exchange fields (`triggerPrice` / `triggerLimitPrice` on `spot.trade.place-oco`).
+  The configured stop-loss exit price itself is never changed by the offset.
 
 Protection is reported as active only after every required leg has an exchange
 identifier. The states are:

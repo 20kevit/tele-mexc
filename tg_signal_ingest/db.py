@@ -996,6 +996,16 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_trading_notifications_notification_id ON trading_notifications(notification_id);
         """,
     ),
+    (
+        17,
+        """
+        -- Record the stop-loss activation trigger transmitted to MEXC on each
+        -- OCO exit leg, distinct from the take-profit limit price and from the
+        -- configured stop-loss exit price (trades.sl_price).  Additive only:
+        -- existing rows keep NULL and are never rewritten.
+        ALTER TABLE trade_orders ADD COLUMN stop_trigger_price TEXT;
+        """,
+    ),
 ]
 
 

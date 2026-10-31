@@ -36,6 +36,7 @@ from ..mexc.errors import (
     MexcUnexpectedResponse,
     MexcWafError,
 )
+from ..mexc.symbols import SymbolValidationError, compute_stop_loss_trigger_price
 from ..repository import QueueItem, Repository
 from .balance import BalanceError, parse_account, validate_balance
 from .parser import ParsedSignal, SignalParser
@@ -1428,6 +1429,31 @@ class TradingEngine:
             "cumulative_quote": _optional_decimal(response.get("cumulativeQuoteQty")),
         }
 
+    def _compute_stop_loss_trigger(
+        self, trade: dict[str, Any], stop_price: Decimal
+    ) -> Decimal | None:
+        """Return the stop-loss activation trigger for ``trade``'s symbol.
+
+        ``trigger = stop_loss_exit_price + offset × symbol_tick_size``.  The
+        configured stop-loss exit price itself is never changed; only the
+        activation trigger moves upward so it can activate earlier as the
+        market falls.  Returns None (fail closed) when symbol metadata is
+        unavailable, so no exit is placed without a verified trigger price.
+        """
+        offset = int(
+            getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 5) or 5
+        )
+        if offset < 1:
+            # Owner disabled the offset: trigger equals the exit price.
+            return stop_price
+        meta = self._symbol_meta(trade.get("symbol"))
+        if meta is None:
+            return None
+        try:
+            return compute_stop_loss_trigger_price(stop_price, meta.price_step, offset)
+        except Exception:  # noqa: BLE001 - fail closed on any metadata/math issue
+            return None
+
     def submit_oco_sell(
         self,
         trade: dict[str, Any],
@@ -1440,18 +1466,32 @@ class TradingEngine:
         """Submit a native OCO SELL pair (limit leg + stop-limit leg) via the CLI.
 
         The limit leg is the take-profit (price); the stop-limit leg is the
-        stop-loss (trigger_price == trigger_limit_price == stop_price).  When one
-        leg activates the exchange cancels the other, giving a true
-        one-cancels-the-other exit without managing two independent orders.
+        stop-loss.  The stop-loss activation *trigger* is five symbol ticks
+        above the configured stop-loss exit price so it activates earlier as
+        the market falls, while the stop-limit execution price stays at the
+        configured exit price.  ``trigger_price`` (activation) and
+        ``trigger_limit_price`` (execution) are therefore distinct fields.
         """
 
         client = self._live_client()
+        trigger_price = self._compute_stop_loss_trigger(trade, stop_price)
+        if trigger_price is None:
+            raise SymbolValidationError(
+                f"stop-loss trigger unavailable for {trade.get('symbol')}: "
+                "symbol metadata missing; refusing to place an untriggered exit"
+            )
+        entry_price = _optional_decimal(trade.get("entry_price"))
+        if entry_price is not None and trigger_price >= entry_price:
+            raise SymbolValidationError(
+                f"stop-loss trigger {trigger_price} is not below the entry "
+                f"price {entry_price}; refusing to place an inverted exit"
+            )
         response = client.place_oco(
             symbol=trade["symbol"],
             side="SELL",
             quantity=quantity,
             price=price,
-            trigger_price=stop_price,
+            trigger_price=trigger_price,
             trigger_limit_price=stop_price,
             client_order_id=client_order_id,
         )
@@ -1461,6 +1501,8 @@ class TradingEngine:
             "state": str(response.get("status") or "NEW"),
             "executed_qty": _optional_decimal(response.get("executedQty")),
             "cumulative_quote": _optional_decimal(response.get("cumulativeQuoteQty")),
+            "trigger_price": str(trigger_price),
+            "trigger_limit_price": str(stop_price),
         }
 
     def submit_stop_loss_market_sell(

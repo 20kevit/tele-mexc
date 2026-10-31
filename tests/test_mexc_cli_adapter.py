@@ -455,3 +455,111 @@ def test_account_is_a_read_only_signed_operation():
     assert "--yes" not in argv
     assert "--data" not in argv
     assert argv[-3:] == ["spot", "asset", "account"]
+
+
+def test_place_oco_sells_limit_leg_at_tp_and_stop_leg_at_exit_price():
+    """A SELL OCO transmits the take-profit as the limit price and the stop-loss
+    as the *trigger* price (five ticks above the exit price is configured
+    elsewhere in the engine), keeping the two fields distinct."""
+    seen: list[list[str]] = []
+
+    def runner(argv, timeout):
+        seen.append(list(argv))
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {"code": 0, "data": {
+                    "orderId": "oco-1",
+                    "state": "NEW",
+                    "triggerPrice": "0.1195",
+                    "triggerLimitPrice": "0.1190",
+                }}
+            ),
+        )
+
+    result = adapter(runner).place_oco(
+        symbol="APEUSDT",
+        side="SELL",
+        quantity=Decimal("24.61"),
+        price=Decimal("0.1227"),
+        trigger_price=Decimal("0.1195"),
+        trigger_limit_price=Decimal("0.1190"),
+        client_order_id="sl-oco-1",
+    )
+    argv = seen[0]
+    assert "--yes" not in argv
+    assert "--no-retry" in argv
+    assert "--read-only" not in argv
+    body = json.loads(argv[argv.index("--data") + 1])
+    assert body == {
+        "currency": "APE",
+        "market": "USDT",
+        "quantity": "24.61",
+        "tradeType": "SELL",
+        "orderType": "OCO_STOP_LIMIT_ORDER",
+        "orderSource": "CLI",
+        "price": "0.1227",
+        "triggerType": "LE",
+        "triggerPrice": "0.1195",
+        "triggerLimitPrice": "0.1190",
+        "clientOrderId": "sl-oco-1",
+    }
+    assert result["triggerPrice"] == "0.1195"
+    assert result["triggerLimitPrice"] == "0.1190"
+
+
+def test_place_oco_fails_closed_when_any_leg_price_missing():
+    with pytest.raises((Exception,)):
+        adapter(lambda a, t: completed(a)).place_oco(
+            symbol="APEUSDT", side="SELL", quantity=Decimal("1"),
+            price=Decimal("0.1227"), trigger_price=None, trigger_limit_price=Decimal("0.1190"),
+        )
+    with pytest.raises((Exception,)):
+        adapter(lambda a, t: completed(a)).place_oco(
+            symbol="APEUSDT", side="SELL", quantity=Decimal("1"),
+            price=Decimal("0.1227"), trigger_price=Decimal("0.1195"), trigger_limit_price=None,
+        )
+
+
+def test_normalize_oco_surfaces_trigger_fields_from_exchange():
+    result = MexcCliAdapter(binary=sys.executable)._normalize_oco(
+        {"orderId": "oco-1", "state": "NEW", "triggerPrice": "0.1195",
+         "triggerLimitPrice": "0.1190", "executedQty": "0"},
+        {},
+    )
+    assert result["triggerPrice"] == "0.1195"
+    assert result["triggerLimitPrice"] == "0.1190"
+
+
+def test_verify_protection_claims_active_only_when_trigger_echoed():
+    def echoed(argv, timeout):
+        if "current-orders" in argv:
+            return completed(argv, stdout=json.dumps({
+                "code": 0, "data": {"list": [{"orderId": "9", "orderType": "1", "state": "1"}]},
+            }))
+        return completed(argv, stdout=json.dumps({
+            "code": 0,
+            "data": {"orderId": "9", "state": "NEW",
+                     "triggerPrice": "0.1195", "triggerLimitPrice": "0.1190"},
+        }))
+
+    result = adapter(echoed).verify_protection(symbol="APEUSDT", order_id="9")
+    assert result["verified"] is True
+    assert result["take_profit"] == "0.1195"
+    assert result["stop_loss"] == "0.1190"
+
+
+def test_verify_protection_unverified_when_trigger_missing():
+    def silent(argv, timeout):
+        if "current-orders" in argv:
+            return completed(argv, stdout=json.dumps({
+                "code": 0, "data": {"list": [{"orderId": "9", "orderType": "1"}]},
+            }))
+        return completed(argv, stdout=json.dumps({
+            "code": 0, "data": {"orderId": "9", "state": "NEW"},
+        }))
+
+    result = adapter(silent).verify_protection(symbol="APEUSDT", order_id="9")
+    assert result["verified"] is False
+    assert result["take_profit"] is None
+    assert result["stop_loss"] is None
