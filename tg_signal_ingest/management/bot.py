@@ -50,7 +50,9 @@ from .signal_review import (
     render_related_messages,
     render_signal_detail,
     render_signal_extract,
+    shorten_utf16,
     signal_by_logical_id,
+    utf16_len,
 )
 from .store import VALIDATION_LIMITS, ManagementStore, utc_now
 
@@ -60,9 +62,12 @@ SENSITIVE_FLOWS = {"auth_phone", "auth_code", "auth_password"}
 JOB_RUNNING = {"pending", "running", "interrupted"}
 MAX_CHANNELS_SNAPSHOT = 100_000
 PREVIEW_LIMIT = 10
-PREVIEW_ITEM_CHARS = 280
-PREVIEW_TOTAL_CHARS = 3700
-REVIEW_MESSAGE_CHARS = 900
+# Preview budgets are UTF-16 code units (Telegram's measure), not Python
+# characters: emoji/astral content counts twice and would otherwise push a
+# whole preview silently over Telegram's 4096-unit hard limit.
+PREVIEW_ITEM_UTF16 = 550
+PREVIEW_TOTAL_UTF16 = 3800
+REVIEW_MESSAGE_UTF16 = 900
 REQUEST_ACTIVE_STATUSES = {"requested", "approved", "started", "review"}
 
 ROLE_FA = {"owner": "مالک", "developer": "توسعه‌دهنده"}
@@ -117,13 +122,36 @@ CORRECTION_FIELDS = {
 # so the bot can delete them and warn; this is not an authentication path.
 _CODE_LIKE_RE = re.compile(r"^\s*\d(?:[\s\-–—]*\d){4,7}\s*$")
 
+#: Telegram's per-message hard limit (UTF-16 code units, "after entities
+#: parsing"). The bot never attaches entities, but emoji-heavy Persian text
+#: can still exceed the limit in Python-character terms, so every budget
+#: below is measured with ``utf16_len``.
+MAX_MESSAGE_UTF16 = 4096
+SAFE_TEXT_UTF16 = 3840
+
 
 def _looks_like_login_code(text: str) -> bool:
     return bool(_CODE_LIKE_RE.fullmatch(text))
 
 
 def _btn(text: str, data: str) -> dict[str, str]:
-    return {"text": text[:64], "callback_data": data}
+    """Build one inline keyboard button within Telegram's limits.
+
+    Button labels are bounded to 64 units (UTF-16, cutting only on code
+    points) and callback payloads to 64 *bytes* — the callback limit is a
+    byte limit, not a character limit, and is validated here so a malformed
+    page can never silently fail at Telegram.
+    """
+
+    label = shorten_utf16(text, 64)
+    if label != text:
+        label = label.rstrip() or "…"
+        label = shorten_utf16(label, 64)
+    if len(data.encode("utf-8")) > 64:
+        raise ValueError(
+            f"callback_data exceeds Telegram's 64-byte limit ({len(data.encode('utf-8'))} bytes)"
+        )
+    return {"text": label, "callback_data": data}
 
 
 def _kb(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
@@ -179,8 +207,10 @@ def _media_label(message: Any) -> str | None:
 
 
 def _shorten(text: str, limit: int) -> str:
+    """Bound a value by UTF-16 units, cutting only on code points."""
+
     text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    return shorten_utf16(text, limit)
 
 
 def format_preview_message(message: Any) -> str:
@@ -211,7 +241,7 @@ def format_preview_message(message: Any) -> str:
                 body = "[پیام سرویس]"
             else:
                 body = "[بدون متن]"
-    return f"#{mid} — {stamp} UTC\n{_shorten(body, PREVIEW_ITEM_CHARS)}"
+    return f"#{mid} — {stamp} UTC\n{_shorten(body, PREVIEW_ITEM_UTF16)}"
 
 
 def _source_text(row: dict[str, Any] | None) -> str:
@@ -219,7 +249,7 @@ def _source_text(row: dict[str, Any] | None) -> str:
         return "[پیام منبع در دسترس نیست]"
     text = str(row.get("text") or row.get("caption") or "").strip()
     if text:
-        return _shorten(text, REVIEW_MESSAGE_CHARS)
+        return _shorten(text, REVIEW_MESSAGE_UTF16)
     if row.get("media_type"):
         return "[پیام رسانه‌ای بدون متن]"
     return "[بدون متن]"
@@ -446,13 +476,38 @@ class ManagementBot:
 
     async def _send(
         self, operator_id: int, text: str, *, markup: dict[str, Any] | None = None
-    ) -> None:
+    ) -> bool:
+        """One bounded outbound text; failures are logged, never fatal.
+
+        ``text`` exceeding Telegram's limit would be rejected by the API and
+        silently lost, so the renderer-side budgets above must always be
+        respected; this guard records the size to make such mistakes visible
+        in the logs without logging any content.
+        """
+
+        utf16_size = utf16_len(text)
+        if utf16_size > MAX_MESSAGE_UTF16:
+            log.error(
+                "management send skipped: text too large for Telegram "
+                "(utf16=%s limit=%s operator=%s)",
+                utf16_size,
+                MAX_MESSAGE_UTF16,
+                operator_id,
+            )
+            return False
         try:
             await asyncio.to_thread(
                 self.bot.send_message, operator_id, text, reply_markup=markup
             )
+            return True
         except Exception as exc:  # noqa: BLE001 - transport failures are logged, never fatal
-            log.warning("management send failed (%s)", exc.__class__.__name__)
+            log.warning(
+                "management send failed (%s) to=%s utf16=%s",
+                exc.__class__.__name__,
+                operator_id,
+                utf16_size,
+            )
+            return False
 
     async def _notify_all(
         self, text: str, *, markup: dict[str, Any] | None = None
@@ -642,6 +697,18 @@ class ManagementBot:
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id") or "")
         operator_id = self._operator(callback)
+        from_id = _from_id(callback)
+        # A known operator pressing a button whose containing message is gone
+        # (deleted / inaccessible) hits the stale-tap branch, not an
+        # authorization failure: Telegram omits ``message`` exactly in that
+        # case. Taps from groups or strangers keep a ``message`` and therefore
+        # fall through to the plain refusal below.
+        if operator_id is None and callback.get("message") is None and from_id in self.operators:
+            await self._answer(
+                callback_id,
+                "این دکمه دیگر معتبر نیست (پیام آن حذف شده یا در دسترس نیست)؛ /start",
+            )
+            return
         if operator_id is None:
             await self._answer(callback_id, "دسترسی مجاز نیست")
             return
@@ -1343,7 +1410,13 @@ class ManagementBot:
             return
         total = self.store.snapshot_count(snapshot_id)
         if total == 0:
-            await self._send(operator_id, "فهرست خالی است.")
+            await self._send(
+                operator_id,
+                "فهرست خالی است؛ برای گرفتن فهرست جدید دوباره تلاش کنید.",
+                markup=_kb(
+                    [[_btn("🔄 به‌روزرسانی", "mg:" + self._token(operator_id, "refresh"))]]
+                ),
+            )
             return
         offset = max(0, min(int(offset), max(0, total - 1)))
         page = self.store.snapshot_page(snapshot_id, offset, 10)
@@ -1651,7 +1724,10 @@ class ManagementBot:
             body = header
             for line in lines:
                 candidate = "\n\n" + line
-                if len(body) + len(candidate) > PREVIEW_TOTAL_CHARS:
+                if (
+                    utf16_len(body) + utf16_len(candidate)
+                    > min(PREVIEW_TOTAL_UTF16, MAX_MESSAGE_UTF16 - 100)
+                ):
                     body += "\n\n… ادامه پیام‌ها به دلیل محدودیت طول نمایش داده نشد."
                     break
                 body += candidate
@@ -1719,6 +1795,19 @@ class ManagementBot:
         )
         rows = page["rows"]
         total = page["total"]
+        if total and offset >= total:
+            # A stale or out-of-range offset (deleted signals, an old message
+            # re-opened later) must never present the channel as empty: snap
+            # back to the last page that still has rows.
+            last_page_offset = ((max(total, 1) - 1) // page_size) * page_size
+            page = recent_signals(
+                self.repo.db,
+                channel_id,
+                limit=page_size,
+                offset=last_page_offset,
+                newest_first=True,
+            )
+            rows, offset = page["rows"], last_page_offset
         if not rows:
             await self._send(
                 operator_id,
@@ -1937,20 +2026,24 @@ class ManagementBot:
                 markup=self._signal_nav_keyboard(operator_id, channel_id, logical_id),
             )
             return
-        per_message = 16
-        chunks = [messages[i : i + per_message] for i in range(0, len(messages), per_message)]
-        first = True
-        for chunk in chunks:
+        # Rendering already groups messages into Telegram-safe segments;
+        # navigation stays attached to the first and last delivery.
+        segments = render_related_messages(channel_id, logical_id, messages)
+        keyboard = self._signal_nav_keyboard(operator_id, channel_id, int(logical_id))
+        failures: list[int] = []
+        for index, segment in enumerate(segments):
+            markup = keyboard if index in (0, len(segments) - 1) else None
+            sent = await self._send(operator_id, segment, markup=markup)
+            if not sent:
+                failures.append(index + 1)
+        if failures:
+            listed = "، ".join(str(n) for n in failures[:10])
+            more = "، …" if len(failures) > 10 else ""
             await self._send(
                 operator_id,
-                render_related_messages(channel_id, logical_id, chunk),
-                markup=(
-                    self._signal_nav_keyboard(operator_id, channel_id, int(logical_id))
-                    if first
-                    else None
-                ),
+                f"⚠️ ارسال بخش(های) {listed}{more} از پیام‌های مرتبط ناموفق بود؛ "
+                f"مجموعاً {len(segments)} بخش تولید شده بود. دوباره همان دکمه را بزنید.",
             )
-            first = False
 
     async def _signal_original(self, operator_id: int, logical_id: int, message_id: int) -> None:
         channel_id, error = self._review_gate(operator_id)
@@ -1966,13 +2059,24 @@ class ManagementBot:
             )
             return
         segments = render_original_message(message, label=f"پیام اصلی سیگنال #{logical_id}")
-        await self._send(operator_id, segments[0])
-        for segment in segments[1:]:
-            await self._send(operator_id, segment)
+        keyboard = self._signal_nav_keyboard(operator_id, channel_id, logical_id)
+        failures: list[int] = []
+        for index, segment in enumerate(segments):
+            sent = await self._send(operator_id, segment)
+            if not sent:
+                failures.append(index + 1)
+        if failures:
+            listed = "، ".join(str(n) for n in failures[:10])
+            more = "، …" if len(failures) > 10 else ""
+            await self._send(
+                operator_id,
+                f"⚠️ ارسال بخش(های) {listed}{more} از پیام اصلی ناموفق بود؛ "
+                f"مجموعاً {len(segments)} بخش تولید شده بود. دوباره همان دکمه را بزنید.",
+            )
         await self._send(
             operator_id,
             "متن خام دست‌نخورده است؛ هرگز حذف یا بازنویسی نمی‌شود.",
-            markup=self._signal_nav_keyboard(operator_id, channel_id, logical_id),
+            markup=keyboard,
         )
 
     async def _raw_review(self, operator_id: int) -> None:

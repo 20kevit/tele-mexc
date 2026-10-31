@@ -18,6 +18,13 @@ from ..analysis.reindex import classification_fa
 #: Telegram's hard limit is 4096 UTF-16 code units per message; keep a
 #: safety margin so keyboards and headers always fit.
 MAX_SEGMENT_UTF16 = 3600
+#: Telegram Bot API hard limit for one text message (UTF-16 code units,
+#: "after entities parsing"). This project never attaches entities, but the
+#: limit is still measured in UTF-16 units, not Python characters.
+MAX_MESSAGE_UTF16 = 4096
+#: Safety budget for any single outgoing review segment; keyboards, headers
+#: and continuation markers must always fit inside the hard limit.
+SAFE_TEXT_UTF16 = 3840
 
 ROLE_FA = {"long": "لانگ", "short": "شورت"}
 
@@ -79,6 +86,36 @@ def slice_utf16(text: str, capacity: int) -> list[str]:
 
 def _fmt(value: Any) -> str:
     return "—" if value in (None, "") else str(value)
+
+
+#: Marker appended when a value had to be shortened for display. The full
+#: value always remains intact in the database; only the presentation is
+#: bounded.
+SHORTEN_MARK = "…"
+
+
+def shorten_utf16(text: str, limit: int) -> str:
+    """Bound ``text`` to ``limit`` UTF-16 units, cutting only on code points.
+
+    This is presentation-only: it never mutates stored rows. ``cut`` counts
+    real UTF-16 widths so astral characters (emoji, rare symbols) can never
+    push a message over Telegram's per-message limit, which is measured in
+    UTF-16 code units and not Python characters.
+    """
+
+    if limit <= 0:
+        return ""
+    if utf16_len(text) <= limit:
+        return text
+    out: list[str] = []
+    used = 0
+    for char in text:
+        width = 2 if ord(char) > 0xFFFF else 1
+        if used + width > limit - len(SHORTEN_MARK.encode("utf-16-le")) // 2:
+            break
+        out.append(char)
+        used += width
+    return "".join(out) + SHORTEN_MARK
 
 
 class SignalReviewUnavailable(Exception):
@@ -230,44 +267,94 @@ def render_signal_detail(channel_id: int, signal: dict[str, Any]) -> str:
 
 
 def render_signal_extract(channel_id: int, signal: dict[str, Any]) -> str:
-    targets = _fmt(signal.get("targets_json"))
+    """Extracted (parsed) fields; every free-form value is bounded.
+
+    ``targets_json`` and ``ambiguities_json`` are stored exactly as the
+    reindex wrote them and are truncated for display only, with an explicit
+    marker when that happens. The whole screen always stays inside
+    Telegram's single-message limit so it can never be silently dropped.
+    """
+
+    targets = shorten_utf16(_fmt(signal.get("targets_json")), 900)
+    ambiguities = shorten_utf16(_fmt(signal.get("ambiguities_json")), 500)
     lines = [
         f"🔎 داده‌های استخراج‌شده — سیگنال #{_fmt(signal.get('logical_id'))}",
         "",
         f"جهت: {direction_fa(signal.get('direction'))}",
-        f"صرافی/نماد: {_fmt(signal.get('exchange'))}:{_fmt(signal.get('symbol_raw'))}"
-        f" → {_fmt(signal.get('symbol'))} (کوته: {_fmt(signal.get('quote_asset'))})",
-        f"تایم‌فریم: {_fmt(signal.get('timeframe'))}",
-        f"ورود: {_fmt(signal.get('entry_price'))}",
-        f"حد ضرر: {_fmt(signal.get('stop_loss'))}",
+        f"صرافی/نماد: {shorten_utf16(_fmt(signal.get('exchange')), 100)}"
+        f":{shorten_utf16(_fmt(signal.get('symbol_raw')), 100)}"
+        f" → {shorten_utf16(_fmt(signal.get('symbol')), 100)}"
+        f" (کوته: {shorten_utf16(_fmt(signal.get('quote_asset')), 50)})",
+        f"تایم‌فریم: {shorten_utf16(_fmt(signal.get('timeframe')), 50)}",
+        f"ورود: {shorten_utf16(_fmt(signal.get('entry_price')), 100)}",
+        f"حد ضرر: {shorten_utf16(_fmt(signal.get('stop_loss')), 100)}",
         f"تارگت‌ها: {targets}",
-        f"تارگت کامل (FULL Target): {_fmt(signal.get('full_target'))}",
-        f"درصد سپرده (فقط اطلاعاتی): {_fmt(signal.get('deposit_pct'))}",
-        f"لوریج پیشنهادی (فقط اطلاعاتی): {_fmt(signal.get('suggested_leverage'))}"
-        f" ({_fmt(signal.get('leverage_pct'))})",
-        f"طبقه‌بندی: {classification_fa(str(signal.get('classification')))}",
-        f"وضعیت تجزیه: {_fmt(signal.get('parse_status'))}",
-        f"مبهمی‌ها: {_fmt(signal.get('ambiguities_json'))}",
+        f"تارگت کامل (FULL Target): {shorten_utf16(_fmt(signal.get('full_target')), 100)}",
+        f"درصد سپرده (فقط اطلاعاتی): {shorten_utf16(_fmt(signal.get('deposit_pct')), 50)}",
+        f"لوریج پیشنهادی (فقط اطلاعاتی): {shorten_utf16(_fmt(signal.get('suggested_leverage')), 50)}"
+        f" ({shorten_utf16(_fmt(signal.get('leverage_pct')), 50)})",
+        f"طبقه‌بندی: {shorten_utf16(classification_fa(str(signal.get('classification'))), 60)}",
+        f"وضعیت تجزیه: {shorten_utf16(_fmt(signal.get('parse_status')), 50)}",
+        f"مبهمی‌ها: {ambiguities}",
         "",
-        f"تاریخ/ساعت منبع: {_fmt(signal.get('source_date_text'))}"
-        f" {_fmt(signal.get('source_time_text'))} (تقویم منبع حفظ شده است)",
-        f"زمان UTC مشتق‌شده: {_fmt(signal.get('source_timestamp_iso'))}",
-        f"پیام منبع: {_fmt(signal.get('origin_message_id'))} · ویرایش: {_fmt(signal.get('edit_version'))}",
+        f"تاریخ/ساعت منبع: {shorten_utf16(_fmt(signal.get('source_date_text')), 50)}"
+        f" {shorten_utf16(_fmt(signal.get('source_time_text')), 50)} (تقویم منبع حفظ شده است)",
+        f"زمان UTC مشتق‌شده: {shorten_utf16(_fmt(signal.get('source_timestamp_iso')), 50)}",
+        f"پیام منبع: {shorten_utf16(_fmt(signal.get('origin_message_id')), 50)}"
+        f" · ویرایش: {shorten_utf16(_fmt(signal.get('edit_version')), 50)}",
         "",
         "این داده‌ها فقط برای مرور تاریخچه‌اند؛ «درصد سپرده» و «لوریج پیشنهادی» "
         "هرگز در محاسبه حجم یا لوریج سفارش به کار نمی‌روند و سیگنال‌های شورت "
-        "هرگز سفارشی ایجاد نمی‌کنند.",
+        "هرگز سفارشی ایجاد نمی‌کنند. مقادیر بسیار طولانی با نشانگر «…» "
+        "کوتاه نمایش داده می‌شوند؛ مقدار کامل در پایگاه‌داده دست‌نخورده است.",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # Every field is individually bounded above, so the normal ceiling sits
+    # well below the hard limit. If a hostile database still overflows,
+    # shed the deficit by shrinking the two JSON digests, then enforce a
+    # deterministic per-line bound as a final guard.
+    over = utf16_len(text) - SAFE_TEXT_UTF16
+    if over > 0:
+        floor = 80
+        shed = min(over, max(0, utf16_len(targets) - floor))
+        if shed:
+            targets = shorten_utf16(targets, utf16_len(targets) - shed)
+            lines[7] = f"تارگت‌ها: {targets}"
+        over = utf16_len("\n".join(lines)) - SAFE_TEXT_UTF16
+        if over > 0:
+            shed = min(over, max(0, utf16_len(ambiguities) - floor))
+            if shed:
+                ambiguities = shorten_utf16(ambiguities, utf16_len(ambiguities) - shed)
+                lines[13] = f"مبهمی‌ها: {ambiguities}"
+        text = "\n".join(lines)
+    if utf16_len(text) > SAFE_TEXT_UTF16:
+        bounded = [shorten_utf16(line, 180) for line in lines]
+        text = "\n".join(bounded)
+    return text
 
 
 def render_related_messages(
-    channel_id: int, logical_id: Any, messages: list[dict[str, Any]]
-) -> str:
-    lines = [f"💌 پیام‌های مرتبط با سیگنال #{_fmt(logical_id)}", ""]
-    if not messages:
-        lines.append("پیام مرتبطی ثبت نشده است.")
-    for item in messages:
+    channel_id: int,
+    logical_id: Any,
+    messages: list[dict[str, Any]],
+    *,
+    max_utf16: int = 3450,
+) -> list[str]:
+    """Every message linked to the signal, as bounded Telegram segments.
+
+    Contract: the returned segments are ordered like the input messages,
+    each segment fits ``max_utf16`` units so no segment can be dropped by
+    Telegram, the first segment carries the intro header and the last one
+    the unresolved-status footer, and continuity markers ``(بخش k/m)`` are
+    shown whenever more than one segment is needed. Original message text
+    is only *shortened for display* with an explicit marker; the stored
+    rows are never modified.
+    """
+
+    if max_utf16 <= 400:
+        raise ValueError("max_utf16 must leave room for headers")
+
+    def item_line(item: dict[str, Any], body_override: str | None = None) -> list[str]:
         head = (
             f"• پیام {_fmt(item.get('message_id'))} — "
             f"{_fmt(item.get('datetime'))} — "
@@ -276,26 +363,72 @@ def render_related_messages(
         )
         if item.get("edit_captures"):
             head += f" — ویرایش ثبت‌شده ×{item['edit_captures']}"
-        lines.append(head)
+        lines: list[str] = [head]
         lines.append(
             f"  طبقه‌بندی: {classification_fa(str(item.get('classification')))}"
         )
         if item.get("reason"):
-            lines.append(f"  دلیل: {_fmt(item.get('reason'))}")
+            lines.append(f"  دلیل: {shorten_utf16(_fmt(item.get('reason')), 200)}")
         if item.get("edit_datetime"):
             lines.append(f"  ویرایش‌شده: {_fmt(item.get('edit_datetime'))}")
         body = item.get("text") or item.get("caption") or ""
         if body:
-            segment = body if utf16_len(body) <= 600 else (
-                slice_utf16(body, 600)[0] + " … (کوتاه‌شده)"
-            )
-            lines.append(f"  متن: {segment}")
+            shown = body if body_override is None else body_override
+            if utf16_len(shown) > 600:
+                shown = shorten_utf16(shown, 600) + " … (کوتاه‌شده)"
+            lines.append(f"  متن: {shown}")
         lines.append("")
-    lines.append(
+        return lines
+
+    footer = (
         "پیام‌های با وضعیت «حل‌نشده» مرجعی دارند که پیام اصلی سیگنال آن در "
         "آرشیو ذخیره نشده است؛ متن خام هرگز حذف یا جایگزین نمی‌شود."
     )
-    return "\n".join(lines)
+
+    # Group item lines into segment bodies within the per-segment budget,
+    # leaving room for intro/continuation headers and the footer.
+    reserved = 700
+    body_cap = max_utf16 - reserved
+    bodies: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for item in messages:
+        block = item_line(item)
+        width = utf16_len("\n".join(block))
+        if width > body_cap:
+            # One huge item still fits alone: bound its displayed body harder.
+            overflow = width - body_cap
+            body = item.get("text") or item.get("caption") or ""
+            if body:
+                tighter = max(50, 600 - overflow)
+                block = item_line(
+                    item,
+                    body_override=shorten_utf16(body, tighter) + " … (کوتاه‌شده)",
+                )
+                width = utf16_len("\n".join(block))
+        if current and used + width > body_cap:
+            bodies.append(current)
+            current = []
+            used = 0
+        current.extend(block)
+        used += width
+    if current:
+        bodies.append(current)
+
+    intro = f"💌 پیام‌های مرتبط با سیگنال #{_fmt(logical_id)}"
+    intro += f" ({len(messages)} پیام)" if messages else ""
+    if not messages:
+        return [intro + "\n\nپیام مرتبطی ثبت نشده است.\n\n" + footer]
+    total = len(bodies)
+    segments: list[str] = []
+    for index, body in enumerate(bodies, start=1):
+        if total == 1:
+            head = intro
+        else:
+            head = f"{intro} — بخش {index} از {total}"
+        tail = "\n" + footer if index == total else "\n"
+        segments.append(head + "\n\n" + "\n".join(body).rstrip("\n") + tail)
+    return segments
 
 
 def render_original_message(

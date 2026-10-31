@@ -109,9 +109,10 @@ class TestRenderers:
         assert "شورت" in detail
 
     def test_related_messages_render_link_status_and_reason(self, indexed_repo):
-        message = sr.render_related_messages(
+        segments = sr.render_related_messages(
             CHANNEL, 301, sr.related_messages(indexed_repo.db, CHANNEL, 301)
         )
+        message = "\n".join(segments)
         assert "متصل" in message
         assert "شناسه و پاسخ" in message
         assert "پیام 502" in message or "پیام 501" in message
