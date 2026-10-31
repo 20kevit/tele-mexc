@@ -3,7 +3,7 @@
 **Project:** tele-mexc (tg-signal-ingest) — Telegram-to-MEXC Spot signal bot  
 **Date:** 2026-10-31  
 **Operator:** OpenCode agent  
-**Final main HEAD:** `94c6436071d1345a6b6c5c625641b715c22f5191`  
+**Final main HEAD:** `241eaa6e5aaff22a9a997ba9516c4710b285eef8`  
 
 ---
 
@@ -245,7 +245,9 @@ Reason: missing TELEGRAM_API_ID / TELEGRAM_API_HASH in environment
 ## 14. Final `main` HEAD and Commit History
 
 ```text
-94c6436 (HEAD -> main) style: fix ruff lint errors in diagnostic commands and engine note
+241eaa6 (HEAD -> main) docs: update AGENTS.md migration count to 1–20
+fef64ad docs: add Git branch consolidation report
+94c6436 style: fix ruff lint errors in diagnostic commands and engine note
 8174475 docs: UI audit findings, fixes and residual risks (management bot)
 eb16d61 management: enforce Telegram UTF-16/byte limits across every bot surface
 0ffd4c6 docs: add trading audit and notification design
@@ -262,8 +264,8 @@ f7b09d0 test: replace documented credential vector with synthetic signing fixtur
 ...
 ```
 
-Final `main` tree: `94c6436071d1345a6b6c5c625641b715c22f5191`  
-Diff against original `main`: 51 files changed, 8,358 insertions(+), 481 deletions(-).  
+Final `main` tree: `241eaa6e5aaff22a9a997ba9516c4710b285eef8`  
+Diff against original `main`: 52 files changed, 8,689 insertions(+), 482 deletions(-).  
 No files from the original `main` were deleted.
 
 ---
