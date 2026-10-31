@@ -40,7 +40,14 @@ from ..repository import QueueItem, Repository
 from .balance import BalanceError, parse_account, validate_balance
 from .parser import ParsedSignal, SignalParser
 from .risk import RiskDecision, RiskManager
-from .store import TERMINAL_INTENT_STATES, RiskLimitExceeded, TradingStore, dec_str
+from .store import (
+    TERMINAL_INTENT_STATES,
+    RiskLimitExceeded,
+    SymbolConflictError,
+    TradingError,
+    TradingStore,
+    dec_str,
+)
 
 log = logging.getLogger("ingest.trading")
 
@@ -82,7 +89,16 @@ class TradingEngine:
         self.repo = repo
         self._now = now or (lambda: datetime.now(UTC))
         self._monotonic = monotonic or time.monotonic
-        self.store = TradingStore(repo.db, cfg.trading, now=self._now)
+        # Use TradeStore (extends TradingStore) so the production Engine path
+        # has direct, DB-backed access to trade-level per-symbol concurrency
+        # without creating a disconnected TradingStore instance.
+        from .trade_store import TradeStore as _TradeStore
+
+        if trade_manager is not None and getattr(trade_manager, "store", None) is not None:
+            # Share the same underlying DB/store — no disconnected instances.
+            self.store = trade_manager.store
+        else:
+            self.store = _TradeStore(repo.db, cfg.trading, now=self._now)
         self.parser = parser or SignalParser()
         self.risk = RiskManager(cfg.trading, self.store)
         self.client = client
@@ -93,6 +109,19 @@ class TradingEngine:
         # Trade lifecycle coordinator (conditional entry, TP1/TP2, SL).  When
         # present and mode is live it owns entry submission for live intents.
         self.trade_manager = trade_manager
+        # If a TradeManager was supplied after Engine creation, wire its store
+        # to the same instance for coherence (Engine is the source of truth
+        # for the DB connection in production wiring).
+        if self.trade_manager is not None and getattr(self.trade_manager, "store", None) is not self.store:
+            # Prefer the Engine's store (already DB-backed) — update TM to share it.
+            # This covers the case where TM was constructed with a separate
+            # TradeStore on the same repo.db: they share the same SQLite file,
+            # but sharing the Python object eliminates any future divergence of
+            # in-memory caches and makes atomicity reasoning trivial.
+            try:
+                self.trade_manager.store = self.store  # type: ignore[attr-defined]
+            except Exception:
+                pass
         # The processing queue is normally single-consumer, but concurrent
         # delivery/retry can call this from more than one thread. Serializing
         # the whole decision keeps the DB reservation and execution atomic.
@@ -270,20 +299,32 @@ class TradingEngine:
 
         # ── Per-symbol concurrency (§3.2) ────────────────────────────
         # A new BUY for a symbol that already has a non-terminal bot-owned
-        # trade/intent must not be admitted.  Unrelated symbols are never
-        # blocked.  This runs *after* the mandatory risk boundary so every
-        # rejection has a precise, auditable reason and the check is durable
-        # across restarts.
+        # trade must not be admitted.  Unrelated symbols are never blocked.
+        # This runs *after* the mandatory risk boundary so every rejection has
+        # a precise, auditable reason and the check is durable across restarts.
+        #
+        # The fast pre-check is advisory; the authoritative atomic check lives
+        # inside store.create_intent() (single DB transaction, safe across
+        # multiple processes).  A DB error here must never silently permit a
+        # BUY — fail closed and notify the developer.
         if parsed.symbol:
-            # Prefer the precise trade-level check when a TradeStore is in use.
             has_trade_check = getattr(self.store, "has_active_trade_for_symbol", None)
-            has_intent_check = getattr(self.store, "has_active_intent_for_symbol", None)
-            conflicting: dict[str, Any] | None = None
             if callable(has_trade_check):
                 try:
                     conflicting = has_trade_check(parsed.symbol)
-                except Exception:
-                    conflicting = None
+                except Exception as exc:
+                    # DB failure must not permit BUY — fail closed
+                    reason = f"per-symbol concurrency check failed; rejecting safely: {exc}"
+                    self.store.update_signal(signal_id, "rejected", reason)
+                    self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
+                    self._notify_rejected(signal_id, parsed, reason, record=record)
+                    # Also alert developer explicitly (lifecycle failure)
+                    try:
+                        if self.notifier:
+                            self.notifier.notify_trade(None, "SYMBOL_CHECK_FAILED", reason)
+                    except Exception:
+                        pass
+                    return None
                 if conflicting is not None:
                     reason = (
                         f"per-symbol concurrency: {parsed.symbol} already has an active trade "
@@ -294,12 +335,6 @@ class TradingEngine:
                     self.store.audit(signal_id, "lifecycle", "rejected_symbol_conflict", reason)
                     self._notify_rejected(signal_id, parsed, reason, record=record)
                     return None
-            # Fallback intent check is deliberately omitted: §3.2 per-symbol
-            # concurrency is defined over durable *trades* (non-terminal trade
-            # states), not over transient intents.  Quote-balance overspend is
-            # covered by §3.3 (outstanding_balance_usage + trading_budget_ledger)
-            # and is tested independently (same-symbol intents share outstanding
-            # quote).  Blocking on intents would mask those balance semantics.
 
         quantized = self._quantize_decision(decision, meta, parsed.action or "")
         if quantized is None:
@@ -330,6 +365,25 @@ class TradingEngine:
                 base_quantity=decision.base_quantity,
                 limit_price=decision.limit_price,
             )
+        except SymbolConflictError as exc:
+            # Atomic per-symbol check inside create_intent rejected the BUY
+            reason = str(exc)
+            self.store.update_signal(signal_id, "rejected", reason)
+            self.store.audit(signal_id, "lifecycle", "rejected_symbol_conflict", reason)
+            self._notify_rejected(signal_id, parsed, reason, record=record)
+            return None
+        except TradingError as exc:
+            # DB/TradingError during atomic admission — fail closed, do not submit
+            reason = f"symbol admission failed safely: {exc}"
+            self.store.update_signal(signal_id, "rejected", reason)
+            self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
+            self._notify_rejected(signal_id, parsed, reason, record=record)
+            try:
+                if self.notifier:
+                    self.notifier.notify_trade(None, "SYMBOL_CHECK_FAILED", reason)
+            except Exception:
+                pass
+            return None
         except RiskLimitExceeded as exc:
             reason = str(exc)
             self.store.update_signal(signal_id, "rejected", reason)
@@ -1503,25 +1557,16 @@ class TradingEngine:
         *,
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
-        """Submit a MARKET sell for the remaining position (stop-loss policy)."""
-        client = self._live_client()
-        cid = client_order_id or f"sl-{trade['trade_id'][-24:]}"
-        response = client.place_order(
-            symbol=trade["symbol"],
-            side="SELL",
-            order_type="MARKET",
-            quote_order_qty=None,
-            quantity=quantity,
-            price=None,
-            client_order_id=cid,
+        """Disabled per owner-confirmed §7 — native OCO SL legs are the only authorized SL.
+
+        No automatic Market Sell may be submitted from signal monitoring,
+        startup recovery, or reconciliation.  This method is intentionally
+        unreachable; any call is a defect and must be surfaced immediately.
+        """
+        raise RuntimeError(
+            "Market Sell stop-loss is disabled per owner-confirmed strategy (§7) — "
+            "native OCO SL legs only; no discretionary Market Sell fallback"
         )
-        order_id = response.get("orderId")
-        return {
-            "exchange_order_id": str(order_id) if order_id is not None else None,
-            "state": str(response.get("status") or "NEW"),
-            "executed_qty": _optional_decimal(response.get("executedQty")),
-            "cumulative_quote": _optional_decimal(response.get("cumulativeQuoteQty")),
-        }
 
     def query_trade_order(self, order: dict[str, Any]) -> dict[str, Any]:
         """Query the exchange status of a TP/SL trade order.

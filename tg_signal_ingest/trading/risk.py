@@ -70,7 +70,18 @@ class RiskManager:
         # every eligible LONG must have symbol, LONG direction, entry, SL, TP1, TP2.
         # No inference of missing values is permitted.
         if signal.entry_price is None:
-            reasons.append("entry price is missing; rejected before BUY (mandatory SL/TP validation)")
+            # Entry-range handling (owner-confirmed §1.3): parser may expose a
+            # low/high range without a canonical single entry price.  No
+            # midpoint or arbitrary derivation is authorized — range-only
+            # execution is explicitly unsupported and must be rejected with a
+            # clear documented reason.
+            if signal.entry_low_price is not None or signal.entry_high_price is not None:
+                reasons.append(
+                    "entry price is missing; entry range (e.g., 100-102) is not supported for automatic execution — "
+                    "provide a single entry price (unsupported range-only execution)"
+                )
+            else:
+                reasons.append("entry price is missing; rejected before BUY (mandatory SL/TP validation)")
         elif signal.entry_price <= 0:
             reasons.append("entry price must be positive")
         # Entry range validation (when present)

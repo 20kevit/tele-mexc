@@ -354,30 +354,15 @@ class TradeStore(TradingStore):
     """
 
     def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
-        """Return the first conflicting trade for *symbol*, or None.
-
-        The check is durability-first: it queries persisted ``trades`` rows
-        inside the same DB that drives intent creation, so it is safe across
-        restarts and multiple workers.  Callers should hold the engine's
-        ``Database.transaction()`` + intent-creation lock, or be prepared for
-        a TOCTOU reconciliation guard downstream.
-        """
+        """Return the first conflicting trade for *symbol*, or None."""
         if not symbol:
             return None
+        placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
         rows = self.db.conn.execute(
-            "SELECT * FROM trades WHERE symbol = ? ORDER BY updated_at DESC LIMIT 20",
-            (symbol,),
+            f"SELECT * FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+            (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
         ).fetchall()
-        for row in rows:
-            state = row["trade_state"] if isinstance(row, dict) or hasattr(row, "__getitem__") else None
-            # sqlite Row → dict-like
-            try:
-                state = row["trade_state"]  # type: ignore[index]
-            except Exception:
-                state = dict(row).get("trade_state")  # fallback
-            if state in self.CONFLICTING_TRADE_STATES:
-                return dict(row)
-        return None
+        return dict(rows[0]) if rows else None
 
     def transition_trade_order(
         self,
