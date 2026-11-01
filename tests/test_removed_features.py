@@ -25,6 +25,7 @@ def test_removed_trading_configuration_fields_are_absent():
         "aggregate_budget_quote",
         "remaining_balance_reserve_pct",
         "fake_price_for_tests",
+        "order_type_policy",
         "allowed_symbols",
         "allowlist_mode",
     ):

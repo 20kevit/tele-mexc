@@ -15,6 +15,7 @@ from typing import Any
 
 from .cli import MexcCliAdapter
 from .client import MexcSpotClient
+from .errors import MexcConfigError
 
 
 class HybridMexcClient:
@@ -49,6 +50,8 @@ class HybridMexcClient:
         take_profit_price: Decimal | None = None,
         stop_loss_price: Decimal | None = None,
     ) -> dict[str, Any]:
+        if str(order_type).upper() != "LIMIT":
+            raise MexcConfigError("only LIMIT Spot orders are supported")
         # The external CLI is a separate network client, but our own callers
         # still share the documented 12 requests/second order bucket.  Acquire
         # the shared gate before spawning it so two local processes cannot

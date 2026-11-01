@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from tg_signal_ingest.mexc.errors import (
+    AccidentalOrderRiskError,
     MexcCliConfirmationRequired,
     MexcNetworkError,
     MexcOrderNotFound,
@@ -1318,3 +1321,84 @@ def test_duplicate_delivery_of_open_intent_does_not_submit_again(cfg, repo):
     assert client.place_calls == 1
     signal = engine.store.get_signal("100:1:0")
     assert signal is not None and signal["status"] == "planned"
+
+
+class CapturingMexc(FakeMexc):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.place_kwargs: list[dict] = []
+
+    def place_order(self, **kwargs):
+        self.place_kwargs.append(dict(kwargs))
+        return super().place_order(**kwargs)
+
+
+def test_market_signal_is_converted_to_limit_entry(cfg, repo):
+    client = CapturingMexc(
+        place_response={"orderId": "ex-mkt", "status": "NEW"},
+    )
+    engine = _engine(cfg, repo, client)
+    text = "MARKET BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+    intent = engine.process_item(_item(100, 401), _store_message(repo, 401, text))
+
+    assert intent is not None
+    assert intent["order_type"] == "limit"
+    assert len(client.place_kwargs) == 1
+    payload = client.place_kwargs[0]
+    assert payload["order_type"] == "LIMIT"
+    assert payload["price"] is not None
+    assert "quote_order_qty" not in payload
+
+
+def test_market_signal_without_entry_is_rejected_before_exchange(cfg, repo):
+    client = CapturingMexc()
+    engine = _engine(cfg, repo, client)
+    text = "MARKET BUY BTCUSDT\nSL: 95\nTP1: 110\nTP2: 120"
+    result = engine.process_item(_item(100, 402), _store_message(repo, 402, text))
+
+    assert result is None
+    assert client.place_kwargs == []
+    signal = engine.store.get_signal("100:402:0")
+    assert signal is not None and signal["status"] == "rejected"
+    assert "entry" in signal["rejection_reason"].lower()
+
+
+def test_recovered_market_intent_cannot_reach_exchange(cfg, repo):
+    client = CapturingMexc()
+    engine = _engine(cfg, repo, client)
+    parsed = SignalParser().parse(ALERT)
+    sid, _ = engine.store.record_signal(parsed, channel_id=100, message_id=403, edit_version=0)
+    intent, _ = engine.store.create_intent(
+        signal=parsed,
+        signal_id=sid,
+        channel_id=100,
+        message_id=403,
+        edit_version=0,
+        idempotency_key="recovered-market",
+        client_order_id="tsi-recovered-market",
+        mode="live",
+        order_type="market",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=None,
+    )
+    result = engine._execute_intent(intent["intent_id"])
+    assert result["state"] == "rejected"
+    assert "LIMIT" in (result["reject_reason"] or "")
+    assert client.place_kwargs == []
+
+
+def test_market_payload_is_rejected_at_the_payload_boundary(cfg, repo):
+    engine = _engine(cfg, repo)
+    with pytest.raises(AccidentalOrderRiskError, match="LIMIT"):
+        engine._order_payload(
+            {
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "order_type": "market",
+                "client_order_id": "x",
+                "quote_amount": "10",
+                "base_quantity": None,
+                "limit_price": None,
+            }
+        )

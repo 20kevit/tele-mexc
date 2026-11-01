@@ -126,15 +126,15 @@ class RiskManager:
 
         if reference_price is not None and reference_price <= 0:
             reference_price = None
-        order_type = self._order_type(signal, reasons)
+        # Entry orders are LIMIT-only by product policy.  A signal that says
+        # MARKET is converted only when it carries a valid Entry price; without
+        # one it is rejected below.
+        order_type = "limit"
         limit_price: Decimal | None = None
-        if order_type == "limit":
-            if signal.entry_price is None:
-                reasons.append("limit order requires an entry price")
-            else:
-                limit_price = signal.entry_price
-        elif reference_price is None:
-            reasons.append("no valid reference price is available for a market order")
+        if signal.entry_price is None:
+            reasons.append("limit order requires an entry price")
+        else:
+            limit_price = signal.entry_price
 
         quote_amount: Decimal | None = None
         base_quantity: Decimal | None = None
@@ -180,19 +180,3 @@ class RiskManager:
             quote_amount=quote_amount,
             base_quantity=base_quantity,
         )
-
-    def _order_type(self, signal: ParsedSignal, reasons: list[str]) -> str:
-        policy = self.cfg.order_type_policy
-        if signal.order_type == "market":
-            if policy == "limit":
-                reasons.append("market order blocked by order_type_policy=limit")
-                return "limit"
-            return "market"
-        if signal.order_type == "limit":
-            return "limit"
-        # No explicit order type: an entry price means a limit entry (the
-        # signal's own semantics are preserved); otherwise use market only when
-        # the owner policy explicitly allows it.
-        if signal.entry_price is not None:
-            return "limit"
-        return "market" if policy == "market" else "limit"

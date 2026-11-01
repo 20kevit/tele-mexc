@@ -78,7 +78,6 @@ class TradingConfig:
     # Owner acknowledgement.  Absence leaves the pipeline unbuildable (fail
     # closed); it never falls back to a simulated or test-only execution path.
     execution_acknowledgement: str | None = None
-    order_type_policy: str = "limit"  # "limit" | "market"; market requires explicit config
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
     balance_max_age_s: float = 5.0  # reject account snapshots older than this
     recon_interval_s: float = 30.0
@@ -134,7 +133,6 @@ class TradingConfig:
     def as_dict_public(self) -> dict[str, object]:
         return {
             "execution_acknowledged": self.execution_acknowledgement == EXECUTION_ACKNOWLEDGEMENT,
-            "order_type_policy": self.order_type_policy,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
             "balance_max_age_s": self.balance_max_age_s,
             "recon_interval_s": self.recon_interval_s,
@@ -426,6 +424,13 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
     # The product has one execution behaviour.  Legacy mode selectors must not
     # silently change it: a stale "sim" config would otherwise look safe while
     # the completed pipeline executes real Spot orders.
+    legacy_policy = tr_raw.get("order_type_policy") or env.get("TRADING_ORDER_TYPE_POLICY")
+    if legacy_policy not in (None, ""):
+        raise ConfigError(
+            "order_type_policy is no longer supported: only LIMIT entry orders are "
+            "allowed. Remove order_type_policy/TRADING_ORDER_TYPE_POLICY."
+        )
+
     legacy_mode = tr_raw.get("mode") or env.get("TRADING_MODE")
     if legacy_mode not in (None, ""):
         raise ConfigError(
@@ -452,6 +457,7 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         "max_open_orders",
         "max_signal_age_s",
         "max_price_deviation_pct",
+        "order_type_policy",
         "aggregate_budget_quote",
         "remaining_balance_reserve_pct",
         "fake_price_for_tests",
@@ -480,13 +486,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
                 "SL < Entry < TP1 <= TP2 are hard mandatory invariants per owner-confirmed strategy. "
                 "Remove this key from config.toml."
             )
-
-    policy = tr_raw.get("order_type_policy")
-    if isinstance(policy, str) and policy:
-        policy = policy.strip().lower()
-        if policy not in ("limit", "market"):
-            raise ConfigError("trading.order_type_policy must be 'limit' or 'market'.")
-        t.order_type_policy = policy
 
     fee_buffer = tr_raw.get("balance_fee_buffer_pct")
     if fee_buffer not in (None, ""):

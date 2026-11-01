@@ -54,15 +54,14 @@ def apply_sizing(
             raise SizingError("fixed order amount must be positive")
         if meta is None:
             raise SizingError("symbol metadata is required to size a buy")
-        if decision.order_type == "market":
-            base = None
-        else:
-            if price is None or price <= 0:
-                raise SizingError("a limit price is required to size a buy")
-            base = meta.quantize_quantity(quote / price)
-            if base <= 0:
-                raise SizingError("buy amount is smaller than the symbol quantity step")
-            quote = base * price
+        if decision.order_type.lower() != "limit":
+            raise SizingError("only LIMIT entry orders can be sized")
+        if price is None or price <= 0:
+            raise SizingError("a limit price is required to size a buy")
+        base = meta.quantize_quantity(quote / price)
+        if base <= 0:
+            raise SizingError("buy amount is smaller than the symbol quantity step")
+        quote = base * price
         meta.validate_order(
             side="BUY",
             order_type=decision.order_type.upper(),

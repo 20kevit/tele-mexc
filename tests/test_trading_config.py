@@ -211,3 +211,19 @@ def test_entry_trigger_offset_invalid_values_are_rejected(tmp_path, value):
     root = _root_with(f"[trading]\nentry_trigger_offset_ticks = {value}", tmp_path=tmp_path)
     with pytest.raises(ConfigError, match="entry_trigger_offset_ticks"):
         load_config(root=root, environ={}, require_credentials=False)
+
+
+def test_order_type_policy_market_is_rejected(tmp_path):
+    root = _root_with('[trading]\norder_type_policy = "market"', tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="order_type_policy"):
+        load_config(root=root, environ={}, require_credentials=False)
+
+
+def test_environment_order_type_policy_cannot_enable_market(tmp_path):
+    root = _root_with("", tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="order_type_policy"):
+        load_config(
+            root=root,
+            environ={"TRADING_ORDER_TYPE_POLICY": "market"},
+            require_credentials=False,
+        )

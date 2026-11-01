@@ -163,9 +163,7 @@ class SharedWeightedRateGate(WeightedRateGate):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._local_fallback: WeightedRateGate | None = None
         if fcntl is None:  # pragma: no cover - Linux deployment
-            self._local_fallback = WeightedRateGate(
-                max_weight, window_s, clock=clock, sleep=sleep
-            )
+            self._local_fallback = WeightedRateGate(max_weight, window_s, clock=clock, sleep=sleep)
 
     def _read_events(self) -> deque[tuple[float, int]]:
         try:
@@ -262,9 +260,7 @@ class MexcSpotClient:
             # Official docs: recvWindow "Max 60000" (POST /api/v3/order param
             # table); error 700005 rejects larger values. Reject locally so a
             # misconfiguration fails before the exchange ever sees it.
-            raise MexcConfigError(
-                f"recvWindow larger than the documented maximum {MAX_RECV_WINDOW_MS} ms"
-            )
+            raise MexcConfigError(f"recvWindow larger than the documented maximum {MAX_RECV_WINDOW_MS} ms")
         self._transport = transport or self._default_transport
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or time.sleep
@@ -306,9 +302,7 @@ class MexcSpotClient:
         except urllib.error.HTTPError as exc:
             return exc.code, dict(exc.headers or {}), exc.read()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise MexcNetworkError(
-                f"network failure contacting MEXC ({exc.__class__.__name__})"
-            ) from exc
+            raise MexcNetworkError(f"network failure contacting MEXC ({exc.__class__.__name__})") from exc
 
     @staticmethod
     def _retry_after(headers: dict[str, str]) -> float | None:
@@ -352,12 +346,16 @@ class MexcSpotClient:
             # truncated or not JSON; Retry-After must never be lost.
             if status == 429:
                 raise MexcRateLimitError(
-                    f"rate limited (429): {msg}", code=code, http_status=status,
+                    f"rate limited (429): {msg}",
+                    code=code,
+                    http_status=status,
                     retry_after_s=retry_after,
                 )
             if status == 418:
                 raise MexcWafError(
-                    f"IP auto-banned (418): {msg}", code=code, http_status=status,
+                    f"IP auto-banned (418): {msg}",
+                    code=code,
+                    http_status=status,
                     retry_after_s=retry_after,
                 )
             raise MexcWafError(f"WAF access denied (403): {msg}", code=code, http_status=status)
@@ -391,9 +389,7 @@ class MexcSpotClient:
             raise order_rejected(f"request rejected (HTTP {status}, code {code}): {msg}", code)
         if status >= 500:
             raise MexcServerError(f"MEXC server error (HTTP {status}): {msg}", code=code, http_status=status)
-        raise MexcServerError(
-            f"unclassified MEXC failure (HTTP {status}): {msg}", code=code, http_status=status
-        )
+        raise MexcServerError(f"unclassified MEXC failure (HTTP {status}): {msg}", code=code, http_status=status)
 
     def request(
         self,
@@ -451,8 +447,7 @@ class MexcSpotClient:
                 if attempt + 1 >= attempts or self._server_clock is None:
                     raise
                 log.warning(
-                    "MEXC timestamp rejected on a read-only request; refreshing "
-                    "the server clock and retrying once"
+                    "MEXC timestamp rejected on a read-only request; refreshing the server clock and retrying once"
                 )
                 try:
                     self._server_clock.refresh(force=True)
@@ -463,16 +458,12 @@ class MexcSpotClient:
         assert last_timestamp_error is not None
         raise last_timestamp_error
 
-    def _acquire_bucket(
-        self, method: str, path: str, *, signed: bool, bucket: str
-    ) -> None:
+    def _acquire_bucket(self, method: str, path: str, *, signed: bool, bucket: str) -> None:
         if bucket == "order":
             # Official POST/DELETE order bucket: 12 requests/second per UID.
             self.order_gate.acquire(1)
             return
-        limit_kind, weight = ENDPOINT_RULES.get(
-            (method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT)
-        )
+        limit_kind, weight = ENDPOINT_RULES.get((method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT))
         try:
             if limit_kind == "uid":
                 self.uid_gate.acquire(weight)
@@ -485,8 +476,7 @@ class MexcSpotClient:
                     self.uid_gate.acquire(1)
         except ValueError as exc:
             raise MexcConfigError(
-                f"configured rate budget is too small for {method} {path} "
-                f"(weight {weight}): {exc}"
+                f"configured rate budget is too small for {method} {path} (weight {weight}): {exc}"
             ) from exc
 
     def _timestamp_for(self, *, is_write: bool) -> int:
@@ -508,9 +498,7 @@ class MexcSpotClient:
         if signed:
             recv_window = int(out_params.get("recvWindow", self.recv_window_ms))
             if not 1 <= recv_window <= MAX_RECV_WINDOW_MS:
-                raise MexcConfigError(
-                    f"recvWindow must be between 1 and {MAX_RECV_WINDOW_MS} ms"
-                )
+                raise MexcConfigError(f"recvWindow must be between 1 and {MAX_RECV_WINDOW_MS} ms")
             out_params["recvWindow"] = recv_window
             out_params["timestamp"] = self._timestamp_for(is_write=is_write)
 
@@ -548,9 +536,7 @@ class MexcSpotClient:
         if status != 200:
             if status in (403, 418, 429):
                 retry_after = self._retry_after(response_headers)
-                self._block_requests(
-                    retry_after if retry_after is not None else DEFAULT_WAF_BACKOFF_S
-                )
+                self._block_requests(retry_after if retry_after is not None else DEFAULT_WAF_BACKOFF_S)
             self._classify_and_raise(status, text, response_headers)
         if text and "json" not in content_type.lower() and not text.lstrip().startswith(("{", "[")):
             raise MexcUnexpectedResponse(f"unexpected content-type {content_type!r}")
@@ -560,16 +546,12 @@ class MexcSpotClient:
             raise MexcUnexpectedResponse("malformed JSON from MEXC") from exc
 
     def _sign(self, total_params: str) -> str:
-        digest = hmac.new(
-            self.api_secret.encode("utf-8"), total_params.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
+        digest = hmac.new(self.api_secret.encode("utf-8"), total_params.encode("utf-8"), hashlib.sha256).hexdigest()
         return digest.lower()
 
     def _require_credentials(self) -> None:
         if not self.api_key or not self.api_secret:
-            raise MexcConfigError(
-                "MEXC API key/secret missing; set MEXC_API_KEY/MEXC_API_SECRET in the private .env"
-            )
+            raise MexcConfigError("MEXC API key/secret missing; set MEXC_API_KEY/MEXC_API_SECRET in the private .env")
 
     # ------------------------------------------------------------- endpoints
 
@@ -621,9 +603,7 @@ class MexcSpotClient:
         return self.request("GET", "/api/v3/account", signed=True)
 
     def api_key_info(self) -> dict[str, Any]:
-        return self.request(
-            "GET", "/api/v3/apiKeyInfo", params={"accessKey": self.api_key}, signed=True
-        )
+        return self.request("GET", "/api/v3/apiKeyInfo", params={"accessKey": self.api_key}, signed=True)
 
     def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params = {"symbol": symbol} if symbol else {}
@@ -641,7 +621,9 @@ class MexcSpotClient:
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_credentials()
-        p: dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type}
+        if str(order_type).upper() != "LIMIT":
+            raise MexcConfigError("only LIMIT Spot orders are supported")
+        p: dict[str, Any] = {"symbol": symbol, "side": side, "type": "LIMIT"}
         if quantity is not None:
             p["quantity"] = _fmt(quantity)
         if quote_order_qty is not None:
@@ -666,7 +648,9 @@ class MexcSpotClient:
         """``POST /api/v3/order/test`` validates without reaching the matching engine."""
 
         self._require_credentials()
-        p: dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type}
+        if str(order_type).upper() != "LIMIT":
+            raise MexcConfigError("only LIMIT Spot orders are supported")
+        p: dict[str, Any] = {"symbol": symbol, "side": side, "type": "LIMIT"}
         if quantity is not None:
             p["quantity"] = _fmt(quantity)
         if quote_order_qty is not None:
@@ -731,9 +715,7 @@ class MexcSpotClient:
 
         if not 1 <= limit <= 5000:
             raise MexcConfigError("depth limit must be between 1 and 5000")
-        return self.request(
-            "GET", "/api/v3/depth", params={"symbol": symbol, "limit": limit}
-        )
+        return self.request("GET", "/api/v3/depth", params={"symbol": symbol, "limit": limit})
 
     def my_trades(
         self,

@@ -49,18 +49,17 @@ def test_fixed_usd_buy_quantizes_and_tracks_actual_notional():
     assert result.quote_amount == Decimal("10.0000")
 
 
-def test_market_buy_uses_quote_budget_not_a_synthetic_price():
-    result = apply_sizing(
-        side="buy",
-        decision=_decision(order_type="market", price=None),
-        meta=Meta(),
-        buy_quote_usd=10.0,
-        sell_pct_free=None,
-        free_base=None,
-        max_quote=Decimal("10"),
-    )
-    assert result.base_quantity is None
-    assert result.quote_amount == Decimal("10.0")
+def test_market_buy_cannot_be_sized():
+    with pytest.raises(SizingError, match="only LIMIT"):
+        apply_sizing(
+            side="buy",
+            decision=_decision(order_type="market", price=None),
+            meta=Meta(),
+            buy_quote_usd=10.0,
+            sell_pct_free=None,
+            free_base=None,
+            max_quote=Decimal("10"),
+        )
 
 
 def test_buy_has_no_arbitrary_cap_but_rejects_below_quantity_step():
@@ -129,11 +128,21 @@ def test_sell_rejects_invalid_percentage(pct):
 def test_sell_fails_closed_without_balance_or_metadata():
     with pytest.raises(SizingError, match="free base-asset balance"):
         apply_sizing(
-            side="sell", decision=_decision(), meta=Meta(), buy_quote_usd=None,
-            sell_pct_free=25.0, free_base=None, max_quote=Decimal("100"),
+            side="sell",
+            decision=_decision(),
+            meta=Meta(),
+            buy_quote_usd=None,
+            sell_pct_free=25.0,
+            free_base=None,
+            max_quote=Decimal("100"),
         )
     with pytest.raises(SizingError, match="symbol metadata"):
         apply_sizing(
-            side="sell", decision=_decision(), meta=None, buy_quote_usd=None,
-            sell_pct_free=25.0, free_base=Decimal("1"), max_quote=Decimal("100"),
+            side="sell",
+            decision=_decision(),
+            meta=None,
+            buy_quote_usd=None,
+            sell_pct_free=25.0,
+            free_base=Decimal("1"),
+            max_quote=Decimal("100"),
         )

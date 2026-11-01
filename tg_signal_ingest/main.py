@@ -90,7 +90,6 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 # One-time owner acknowledgement; required before the pipeline is constructed.
 # execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 # order_quote_amount = 3
-# order_type_policy = "limit"
 # Conditional LIMIT entry trigger distance (default exactly 3 ticks).
 # entry_trigger_offset_ticks = 3
 # recon_interval_s = 30
@@ -1094,7 +1093,6 @@ def cmd_trading_status(_args) -> int:
     )
     print(f"  order amount: {t.order_quote_amount:g} USDT (source: {t.order_quote_amount_source})")
     print("  risk gates: Spot BUY only; fixed owner quote; no symbol allowlist or order caps")
-    print(f"  order type policy: {t.order_type_policy}")
     print(f"  emergency_stop: {t.emergency_stop}")
     print(f"  MEXC credentials: {'set' if cfg.mexc.api_key and cfg.mexc.api_secret else 'missing'}")
     print(f"  intents by state: {counts or 'none'}")

@@ -114,8 +114,12 @@ def test_place_uses_verified_yes_flag_when_enabled():
         return completed(argv, stdout=json.dumps({"code": 0, "data": {"orderId": "ex-1"}}))
 
     adapter(runner, confirm_writes=True).place_order(
-        symbol="BTCUSDT", side="BUY", order_type="limit",
-        quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
+        symbol="BTCUSDT",
+        side="BUY",
+        order_type="limit",
+        quantity=Decimal("1"),
+        price=Decimal("1"),
+        client_order_id="id-1",
     )
     assert seen[0][1] == "--no-retry"
     assert seen[0][2] == "--yes"
@@ -130,8 +134,13 @@ def test_dry_run_sends_no_yes_and_no_request():
         return completed(argv, stdout=json.dumps({"method": "POST"}))
 
     result = adapter(runner, confirm_writes=True).place_order(
-        symbol="BTCUSDT", side="BUY", order_type="limit",
-        quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1", dry_run=True,
+        symbol="BTCUSDT",
+        side="BUY",
+        order_type="limit",
+        quantity=Decimal("1"),
+        price=Decimal("1"),
+        client_order_id="id-1",
+        dry_run=True,
     )
     assert result["dry_run"] is True
     assert "--dry-run" in seen[0]
@@ -143,56 +152,81 @@ def test_dry_run_sends_no_yes_and_no_request():
 def test_tp_sl_direction_is_validated_locally():
     with pytest.raises(MexcPrecisionError):
         adapter(lambda a, t: completed(a)).build_place_body(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("100"),
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
             take_profit_price=Decimal("90"),
         )
     with pytest.raises(MexcPrecisionError):
         adapter(lambda a, t: completed(a)).build_place_body(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("100"),
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
             stop_loss_price=Decimal("100"),
         )
 
 
-def test_market_orders_cannot_attach_tp_sl():
-    with pytest.raises(MexcConfigError):
+def test_market_orders_are_disabled_at_the_payload_boundary():
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
         adapter(lambda a, t: completed(a)).build_place_body(
-            symbol="BTCUSDT", side="BUY", order_type="market",
-            quantity=Decimal("1"), take_profit_price=Decimal("110"),
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="market",
+            quantity=Decimal("1"),
+            take_profit_price=Decimal("110"),
         )
 
 
-def test_market_requires_exactly_one_size_field():
-    with pytest.raises(MexcConfigError):
-        adapter(lambda a, t: completed(a)).place_market(
-            symbol="BTCUSDT", side="BUY", quantity=Decimal("1"),
-            quote_order_qty=Decimal("10"),
+def test_market_orders_are_disabled_at_the_cli_boundary():
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
+        adapter(lambda a, t: completed(a)).place_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="market",
+            quantity=Decimal("1"),
         )
 
 
 def test_client_order_id_is_validated():
     with pytest.raises(MexcConfigError):
         adapter(lambda a, t: completed(a)).place_order(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("1"), client_order_id="bad id!",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+            client_order_id="bad id!",
         )
 
 
 def test_duplicate_response_is_typed_for_reconciliation():
     def runner(argv, timeout):
         return completed(
-            argv, code=2,
-            stdout=json.dumps({"error": {
-                "type": "validation", "subtype": "duplicate",
-                "message": "duplicate clientOrderId",
-            }}),
+            argv,
+            code=2,
+            stdout=json.dumps(
+                {
+                    "error": {
+                        "type": "validation",
+                        "subtype": "duplicate",
+                        "message": "duplicate clientOrderId",
+                    }
+                }
+            ),
         )
 
     with pytest.raises(MexcDuplicateOrder):
         adapter(runner).place_order(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+            client_order_id="id-1",
         )
 
 
@@ -202,22 +236,39 @@ def test_unstructured_write_failure_is_uncertain_not_rejected():
 
     with pytest.raises(MexcNetworkError):
         adapter(runner).place_order(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+            client_order_id="id-1",
         )
 
 
 def test_client_order_id_collision_is_detected_without_the_word_duplicate():
     def runner(argv, timeout):
-        return completed(argv, code=2, stdout=json.dumps({"error": {
-            "type": "validation", "subtype": "invalid",
-            "message": "clientOrderId already exists for this account",
-        }}))
+        return completed(
+            argv,
+            code=2,
+            stdout=json.dumps(
+                {
+                    "error": {
+                        "type": "validation",
+                        "subtype": "invalid",
+                        "message": "clientOrderId already exists for this account",
+                    }
+                }
+            ),
+        )
 
     with pytest.raises(MexcDuplicateOrder):
         adapter(runner).place_order(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+            client_order_id="id-1",
         )
 
 
@@ -226,11 +277,17 @@ def test_missing_credentials_are_typed_and_redacted():
 
     def runner(argv, timeout):
         return completed(
-            argv, code=2,
-            stdout=json.dumps({"error": {
-                "type": "validation", "subtype": "failed_precondition",
-                "message": f"this operation requires API credentials {secret}",
-            }}),
+            argv,
+            code=2,
+            stdout=json.dumps(
+                {
+                    "error": {
+                        "type": "validation",
+                        "subtype": "failed_precondition",
+                        "message": f"this operation requires API credentials {secret}",
+                    }
+                }
+            ),
         )
 
     with pytest.raises(MexcAuthError) as caught:
@@ -244,14 +301,16 @@ def test_exchange_api_key_format_error_is_auth_not_server():
         return completed(
             argv,
             code=6,
-            stdout=json.dumps({
-                "error": {
-                    "type": "api",
-                    "subtype": "upstream_error",
-                    "message": "API-key format invalid",
-                    "code": 700001,
+            stdout=json.dumps(
+                {
+                    "error": {
+                        "type": "api",
+                        "subtype": "upstream_error",
+                        "message": "API-key format invalid",
+                        "code": 700001,
+                    }
                 }
-            }),
+            ),
         )
 
     with pytest.raises(MexcAuthError) as caught:
@@ -270,8 +329,12 @@ def test_write_without_confirmation_is_terminal_and_clear():
 
     with pytest.raises(MexcCliConfirmationRequired):
         adapter(runner).place_order(
-            symbol="BTCUSDT", side="BUY", order_type="limit",
-            quantity=Decimal("1"), price=Decimal("1"), client_order_id="id-1",
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="limit",
+            quantity=Decimal("1"),
+            price=Decimal("1"),
+            client_order_id="id-1",
         )
     assert len(calls) == 1
     assert "--no-retry" in calls[0]
@@ -281,15 +344,24 @@ def test_write_without_confirmation_is_terminal_and_clear():
 def test_verify_protection_only_claims_active_when_echoed():
     def echoed(argv, timeout):
         if "current-orders" in argv:
-            return completed(argv, stdout=json.dumps({
-                "code": 0,
-                "data": {"list": [{"orderId": "9", "orderType": "1", "state": "1"}]},
-            }))
-        return completed(argv, stdout=json.dumps({
-            "code": 0,
-            "data": {"orderId": "9", "state": "NEW",
-                     "profitTriggerPrice": "110", "loseTriggerPrice": "95"},
-        }))
+            return completed(
+                argv,
+                stdout=json.dumps(
+                    {
+                        "code": 0,
+                        "data": {"list": [{"orderId": "9", "orderType": "1", "state": "1"}]},
+                    }
+                ),
+            )
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "NEW", "profitTriggerPrice": "110", "loseTriggerPrice": "95"},
+                }
+            ),
+        )
 
     result = adapter(echoed).verify_protection(symbol="BTCUSDT", order_id="9")
     assert result["verified"] is True
@@ -297,12 +369,24 @@ def test_verify_protection_only_claims_active_when_echoed():
 
     def not_echoed(argv, timeout):
         if "current-orders" in argv:
-            return completed(argv, stdout=json.dumps({
-                "code": 0, "data": {"list": [{"orderId": "9", "orderType": "1"}]},
-            }))
-        return completed(argv, stdout=json.dumps({
-            "code": 0, "data": {"orderId": "9", "state": "NEW"},
-        }))
+            return completed(
+                argv,
+                stdout=json.dumps(
+                    {
+                        "code": 0,
+                        "data": {"list": [{"orderId": "9", "orderType": "1"}]},
+                    }
+                ),
+            )
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "NEW"},
+                }
+            ),
+        )
 
     result = adapter(not_echoed).verify_protection(symbol="BTCUSDT", order_id="9")
     assert result["verified"] is False
@@ -315,13 +399,24 @@ def test_find_by_client_id_checks_open_then_history():
         calls.append(list(argv))
         if "current-orders" in argv:
             return completed(argv, stdout=json.dumps({"code": 0, "data": {"list": []}}))
-        return completed(argv, stdout=json.dumps({
-            "code": 0,
-            "data": {"list": [{
-                "orderId": "77", "clientOrderId": "tsi-abc",
-                "state": "1", "orderType": "1",
-            }]},
-        }))
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {
+                                "orderId": "77",
+                                "clientOrderId": "tsi-abc",
+                                "state": "1",
+                                "orderType": "1",
+                            }
+                        ]
+                    },
+                }
+            ),
+        )
 
     found = adapter(runner).find_by_client_id("BTCUSDT", "tsi-abc")
     assert found["orderId"] == "77"
@@ -339,13 +434,18 @@ def test_query_order_retries_the_other_order_type_when_listing_is_gone():
         detail_calls.append(order_type)
         if order_type == "LIMIT_ORDER":
             return completed(
-                argv, stdout=json.dumps({"code": 500, "msg": "order does not exist"}),
+                argv,
+                stdout=json.dumps({"code": 500, "msg": "order does not exist"}),
             )
-        return completed(argv, stdout=json.dumps({
-            "code": 0,
-            "data": {"orderId": "9", "state": "FILLED", "orderType": "5",
-                     "executedQty": "2", "price": "50"},
-        }))
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "FILLED", "orderType": "5", "executedQty": "2", "price": "50"},
+                }
+            ),
+        )
 
     detail = adapter(runner).query_order(symbol="BTCUSDT", order_id="9")
     assert detail["orderId"] == "9"
@@ -359,16 +459,27 @@ def test_query_order_does_not_invent_an_order_type():
 
     def runner(argv, timeout):
         if "current-orders" in argv:
-            return completed(argv, stdout=json.dumps({
-                "code": 0,
-                "data": {"list": [{"orderId": "9", "orderType": "5", "state": "2"}]},
-            }))
+            return completed(
+                argv,
+                stdout=json.dumps(
+                    {
+                        "code": 0,
+                        "data": {"list": [{"orderId": "9", "orderType": "5", "state": "2"}]},
+                    }
+                ),
+            )
         if "history-orders" in argv:
             return completed(argv, stdout=json.dumps({"code": 0, "data": {"list": []}}))
         detail_calls.append(argv[argv.index("--orderType") + 1])
-        return completed(argv, stdout=json.dumps({
-            "code": 0, "data": {"orderId": "9", "state": "FILLED"},
-        }))
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "FILLED"},
+                }
+            ),
+        )
 
     detail = adapter(runner).query_order(symbol="BTCUSDT", order_id="9")
     assert detail_calls == ["MARKET_ORDER"]
@@ -383,17 +494,22 @@ def test_query_order_does_not_retry_a_credential_failure():
             return completed(argv, stdout=json.dumps({"code": 0, "data": {"list": []}}))
         detail_calls.append(list(argv))
         return completed(
-            argv, code=2,
-            stdout=json.dumps({"error": {
-                "type": "auth", "subtype": "unauthorized",
-                "message": "authentication failed for this profile",
-            }}),
+            argv,
+            code=2,
+            stdout=json.dumps(
+                {
+                    "error": {
+                        "type": "auth",
+                        "subtype": "unauthorized",
+                        "message": "authentication failed for this profile",
+                    }
+                }
+            ),
         )
 
     with pytest.raises(MexcAuthError):
         adapter(runner).query_order(symbol="BTCUSDT", order_id="9")
     assert len(detail_calls) == 1
-
 
 
 def test_profiles_lists_saved_names_without_selecting_a_profile():
@@ -468,12 +584,15 @@ def test_place_oco_sells_limit_leg_at_tp_and_stop_leg_at_exit_price():
         return completed(
             argv,
             stdout=json.dumps(
-                {"code": 0, "data": {
-                    "orderId": "oco-1",
-                    "state": "NEW",
-                    "triggerPrice": "0.1195",
-                    "triggerLimitPrice": "0.1190",
-                }}
+                {
+                    "code": 0,
+                    "data": {
+                        "orderId": "oco-1",
+                        "state": "NEW",
+                        "triggerPrice": "0.1195",
+                        "triggerLimitPrice": "0.1190",
+                    },
+                }
             ),
         )
 
@@ -511,20 +630,33 @@ def test_place_oco_sells_limit_leg_at_tp_and_stop_leg_at_exit_price():
 def test_place_oco_fails_closed_when_any_leg_price_missing():
     with pytest.raises((Exception,)):
         adapter(lambda a, t: completed(a)).place_oco(
-            symbol="APEUSDT", side="SELL", quantity=Decimal("1"),
-            price=Decimal("0.1227"), trigger_price=None, trigger_limit_price=Decimal("0.1190"),
+            symbol="APEUSDT",
+            side="SELL",
+            quantity=Decimal("1"),
+            price=Decimal("0.1227"),
+            trigger_price=None,
+            trigger_limit_price=Decimal("0.1190"),
         )
     with pytest.raises((Exception,)):
         adapter(lambda a, t: completed(a)).place_oco(
-            symbol="APEUSDT", side="SELL", quantity=Decimal("1"),
-            price=Decimal("0.1227"), trigger_price=Decimal("0.1195"), trigger_limit_price=None,
+            symbol="APEUSDT",
+            side="SELL",
+            quantity=Decimal("1"),
+            price=Decimal("0.1227"),
+            trigger_price=Decimal("0.1195"),
+            trigger_limit_price=None,
         )
 
 
 def test_normalize_oco_surfaces_trigger_fields_from_exchange():
     result = MexcCliAdapter(binary=sys.executable)._normalize_oco(
-        {"orderId": "oco-1", "state": "NEW", "triggerPrice": "0.1195",
-         "triggerLimitPrice": "0.1190", "executedQty": "0"},
+        {
+            "orderId": "oco-1",
+            "state": "NEW",
+            "triggerPrice": "0.1195",
+            "triggerLimitPrice": "0.1190",
+            "executedQty": "0",
+        },
         {},
     )
     assert result["triggerPrice"] == "0.1195"
@@ -534,14 +666,24 @@ def test_normalize_oco_surfaces_trigger_fields_from_exchange():
 def test_verify_protection_claims_active_only_when_trigger_echoed():
     def echoed(argv, timeout):
         if "current-orders" in argv:
-            return completed(argv, stdout=json.dumps({
-                "code": 0, "data": {"list": [{"orderId": "9", "orderType": "1", "state": "1"}]},
-            }))
-        return completed(argv, stdout=json.dumps({
-            "code": 0,
-            "data": {"orderId": "9", "state": "NEW",
-                     "triggerPrice": "0.1195", "triggerLimitPrice": "0.1190"},
-        }))
+            return completed(
+                argv,
+                stdout=json.dumps(
+                    {
+                        "code": 0,
+                        "data": {"list": [{"orderId": "9", "orderType": "1", "state": "1"}]},
+                    }
+                ),
+            )
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "NEW", "triggerPrice": "0.1195", "triggerLimitPrice": "0.1190"},
+                }
+            ),
+        )
 
     result = adapter(echoed).verify_protection(symbol="APEUSDT", order_id="9")
     assert result["verified"] is True
@@ -552,12 +694,24 @@ def test_verify_protection_claims_active_only_when_trigger_echoed():
 def test_verify_protection_unverified_when_trigger_missing():
     def silent(argv, timeout):
         if "current-orders" in argv:
-            return completed(argv, stdout=json.dumps({
-                "code": 0, "data": {"list": [{"orderId": "9", "orderType": "1"}]},
-            }))
-        return completed(argv, stdout=json.dumps({
-            "code": 0, "data": {"orderId": "9", "state": "NEW"},
-        }))
+            return completed(
+                argv,
+                stdout=json.dumps(
+                    {
+                        "code": 0,
+                        "data": {"list": [{"orderId": "9", "orderType": "1"}]},
+                    }
+                ),
+            )
+        return completed(
+            argv,
+            stdout=json.dumps(
+                {
+                    "code": 0,
+                    "data": {"orderId": "9", "state": "NEW"},
+                }
+            ),
+        )
 
     result = adapter(silent).verify_protection(symbol="APEUSDT", order_id="9")
     assert result["verified"] is False

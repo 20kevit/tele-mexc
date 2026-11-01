@@ -136,3 +136,41 @@ def test_test_order_is_officially_validation_only():
     assert url == "https://api.mexc.com/api/v3/order/test"
     assert method == "POST"
     assert b"symbol=MXUSDT" in body and json.loads(b"{}") == {}
+
+
+def test_rest_client_rejects_market_orders_before_transport():
+    class RecordingTransport:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("transport must not be reached for MARKET")
+
+    transport = RecordingTransport()
+    client = MexcSpotClient(
+        "k",
+        "s",
+        transport=transport,
+        clock=lambda: 1700000000000,
+        general_gate=WeightedRateGate(100, 1.0),
+        uid_gate=WeightedRateGate(100, 1.0),
+        order_gate=WeightedRateGate(100, 1.0),
+    )
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
+        client.place_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("0.1"),
+            price=None,
+        )
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
+        client.place_test_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("0.1"),
+            price=None,
+        )
+    assert transport.calls == []

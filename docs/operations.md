@@ -11,7 +11,7 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
   `order_quote_amount`.
 - No withdrawals, futures, leverage, short selling, symbol allowlist, or
   per-signal approval gate.
-- Entry orders are LIMIT. Conditional entry waits for price to cross the
+- Entry orders are LIMIT-only; MARKET is rejected at configuration, risk, REST, CLI, and payload boundaries. Conditional entry waits for price to cross the
   configured trigger; the default is exactly 3 exchange ticks below Entry and
   a missing offset resolves to 3, never direct entry.
 - `/pause` is enforced at the exchange-submission boundary; `/resume` rechecks

@@ -117,14 +117,14 @@ permission failures and require the key's Spot permissions to be corrected.
 ## Configuration (`[trading]` in `config/config.toml`)
 
 Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
-`TRADING_ORDER_QUOTE_AMOUNT`, `TRADING_AGGREGATE_BUDGET`,
+`TRADING_ORDER_QUOTE_AMOUNT`,
 `MEXC_CLI_BINARY`, `MEXC_CLI_PROFILE`.
 
 | Key | Default | Validation / meaning |
 | --- | --- | --- |
 | `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
 | `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
-| `order_type_policy` | `limit` | `limit` or `market`; explicit signal semantics still apply |
+| Order type | LIMIT only | `order_type_policy`, `TRADING_ORDER_TYPE_POLICY`, and MARKET execution are rejected |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
 | `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
 | `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
@@ -177,7 +177,7 @@ enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 - Futures/perpetual/margin/leverage wording makes the signal non-Spot and
   ambiguous.
 - Missing/unsafe entry, symbol, or required fields fail closed.
-- Explicit market signals are blocked when `order_type_policy = "limit"`.
+- A signal marked MARKET is converted to LIMIT only when it has a valid Entry price; otherwise it is rejected. MARKET orders are never submitted.
 - No OCR: media without usable caption text is not actionable.
 
 ## Risk and sizing
@@ -192,9 +192,9 @@ enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 - missing fixed quote amount;
 - unsupported symbol/order type, precision, min/max notional.
 
-Order type: an explicit signal type wins unless policy blocks it; otherwise an
-entry price implies LIMIT, and no entry price uses MARKET only when policy is
-`market`.
+Order type is always LIMIT. A MARKET signal is converted to LIMIT when an Entry
+price exists; without one it fails closed. Configuration cannot re-enable
+MARKET.
 
 Quantity is `order_quote_amount / price`, then quantized **down** to the symbol
 lot step and validated against `exchangeInfo` minimum/maximum and price guards.
@@ -509,8 +509,8 @@ conditional entry defers the entry intent until a price trigger.
 - **TP2:** second target; limit SELL of `tp2_allocation_pct_of_remaining` of what
   remains after TP1.
 - **Stop-loss:** parsed `sl_price`; one per trade. SL wins when SL and TP are
-  crossed in the same tick. It cancels entry remainder and open TPs, reconciles
-  fills, then market-sells the remaining bot-owned quantity.
+  crossed in the same tick. Protective exits use exchange-side OCO stop-limit
+  legs; no MARKET order is submitted.
 - **Partial fills:** tracked per order; partial SL remains `exit_pending` for
   reconciliation.
 - **Quantities:** quantized down; never exceeds acquired minus outstanding sells.

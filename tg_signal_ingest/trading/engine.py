@@ -1154,21 +1154,20 @@ class TradingEngine:
             return result
 
     def _order_payload(self, intent: dict[str, Any]) -> dict[str, Any]:
+        # Last-line defence at the payload boundary: MARKET must never reach
+        # REST or CLI.  Intent validation also rejects it earlier.
+        if str(intent.get("order_type") or "").lower() != "limit":
+            raise AccidentalOrderRiskError("only LIMIT Spot entry orders are allowed; MARKET is disabled")
         payload: dict[str, Any] = {
             "symbol": intent["symbol"],
             "side": intent["side"].upper(),
-            "order_type": intent["order_type"].upper(),
+            "order_type": "LIMIT",
             "client_order_id": intent["client_order_id"],
         }
         qty = Decimal(intent["base_quantity"]) if intent.get("base_quantity") else None
         price = Decimal(intent["limit_price"]) if intent.get("limit_price") else None
-        quote = Decimal(intent["quote_amount"]) if intent.get("quote_amount") else None
-        if intent["order_type"] == "market" and intent["side"] == "buy":
-            payload["quote_order_qty"] = quote
-        else:
-            payload["quantity"] = qty
-        if intent["order_type"] == "limit":
-            payload["price"] = price
+        payload["quantity"] = qty
+        payload["price"] = price
         return payload
 
     # -------------------------------------------------------- TP/SL protection
@@ -1294,6 +1293,12 @@ class TradingEngine:
             raise AccidentalOrderRiskError("Spot order blocked: execution acknowledgement is not configured")
         if self.client is None:
             raise AccidentalOrderRiskError("Spot order blocked: no MEXC client configured")
+
+        if str(intent.get("order_type") or "").lower() != "limit":
+            return self._reject_before_submit(
+                intent,
+                "MARKET orders are disabled; only LIMIT entry orders are allowed",
+            )
 
         intent_id = intent["intent_id"]
         # The trade manager persists a fail-closed block whenever any bot-owned
