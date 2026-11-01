@@ -28,6 +28,10 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     stored value was applied.
     """
 
+    # Signal validity is independent of the order amount, so it is applied even
+    # when an environment override owns the amount.
+    _apply_persisted_signal_validity(cfg, repo)
+
     source = str(getattr(cfg.trading, "order_quote_amount_source", ""))
     if source == "env":
         return False
@@ -54,7 +58,6 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     cfg.trading.order_quote_amount_source = "legacy database (buy_quote_usd)" if legacy else "database (Telegram menu)"
     cfg.trading.amount_configured = True
     log.info("applied persisted order amount %.8g USDT from the control database", value)
-    _apply_persisted_signal_validity(cfg, repo)
     return True
 
 

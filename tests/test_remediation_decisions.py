@@ -383,3 +383,13 @@ def test_manual_entry_cancel_closes_without_resubmission(cfg, repo) -> None:
     assert store.get_trade("trade-m")["trade_state"] == "closed"
     assert engine.place_calls == 0, "a manual cancel must never be resubmitted"
     assert any(key == "ENTRY_NOT_FILLED" for key in notified)
+
+
+def test_persisted_signal_validity_applies_even_with_an_env_amount(cfg, repo) -> None:
+    from tg_signal_ingest.trading.runtime import apply_persisted_trading_settings
+
+    store = TradingStore(repo.db, cfg.trading)
+    store.set_setting("signal_validity_hours", "6")
+    cfg.trading.order_quote_amount_source = "env"
+    apply_persisted_trading_settings(cfg, repo)
+    assert cfg.trading.signal_validity_s == 6 * 3600
