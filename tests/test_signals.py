@@ -8,9 +8,7 @@ from tg_signal_ingest.trading.parser import SignalParser
 
 
 def test_parses_plain_spot_alert_with_targets_and_stop():
-    parsed = SignalParser().parse(
-        "BUY BTCUSDT\nENTRY: 100\nTP1: 110\nTP2: 120\nSL: 95\nSIZE: $25"
-    )
+    parsed = SignalParser().parse("BUY BTCUSDT\nENTRY: 100\nTP1: 110\nTP2: 120\nSL: 95\nSIZE: $25")
     assert parsed.kind == "alert"
     assert parsed.action == "buy"
     assert parsed.symbol == "BTCUSDT"
@@ -75,9 +73,7 @@ def test_dollar_base_symbol_defaults_to_usdt_quote():
 
 
 def test_cancel_word_inside_commentary_does_not_cancel_a_buy():
-    parsed = SignalParser().parse(
-        "BUY BTCUSDT ENTRY 100 TP 120 SL 95. Price may close above resistance later."
-    )
+    parsed = SignalParser().parse("BUY BTCUSDT ENTRY 100 TP 120 SL 95. Price may close above resistance later.")
     assert parsed.kind == "alert"
     assert parsed.action == "buy"
 
@@ -88,7 +84,7 @@ def test_numeric_slash_range_is_not_a_symbol():
     assert parsed.symbol is None
 
 
-def test_direction_mapping_and_unsupported_futures_are_rejected():
+def test_direction_mapping_and_futures_terminology_is_ingested():
     parser = SignalParser()
     long_signal = parser.parse("LONG BTCUSDT ENTRY 100 TP 110 SL 95")
     assert long_signal.kind == "alert"
@@ -104,9 +100,9 @@ def test_direction_mapping_and_unsupported_futures_are_rejected():
         "SELL BTCUSDT FUTURES ENTRY 100 TP 90 SL 105",
     ):
         parsed = parser.parse(text)
-        assert parsed.kind == "ambiguous", text
-        assert not parsed.actionable
-        assert any("Futures" in reason for reason in parsed.reasons)
+        assert parsed.kind == "alert", text
+        assert parsed.actionable
+        assert not any("Futures" in reason for reason in parsed.reasons)
 
 
 def test_channel_long_template_maps_to_spot_buy():

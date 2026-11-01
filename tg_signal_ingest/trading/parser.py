@@ -21,13 +21,54 @@ from decimal import Decimal, InvalidOperation
 PARSER_VERSION = 2
 
 QUOTE_ASSETS = (
-    "USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "EUR", "TRY", "BRZ", "USD",
+    "USDT",
+    "USDC",
+    "FDUSD",
+    "BUSD",
+    "TUSD",
+    "DAI",
+    "BTC",
+    "ETH",
+    "EUR",
+    "TRY",
+    "BRZ",
+    "USD",
 )
 _NON_SYMBOL_WORDS = {
-    "BUY", "SELL", "LONG", "SHORT", "ENTRY", "TARGET", "TARGETS", "STOP", "LOSS", "PRICE",
-    "AMOUNT", "QUANTITY", "MARKET", "LIMIT", "SIGNAL", "UPDATE", "CANCEL", "CLOSE", "TAKE",
-    "PROFIT", "ALERT", "SPOT", "ORDER", "ZONE", "RANGE", "TP", "SL", "USD", "TIME", "DEPOSIT",
-    "LEV", "SUGGESTED", "MAX", "FULL",
+    "BUY",
+    "SELL",
+    "LONG",
+    "SHORT",
+    "ENTRY",
+    "TARGET",
+    "TARGETS",
+    "STOP",
+    "LOSS",
+    "PRICE",
+    "AMOUNT",
+    "QUANTITY",
+    "MARKET",
+    "LIMIT",
+    "SIGNAL",
+    "UPDATE",
+    "CANCEL",
+    "CLOSE",
+    "TAKE",
+    "PROFIT",
+    "ALERT",
+    "SPOT",
+    "ORDER",
+    "ZONE",
+    "RANGE",
+    "TP",
+    "SL",
+    "USD",
+    "TIME",
+    "DEPOSIT",
+    "LEV",
+    "SUGGESTED",
+    "MAX",
+    "FULL",
 }
 
 _NUM = r"(\d[\d,]*(?:\.\d+)?)"
@@ -48,10 +89,6 @@ _RESULT_RE = re.compile(
 )
 _BUY_RE = re.compile(r"\b(?:BUY|LONG)\b", re.I)
 _SELL_RE = re.compile(r"\b(?:SELL|SHORT)\b", re.I)
-_NON_SPOT_RE = re.compile(
-    r"\b(?:FUTURES?|PERPETUAL|PERP|MARGIN|LEVERAGED)\b|\bLEVERAGE\b|\b\d{1,3}(?:\.\d+)?\s*[Xx]\b",
-    re.I,
-)
 _ENTRY_RE = re.compile(
     rf"\b(?:ENTRY(?:\s*(?:PRICE|ZONE|RANGE|AT))?|BUY\s*(?:AT|@)|SELL\s*(?:AT|@)|"
     rf"ورود(?:\s*(?:در|با))?\s*(?:قیمت)?)\s*[:=]?\s*(?:{_RANGE}|{_PRICE})",
@@ -137,11 +174,7 @@ def _extract_symbol(text: str) -> str | None:
         return base + "USDT"
     for quote in sorted(QUOTE_ASSETS, key=len, reverse=True):
         m = re.search(rf"\b(?=[A-Z0-9]*[A-Z])([A-Z0-9]{{2,15}}){quote}\b", symbol_text)
-        if (
-            m
-            and m.group(0) not in _NON_SYMBOL_WORDS
-            and m.group(1) not in _NON_SYMBOL_WORDS
-        ):
+        if m and m.group(0) not in _NON_SYMBOL_WORDS and m.group(1) not in _NON_SYMBOL_WORDS:
             return m.group(1) + quote
     return None
 
@@ -205,8 +238,19 @@ class SignalParser:
 
         if not normalized:
             return ParsedSignal(
-                "info", None, None, None, None, None, (), None, None, None,
-                raw, normalized, fingerprint,
+                "info",
+                None,
+                None,
+                None,
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                raw,
+                normalized,
+                fingerprint,
             )
 
         cancel = bool(_CANCEL_RE.match(normalized))
@@ -217,19 +261,37 @@ class SignalParser:
 
         if cancel:
             return ParsedSignal(
-                "cancel", action, symbol, None, None, None, (), None, None, None,
-                raw, normalized, fingerprint,
+                "cancel",
+                action,
+                symbol,
+                None,
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                raw,
+                normalized,
+                fingerprint,
             )
 
         if result:
             return ParsedSignal(
-                "result", action, symbol, None, None, None, (), None, None, None,
-                raw, normalized, fingerprint,
+                "result",
+                action,
+                symbol,
+                None,
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                raw,
+                normalized,
+                fingerprint,
             )
-
-        non_spot = bool(_NON_SPOT_RE.search(normalized))
-        if non_spot:
-            reasons.append("unsupported Futures/perpetual/leveraged instruction (Spot BUY only)")
 
         entry, low, high = _extract_entry(normalized)
         targets = _extract_targets(normalized)
@@ -249,17 +311,52 @@ class SignalParser:
         if reasons:
             if action is None and symbol is None and not targets and stop is None:
                 return ParsedSignal(
-                    "info", None, None, entry, low, high, targets, stop, order_type, amount,
-                    raw, normalized, fingerprint, ("not an actionable signal",),
+                    "info",
+                    None,
+                    None,
+                    entry,
+                    low,
+                    high,
+                    targets,
+                    stop,
+                    order_type,
+                    amount,
+                    raw,
+                    normalized,
+                    fingerprint,
+                    ("not an actionable signal",),
                 )
             return ParsedSignal(
-                "ambiguous", action, symbol, entry, low, high, targets, stop, order_type, amount,
-                raw, normalized, fingerprint, tuple(reasons),
+                "ambiguous",
+                action,
+                symbol,
+                entry,
+                low,
+                high,
+                targets,
+                stop,
+                order_type,
+                amount,
+                raw,
+                normalized,
+                fingerprint,
+                tuple(reasons),
             )
 
         return ParsedSignal(
-            default_kind, action, symbol, entry, low, high, targets, stop, order_type, amount,
-            raw, normalized, fingerprint,
+            default_kind,
+            action,
+            symbol,
+            entry,
+            low,
+            high,
+            targets,
+            stop,
+            order_type,
+            amount,
+            raw,
+            normalized,
+            fingerprint,
         )
 
     @staticmethod

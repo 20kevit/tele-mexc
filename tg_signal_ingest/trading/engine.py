@@ -273,7 +273,7 @@ class TradingEngine:
             return None
 
         # A genuine BUY/SELL candidate that the parser could not turn into an
-        # executable alert (missing entry/symbol, Futures instruction, ...) is
+        # executable alert (missing entry/symbol or another invalid field) is
         # a local rejection and is reported to both recipients.
         if parsed.kind == "ambiguous":
             reason = "; ".join(parsed.reasons) or "ambiguous signal"
@@ -722,7 +722,7 @@ class TradingEngine:
 
         ``ambiguous`` is included when the parser detected a direction: those
         are real signals that failed local validation (missing entry/symbol,
-        unsupported Futures instruction, ...), not ordinary chatter.
+        missing/invalid fields, ...), not ordinary chatter.  Futures/leverage wording alone is not a rejection reason.
         """
 
         return parsed.kind in ("alert", "update", "ambiguous") and parsed.action in ("buy", "sell")

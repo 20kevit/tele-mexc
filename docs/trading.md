@@ -174,8 +174,10 @@ enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 | `ambiguous` | Direction detected but required fields/format are not safe |
 
 - LONG is treated as BUY; SHORT/SELL is retained but rejected by risk.
-- Futures/perpetual/margin/leverage wording makes the signal non-Spot and
-  ambiguous.
+- Futures/perpetual/margin/leverage wording is ingested but never enables
+  Futures execution.  A LONG signal with a Spot-compatible symbol and complete
+  Entry/SL/TP1/TP2 fields is executed as a Spot BUY; leverage/deposit text is
+  ignored for sizing.
 - Missing/unsafe entry, symbol, or required fields fail closed.
 - A signal marked MARKET is converted to LIMIT only when it has a valid Entry price; otherwise it is rejected. MARKET orders are never submitted.
 - No OCR: media without usable caption text is not actionable.
