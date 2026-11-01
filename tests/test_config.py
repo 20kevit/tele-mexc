@@ -31,9 +31,7 @@ def test_invalid_api_id_type(tmp_path: Path):
 
 
 def test_env_file_values_loaded(tmp_path: Path):
-    (tmp_path / ".env").write_text(
-        "# comment\nexport TELEGRAM_API_ID=999\nTELEGRAM_API_HASH=abc\n"
-    )
+    (tmp_path / ".env").write_text("# comment\nexport TELEGRAM_API_ID=999\nTELEGRAM_API_HASH=abc\n")
     cfg = load_config(root=tmp_path, environ={}, require_credentials=True)
     assert cfg.api_id == 999
     assert cfg.api_hash == "abc"
@@ -45,7 +43,7 @@ def test_toml_overrides(tmp_path: Path):
     (tmp_path / "config").mkdir(exist_ok=True)
     (tmp_path / "config" / "config.toml").write_text(
         'backfill_scope = "since"\nbackfill_since = "2025-01-01"\n'
-        '[options]\ndownload_media = true\nrecovery_sweep_size = 42\n'
+        "[options]\ndownload_media = true\nrecovery_sweep_size = 42\n"
     )
     cfg = load_config(root=tmp_path, environ={}, require_credentials=True)
     assert cfg.backfill_scope == "since"
@@ -56,9 +54,7 @@ def test_toml_overrides(tmp_path: Path):
 
 def test_session_path_env_overrides_toml(tmp_path: Path):
     (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "config.toml").write_text(
-        'session_path = "config/employer_session"\n'
-    )
+    (tmp_path / "config" / "config.toml").write_text('session_path = "config/employer_session"\n')
     cfg = load_config(
         root=tmp_path,
         environ={
@@ -73,9 +69,7 @@ def test_session_path_env_overrides_toml(tmp_path: Path):
 
 def test_session_path_toml_used_without_env_override(tmp_path: Path):
     (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "config.toml").write_text(
-        'session_path = "config/employer_session"\n'
-    )
+    (tmp_path / "config" / "config.toml").write_text('session_path = "config/employer_session"\n')
     cfg = load_config(
         root=tmp_path,
         environ={"TELEGRAM_API_ID": "1", "TELEGRAM_API_HASH": "h"},
@@ -134,7 +128,6 @@ def test_owner_and_developer_ids_are_separate_and_numeric(tmp_path: Path):
     assert cfg.control.owner_user_id == 111
     assert cfg.control.developer_user_id == 222
     assert cfg.control.configured is True
-    assert cfg.control.management_configured is True
 
     with pytest.raises(ConfigError, match="numeric"):
         load_config(

@@ -37,8 +37,6 @@ LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 
 @pytest.fixture()
 def env(cfg: AppConfig, repo: Repository):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = LIVE_TOKEN
     cfg.trading.entry_trigger_offset_ticks = 2
     store = TradeStore(repo.db, cfg.trading)
     client = FakeClient()
@@ -52,10 +50,18 @@ def env(cfg: AppConfig, repo: Repository):
 def _parsed(*, entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL) -> ParsedSignal:
     targets = tuple(v for v in (tp1, tp2) if v is not None)
     return ParsedSignal(
-        kind="alert", action="buy", symbol=SYMBOL,
-        entry_price=entry, entry_low_price=None, entry_high_price=None,
-        target_prices=targets, stop_loss=sl, order_type="limit",
-        amount_text=None, raw_text="buy", normalized_text="buy",
+        kind="alert",
+        action="buy",
+        symbol=SYMBOL,
+        entry_price=entry,
+        entry_low_price=None,
+        entry_high_price=None,
+        target_prices=targets,
+        stop_loss=sl,
+        order_type="limit",
+        amount_text=None,
+        raw_text="buy",
+        normalized_text="buy",
         fingerprint_sha256="abc",
     )
 
@@ -70,8 +76,7 @@ def _insert_signal(store: TradeStore, signal_id: str) -> None:
         )
 
 
-def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
-                   client_order_id: str = "tsi-1") -> dict:
+def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1", client_order_id: str = "tsi-1") -> dict:
     _insert_signal(store, signal_id)
     iid = f"intent-{client_order_id}"
     with store.db.transaction() as conn:
@@ -81,8 +86,24 @@ def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
              order_type, quote_amount, base_quantity, limit_price, mode, state,
              create_msg_id, create_channel_id, planned_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (iid, signal_id, f"idem-{client_order_id}", client_order_id, SYMBOL, "buy",
-             "limit", "10", "0.1", str(ENTRY), "live", "planned", 1, 100, "now", "now"),
+            (
+                iid,
+                signal_id,
+                f"idem-{client_order_id}",
+                client_order_id,
+                SYMBOL,
+                "buy",
+                "limit",
+                "10",
+                "0.1",
+                str(ENTRY),
+                "live",
+                "planned",
+                1,
+                100,
+                "now",
+                "now",
+            ),
         )
     return store.get_intent(iid)
 
@@ -99,10 +120,18 @@ def _setup_filled_trade(env, *, fill_qty: Decimal = Decimal("0.1")):
     tm.on_intent_executed(intent)
     client.fill_order(intent["exchange_order_id"], fill_qty, fill_qty * ENTRY, ENTRY)
     store.add_fill(
-        exchange_order_id=intent["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(ENTRY), "qty": str(fill_qty),
-             "quoteQty": str(fill_qty * ENTRY), "commission": "0",
-             "commissionAsset": "USDT", "isBuyer": 1, "isMaker": 0, "time": 1},
+        exchange_order_id=intent["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(ENTRY),
+            "qty": str(fill_qty),
+            "quoteQty": str(fill_qty * ENTRY),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 1,
+            "isMaker": 0,
+            "time": 1,
+        },
     )
     tm._reconcile_entry_fills(store.get_trade(decision.trade["trade_id"]))
     return store.get_trade(decision.trade["trade_id"])
@@ -112,9 +141,7 @@ def test_live_buy_without_stop_loss_is_rejected_before_submission(env):
     cfg, store, engine, client, notifier, tm = env
     intent = _insert_intent(store, client_order_id="no-sl")
 
-    decision = tm.on_intent_planned(
-        intent, _parsed(sl=None), reference_price=Decimal("100")
-    )
+    decision = tm.on_intent_planned(intent, _parsed(sl=None), reference_price=Decimal("100"))
 
     assert decision.rejected is True
     assert decision.trade is None
@@ -174,11 +201,11 @@ def test_buy_block_clears_only_when_no_unsold_quantity_remains(env, monkeypatch)
     assert store.buy_block_reason() is not None
 
     # Record a fully filled stop-loss sale of the remaining base quantity.
-    order = tm._create_trade_order(
-        trade, "stop_loss", Decimal("0.1"), None, order_type="MARKET"
-    )
+    order = tm._create_trade_order(trade, "stop_loss", Decimal("0.1"), None, order_type="MARKET")
     store.transition_trade_order(
-        order["trade_order_id"], "filled", sold_qty=Decimal("0.1"),
+        order["trade_order_id"],
+        "filled",
+        sold_qty=Decimal("0.1"),
         exchange_order_id="sl-1",
     )
     tm._refresh_buy_block()
@@ -201,9 +228,7 @@ def test_restart_rebuilds_block_then_restores_protection(env, monkeypatch):
     # Simulate a stale cleared flag: restart must rebuild the block from
     # durable trade state before/after reconciliation.
     store.set_buy_block(None)
-    tm2 = TradeManager(
-        cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier()
-    )
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     assert store.get_trade(trade["trade_id"])["trade_state"] == UNPROTECTED_CRITICAL
     assert store.buy_block_reason() is not None

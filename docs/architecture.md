@@ -10,10 +10,9 @@ Telegram (MTProto, direct TLS)
         │  live events / backfill / recovery
         ▼
   ingest service ──► SQLite archive ──► processing queue ──► trading pipeline
-        │                 │                                      │
-        │                 └── offline analysis (manual)          ▼
-        │                                                MEXC Spot v3 REST
-        └── notification Bot API ──► owner/developer      (sim/testonly/live)
+        │                 │                                      ▼
+        │                 └── historical archive          MEXC Spot v3 REST
+        └── notification Bot API ──► owner/developer      (automatic MEXC Spot)
 ```
 
 One Telegram account and one selected channel. SQLite is the only durable
@@ -23,40 +22,42 @@ store. There is no HTTP server and no inbound network listener.
 
 | Entry point | What runs | Locks |
 | --- | --- | --- |
-| `tg-ingest serve` | Telegram ingestion, backfill, queue consumer, trading engine, notifications, live reconciliation/monitor | `<db>.serve.lock` |
-| `tg-ingest manage run` | Two-operator management bot; data-only, bounded validation | `<db>.serve.lock` + `<db>.control.lock` |
-| `tg-ingest control run` | Legacy owner controller only; no ingestion worker | `<db>.control.lock` |
-| `tg-ingest analyze ...` | Offline analysis of stored messages | none |
+| `tg-ingest serve` | Telegram ingestion, backfill, queue consumer, trading engine, notifications, reconciliation/monitor, and — when `cfg.control.enabled` — the ControlBot task | `<db>.serve.lock` and, when control is enabled, `<db>.control.lock` |
+| `tg-ingest control run` | Standalone owner/developer controller; no ingestion, backfill, queue, or trading worker | `<db>.control.lock` |
 | Other CLI commands | Short-lived DB/network checks | none |
 
 Locks use kernel `flock`; they are released automatically on process exit or
-crash. Control and management use the same Bot API token, so do not run them
-concurrently.
+crash. `serve` and `control run` must not target the same database at the same
+time because both may own the control lock.
 
 ## `serve` startup sequence
 
 Implemented in `tg_signal_ingest/service.py`.
 
-1. Acquire the serve lock; load config; open and migrate SQLite.
+1. Acquire the serve lock; when control is enabled, also acquire the control
+   lock. Load config; open and migrate SQLite.
 2. Build the trading engine and notification outbox.
 3. Connect to Telegram directly, verify the saved session, resolve the selected
    channel.
 4. Requeue queue items left in `processing` by a crashed run.
-5. Snapshot the selected channel's newest already-stored message id, before
+5. Mark runtime Telegram/MEXC/channel readiness for the submission gate.
+6. Snapshot the selected channel's newest already-stored message id, before
    live handlers are attached.
-6. Persist/advance the tradeable activation boundary to that snapshot (forward
+7. Persist/advance the tradeable activation boundary to that snapshot (forward
    only), still before handlers are attached. A message delivered after the
    snapshot stays above the boundary.
-7. Attach live new-message, edit, and delete handlers.
-8. If a previous watermark exists, sweep the id gap for messages posted while
+8. Attach live new-message, edit, and delete handlers.
+9. If a previous watermark exists, sweep the id gap for messages posted while
    offline; those rows are `source='recovery'` and non-tradeable; refresh the
    recent window to catch edits.
-9. Start background workers:
+10. Start background workers:
    - history import if `not_started` or `in_progress`;
    - processing-queue consumer;
-   - durable notification flusher when a Bot API client and recipients exist;
-   - in `live` mode only: reconciliation sweep and market monitor.
-10. Wait for SIGINT/SIGTERM or a Telegram disconnect.
+   - reconciliation sweep;
+   - market monitor when a `TradeManager` exists;
+   - the ControlBot task when `serve` was started with control enabled.
+11. Wait for SIGINT/SIGTERM or a Telegram disconnect. Shutdown cancels and awaits
+    queue, backfill, reconciliation, monitor, tick, and control tasks.
 
 On disconnect, the service rebuilds the Telegram client and reconnects with
 bounded exponential backoff plus jitter. FloodWait always wins: the process
@@ -86,8 +87,7 @@ and audited, never fed to the processing/trading path.
 **Backfill** (`tg_signal_ingest/backfill.py`) pages from newest to oldest using
 `backfill_next_max_id`, with `backfill_scope` = `full` or `since`. Each page
 commits messages and a checkpoint. A resumed run continues from the checkpoint;
-a completed run is a no-op. The management bot has a separate, bounded,
-data-only ingestion worker that never touches the processing queue.
+a completed run is a no-op.
 
 **Live gap recovery** walks message ids above `live_last_seen_message_id` in
 `recovery_sweep_size` pages and advances the watermark. `refresh_recent_window`
@@ -117,11 +117,12 @@ raw message text
   → signals row
   → replay/activation-boundary guard
   → RiskManager (BUY only, fixed quote amount, symbol constraints)
-  → order_intents row + atomic budget reservation
-  → sim / testonly / live execution
+  → order_intents row + atomic technical reservation
+  → submission gate (pause + readiness)
+  → LIMIT-only MEXC Spot execution
   → exchange_orders, order_status_history, order_fills
   → reconciliation and durable notifications
-  → optional TradeManager lifecycle (conditional entry, TP1/TP2, SL)
+  → TradeManager lifecycle (conditional entry, TP1/TP2, native OCO SL)
 ```
 
 Key ordering guarantees:
@@ -152,8 +153,8 @@ stdlib `urllib` in a worker thread. It provides:
 
 No withdrawals, futures, leverage, or undocumented endpoints are implemented.
 
-Live **write** operations (place/cancel/query and native OCO exits)
-additionally use the official `@mexc-ai/cli` through `mexc/cli.py`.
+Live **write** operations (place, cancel, and native OCO exits) additionally
+use the official `@mexc-ai/cli` through `mexc/cli.py`; reads stay on REST.
 `mexc/hybrid.py` keeps reads on REST and writes on the CLI; the reason for the
 split and its fail-closed rules are in `docs/trading.md`. The adapter never
 receives API keys: it uses the CLI's own encrypted profile.
@@ -165,17 +166,18 @@ lock. Exchange uncertainty is a first-class state, not an exception to retry:
 `unknown_requires_reconciliation` and `fill_sync_required` keep the record
 visible until reconciliation resolves it. See `docs/data-model.md`.
 
-## Legacy and adjacent components
+## Control-bot lifecycle
 
-- `control/` is a legacy owner controller plus the shared Bot API client. It is
-  not embedded in `serve`: `main.py` does not pass a control bot to
-  `IngestService`, and the production service uses only
-  `control.bot_api.BotApiClient` for notifications. (The service constructor
-  still accepts an optional `control_bot` for tests/embedding.)
-- `management/` is the current two-operator channel/preview/validation bot. It
-  does not instantiate the trading engine, MEXC client, or processing queue.
-- `analysis/` is a separate offline parser and review pipeline. It does not
-  contact Telegram/MEXC and is not wired into `serve`.
+- `control/` contains the owner/developer controller, setup store, and Bot API
+  client.
+- `cmd_serve` builds the ControlBot when `cfg.control.enabled` is true, acquires
+  both locks, and passes it to `IngestService`. The service runs
+  `ControlBot.run()` as an asyncio task and attaches the same trading engine, so
+  menu settings and pause/resume affect the live engine.
+- `control run` builds the same bot without ingestion/backfill/queue/trading
+  workers and acquires only the control lock.
+- If control is disabled, the service still reuses only
+  `control.bot_api.BotApiClient` for durable trading notifications.
 
 ## Trade-lifecycle wiring
 

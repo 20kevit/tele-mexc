@@ -40,6 +40,11 @@ MEXC_BASE_URL_ENV = "MEXC_BASE_URL"
 # Live trading always requires an explicit, separate user enablement step.
 DEFAULT_MEXC_BASE_URL = "https://api.mexc.com"  # verified against official docs
 
+# One-time owner acknowledgement required before the automatic Spot pipeline
+# can be constructed.  It is not a per-order approval and it does not select a
+# product mode; the product has exactly one execution behaviour.
+EXECUTION_ACKNOWLEDGEMENT = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+
 
 class ConfigError(Exception):
     """Configuration is missing or invalid; message is safe to display."""
@@ -62,7 +67,7 @@ class MexcConfig:
     cli_profile: str | None = None
     cli_timeout_s: float = 5.0
     cli_min_version: str = "0.0.22"
-    cli_confirm_noninteractive_writes: bool = False
+    cli_confirm_noninteractive_writes: bool = True
 
 
 @dataclass
@@ -70,33 +75,22 @@ class TradingConfig:
     """All financial limits are user-configurable; defaults are conservative
     software placeholders only (documented as such, not sanctioned values)."""
 
-    mode: str = "sim"  # "sim" | "testonly" | "live"; "live" never auto-enabled
-    live_enabled_token: str | None = None  # must equal config.mexc_live_i_understand to arm live
-    max_quote_per_order: float = 10.0
-    daily_max_orders: int = 2
-    max_open_orders: int = 2
-    max_signal_age_s: float = 900.0  # reject signals older than this
-    max_price_deviation_pct: float = 1.0  # vs reference price at decision time
-    # Owner-confirmed invariants — hard requirements, not configurable.
-    # SL, TP1, TP2 and SL < Entry < TP1 <= TP2 are mandatory and cannot be
-    # disabled via TOML or environment. These fields are intentionally absent
-    # from configuration to prevent bypass.
-    order_type_policy: str = "limit"  # "limit" | "market"; market requires explicit config
-    remaining_balance_reserve_pct: float = 20.0  # reserve when spending an asset
+    # Owner acknowledgement.  Absence leaves the pipeline unbuildable (fail
+    # closed); it never falls back to a simulated or test-only execution path.
+    execution_acknowledgement: str | None = None
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
     balance_max_age_s: float = 5.0  # reject account snapshots older than this
     recon_interval_s: float = 30.0
     emergency_stop: bool = False  # app_state runtime flag; config initial value
-    fake_price_for_tests: bool = False
     # Fixed per-order quote amount (owner-approved, never inferred from signal text).
     order_quote_amount: float = 3.0
     order_quote_amount_source: str = "default (3 USDT)"
     amount_configured: bool = True
-    # Cumulative test/live budget reference (USDT). Configurable; no hard ceiling.
-    aggregate_budget_quote: float = 50.0
-    # Conditional entry: when set to an int >= 1, trades wait for an upward price
-    # trigger before submission. None or 0 disables conditional entry.
-    entry_trigger_offset_ticks: int | None = None
+    # Conditional LIMIT entry: wait for price to cross this many ticks below
+    # the signal Entry reference. The canonical strategy default is exactly 3.
+    # It remains configurable, but it cannot be disabled or turned into a
+    # silent direct-entry fallback.
+    entry_trigger_offset_ticks: int = 3
     entry_trigger_stale_threshold_s: float = 60.0
     # Take-profit allocation percentages.
     tp1_allocation_pct_of_acquired: float = 50.0
@@ -114,9 +108,22 @@ class TradingConfig:
     monitor_backoff_base_s: float = 1.0
 
     @property
+    def effective_entry_trigger_offset_ticks(self) -> int:
+        """Resolve the canonical trigger offset, treating legacy unset as 3.
+
+        Explicit invalid values are left visible so execution can fail closed
+        instead of silently falling back to direct entry.
+        """
+
+        value = self.entry_trigger_offset_ticks
+        if value is None:  # legacy/directly constructed configuration
+            return 3
+        return value
+
+    @property
     def conditional_entry_enabled(self) -> bool:
-        """Conditional entry is active when a positive trigger offset is configured."""
-        return self.entry_trigger_offset_ticks is not None and self.entry_trigger_offset_ticks >= 1
+        """Conditional entry is always the strategy; invalid offsets fail later."""
+        return self.effective_entry_trigger_offset_ticks >= 1
 
     @property
     def stop_loss_trigger_enabled(self) -> bool:
@@ -125,14 +132,7 @@ class TradingConfig:
 
     def as_dict_public(self) -> dict[str, object]:
         return {
-            "mode": self.mode,
-            "max_quote_per_order": self.max_quote_per_order,
-            "daily_max_orders": self.daily_max_orders,
-            "max_open_orders": self.max_open_orders,
-            "max_signal_age_s": self.max_signal_age_s,
-            "max_price_deviation_pct": self.max_price_deviation_pct,
-            "order_type_policy": self.order_type_policy,
-            "remaining_balance_reserve_pct": self.remaining_balance_reserve_pct,
+            "execution_acknowledged": self.execution_acknowledgement == EXECUTION_ACKNOWLEDGEMENT,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
             "balance_max_age_s": self.balance_max_age_s,
             "recon_interval_s": self.recon_interval_s,
@@ -140,8 +140,7 @@ class TradingConfig:
             "order_quote_amount": self.order_quote_amount,
             "order_quote_amount_source": self.order_quote_amount_source,
             "amount_configured": self.amount_configured,
-            "aggregate_budget_quote": self.aggregate_budget_quote,
-            "entry_trigger_offset_ticks": self.entry_trigger_offset_ticks,
+            "entry_trigger_offset_ticks": self.effective_entry_trigger_offset_ticks,
             "entry_trigger_stale_threshold_s": self.entry_trigger_stale_threshold_s,
             "tp1_allocation_pct_of_acquired": self.tp1_allocation_pct_of_acquired,
             "tp2_allocation_pct_of_remaining": self.tp2_allocation_pct_of_remaining,
@@ -174,12 +173,6 @@ class ControlConfig:
     @property
     def configured(self) -> bool:
         return bool(self.bot_token and self.owner_user_id)
-
-    @property
-    def management_configured(self) -> bool:
-        """The two-operator management bot needs both explicit numeric IDs."""
-
-        return bool(self.bot_token and self.owner_user_id and self.developer_user_id)
 
 
 @dataclass
@@ -421,67 +414,69 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
     cli_confirm_present = "confirm_noninteractive_writes" in cli_raw
     cli_confirm = cli_raw.get("confirm_noninteractive_writes")
     if cli_confirm is not None and not isinstance(cli_confirm, bool):
-        raise ConfigError(
-            "mexc_cli.confirm_noninteractive_writes must be true or false."
-        )
+        raise ConfigError("mexc_cli.confirm_noninteractive_writes must be true or false.")
     if isinstance(cli_confirm, bool):
         m.cli_confirm_noninteractive_writes = cli_confirm
 
     trading_toml = toml.get("trading", {})
     tr_raw: dict[str, object] = dict(trading_toml) if isinstance(trading_toml, dict) else {}
-    env_mode = env.get("TRADING_MODE")
-    if env_mode:
-        tr_raw["mode"] = env_mode
 
+    # The product has one execution behaviour.  Legacy mode selectors must not
+    # silently change it: a stale "sim" config would otherwise look safe while
+    # the completed pipeline executes real Spot orders.
+    legacy_policy = tr_raw.get("order_type_policy") or env.get("TRADING_ORDER_TYPE_POLICY")
+    if legacy_policy not in (None, ""):
+        raise ConfigError(
+            "order_type_policy is no longer supported: only LIMIT entry orders are "
+            "allowed. Remove order_type_policy/TRADING_ORDER_TYPE_POLICY."
+        )
+
+    legacy_mode = tr_raw.get("mode") or env.get("TRADING_MODE")
+    if legacy_mode not in (None, ""):
+        raise ConfigError(
+            "trading.mode is no longer supported: the pipeline has one MEXC Spot "
+            "execution behaviour. Remove mode/TRADING_MODE from the configuration."
+        )
     t = cfg.trading
-    mode = tr_raw.get("mode")
-    if isinstance(mode, str) and mode:
-        mode = mode.strip().lower()
-        if mode not in ("sim", "testonly", "live"):
-            raise ConfigError("trading.mode must be 'sim', 'testonly' or 'live'.")
-        t.mode = mode
-    token = _optional_env(env, tr_raw, "TRADING_LIVE_TOKEN", "live_enabled_token")
-    if token:
-        t.live_enabled_token = token
+    legacy_token = tr_raw.get("live_enabled_token") or env.get("TRADING_LIVE_TOKEN")
+    if legacy_token not in (None, ""):
+        raise ConfigError(
+            "trading.live_enabled_token is no longer supported. Remove it and set "
+            "execution_acknowledgement (or TRADING_EXECUTION_ACKNOWLEDGEMENT) instead."
+        )
+    acknowledgement = _optional_env(env, tr_raw, "TRADING_EXECUTION_ACKNOWLEDGEMENT", "execution_acknowledgement")
+    if acknowledgement:
+        t.execution_acknowledgement = acknowledgement.strip()
 
-    if t.mode == "live" and t.live_enabled_token != "I_UNDERSTAND_REAL_MONEY_AND_RISKS":
-        raise ConfigError(
-            "trading.mode = 'live' refuses to start without live_enabled_token = "
-            "'I_UNDERSTAND_REAL_MONEY_AND_RISKS' in [trading] config.toml (fail closed)."
-        )
-    if t.mode == "live" and not m.cli_enabled:
-        raise ConfigError(
-            "trading.mode = 'live' requires [mexc_cli] enabled = true in config.toml "
-            "(the MEXC CLI backend is required for live Spot writes)."
-        )
-    if t.mode == "live" and not cli_confirm_present:
-        # A service cannot answer the CLI's terminal prompt.  The explicit live
-        # token above is the owner's authorization; without this default every
-        # live signal would be rejected locally after validation.  An explicit
-        # false is still honored as a fail-closed operator override.
+    # These controls belonged to the removed product-mode split or to the old
+    # allowlist.  Silently ignoring them would change financial behaviour, so
+    # an old configuration fails closed until the operator removes them.
+    for obsolete in (
+        "max_quote_per_order",
+        "daily_max_orders",
+        "max_open_orders",
+        "max_signal_age_s",
+        "max_price_deviation_pct",
+        "order_type_policy",
+        "aggregate_budget_quote",
+        "remaining_balance_reserve_pct",
+        "fake_price_for_tests",
+        "allowed_symbols",
+        "allowlist_mode",
+    ):
+        if obsolete in tr_raw:
+            raise ConfigError(
+                f"trading.{obsolete} is no longer supported. Remove it; the product "
+                "uses one fixed order_quote_amount, no symbol allowlist, and no "
+                "daily/open-order caps."
+            )
+
+    if not cli_confirm_present:
+        # Automatic execution is the product behaviour.  A service cannot
+        # answer the CLI's terminal prompt, so the one-time acknowledgement
+        # authorizes non-interactive writes.  An explicit false remains a
+        # fail-closed operator override.
         m.cli_confirm_noninteractive_writes = True
-
-    positive_specs = (
-        ("max_quote_per_order", float),
-        ("max_open_orders", int),
-        ("daily_max_orders", int),
-        ("max_signal_age_s", float),
-        ("max_price_deviation_pct", float),
-    )
-    for name, cast in positive_specs:
-        val = tr_raw.get(name)
-        if val is None or val == "":
-            continue
-        if (
-            not isinstance(val, (int, float))
-            or isinstance(val, bool)
-            or not math.isfinite(float(val))
-            or float(val) <= 0
-        ):
-            raise ConfigError(f"trading.{name} must be a positive finite number.")
-        if cast is int and not float(val).is_integer():
-            raise ConfigError(f"trading.{name} must be a whole number.")
-        setattr(t, name, cast(val))
 
     # Mandatory invariants cannot be disabled via configuration.
     for forbidden in ("require_stop_loss", "require_tp1", "require_tp2", "enforce_price_relationship"):
@@ -491,24 +486,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
                 "SL < Entry < TP1 <= TP2 are hard mandatory invariants per owner-confirmed strategy. "
                 "Remove this key from config.toml."
             )
-
-    policy = tr_raw.get("order_type_policy")
-    if isinstance(policy, str) and policy:
-        policy = policy.strip().lower()
-        if policy not in ("limit", "market"):
-            raise ConfigError("trading.order_type_policy must be 'limit' or 'market'.")
-        t.order_type_policy = policy
-
-    reserve = tr_raw.get("remaining_balance_reserve_pct")
-    if reserve not in (None, ""):
-        if (
-            not isinstance(reserve, (int, float))
-            or isinstance(reserve, bool)
-            or not math.isfinite(float(reserve))
-            or not 0 <= float(reserve) < 100
-        ):
-            raise ConfigError("trading.remaining_balance_reserve_pct must be between 0 and 100.")
-        t.remaining_balance_reserve_pct = float(reserve)
 
     fee_buffer = tr_raw.get("balance_fee_buffer_pct")
     if fee_buffer not in (None, ""):
@@ -549,7 +526,7 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
 
     # ---- order_quote_amount (fixed per-order quote, owner-approved) ----
     # Precedence: env TRADING_ORDER_QUOTE_AMOUNT > TOML order_quote_amount
-    #             > TOML legacy max_quote_per_order > built-in default 3.0.
+    #             > built-in default 3.0.
     order_amount_env = env.get("TRADING_ORDER_QUOTE_AMOUNT")
     order_amount_val = None
     order_amount_source = None
@@ -567,14 +544,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
             except (TypeError, ValueError) as exc:
                 raise ConfigError("trading.order_quote_amount must be a finite number.") from exc
             order_amount_source = "config"
-        else:
-            legacy = tr_raw.get("max_quote_per_order")
-            if legacy not in (None, ""):
-                try:
-                    order_amount_val = float(str(legacy))
-                except (TypeError, ValueError) as exc:
-                    raise ConfigError("trading.max_quote_per_order must be a finite number.") from exc
-                order_amount_source = "legacy max_quote_per_order"
 
     if order_amount_val is not None:
         if (
@@ -593,27 +562,11 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         t.order_quote_amount_source = "default (3 USDT)"
         t.amount_configured = True
 
-    # ---- aggregate_budget_quote (cumulative budget reference) ----
-    budget_val = tr_raw.get("aggregate_budget_quote")
-    if budget_val not in (None, ""):
-        if (
-            not isinstance(budget_val, (int, float))
-            or isinstance(budget_val, bool)
-            or not math.isfinite(float(budget_val))
-            or float(budget_val) <= 0
-        ):
-            raise ConfigError("trading.aggregate_budget_quote must be a positive finite number.")
-        t.aggregate_budget_quote = float(budget_val)
-
     # ---- conditional entry trigger offset ----
     offset_val = tr_raw.get("entry_trigger_offset_ticks")
     if offset_val not in (None, ""):
-        if (
-            not isinstance(offset_val, int)
-            or isinstance(offset_val, bool)
-            or offset_val < 0
-        ):
-            raise ConfigError("trading.entry_trigger_offset_ticks must be a whole number >= 0.")
+        if not isinstance(offset_val, int) or isinstance(offset_val, bool) or offset_val < 1:
+            raise ConfigError("trading.entry_trigger_offset_ticks must be a whole number >= 1.")
         t.entry_trigger_offset_ticks = int(offset_val)
 
     stale_val = tr_raw.get("entry_trigger_stale_threshold_s")
@@ -651,11 +604,7 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
 
     sl_retries_val = tr_raw.get("stop_loss_max_retries")
     if sl_retries_val not in (None, ""):
-        if (
-            not isinstance(sl_retries_val, int)
-            or isinstance(sl_retries_val, bool)
-            or sl_retries_val < 1
-        ):
+        if not isinstance(sl_retries_val, int) or isinstance(sl_retries_val, bool) or sl_retries_val < 1:
             raise ConfigError("trading.stop_loss_max_retries must be a whole number >= 1.")
         t.stop_loss_max_retries = int(sl_retries_val)
 
@@ -666,9 +615,7 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
             or isinstance(sl_trigger_offset_val, bool)
             or sl_trigger_offset_val < 0
         ):
-            raise ConfigError(
-                "trading.stop_loss_trigger_offset_ticks must be a whole number >= 0."
-            )
+            raise ConfigError("trading.stop_loss_trigger_offset_ticks must be a whole number >= 0.")
         t.stop_loss_trigger_offset_ticks = int(sl_trigger_offset_val)
 
     poll_val = tr_raw.get("monitor_poll_interval_s")
@@ -715,9 +662,7 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
     c.bot_token = str(token).strip() if token else None
     c.secret_key = str(secret) if secret else None
     if c.bot_token and ":" not in c.bot_token:
-        raise ConfigError(
-            "CONTROL_BOT_TOKEN is malformed; expected the token issued by @BotFather (number:value)."
-        )
+        raise ConfigError("CONTROL_BOT_TOKEN is malformed; expected the token issued by @BotFather (number:value).")
     if c.secret_key and len(c.secret_key.strip().encode("utf-8")) < 16:
         raise ConfigError("CONTROL_SECRET_KEY must contain at least 16 bytes of entropy.")
     if owner not in (None, ""):
@@ -729,9 +674,7 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
         try:
             c.developer_user_id = int(str(developer).strip())
         except ValueError as exc:
-            raise ConfigError(
-                "CONTROL_DEVELOPER_USER_ID must be a numeric Telegram user id."
-            ) from exc
+            raise ConfigError("CONTROL_DEVELOPER_USER_ID must be a numeric Telegram user id.") from exc
     if isinstance(enabled, str) and enabled:
         c.enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
     elif c.configured:
@@ -743,22 +686,14 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
     if c.owner_user_id is not None and c.owner_user_id <= 0:
         raise ConfigError("CONTROL_OWNER_USER_ID must be a positive numeric Telegram user id.")
     if c.developer_user_id is not None and c.developer_user_id <= 0:
-        raise ConfigError(
-            "CONTROL_DEVELOPER_USER_ID must be a positive numeric Telegram user id."
-        )
-    if (
-        c.owner_user_id is not None
-        and c.developer_user_id is not None
-        and c.owner_user_id == c.developer_user_id
-    ):
+        raise ConfigError("CONTROL_DEVELOPER_USER_ID must be a positive numeric Telegram user id.")
+    if c.owner_user_id is not None and c.developer_user_id is not None and c.owner_user_id == c.developer_user_id:
         raise ConfigError(
             "CONTROL_OWNER_USER_ID and CONTROL_DEVELOPER_USER_ID must be different; "
             "roles must remain distinguishable in authorization and audit records."
         )
     if c.enabled and not c.configured:
-        raise ConfigError(
-            "control bot is enabled but CONTROL_BOT_TOKEN and CONTROL_OWNER_USER_ID are both required."
-        )
+        raise ConfigError("control bot is enabled but CONTROL_BOT_TOKEN and CONTROL_OWNER_USER_ID are both required.")
 
 
 def _validate(cfg: AppConfig, require_credentials: bool = True) -> None:
@@ -769,6 +704,4 @@ def _validate(cfg: AppConfig, require_credentials: bool = True) -> None:
             "(see docs/OPERATIONS.md, section 'Obtain Telegram API credentials')."
         )
     if cfg.backfill_scope == "since" and not cfg.backfill_since:
-        raise ConfigError(
-            "backfill_scope = 'since' requires backfill_since = 'YYYY-MM-DD' in config.toml."
-        )
+        raise ConfigError("backfill_scope = 'since' requires backfill_since = 'YYYY-MM-DD' in config.toml.")

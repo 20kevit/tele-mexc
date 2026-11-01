@@ -32,8 +32,15 @@ LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 
 def _item(channel_id: int, message_id: int) -> QueueItem:
     return QueueItem(
-        queue_id=0, channel_id=channel_id, message_id=message_id, item_type="message",
-        status="processing", targets_version=0, attempts=0, available_at="", created_at="",
+        queue_id=0,
+        channel_id=channel_id,
+        message_id=message_id,
+        item_type="message",
+        status="processing",
+        targets_version=0,
+        attempts=0,
+        available_at="",
+        created_at="",
     )
 
 
@@ -93,8 +100,7 @@ class FakeMexc:
         self.trades_calls = 0
         self.ticker_calls = 0
         self.query_results: list[dict] = [
-            {"orderId": "ex-1", "status": "CANCELED", "executedQty": "0",
-             "cumulativeQuoteQty": "0"},
+            {"orderId": "ex-1", "status": "CANCELED", "executedQty": "0", "cumulativeQuoteQty": "0"},
         ]
         self.symbols = FakeRegistry()
         self.place_response = {"orderId": "ex-1", "status": "NEW"}
@@ -135,14 +141,11 @@ class FakeMexc:
         return {"status": "CANCELED"}
 
 
-def _engine(cfg, repo, fake, *, mode, boundary="0", registry=None) -> TradingEngine:
-    cfg.trading.mode = mode
-    cfg.trading.live_enabled_token = LIVE_TOKEN
+def _engine(cfg, repo, fake, *, mode=None, boundary="0", registry=None) -> TradingEngine:
+    del mode  # one automatic Spot behaviour; this file uses a fake exchange
     cfg.trading.order_quote_amount = 10.0
     cfg.trading.order_quote_amount_source = "test"
-    engine = TradingEngine(
-        cfg, repo, client=fake, registry=registry or FakeRegistry(), now=lambda: NOW
-    )
+    engine = TradingEngine(cfg, repo, client=fake, registry=registry or FakeRegistry(), now=lambda: NOW)
     if boundary is not None:
         engine.store.set_app_state_once("trading.activation_boundary_message_id", boundary)
     return engine
@@ -150,7 +153,7 @@ def _engine(cfg, repo, fake, *, mode, boundary="0", registry=None) -> TradingEng
 
 def test_live_signal_is_submitted_automatically_without_approval(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="live")
+    engine = _engine(cfg, repo, fake, mode="spot")
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
 
     assert intent is not None
@@ -159,13 +162,12 @@ def test_live_signal_is_submitted_automatically_without_approval(cfg, repo):
     assert intent["state"] in ("submitted", "canceled")
     assert fake.place_calls == 1
     assert fake.account_calls >= 1
-    assert fake.test_calls == 0
     assert len(engine.store.list_intents(limit=5)) == 1
 
 
 def test_live_buy_is_blocked_when_exit_protection_flag_is_set(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="live")
+    engine = _engine(cfg, repo, fake, mode="spot")
     engine.store.set_buy_block("unprotected position(s): BTCUSDT:trade-1")
 
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
@@ -178,7 +180,7 @@ def test_live_buy_is_blocked_when_exit_protection_flag_is_set(cfg, repo):
 
 def test_live_replay_below_activation_boundary_is_rejected(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="live", boundary="1")
+    engine = _engine(cfg, repo, fake, mode="spot", boundary="1")
     result = engine.process_item(_item(100, 1), _store_message(repo, 1))
 
     assert result is None
@@ -189,7 +191,7 @@ def test_live_replay_below_activation_boundary_is_rejected(cfg, repo):
 
 def test_missing_activation_boundary_fails_closed(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="live", boundary=None)
+    engine = _engine(cfg, repo, fake, mode="spot", boundary=None)
     result = engine.process_item(_item(100, 1), _store_message(repo, 1))
 
     assert result is None
@@ -201,80 +203,70 @@ def test_missing_activation_boundary_fails_closed(cfg, repo):
 def test_emergency_stop_blocks_intent_creation_and_existing_execution(cfg, repo, monkeypatch):
     fake = FakeMexc()
     cfg.trading.emergency_stop = True
-    engine = _engine(cfg, repo, fake, mode="testonly")
+    engine = _engine(cfg, repo, fake, mode="spot")
     result = engine.process_item(_item(100, 1), _store_message(repo, 1))
     assert result is None
-    assert fake.test_calls == 0 and fake.place_calls == 0
+    assert fake.place_calls == 0
     signals = engine.store.list_signals(limit=5)
     assert signals and "emergency stop" in (signals[0]["rejection_reason"] or "")
 
     # A planned intent that predates the stop must not become exchange traffic.
     cfg.trading.emergency_stop = False
-    engine2 = _engine(cfg, repo, fake, mode="testonly", boundary="1")
-    monkeypatch.setattr(
-        engine2, "_execute_intent", lambda intent_id: engine2.store.get_intent(intent_id)
-    )
+    engine2 = _engine(cfg, repo, fake, mode="spot", boundary="1")
+    monkeypatch.setattr(engine2, "_execute_intent", lambda intent_id: engine2.store.get_intent(intent_id))
     planned = engine2.process_item(_item(100, 2), _store_message(repo, 2))
     assert planned is not None and planned["state"] == "planned"
     cfg.trading.emergency_stop = True
     rejected = engine2.execute_intent(planned["intent_id"])
     assert rejected["state"] == "rejected"
     assert "emergency stop" in (rejected.get("reject_reason") or "")
-    assert fake.place_calls == 0 and fake.test_calls == 0
+    assert fake.place_calls == 0
 
 
 def test_no_signal_age_limit(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="testonly")
-    result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, seconds_old=3 * 24 * 3600)
-    )
+    engine = _engine(cfg, repo, fake, mode="spot")
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, seconds_old=3 * 24 * 3600))
     assert result is not None
-    assert fake.test_calls == 1
+    assert fake.place_calls == 1
 
 
 def test_no_manual_allowlist_blocks_dynamic_symbol(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="testonly")
+    engine = _engine(cfg, repo, fake, mode="spot")
     result = engine.process_item(
         _item(100, 1), _store_message(repo, 1, text="BUY ETHUSDT\nENTRY: 2000\nSL: 1900\nTP1: 2100\nTP2: 2200")
     )
     assert result is not None
-    assert fake.test_calls == 1
+    assert fake.place_calls == 1
 
 
 def test_unknown_exchange_symbol_fails_closed(cfg, repo):
     fake = FakeMexc()
-    engine = TradingEngine(
-        cfg, repo, client=fake, registry=MissingRegistry(), now=lambda: NOW
-    )
-    cfg.trading.mode = "testonly"
+    engine = TradingEngine(cfg, repo, client=fake, registry=MissingRegistry(), now=lambda: NOW)
     cfg.trading.order_quote_amount = 10.0
     engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
     result = engine.process_item(
         _item(100, 1), _store_message(repo, 1, text="BUY NOPEUSDT\nENTRY: 1\nSL: 0.9\nTP1: 2\nTP2: 3")
     )
     assert result is None
-    assert fake.test_calls == 0
+    assert fake.place_calls == 0
 
 
-def test_sim_with_attached_client_performs_zero_exchange_calls(cfg, repo):
+def test_missing_acknowledgement_blocks_every_submission(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="sim")
+    engine = _engine(cfg, repo, fake, mode="spot")
+    cfg.trading.execution_acknowledgement = None
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
     assert intent is not None
     stored = engine.store.get_intent(intent["intent_id"])
-    assert stored is not None and stored["state"] == "filled"
-    assert (stored.get("exchange_order_id") or "").startswith("sim-")
-    assert (
-        fake.place_calls == 0 and fake.test_calls == 0 and fake.query_calls == 0
-        and fake.account_calls == 0 and fake.ticker_calls == 0
-    )
+    assert stored is not None and stored["state"] == "planned"
+    assert fake.place_calls == 0 and fake.query_calls == 0 and fake.account_calls == 0
 
 
 def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="testonly")
+    engine = _engine(cfg, repo, fake, mode="spot")
     text = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120\nAMOUNT: $5000 USDT\nDEPOSIT 25%"
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, text=text))
     assert intent is not None
@@ -284,11 +276,9 @@ def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):
 
 def test_short_signal_is_parsed_but_never_sold(cfg, repo):
     fake = FakeMexc()
-    engine = _engine(cfg, repo, fake, mode="testonly")
-    result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, text="SHORT BTCUSDT\nENTRY: 100\nTP1: 90")
-    )
+    engine = _engine(cfg, repo, fake, mode="spot")
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, text="SHORT BTCUSDT\nENTRY: 100\nTP1: 90"))
     assert result is None
-    assert fake.test_calls == 0 and fake.place_calls == 0
+    assert fake.place_calls == 0
     signal = engine.store.get_signal("100:1:0")
     assert signal is not None and "SHORT/SELL" in signal["rejection_reason"]

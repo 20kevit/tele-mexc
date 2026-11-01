@@ -123,9 +123,7 @@ class Repository:
 
     def select_channel(self, channel_id: int) -> None:
         with self.db.transaction() as conn:
-            existing = conn.execute(
-                "SELECT channel_id FROM channels WHERE channel_id = ?", (channel_id,)
-            ).fetchone()
+            existing = conn.execute("SELECT channel_id FROM channels WHERE channel_id = ?", (channel_id,)).fetchone()
             if existing is None:
                 raise KeyError(f"channel {channel_id} is not registered; list channels first")
             conn.execute("UPDATE channels SET is_selected = 0, updated_at = ? WHERE is_selected = 1", (UTC_NOW(),))
@@ -136,12 +134,10 @@ class Repository:
 
     # ----------------------------------------------------------- messages
 
-    def upsert_message(
-        self, record: StoredMessage, *, enqueue_processing: bool = True
-    ) -> UpsertResult:
+    def upsert_message(self, record: StoredMessage, *, enqueue_processing: bool = True) -> UpsertResult:
         """Insert or update one message.
 
-        ``enqueue_processing`` is disabled by the management backfill: history
+        ``enqueue_processing`` is disabled by historical backfill: history
         ingestion is data-only and must never activate downstream parsing or
         trading just because a message was stored.
         """
@@ -235,14 +231,16 @@ class Repository:
             # stored row that already carries an edit date.
             existing_edit_dt = row["edit_datetime"]
             incoming_edit_dt = record.edit_datetime
-            stale = (
-                existing_edit_dt is not None
-                and (incoming_edit_dt is None or str(incoming_edit_dt) < str(existing_edit_dt))
+            stale = existing_edit_dt is not None and (
+                incoming_edit_dt is None or str(incoming_edit_dt) < str(existing_edit_dt)
             )
             if stale:
                 log.debug(
                     "stale history version ignored for %s/%s (fetched %s, stored %s)",
-                    record.channel_id, record.message_id, incoming_edit_dt, existing_edit_dt,
+                    record.channel_id,
+                    record.message_id,
+                    incoming_edit_dt,
+                    existing_edit_dt,
                 )
                 return UpsertResult(UpsertOutcome.UNCHANGED, old_version, old_version)
 
@@ -558,8 +556,15 @@ class Repository:
                 if res.rowcount:
                     items.append(
                         QueueItem(
-                            row["queue_id"], row["channel_id"], row["message_id"], row["item_type"], "processing",
-                            row["targets_version"], row["attempts"], row["available_at"], row["created_at"],
+                            row["queue_id"],
+                            row["channel_id"],
+                            row["message_id"],
+                            row["item_type"],
+                            "processing",
+                            row["targets_version"],
+                            row["attempts"],
+                            row["available_at"],
+                            row["created_at"],
                         )
                     )
         return items
@@ -570,8 +575,7 @@ class Repository:
 
         with self.db.transaction() as conn:
             res = conn.execute(
-                "UPDATE processing_queue SET status = 'pending', claimed_at = NULL "
-                "WHERE status = 'processing'"
+                "UPDATE processing_queue SET status = 'pending', claimed_at = NULL WHERE status = 'processing'"
             )
             return res.rowcount
 
@@ -589,8 +593,7 @@ class Repository:
             safe_error = (error or "")[:MAX_QUEUE_ERROR_LEN].replace("\n", " ")
             if attempts >= self.processing_max_attempts:
                 conn.execute(
-                    "UPDATE processing_queue SET status = 'failed', attempts = ?, last_error = ? "
-                    "WHERE queue_id = ?",
+                    "UPDATE processing_queue SET status = 'failed', attempts = ?, last_error = ? WHERE queue_id = ?",
                     (attempts, safe_error, item.queue_id),
                 )
             else:
@@ -599,9 +602,7 @@ class Repository:
                 if delay < 0.001:
                     delay = 0.0
                 available_at = (
-                    (datetime.now(UTC) + timedelta(seconds=delay))
-                    .isoformat(timespec="seconds")
-                    .replace("+00:00", "Z")
+                    (datetime.now(UTC) + timedelta(seconds=delay)).isoformat(timespec="seconds").replace("+00:00", "Z")
                     if delay
                     else UTC_NOW()
                 )
@@ -613,9 +614,7 @@ class Repository:
 
     def queue_counts(self) -> dict[str, int]:
         counts = {"pending": 0, "processing": 0, "processed": 0, "failed": 0}
-        for row in self.db.conn.execute(
-            "SELECT status, COUNT(*) AS c FROM processing_queue GROUP BY status"
-        ):
+        for row in self.db.conn.execute("SELECT status, COUNT(*) AS c FROM processing_queue GROUP BY status"):
             status = row["status"]
             if status in counts:
                 counts[status] = int(row["c"])

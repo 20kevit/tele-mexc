@@ -28,8 +28,6 @@ SYMBOL = "BTCUSDT"
 
 @pytest.fixture()
 def env(cfg: AppConfig, repo: Repository):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     store = TradeStore(repo.db, cfg.trading)
     client = FakeClient()
     engine = FakeEngine(cfg, store, client=client)
@@ -40,17 +38,31 @@ def env(cfg: AppConfig, repo: Repository):
 
 def _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL) -> ParsedSignal:
     return ParsedSignal(
-        kind="alert", action="buy", symbol=SYMBOL,
-        entry_price=entry, entry_low_price=None, entry_high_price=None,
-        target_prices=(tp1, tp2), stop_loss=sl, order_type="limit",
-        amount_text=None, raw_text="buy", normalized_text="buy",
+        kind="alert",
+        action="buy",
+        symbol=SYMBOL,
+        entry_price=entry,
+        entry_low_price=None,
+        entry_high_price=None,
+        target_prices=(tp1, tp2),
+        stop_loss=sl,
+        order_type="limit",
+        amount_text=None,
+        raw_text="buy",
+        normalized_text="buy",
         fingerprint_sha256="abc",
     )
 
 
-def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
-                   client_order_id: str = "tsi-1", entry: Decimal = ENTRY,
-                   quote: Decimal = Decimal("10"), state: str = "planned") -> dict[str, Any]:
+def _insert_intent(
+    store: TradeStore,
+    *,
+    signal_id: str = "sig-1",
+    client_order_id: str = "tsi-1",
+    entry: Decimal = ENTRY,
+    quote: Decimal = Decimal("10"),
+    state: str = "planned",
+) -> dict[str, Any]:
     iid = f"intent-{client_order_id}"
     with store.db.transaction() as conn:
         conn.execute(
@@ -65,8 +77,24 @@ def _insert_intent(store: TradeStore, *, signal_id: str = "sig-1",
              order_type, quote_amount, base_quantity, limit_price, mode, state,
              create_msg_id, create_channel_id, planned_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (iid, signal_id, f"idem-{client_order_id}", client_order_id, SYMBOL, "buy",
-             "limit", str(quote), "0.1", str(entry), "live", state, 1, 100, "now", "now"),
+            (
+                iid,
+                signal_id,
+                f"idem-{client_order_id}",
+                client_order_id,
+                SYMBOL,
+                "buy",
+                "limit",
+                str(quote),
+                "0.1",
+                str(entry),
+                "live",
+                state,
+                1,
+                100,
+                "now",
+                "now",
+            ),
         )
     return store.get_intent(iid)
 
@@ -79,15 +107,18 @@ def _apply_conditional(cfg: AppConfig, ticks: int = 2) -> None:
 # Direct vs conditional decision
 # --------------------------------------------------------------------------
 
-def test_conditional_entry_disabled_creates_no_trade(env):
+
+def test_missing_offset_defaults_to_three_tick_conditional_entry(env):
     cfg, store, engine, client, notifier, tm = env
-    # offset_ticks is None -> conditional entry off; live mode still creates trade
-    # but with entry_mode direct (market < entry but no trigger configured).
+    cfg.trading.entry_trigger_offset_ticks = None  # legacy persisted shape
     intent = _insert_intent(store)
     decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
-    assert decision.deferred is False
+    assert decision.deferred is True
     assert decision.trade is not None
-    assert decision.trade["entry_mode"] == "direct"
+    assert decision.trade["entry_mode"] == "conditional"
+    assert int(decision.trade["trigger_offset_ticks"]) == 3
+    assert Decimal(decision.trade["trigger_price"]) == Decimal("99.97")
+    assert client.place_calls == []
 
 
 def test_conditional_entry_below_market_waits(env):
@@ -118,6 +149,17 @@ def test_conditional_entry_no_reference_price_fails_closed(env):
     assert len(store.list_trades()) == 0
 
 
+def test_missing_offset_with_no_reference_fails_closed_not_direct(env):
+    cfg, store, engine, client, notifier, tm = env
+    cfg.trading.entry_trigger_offset_ticks = None
+    intent = _insert_intent(store)
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=None)
+    assert decision.rejected is True
+    assert decision.trade is None
+    assert client.place_calls == []
+    assert store.get_intent(intent["intent_id"])["state"] == "rejected"
+
+
 def test_market_at_or_above_entry_is_direct(env):
     cfg, store, engine, client, notifier, tm = env
     _apply_conditional(cfg)
@@ -132,6 +174,7 @@ def test_market_at_or_above_entry_is_direct(env):
 # --------------------------------------------------------------------------
 # Trigger monitoring
 # --------------------------------------------------------------------------
+
 
 def test_trigger_not_reached_keeps_pending(env):
     cfg, store, engine, client, notifier, tm = env
@@ -225,17 +268,47 @@ def test_stale_price_observation_is_ignored(env):
 
 def test_invalid_config_offset_below_one_fails_closed(env):
     cfg, store, engine, client, notifier, tm = env
-    cfg.trading.entry_trigger_offset_ticks = 0  # invalid; conditional entry off
+    cfg.trading.entry_trigger_offset_ticks = 0
     intent = _insert_intent(store)
-    # offset 0 -> conditional disabled -> direct path (no trigger watcher).
     assert cfg.trading.conditional_entry_enabled is False
     decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
-    assert decision.deferred is False
+    assert decision.rejected is True
+    assert decision.trade is None
+    assert client.place_calls == []
+    assert store.get_intent(intent["intent_id"])["state"] == "rejected"
+
+
+def test_default_trigger_is_exactly_three_exchange_ticks(env):
+    cfg, store, engine, client, notifier, tm = env
+    assert cfg.trading.entry_trigger_offset_ticks == 3
+    assert cfg.trading.effective_entry_trigger_offset_ticks == 3
+    assert tm._compute_trigger(Decimal("100"), 3, Decimal("0.01")) == Decimal("99.97")
+    assert tm._compute_trigger(Decimal("100"), 3, Decimal("0.0005")) == Decimal("99.9985")
+    assert tm._compute_trigger(Decimal("100"), 3, Decimal("0.05")) == Decimal("99.85")
+
+
+def test_trigger_rounding_floors_to_the_symbol_tick_grid(env):
+    cfg, store, engine, client, notifier, tm = env
+    # 100.07 - 0.15 = 99.92; the 0.05 grid step below it is 99.90.
+    assert tm._compute_trigger(Decimal("100.07"), 3, Decimal("0.05")) == Decimal("99.90")
+    # A larger tick size moves the same nominal 3 ticks further in price.
+    assert tm._compute_trigger(Decimal("250"), 3, Decimal("0.1")) == Decimal("249.7")
+
+
+def test_explicit_offset_override_is_respected(env):
+    cfg, store, engine, client, notifier, tm = env
+    cfg.trading.entry_trigger_offset_ticks = 5
+    intent = _insert_intent(store)
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.deferred is True
+    assert int(decision.trade["trigger_offset_ticks"]) == 5
+    assert Decimal(decision.trade["trigger_price"]) == Decimal("99.95")
 
 
 # --------------------------------------------------------------------------
 # Restart safety
 # --------------------------------------------------------------------------
+
 
 def test_pending_entry_survives_restart(env):
     cfg, store, engine, client, notifier, tm = env
@@ -247,8 +320,10 @@ def test_pending_entry_survives_restart(env):
     tm2.recover_on_startup()
     t = store.get_trade(trade["trade_id"])
     assert t["trade_state"] == "pending_entry"
-    assert tm2.store.list_trades(state="pending_entry") == [t] or \
-        store.get_trade(trade["trade_id"])["trade_state"] == "pending_entry"
+    assert (
+        tm2.store.list_trades(state="pending_entry") == [t]
+        or store.get_trade(trade["trade_id"])["trade_state"] == "pending_entry"
+    )
 
 
 def test_trigger_state_recomputed_after_restart(env):
@@ -275,12 +350,12 @@ def test_trigger_state_recomputed_after_restart(env):
 # SL/TP prices parsed onto the trade
 # --------------------------------------------------------------------------
 
+
 def test_parsed_prices_attached_to_trade(env):
     cfg, store, engine, client, notifier, tm = env
     _apply_conditional(cfg, ticks=2)
     intent = _insert_intent(store)
-    trade = tm.on_intent_planned(intent, _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL),
-                                 reference_price=Decimal("90"))
+    trade = tm.on_intent_planned(intent, _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL), reference_price=Decimal("90"))
     t = store.get_trade(trade.trade["trade_id"])
     assert t["tp1_price"] == str(TP1)
     assert t["tp2_price"] == str(TP2)

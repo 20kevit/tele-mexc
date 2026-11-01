@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # Forensic Investigation: OCO Cancellations and Reliable Event Logging
 
 ## 1. Retrieve logs for exact time windows
@@ -6,8 +11,8 @@
 - **Host timezone**: UTC (all journal timestamps are in UTC, no timezone conversion needed)
 - **Application runs**: `tg-ingest serve` as systemd service `tg-ingest.service`
 - **Log format**: `2026-10-28 HH:MM:SS,mmm INFO/WARNING/ERROR ingest.service/...`
-- **Application working directory**: `/opt/projects/akha1`
-- **Service**: `ExecStart=/opt/projects/akha1/.venv/bin/tg-ingest serve`
+- **Application working directory**: `<repo-root>`
+- **Service**: `ExecStart=<repo-root>/.venv/bin/tg-ingest serve`
 
 ### APEUSDT time window: 2026-10-28 12:29:59 UTC through 12:40:00 UTC
 
@@ -36,7 +41,7 @@
 | `12:15:04` | `ingest.service` | INFO | live message 19268 stored (media=text-only) |
 | `12:15:28` | `ingest.service` | INFO | live message 19269 stored (media=text-only) |
 | `12:15:30` | `ingest.trading.monitor` | WARNING | websocket feed interrupted (PriceFeedError); polling fallback active |
-| `12:15:07` (trade state) | — | — | ICP trade `trade-tsifc989fdacd2f908ba3391f4bb3b0` transitioned to `needs_reconciliation` (recorded in DB) |
+| `12:15:07` (trade state) | — | — | ICP trade `<trade-id>` transitioned to `needs_reconciliation` (recorded in DB) |
 
 ---
 
@@ -44,17 +49,17 @@
 
 ### Database state evidence
 
-**APE signal (`1530389001:19263:0`):**
+**APE signal (`<channel-id>:19263:0`):**
 - Trade order `to-t1-2751a350b68980cb` (tp1): `state: CANCELED`, `sold_qty: 0`, `allocated_qty: 12.16`, `price: 0.1238`, `created_at: 2026-10-28T10:58:39Z`, `updated_at: 2026-10-28T12:35:00Z`
 - Trade order `to-t2-66eb4f5f6d8da0b1` (tp2): `state: CANCELED`, `sold_qty: 0`, `allocated_qty: 12.17`, `price: 0.1242`, `created_at: 2026-10-28T10:58:42Z`, `updated_at: 2026-10-28T12:34:59Z`
-- Trade `trade-tsia380f0c1a5725b11751d4793b0e6`: `trade_state: needs_reconciliation`, `retry_count: 9`, `last_error: order query failed for to-t1-2751a350b68980cb`, `entry_order_id: C02__744081362729730048033`, `entry_exchange_status: FILLED`
-- No `order_fills` rows for the TP order exchange IDs (`C02__744081629340721153033`, `C02__744081636336824321033`)
+- Trade `<trade-id>`: `trade_state: needs_reconciliation`, `retry_count: 9`, `last_error: order query failed for to-t1-2751a350b68980cb`, `entry_order_id: <exchange-order-id>`, `entry_exchange_status: FILLED`
+- No `order_fills` rows for the TP order exchange IDs (`<exchange-order-id>`, `<exchange-order-id>`)
 
-**ICP signal (`1530389001:19260:0`):**
+**ICP signal (`<channel-id>:19260:0`):**
 - Trade order `to-t1-1e68aea223057e4b` (tp1): `state: CANCELED`, `sold_qty: 0`, `allocated_qty: 0.57`, `price: 2.633`, `created_at: 2026-10-28T10:01:46Z`, `updated_at: 2026-10-28T12:15:07Z`
 - Trade order `to-t2-83adfd7ae0aa403c` (tp2): `state: CANCELED`, `sold_qty: 0`, `allocated_qty: 0.57`, `price: 2.642`, `created_at: 2026-10-28T10:01:47Z`, `updated_at: 2026-10-28T12:15:07Z`
-- Trade `trade-tsifc989fdacd2f908ba3391f4bb3b0`: `trade_state: needs_reconciliation`, `retry_count: 10`, `last_error: order query failed for to-t1-1e68aea223057e4b`, `entry_order_id: C02__744067285324357632033`, `entry_exchange_status: FILLED`
-- One `order_fills` row exists for entry order `C02__744067285324357632033`: `fee_amount: 0.0014934`, `fee_asset: USDT`
+- Trade `<trade-id>`: `trade_state: needs_reconciliation`, `retry_count: 10`, `last_error: order query failed for to-t1-1e68aea223057e4b`, `entry_order_id: <exchange-order-id>`, `entry_exchange_status: FILLED`
+- One `order_fills` row exists for entry order `<exchange-order-id>`: `fee_amount: 0.0014934`, `fee_asset: USDT`
 
 ### Which component first changed each TP order to `CANCELED`?
 
@@ -115,7 +120,7 @@ These query failures occurred shortly before the TP orders were marked `CANCELED
 - Both TP orders have `sold_qty: 0` — if the exchange had accepted and filled either leg, `sold_qty` would reflect the executed quantity
 - The `CANCELED` state is local; no exchange `orderId` or fill confirmation is recorded in `trade_orders` (the `exchange_order_id` field contains the MEXC-generated ID, but `exchange_status` is `CANCELED`, not `FILLED` or `PARTIALLY_FILLED`)
 - The journal logs show only `trade order query failed`, never `order submitted`, `order filled`, or `order canceled` from the exchange
-- The entry orders (`C02__744081362729730048033` for APE, `C02__744067285324357632033` for ICP) were the only orders accepted and filled by MEXC
+- The entry orders (`<exchange-order-id>` for APE, `<exchange-order-id>` for ICP) were the only orders accepted and filled by MEXC
 
 ### Is there evidence that a stop-loss order was active at the relevant time?
 
@@ -267,7 +272,7 @@ The codebase already implements several resilience patterns:
 ## 5. Deliverables
 
 ### File created
-`/opt/projects/akha1/docs/evidence/oco-cancellation-logging-investigation.md`
+`<repo-root>/docs/evidence/oco-cancellation-logging-investigation.md`
 
 ### Exact commands run
 ```bash
@@ -280,8 +285,8 @@ journalctl -u tg-ingest.service --no-pager -q 2>/dev/null | awk '/2026-10-28 12:
 python3 -c "import sqlite3; conn=sqlite3.connect('data/ingest.sqlite3'); ..."
 
 # Source code inspection (read-only file reads)
-read /opt/projects/akha1/tg_signal_ingest/trading/trade_manager.py
-read /opt/projects/akha1/tg_signal_ingest/trading/engine.py
+read <repo-root>/tg_signal_ingest/trading/trade_manager.py
+read <repo-root>/tg_signal_ingest/trading/engine.py
 ```
 
 ### Evidence found
@@ -304,7 +309,7 @@ read /opt/projects/akha1/tg_signal_ingest/trading/engine.py
 
 3. **Why `retry_count` differs** (APE=9 vs ICP=10): Subtle difference in processing loop iterations, possibly due to message arrival timing relative to the service restart or recovery sweep.
 
-4. **Whether the entry order clock was correct**: The entry orders (`C02__744081362729730048033` and `C02__744067285324357632033`) were successfully submitted and filled, which means the MEXC API accepted the timestamps at submission time. The drift must have occurred afterward.
+4. **Whether the entry order clock was correct**: The entry orders (`<exchange-order-id>` and `<exchange-order-id>`) were successfully submitted and filled, which means the MEXC API accepted the timestamps at submission time. The drift must have occurred afterward.
 
 ### No runtime state changed
 - No database rows modified during this investigation (all queries were READ-ONLY `SELECT`)

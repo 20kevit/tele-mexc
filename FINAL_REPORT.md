@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # Final Report: tele-mexc Execution Flow Fixes
 
 ## 1. Root Cause of Approval Prompt / Unexpected Market Order
@@ -120,7 +125,7 @@ The /version module was verified via unit test (commit SHA, branch, dirty state,
 | Commit SHA | `61e66a4cb5a8a104933f9c813275425c3e080ccd` |
 | Working tree | Clean (0 uncommitted changes) |
 | PR #2 changes | Merged from `public/main` (5aba737, 0e76cb0, 2cea664 + merge 391eb6a) |
-| `ui-audit` branch | Preserved (unrelated history, no common ancestor, worktree at `/opt/projects/akha1-ui-audit`) |
+| `ui-audit` branch | Preserved (unrelated history, no common ancestor, worktree at `<repo-root>-ui-audit`) |
 | Local `main` branch | Preserved (foundational commits, behind current branch) |
 | Local `public-review` branch | Preserved (merge base `a3a10b5`, ancestor of current) |
 | Remote branches | Untouched (no force-push, no shared history rewrite) |
@@ -163,11 +168,11 @@ No regressions introduced. Pre-existing lint/type issues in `main.py` (unused `T
 
 ## 9. Production Service Verification
 
-**Service:** `tg-ingest` (systemd), `WorkingDirectory=/opt/projects/akha1`, `ExecStart=.venv/bin/tg-ingest serve`
+**Service:** `tg-ingest` (systemd), `WorkingDirectory=<repo-root>`, `ExecStart=.venv/bin/tg-ingest serve`
 
 **Restart evidence (from `journalctl -u tg-ingest`):**
-- Old PID 481262 stopped cleanly: `processing loop finished: processed=14 retried=0 failed=0 superseded=0`
-- New PID 485996 started: `control bot task started`, `telegram session verified; transport=direct TCP/TLS`, `listening to channel: id=1530389001`, `trading activation boundary armed at message id 19356`, `recovery sweep complete: 0 gap message(s) fetched, 500 recent refreshed`, `history import already done; skipping backfill`, `market monitor started for conditional-entry/TP/SL lifecycle`
+- Old process stopped cleanly: `processing loop finished: processed=14 retried=0 failed=0 superseded=0`
+- New process started: `control bot task started`, `telegram session verified; transport=direct TCP/TLS`, `listening to channel: id=<channel-id>`, `trading activation boundary armed at message id 19356`, `recovery sweep complete: 0 gap message(s) fetched, 500 recent refreshed`, `history import already done; skipping backfill`, `market monitor started for conditional-entry/TP/SL lifecycle`
 
 **Verification results:**
 - ✅ Service is active and enabled
@@ -187,7 +192,7 @@ No regressions introduced. Pre-existing lint/type issues in `main.py` (unused `T
 **Limitations:**
 1. **Live `/version` delivery not end-to-end verified**: The `/version` Telegram command handler is implemented and unit-tested, but live delivery through the control bot was not tested because the bot token and owner user ID are production secrets. To verify, an authorized operator should send `/version` to the control bot and confirm the output matches the expected format.
 
-2. **ui-audit branch not merged**: The `ui-audit` branch has completely unrelated history (no common ancestor) with the canonical branch. Its unique commits (structured channel parser v2, UI audit findings, management bot UTF-16 limits, etc.) are preserved in the separate worktree at `/opt/projects/akha1-ui-audit` but not integrated. Merging would require manual conflict resolution across unrelated histories.
+2. **ui-audit branch not merged**: The `ui-audit` branch has completely unrelated history (no common ancestor) with the canonical branch. Its unique commits (structured channel parser v2, UI audit findings, management bot UTF-16 limits, etc.) are preserved in the separate worktree at `<repo-root>-ui-audit` but not integrated. Merging would require manual conflict resolution across unrelated histories.
 
 3. **Pre-existing lint/type issues**: Two mypy errors and several ruff warnings remain in `main.py` and `engine.py`. These predate this work and were not introduced or worsened by it.
 

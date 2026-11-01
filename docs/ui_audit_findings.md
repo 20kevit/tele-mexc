@@ -1,6 +1,10 @@
+> **Status note:** This audit describes the removed two-operator `manage` bot.
+> The bot and its bounded-import/review UI were removed; the findings remain as
+> historical evidence only.
+
 # UI/UX Audit — Management Bot Interface (findings & fixes)
 
-Branch: `ui-audit` (worktree `/opt/projects/akha1-ui-audit`), commit `df64f72` on top of `1b6e8ac`.
+Branch: `ui-audit` (worktree `<repo-root>-ui-audit`), commit `df64f72` on top of `1b6e8ac`.
 Scope: every user-facing surface of the Telegram management bot
 (`tg_signal_ingest/management/`), with focus on the `/signals` review feature;
 the control bot (`tg_signal_ingest/control/`) was audited read-only.

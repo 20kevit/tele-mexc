@@ -16,23 +16,38 @@ otherwise healthy sibling means partial, not full, protection.
 
 - Spot **BUY only** for signals. SHORT/SELL is parsed for reporting and then
   rejected. Sell orders exist only for TP1/TP2/stop-loss exits.
-- No futures, leverage, margin, withdrawals, or unofficial endpoints.
+- No Futures/Margin order execution, leverage, withdrawals, or unofficial
+  endpoints. Futures/Perpetual signal text is ingested but never executed as a
+  Futures/Margin order.
 - One fixed owner-configured quote amount per BUY. Signal deposit/balance/
   leverage text is never used for sizing.
 - One intent per Telegram message; conflicting edits cannot create a second.
 - No blind retry after an uncertain submission.
 - Historical, backfilled, and at/below-boundary messages never trade.
 
-## Modes
+## Execution model
 
-| Mode | Behavior | Requirements |
-| --- | --- | --- |
-| `sim` (default) | Parse, risk-check, plan, then immediately mark the intent filled locally with `sim-...` | No MEXC credentials or network |
-| `testonly` | Call official `POST /api/v3/order/test`; never reaches the matching engine | Credentials + positive `order_quote_amount` |
-| `live` | Submit a real Spot BUY; reconcile and record fills | Credentials + positive amount + exact live token |
+There is one execution behaviour: automatic MEXC Spot BUY on a valid signal.
+There is no simulated, test-only, or live product mode and no per-signal
+approval.
 
-`live_enabled_token` must be exactly
-`I_UNDERSTAND_REAL_MONEY_AND_RISKS`; anything else prevents startup in live mode.
+| Requirement | Behavior |
+| --- | --- |
+| Owner acknowledgement | `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` is required to construct the pipeline |
+| MEXC CLI backend | `[mexc_cli] enabled = true` and a healthy CLI profile are required for Spot writes |
+| Sizing | One fixed `order_quote_amount` chosen by the owner; signal text never changes it |
+| Submission boundary | Pause, emergency stop, Telegram/MEXC/channel readiness and reconciliation blockers are checked atomically with the `planned -> submitting` claim |
+
+`control_setup.paused` is authoritative. `/pause` takes an exclusive kernel
+`flock`, waits for any in-flight submission to finish, writes the pause state,
+and only then acknowledges. `/resume` checks readiness again (including
+emergency stop and unresolved reconciliation) and refuses to clear the pause
+when any prerequisite is missing. The shared lock is
+`<db_path>.submission.lock`; the kernel releases it on a crash.
+
+`order_intents.mode` remains a historical database column. New intents are
+written as `live`; legacy `sim`/`testonly` rows are never executable and are
+rejected locally if a stale queue item tries to resume them.
 
 ## Execution backends (REST reads + CLI writes)
 
@@ -42,7 +57,9 @@ Two transports are used deliberately, not as competing integrations:
 | --- | --- | --- |
 | Exchange metadata, balances, single-order query and fills | REST `MexcSpotClient` | Spot v3 read and accounting implementation |
 | Live BUY/SELL and OCO placement, cancellation | `@mexc-ai/cli` adapter | Live write backend |
-| `testonly` validation | REST `POST /api/v3/order/test` | Official validation endpoint; no matching-engine order |
+
+The low-level REST `POST /api/v3/order/test` primitive remains available for
+contract tests, but it is not a product mode and has no CLI command.
 
 The CLI adapter (`mexc/cli.py`) is argv-only, bounded by a timeout, and never
 starts a shell. It uses the CLI's own encrypted profile
@@ -53,12 +70,12 @@ Reads remain on REST so there is one market-data/account implementation.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | live mode refuses `false`; a missing binary fails closed |
+| `enabled` | `true` | required for the automatic Spot pipeline; a missing binary fails closed |
 | `binary` | auto | explicit path; else `MEXC_CLI_BINARY`, the known per-platform path, then `PATH` |
 | `profile` | active profile | optional profile name passed as `--profile` |
 | `timeout_s` | `5.0` | subprocess timeout in `(0, 60]` |
 | `min_version` | `0.0.22` | minimum accepted CLI version |
-| `confirm_noninteractive_writes` | auto | live mode arms `--yes` when absent; explicit `false` keeps live writes fail-closed; non-live modes default `false` |
+| `confirm_noninteractive_writes` | `true` | arms the CLI `--yes`; explicit `false` keeps writes fail-closed |
 
 Writes always pass `--no-retry`; the adapter never retries a placement. The
 `clientOrderId` is reused verbatim. A CLI `duplicate` response means the earlier
@@ -66,12 +83,10 @@ attempt landed, so it becomes `unknown_requires_reconciliation` and is
 reconciled, never resubmitted. A CLI write without explicit confirmation is
 rejected locally and no request reaches the exchange.
 
-Live mode is already an explicit owner authorization: the service cannot answer
-the CLI's terminal prompt, so when `confirm_noninteractive_writes` is absent the
-loader arms `--yes` for live writes. Setting it to `false` is honored as a
-fail-closed override, but then every live write is rejected locally. Set it to
-`false` only when intentionally disabling live writes; otherwise leave it unset
-or set `true`.
+Automatic execution is the product behaviour: the service cannot answer the
+CLI's terminal prompt, so non-interactive writes are armed by default. Setting
+`confirm_noninteractive_writes` to `false` is honored as a fail-closed override;
+every write is then rejected locally. Leave it unset or set it to `true`.
 
 ### CLI credential profile (owner-only)
 
@@ -103,24 +118,21 @@ permission failures and require the key's Spot permissions to be corrected.
 
 ## Configuration (`[trading]` in `config/config.toml`)
 
-Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
-`TRADING_ORDER_QUOTE_AMOUNT`, `TRADING_AGGREGATE_BUDGET`,
+Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
+`TRADING_ORDER_QUOTE_AMOUNT`,
 `MEXC_CLI_BINARY`, `MEXC_CLI_PROFILE`.
 
 | Key | Default | Validation / meaning |
 | --- | --- | --- |
-| `mode` | `sim` | `sim`, `testonly`, or `live` |
-| `live_enabled_token` | unset | exact acknowledgement token for live |
-| `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
-| `aggregate_budget_quote` | `50.0` | cumulative spend reference for reporting; must be >0; never caps per-order size and is not enforced as a ceiling |
-| `order_type_policy` | `limit` | `limit` or `market`; explicit signal semantics still apply |
-| `remaining_balance_reserve_pct` | `20.0` | `0 ≤ value < 100` |
-| `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5` |
-| `balance_max_age_s` | `5.0` | `(0, 300]`; stale account snapshots fail closed |
-| `recon_interval_s` | `30.0` | live reconciliation period, minimum 5 s |
+| `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
+| `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (`control_settings.order_quote_amount`) > `[trading]` > default. A legacy `buy_quote_usd` value is read only when the canonical key is absent. |
+| Order type | LIMIT only | `order_type_policy`, `TRADING_ORDER_TYPE_POLICY`, and MARKET execution are rejected |
+| `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
+| `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
+| `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
-| `entry_trigger_offset_ticks` | unset | unset = direct entry; otherwise integer ≥1 enables conditional entry |
-| `entry_trigger_stale_threshold_s` | `60.0` | positive; older price ticks are ignored |
+| `entry_trigger_offset_ticks` | `3` | integer ≥1; conditional LIMIT entry waits for price to cross `Entry - offset × tick_size`. Missing resolves to 3; it cannot disable conditional entry or fall back to direct entry |
+| `entry_trigger_stale_threshold_s` | `60.0` | positive; a conditional-entry order is not triggered from an older price tick |
 | `tp1_allocation_pct_of_acquired` | `50.0` | 0–100 of actual acquired quantity |
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
 | `stop_loss_max_retries` | `3` | integer ≥1; caps definitive TP/SL rejection retries |
@@ -129,14 +141,30 @@ Environment overrides: `TRADING_MODE`, `TRADING_LIVE_TOKEN`,
 | `monitor_max_retries` | `5` | integer ≥1 |
 | `monitor_backoff_base_s` | `1.0` | positive |
 
+Legacy `mode`, `live_enabled_token`, `max_quote_per_order`, daily/open-order
+caps, signal-age/price-deviation caps, `allowed_symbols`, and `allowlist_mode`
+are rejected at load time. They are not silently ignored because that would
+change financial behaviour.
+
+### Retained safety parameters
+
+| Setting | Why it is retained |
+| --- | --- |
+| `execution_acknowledgement` | One-time global construction gate proving the owner intends automatic real Spot execution. It is not per-order approval. |
+| `balance_fee_buffer_pct` | The exact exchange fee is only visible after fills; the pre-trade requirement adds a small documented buffer so the quote/base balance is sufficient. |
+| `balance_max_age_s` | Prevents a decision based on a stale account snapshot. It is a freshness check, not portfolio polling. |
+| `entry_trigger_stale_threshold_s` | Prevents a conditional entry from triggering on an old market tick. |
+| `entry_trigger_offset_ticks` | Conditional-entry trigger distance; default exactly 3 ticks, still owner-adjustable. |
+| `stop_loss_trigger_offset_ticks` | Controls the OCO stop activation trigger relative to the configured stop exit price. |
+
+
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
-threshold or mandatory stop-loss rule. Valid symbols are not restricted by an
-operator-maintained allowlist; MEXC market metadata and order filters remain
-enforced. The `trading_daily_spend` table is maintained but no cap reads it.
+threshold, or symbol allowlist. MEXC market metadata and order filters remain
+enforced. The historical `trading_daily_spend` table is retained for compatibility but is no longer written or read.
 
 ## Parsing and executable signals
 
-`trading/parser.py` is deterministic and independent of the offline analyzer.
+`trading/parser.py` is the only production parser.
 
 | Kind | Meaning |
 | --- | --- |
@@ -148,10 +176,13 @@ enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 | `ambiguous` | Direction detected but required fields/format are not safe |
 
 - LONG is treated as BUY; SHORT/SELL is retained but rejected by risk.
-- Futures/perpetual/margin/leverage wording makes the signal non-Spot and
-  ambiguous.
+- Futures/perpetual/margin/leverage wording is ingested but never enables
+  Futures execution. A LONG signal with a Spot-compatible symbol and complete
+  Entry/SL/TP1/TP2 fields is executed as a Spot BUY; leverage/deposit text is
+  ignored for sizing.
 - Missing/unsafe entry, symbol, or required fields fail closed.
-- Explicit market signals are blocked when `order_type_policy = "limit"`.
+- A signal marked MARKET is converted to LIMIT only when it has a valid Entry
+  price; otherwise it is rejected. MARKET orders are never submitted.
 - No OCR: media without usable caption text is not actionable.
 
 ## Risk and sizing
@@ -166,9 +197,9 @@ enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 - missing fixed quote amount;
 - unsupported symbol/order type, precision, min/max notional.
 
-Order type: an explicit signal type wins unless policy blocks it; otherwise an
-entry price implies LIMIT, and no entry price uses MARKET only when policy is
-`market`.
+Order type is always LIMIT. A MARKET signal is converted to LIMIT when an Entry
+price exists; without one it fails closed. Configuration cannot re-enable
+MARKET.
 
 Quantity is `order_quote_amount / price`, then quantized **down** to the symbol
 lot step and validated against `exchangeInfo` minimum/maximum and price guards.
@@ -181,7 +212,7 @@ At each `serve` start, **before live handlers are registered**, the engine
 snapshots the selected channel's newest stored message id and persists
 `max(existing boundary, snapshot)`. The boundary is forward-only.
 
-In `testonly`/`live`:
+Always:
 
 - a message at or below the boundary is rejected as historical;
 - `source='backfill'` and `source='recovery'` rows are non-tradeable regardless
@@ -303,40 +334,37 @@ Market polling:
   prices. Order submission remains governed by the no-retry
   `unknown_requires_reconciliation` path.
 
-## Budget ledger
+## Technical reservation ledger
 
-For `testonly`/`live`, intent creation and budget reservation are one atomic
-transaction. The reserved amount is:
+Intent creation and its reservation are one atomic transaction. The reserved
+amount is:
 
 ```
 quote_amount * (1 + balance_fee_buffer_pct / 100)
 ```
 
-`trading_budget_ledger` states:
+`trading_budget_ledger` is **not a portfolio budget** and has no configurable
+spending cap. It prevents duplicate reservations and keeps concurrent intent
+creation coherent. States:
 
 | State | Effect |
 | --- | --- |
-| `reserved` | Counts against the cap |
-| `uncertain` | Frozen; still counts; never auto-released |
-| `settled` | Reservation removed; actual spend and fees retained |
-| `released` | No charge; used for rejected/failed/never-sent intents |
+| `reserved` | Active technical reservation |
+| `uncertain` | Frozen until reconciliation; never auto-released |
+| `settled` | Reservation replaced by actual spend and fees |
+| `released` | Rejected/failed/never-sent intent; no active reservation |
 
 - Filled: settle actual `cumulativeQuoteQty` (or fill totals), plus real fees;
   when fees are not yet visible, the configured buffer is retained.
 - Canceled: retain actual partial spend and fees.
 - Rejected/failed/canceled-locally: release.
-- The summary is `limit - active_reserved - settled_spend`; restart never
-  resets the ledger.
-- `testonly` creates and then releases a reservation around the test order, so
-  it does not consume the live budget.
+- Restart never resets the ledger.
 
 ## Execution
 
-| Mode | Flow |
-| --- | --- |
-| `sim` | `planned → submitting → filled`, exchange id `sim-<client_order_id>`, no network |
-| `testonly` | `planned → submitting → submitted → canceled_local`, exchange status `TEST_ONLY_ACCEPTED` |
-| `live` | Budget ensure → fresh balance preflight → `submitting` → exchange → `submitted`/uncertain/rejected → reconciliation |
+Flow: reservation ensure → fresh balance preflight → `submitting` → exchange →
+`submitted`/uncertain/rejected → reconciliation. Pause/readiness are checked in
+the same transaction as `planned → submitting`.
 
 Live balance preflight:
 
@@ -345,8 +373,9 @@ Live balance preflight:
   asset is missing.
 - Required = order notional × fee factor (BUY) or base quantity × fee factor
   (SELL).
-- Subtract outstanding local open intents for the same symbol; also keep
-  `remaining_balance_reserve_pct` free.
+- Subtract outstanding local open intents for the same symbol; the remaining
+  free amount must cover the fee-inclusive requirement. No percentage of the
+  account is reserved.
 - A timestamp rejection (`700003`/`10073`) on the read-only account query is
   retried once with a fresh signature. A second failure rejects before any
   order call; other balance errors are never retried.
@@ -371,7 +400,7 @@ native MEXC OCO SELL orders against the **actual acquired base quantity**:
   market falls.
 - OCO 2: the remaining allocation at TP2, with the same split between the
   stop-limit execution price (configured stop-loss, unchanged) and the
-  activation trigger (five ticks above it).
+  activation trigger (the configured `stop_loss_trigger_offset_ticks`, default 3 ticks above it).
 - Each OCO is one exchange order with two linked legs; when one leg activates,
   the exchange cancels the other leg inside that OCO. The two OCO orders do not
   cancel each other.
@@ -479,14 +508,14 @@ conditional entry defers the entry intent until a price trigger.
 - **Entry:** limit BUY at the signal entry price; never converts to market.
 - **Conditional entry:** if market < entry and offset ≥1, wait for
   `entry_price - offset_ticks × tick_size`, then submit the limit BUY through the
-  engine's budget/balance gate. Missing/stale price fails closed.
+  engine's reservation/balance gate. Missing/stale price fails closed.
 - **TP1:** first target; limit SELL of
   `tp1_allocation_pct_of_acquired` of actual filled quantity.
 - **TP2:** second target; limit SELL of `tp2_allocation_pct_of_remaining` of what
   remains after TP1.
 - **Stop-loss:** parsed `sl_price`; one per trade. SL wins when SL and TP are
-  crossed in the same tick. It cancels entry remainder and open TPs, reconciles
-  fills, then market-sells the remaining bot-owned quantity.
+  crossed in the same tick. Protective exits use exchange-side OCO stop-limit
+  legs; no MARKET order is submitted.
 - **Partial fills:** tracked per order; partial SL remains `exit_pending` for
   reconciliation.
 - **Quantities:** quantized down; never exceeds acquired minus outstanding sells.
@@ -526,9 +555,9 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
   Any residual remains recorded and is not silently dropped.
 - On restart, `serve` runs `recover_on_startup()` and periodically
   `reconcile_all_open()`. `stop_loss_executing` and `exit_pending` resume
-  cancellation/fill accounting before selling any remainder. A market exit that
-  partially filled, then canceled while offline, is completed with a new
-  order id for the remaining quantity.
+  cancellation/fill accounting before selling any remainder. A partially
+  filled order that was canceled while offline is completed with a new order id
+  for the remaining quantity, subject to the no-oversell checks.
 - A TP state that was persisted before its allocation/order was written is
   completed on recovery. A `pending` row (created locally, never sent) is
   resumed, and its quantity is rebased against current fills so a late fill
@@ -551,13 +580,15 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - Every OCO transition writes an audit event (`oco.intended`, `oco.state`,
   `oco.sibling_canceled`) and a notification (`OCO_PROTECTION_ACTIVE`,
   `OCO_PROTECTION_PARTIAL`, `OCO_PROTECTION_UNCERTAIN`, `OCO_PROTECTION_FAILED`)
-  routed per the owner/developer preferences below.
+  routed by recipient role and the selected minimum severity below.
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
 
-- All exit monitoring is active even when `entry_trigger_offset_ticks` is unset
-  (conditional entry disabled). New trade symbols are subscribed to the monitor
-  after startup, and the REST fallback fetches prices through the MEXC client.
+- Conditional LIMIT entry is always the strategy when market is below Entry;
+  the default trigger is exactly 3 exchange ticks below Entry.
+- All exit monitoring is active for every trade. New trade symbols are
+  subscribed to the monitor after startup, and the REST fallback fetches prices
+  through the MEXC client.
 
 ### Pre-BUY exit-protection gate and the new-BUY block
 
@@ -602,8 +633,9 @@ changes; audit events are written as `trading.buy_block`.
   (up to 100 rows) of `current-orders`, then `history-orders`. The live hybrid
   client delegates single-order queries to REST instead. Unresolved orders
   remain uncertain and are not blindly resubmitted.
-- Attached TP/SL is only available on `spot trade place` (limit). Market entries
-  rely on local management.
+- Attached TP/SL is only available on `spot trade place` (limit). Entry orders
+  are LIMIT-only; MARKET execution is rejected at configuration, risk, REST,
+  CLI, and payload boundaries.
 - Exchange-side protection is `active` only when the order detail echoes the
   requested trigger prices. Triggered attached-order listing behavior has not
   been validated with real credentials here.
@@ -628,32 +660,21 @@ changes; audit events are written as `trading.buy_block`.
 Owner/developer notices are written to `trading_notifications` before delivery
 and retried independently of order execution. The outbox key is
 `(event_key, role)`; long text is split into chunks. A notification failure can
-never resubmit an order. Each event carries a `category` and `event_type`, and
-delivery goes only to recipients whose persisted preference enables that
-category.
+never resubmit an order. Each event carries a severity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, or
+`CRITICAL`). The control bot exposes one selectable minimum severity:
 
-### Notification categories and defaults
+| Selected level | Delivered |
+| --- | --- |
+| DEBUG | DEBUG and above |
+| INFO | INFO and above |
+| WARNING | WARNING and above |
+| ERROR | ERROR and above |
+| CRITICAL | CRITICAL only |
 
-| Category | Owner default | Developer default |
-| --- | --- | --- |
-| `signal_decision` | off | on |
-| `signal_accepted` | on | on |
-| `exchange_operation` | on | on |
-| `order_lifecycle` | on | on |
-| `oco_lifecycle` | on | on |
-| `take_profit` | on | on |
-| `stop_loss` | on | on |
-| `reconciliation` | on | on |
-| `critical` | on | on |
-| `diagnostic` | off | on |
-| `notification_delivery` | off | on |
-| `recovery` | off | on |
-
-The owner opts out of routine local signal rejections (`signal_decision` off);
-the developer receives every category. Preferences are stored in
-`notification_preferences` and can be toggled through the control bot's Persian
-"تنظیمات اعلان‌ها" menu (`n:settings`), with fallback to these code defaults
-when a row is missing.
+Recipient routing is separate from severity: genuine signals go to owner and
+developer, routine local rejections/diagnostics go to the developer, and
+recovery notices default to the developer. The obsolete per-role/per-category
+`notification_preferences` table is historical and is no longer read or written.
 
 ### Delivery outcomes and ambiguous recovery
 
@@ -693,15 +714,11 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 .venv/bin/tg-ingest trading intents --limit 20
 .venv/bin/tg-ingest trading parse <message_id>
 .venv/bin/tg-ingest trading reconcile
-.venv/bin/tg-ingest trading trades [--state <state>]
-.venv/bin/tg-ingest trading trade <trade-id>
 .venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
 .venv/bin/tg-ingest trading verify
-.venv/bin/tg-ingest trading test-order --symbol BTCUSDT --side BUY --quote 10
 ```
 
-`verify`, `test-order`, and `reconcile` touch MEXC. `test-order` is refused
-unless mode is `testonly` or `live`. Never run them without explicit
+`verify` and `reconcile` touch MEXC. Never run them without explicit
 authorization. `preflight` performs local binary/version/schema and CLI-profile
 checks; with `--network` it also runs the CLI doctor, one signed read-only
 `current-orders` query, a signed `spot asset account` read, REST key validation,
@@ -726,23 +743,22 @@ modifies an order.
   remains a terminal local rejection and contributes no spend.
 
 
-## Live-enablement checklist (manual, separate approval)
+## Live-enablement checklist (owner-authorized)
 
 1. Run `trading preflight --network`; confirm the CLI profile is saved/active,
    the CLI and REST keys read the same Spot account, and exit monitoring paths
-   are validated with a separate explicit approval.
+   are validated under an explicit owner-approved live test plan.
 2. Use a MEXC key with Spot read + Spot trade only; enable IP allowlist; no
    withdrawal permission.
 3. Set `order_quote_amount` to an owner-approved positive value.
-4. Set `aggregate_budget_quote` to an owner-approved positive value (default 50 USDT; no hard ceiling).
-5. Run with `testonly` first; inspect intents, balances, precision, and logs.
-6. Set `mode = "live"` and the exact `live_enabled_token`.
-7. Leave `mexc_cli.confirm_noninteractive_writes` unset (live arms `--yes`) or
-   set it to `true`; never leave an explicit `false` when live writes are
-   intended.
-8. Restart once; confirm the activation boundary advanced.
-9. Submit one minimal test signal only after a separate explicit approval.
-10. Monitor `trading status`, `trading intents`, and the notification outbox.
+4. Set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`.
+   This is a one-time global construction gate, not per-order approval.
+5. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
+   set it to `true`; never leave an explicit `false` when writes are intended.
+6. Complete owner setup: Telegram authenticated, MEXC verified, and channel
+   selected.
+7. Restart once; confirm the activation boundary advanced.
+8. Monitor `trading status`, `trading intents`, and the notification outbox.
 
 ### OCO certainty follow-up review
 

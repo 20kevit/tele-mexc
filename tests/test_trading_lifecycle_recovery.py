@@ -113,14 +113,10 @@ def make_env(
     min_notional: str = "1.0",
     engine_cls: type[FakeEngine] = FakeEngine,
 ):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     # Exit monitoring must work with conditional entry disabled.
     cfg.trading.entry_trigger_offset_ticks = None
     store = TradeStore(repo.db, cfg.trading)
-    client = FakeClient(
-        FakeRegistry(FakeMeta(min_notional=min_notional))
-    )
+    client = FakeClient(FakeRegistry(FakeMeta(min_notional=min_notional)))
     engine = engine_cls(cfg, store, client=client)
     notifier = FakeNotifier()
     tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
@@ -141,9 +137,7 @@ def setup_trade(env, *, fill: Decimal | None = None, confirm: bool = True):
     """
     cfg, store, engine, client, notifier, tm = env
     intent = _insert_intent(store)
-    decision = tm.on_intent_planned(
-        intent, _parsed(), reference_price=Decimal("100")
-    )
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100"))
     assert decision.deferred is False
     trade = decision.trade
     engine._execute_intent(intent["intent_id"])
@@ -221,13 +215,20 @@ def test_oco_tp1_fill_advances_toward_tp2(env):
     trade, _ = setup_trade(env, fill=Decimal("0.1"))
     tp1_order = _oco_orders(store, trade, "tp1")[0]
     # Credit TP1 OCO fill.
-    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP1, TP1)
+    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP1, TP1)
     store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP1), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP1),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
@@ -241,21 +242,35 @@ def test_oco_both_filled_closes_trade(env):
     tp1_order = _oco_orders(store, trade, "tp1")[0]
     tp2_order = _oco_orders(store, trade, "tp2")[0]
     # Fill both OCOs.
-    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP1, TP1)
+    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP1, TP1)
     store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP1), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP1),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
-    client.fill_order(tp2_order["exchange_order_id"], Decimal("0.05"),
-                      Decimal("0.05") * TP2, TP2)
+    client.fill_order(tp2_order["exchange_order_id"], Decimal("0.05"), Decimal("0.05") * TP2, TP2)
     store.add_fill(
-        exchange_order_id=tp2_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP2), "qty": "0.05", "quoteQty": str(Decimal("0.05") * TP2),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 3},
+        exchange_order_id=tp2_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP2),
+            "qty": "0.05",
+            "quoteQty": str(Decimal("0.05") * TP2),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 3,
+        },
     )
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
@@ -299,9 +314,7 @@ def test_oco_position_recovers_after_restart(env):
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active"
     # New manager over the same DB (simulated restart).
-    tm2 = TradeManager(
-        cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier()
-    )
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     t = store.get_trade(trade["trade_id"])
     assert t["trade_state"] == "oco_active", t
@@ -312,22 +325,27 @@ def test_oco_restart_after_partial_fill(env):
     trade, _ = setup_trade(env, fill=Decimal("0.1"))
     tp1_order = _oco_orders(store, trade, "tp1")[0]
     # Partial TP1 fill, then restart.
-    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.02"),
-                      Decimal("0.02") * TP1, TP1)
+    client.fill_order(tp1_order["exchange_order_id"], Decimal("0.02"), Decimal("0.02") * TP1, TP1)
     store.add_fill(
-        exchange_order_id=tp1_order["exchange_order_id"], symbol=SYMBOL,
-        raw={"price": str(TP1), "qty": "0.02", "quoteQty": str(Decimal("0.02") * TP1),
-             "commission": "0", "commissionAsset": "USDT", "isBuyer": 0, "isMaker": 1,
-             "time": 2},
+        exchange_order_id=tp1_order["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(TP1),
+            "qty": "0.02",
+            "quoteQty": str(Decimal("0.02") * TP1),
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 0,
+            "isMaker": 1,
+            "time": 2,
+        },
     )
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
     assert Decimal(trade["tp1_sold_qty"]) == Decimal("0.02")
 
     # Simulated restart: fresh manager reconciles existing OCO orders.
-    tm2 = TradeManager(
-        cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier()
-    )
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active", trade
@@ -372,17 +390,13 @@ def test_oco_partial_survives_restart(env):
     # Mark the second OCO as rejected to simulate partial success.  The
     # reconciliation retries the rejected leg, which also fails, so the trade
     # must stay honestly partial rather than claiming full protection.
-    store.transition_trade_order(
-        tp2_order["trade_order_id"], "rejected", note="OCO 2 rejected by exchange"
-    )
+    store.transition_trade_order(tp2_order["trade_order_id"], "rejected", note="OCO 2 rejected by exchange")
     tm._reconcile_trade(trade["trade_id"])
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_partial", trade
 
     # Restart: partial state is preserved, not silently completed.
-    tm2 = TradeManager(
-        cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier()
-    )
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
     tm2.recover_on_startup()
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_partial", trade
@@ -414,9 +428,7 @@ def test_generated_client_order_ids_fit_the_cli_limit(env):
     cfg, store, engine, client, notifier, tm = env
     trade, _ = setup_trade(env, fill=Decimal("0.1"))
     ids = [
-        order["client_order_id"]
-        for order in store.list_trade_orders(trade["trade_id"])
-        if order.get("client_order_id")
+        order["client_order_id"] for order in store.list_trade_orders(trade["trade_id"]) if order.get("client_order_id")
     ]
     assert ids
     assert all(len(cid) <= 32 and cid.isascii() for cid in ids)
@@ -430,7 +442,9 @@ def test_uncertain_oco_is_not_confirmed_protection(env, state, has_exchange_id, 
     trade, _ = setup_trade(env, fill=Decimal("0.1"))
     order = _oco_orders(store, trade, "tp1")[0]
     store.transition_trade_order(
-        order["trade_order_id"], state, note="simulated interrupted operation",
+        order["trade_order_id"],
+        state,
+        note="simulated interrupted operation",
     )
     # Clear the ID explicitly: transition_trade_order preserves absent fields.
     with store.db.transaction() as conn:
@@ -438,6 +452,7 @@ def test_uncertain_oco_is_not_confirmed_protection(env, state, has_exchange_id, 
             "UPDATE trade_orders SET exchange_order_id=? WHERE trade_order_id=?",
             (order["exchange_order_id"] if has_exchange_id else None, order["trade_order_id"]),
         )
+
     def forbidden_write(*args, **kwargs):
         pytest.fail("certainty classification must not submit or cancel orders")
 
@@ -468,12 +483,15 @@ def test_mixed_oco_uncertainty_wins(env, monkeypatch, other_state, uncertain_sta
     cfg, store, engine, client, notifier, tm = env
     trade, _ = setup_trade(env, fill=Decimal("0.1"))
     first = _oco_orders(store, trade, "tp1")[0]
-    store.transition_trade_order(first["trade_order_id"], other_state, sold_qty=Decimal("0.05")
-                                 if other_state == "filled" else Decimal("0"))
+    store.transition_trade_order(
+        first["trade_order_id"], other_state, sold_qty=Decimal("0.05") if other_state == "filled" else Decimal("0")
+    )
     extra = tm._create_trade_order(trade, "tp1", Decimal("0.05"), TP1, order_type="OCO_STOP_LIMIT_ORDER")
     store.transition_trade_order(extra["trade_order_id"], uncertain_state)
+
     def forbidden(*args, **kwargs):
         pytest.fail("must not write when any prior placement is uncertain")
+
     monkeypatch.setattr(engine, "submit_oco_sell", forbidden)
     assert tm._ensure_oco_leg(trade, "tp1", Decimal("0.05"), TP1, SL) == "uncertain"
     tm._place_oco_exits(trade)

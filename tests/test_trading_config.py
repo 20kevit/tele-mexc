@@ -18,10 +18,12 @@ def _root_with(toml_text: str, env: dict[str, str] | None = None, tmp_path: Path
     return tmp
 
 
-def test_default_trading_mode_is_sim_and_default_amount_is_3_usdt(tmp_path):
+def test_default_execution_is_unacknowledged_and_amount_is_3_usdt(tmp_path):
     root = _root_with("", tmp_path=tmp_path)
     cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.mode == "sim"
+    assert cfg.trading.execution_acknowledgement is None
+    assert not hasattr(cfg.trading, "mode")
+    assert not hasattr(cfg.trading, "live_enabled_token")
     assert cfg.trading.order_quote_amount == 3.0
     assert cfg.trading.amount_configured is True
     assert cfg.trading.order_quote_amount_source == "default (3 USDT)"
@@ -53,45 +55,36 @@ def test_invalid_base_url_rejected(tmp_path):
         load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_trading_mode_validation(tmp_path):
-    root = _root_with("[trading]\nmode = 'yolo'", tmp_path=tmp_path)
-    with pytest.raises(ConfigError, match="mode"):
+def test_legacy_mode_selector_is_rejected(tmp_path):
+    for value in ("sim", "testonly", "live", "yolo"):
+        root = _root_with(f"[trading]\nmode = '{value}'", tmp_path=tmp_path / value)
+        with pytest.raises(ConfigError, match="mode"):
+            load_config(root=root, environ={}, require_credentials=False)
+
+
+def test_legacy_live_token_is_rejected(tmp_path):
+    root = _root_with("[trading]\nlive_enabled_token = 'anything'", tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="live_enabled_token"):
         load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_live_mode_requires_token(tmp_path):
-    root = _root_with("[trading]\nmode = 'live'", tmp_path=tmp_path)
-    with pytest.raises(ConfigError, match="fail closed"):
-        load_config(root=root, environ={}, require_credentials=False)
-
-
-def test_live_mode_with_token_uses_default_amount_when_not_explicit(tmp_path):
+def test_execution_acknowledgement_loads_from_toml_and_env(tmp_path):
     root = _root_with(
-        "[trading]\nmode = 'live'\nlive_enabled_token = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS'",
+        "[trading]\nexecution_acknowledgement = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS'",
         tmp_path=tmp_path,
     )
     cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.mode == "live"
+    assert cfg.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     assert cfg.trading.order_quote_amount == 3.0
     assert cfg.trading.order_quote_amount_source == "default (3 USDT)"
 
-    root = _root_with(
-        "[trading]\nmode = 'live'\nlive_enabled_token = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS'\n"
-        "order_quote_amount = 25",
-        tmp_path=tmp_path / "armed",
+    root = _root_with("", tmp_path=tmp_path / "env")
+    cfg = load_config(
+        root=root,
+        environ={"TRADING_EXECUTION_ACKNOWLEDGEMENT": "I_UNDERSTAND_REAL_MONEY_AND_RISKS"},
+        require_credentials=False,
     )
-    cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.mode == "live"
-    assert cfg.trading.order_quote_amount == 25.0
-    assert cfg.trading.order_quote_amount_source == "config"
-
-
-def test_testonly_uses_default_amount_when_not_explicit(tmp_path):
-    root = _root_with("[trading]\nmode = 'testonly'", tmp_path=tmp_path)
-    cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.mode == "testonly"
-    assert cfg.trading.order_quote_amount == 3.0
-    assert cfg.trading.order_quote_amount_source == "default (3 USDT)"
+    assert cfg.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 
 
 def test_default_amount_is_3_usdt_and_can_be_overridden(tmp_path):
@@ -128,15 +121,13 @@ def test_amount_must_be_numeric(tmp_path):
         load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_amount_is_not_coupled_to_aggregate_budget(tmp_path):
+def test_removed_aggregate_budget_key_is_rejected(tmp_path):
     root = _root_with(
         "[trading]\norder_quote_amount = 60\naggregate_budget_quote = 50",
         tmp_path=tmp_path,
     )
-    t = load_config(root=root, environ={}, require_credentials=False).trading
-    # Per-order size is owner-controlled; the aggregate value is reference-only.
-    assert t.order_quote_amount == 60.0
-    assert t.aggregate_budget_quote == 50.0
+    with pytest.raises(ConfigError, match="aggregate_budget_quote"):
+        load_config(root=root, environ={}, require_credentials=False)
 
 
 def test_amount_from_environment(tmp_path):
@@ -150,11 +141,10 @@ def test_amount_from_environment(tmp_path):
     assert cfg.trading.order_quote_amount_source == "env"
 
 
-def test_explicit_legacy_key_is_accepted_as_fixed_amount(tmp_path):
+def test_legacy_fixed_amount_key_is_rejected(tmp_path):
     root = _root_with("[trading]\nmax_quote_per_order = 42.5", tmp_path=tmp_path)
-    t = load_config(root=root, environ={}, require_credentials=False).trading
-    assert t.order_quote_amount == 42.5
-    assert t.order_quote_amount_source == "legacy max_quote_per_order"
+    with pytest.raises(ConfigError, match="max_quote_per_order"):
+        load_config(root=root, environ={}, require_credentials=False)
 
 
 def test_bad_amount_fails_closed(tmp_path):
@@ -169,43 +159,71 @@ def test_bad_amount_fails_closed(tmp_path):
 
 def test_non_finite_amount_fails_closed(tmp_path):
     for i, value in enumerate(("nan", "inf", "-inf")):
-        root = _root_with(
-            f"[trading]\norder_quote_amount = {value}", tmp_path=tmp_path / f"nf{i}"
-        )
+        root = _root_with(f"[trading]\norder_quote_amount = {value}", tmp_path=tmp_path / f"nf{i}")
         with pytest.raises(ConfigError, match="finite"):
             load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_removed_arbitrary_restriction_keys_are_ignored(tmp_path):
-    # require_stop_loss / require_tp1 etc. are no longer configurable — they are
-    # hard mandatory invariants.  Attempting to set them via TOML must be rejected.
+def test_removed_arbitrary_restriction_keys_are_rejected(tmp_path):
+    # require_stop_loss / require_tp1 etc. are hard mandatory invariants.
     root = _root_with(
-        "[trading]\norder_quote_amount = 10\ndaily_max_orders = 2\nmax_open_orders = 2\n"
-        "max_signal_age_s = 900\nmax_price_deviation_pct = 1\nrequire_stop_loss = true",
+        "[trading]\norder_quote_amount = 10\nrequire_stop_loss = true",
         tmp_path=tmp_path,
     )
     with pytest.raises(ConfigError, match="not configurable"):
         load_config(root=root, environ={}, require_credentials=False)
-    # Without the forbidden keys, config loads successfully.
-    root2 = _root_with(
-        "[trading]\norder_quote_amount = 10\ndaily_max_orders = 2\nmax_open_orders = 2\n"
-        "max_signal_age_s = 900\nmax_price_deviation_pct = 1",
-        tmp_path=tmp_path,
-    )
-    t = load_config(root=root2, environ={}, require_credentials=False).trading
-    assert t.order_quote_amount == 10.0
-    assert t.daily_max_orders == 2
-    assert t.max_open_orders == 2
-    assert t.max_signal_age_s == 900.0
-    assert t.max_price_deviation_pct == 1.0
-    assert not hasattr(t, "allowed_symbols")
+    for obsolete in (
+        "daily_max_orders",
+        "max_open_orders",
+        "max_signal_age_s",
+        "max_price_deviation_pct",
+    ):
+        root2 = _root_with(f"[trading]\norder_quote_amount = 10\n{obsolete} = 2", tmp_path=tmp_path / obsolete)
+        with pytest.raises(ConfigError, match=obsolete):
+            load_config(root=root2, environ={}, require_credentials=False)
 
 
-def test_legacy_allowlist_configuration_is_ignored(tmp_path):
-    root = _root_with(
-        "[trading]\nallowed_symbols = ['BTCUSDT']\nallowlist_mode = 'explicit_allowlist'",
-        tmp_path=tmp_path,
-    )
-    cfg = load_config(root=root, environ={}, require_credentials=False)
+def test_legacy_allowlist_configuration_is_rejected(tmp_path):
+    for key in ("allowed_symbols", "allowlist_mode"):
+        root = _root_with(f"[trading]\n{key} = 'BTCUSDT'", tmp_path=tmp_path / key)
+        with pytest.raises(ConfigError, match=key):
+            load_config(root=root, environ={}, require_credentials=False)
+    cfg = load_config(root=_root_with("", tmp_path=tmp_path / "clean"), environ={}, require_credentials=False)
     assert not hasattr(cfg.trading, "allowed_symbols")
     assert not hasattr(cfg.trading, "allowlist_mode")
+
+
+def test_entry_trigger_offset_defaults_to_three(tmp_path):
+    cfg = load_config(root=_root_with("", tmp_path=tmp_path), environ={}, require_credentials=False)
+    assert cfg.trading.entry_trigger_offset_ticks == 3
+    assert cfg.trading.effective_entry_trigger_offset_ticks == 3
+
+
+def test_entry_trigger_offset_explicit_override(tmp_path):
+    root = _root_with("[trading]\nentry_trigger_offset_ticks = 5", tmp_path=tmp_path)
+    cfg = load_config(root=root, environ={}, require_credentials=False)
+    assert cfg.trading.entry_trigger_offset_ticks == 5
+    assert cfg.trading.effective_entry_trigger_offset_ticks == 5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "'3'", "true", "3.5"])
+def test_entry_trigger_offset_invalid_values_are_rejected(tmp_path, value):
+    root = _root_with(f"[trading]\nentry_trigger_offset_ticks = {value}", tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="entry_trigger_offset_ticks"):
+        load_config(root=root, environ={}, require_credentials=False)
+
+
+def test_order_type_policy_market_is_rejected(tmp_path):
+    root = _root_with('[trading]\norder_type_policy = "market"', tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="order_type_policy"):
+        load_config(root=root, environ={}, require_credentials=False)
+
+
+def test_environment_order_type_policy_cannot_enable_market(tmp_path):
+    root = _root_with("", tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="order_type_policy"):
+        load_config(
+            root=root,
+            environ={"TRADING_ORDER_TYPE_POLICY": "market"},
+            require_credentials=False,
+        )

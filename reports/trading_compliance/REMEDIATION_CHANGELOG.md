@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 <!-- VERIFICATION 2026-10-31T2026-10-31T08:21:53.180647 — Mocked (unit) vs Live (integration) distinction -->
 > **Verification (mocked, disposable DBs — no live exchange, no real login):**  
 > `pytest tests/test_trading_engine.py tests/test_trading_config.py tests/test_trading_live_gates.py tests/test_owner_confirmed_deterministic.py tests/test_critical_review_fixes.py` → **105 passed** (42+18+10+15+20) in ~7.6s on Python 3.11.  

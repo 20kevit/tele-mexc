@@ -18,7 +18,7 @@ def test_cli_defaults_are_fail_closed_and_documented():
     assert app.mexc.cli_binary is None
     assert app.mexc.cli_profile is None
     assert app.mexc.cli_min_version == "0.0.22"
-    assert app.mexc.cli_confirm_noninteractive_writes is False
+    assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
 def test_cli_section_overrides_defaults():
@@ -45,29 +45,29 @@ def test_cli_section_overrides_defaults():
     assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
-def test_live_mode_arms_noninteractive_cli_writes_by_default():
+def test_acknowledgement_arms_noninteractive_cli_writes_by_default():
     app = _app()
     _load_mexc_and_trading(
         app,
-        {"trading": {
-            "mode": "live",
-            "live_enabled_token": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
-        }},
+        {
+            "trading": {
+                "execution_acknowledgement": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
+            }
+        },
         {},
     )
-    assert app.trading.mode == "live"
+    assert app.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
-def test_live_mode_preserves_an_explicit_noninteractive_opt_out():
+def test_acknowledgement_preserves_an_explicit_noninteractive_opt_out():
     app = _app()
     _load_mexc_and_trading(
         app,
         {
             "mexc_cli": {"confirm_noninteractive_writes": False},
             "trading": {
-                "mode": "live",
-                "live_enabled_token": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
+                "execution_acknowledgement": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
             },
         },
         {},
@@ -78,9 +78,7 @@ def test_live_mode_preserves_an_explicit_noninteractive_opt_out():
 def test_non_bool_noninteractive_setting_is_rejected():
     app = _app()
     with pytest.raises(ConfigError, match=r"confirm_noninteractive_writes"):
-        _load_mexc_and_trading(
-            app, {"mexc_cli": {"confirm_noninteractive_writes": "yes"}}, {}
-        )
+        _load_mexc_and_trading(app, {"mexc_cli": {"confirm_noninteractive_writes": "yes"}}, {})
 
 
 @pytest.mark.parametrize("value", [0, -1, 121, float("nan")])
@@ -96,9 +94,19 @@ def test_cli_min_version_shape_is_validated():
         _load_mexc_and_trading(app, {"mexc_cli": {"min_version": "latest"}}, {})
 
 
-def test_live_mode_refuses_to_disable_the_cli_backend():
+def test_cli_backend_may_be_disabled_for_diagnostics():
     app = _app()
-    with pytest.raises(ConfigError, match=r"requires \[mexc_cli\] enabled = true"):
+    _load_mexc_and_trading(
+        app,
+        {"mexc_cli": {"enabled": False}, "trading": {"order_quote_amount": 10}},
+        {},
+    )
+    assert app.mexc.cli_enabled is False
+
+
+def test_legacy_mode_selector_is_rejected():
+    app = _app()
+    with pytest.raises(ConfigError, match="mode"):
         _load_mexc_and_trading(
             app,
             {
@@ -110,16 +118,3 @@ def test_live_mode_refuses_to_disable_the_cli_backend():
             },
             {},
         )
-
-
-def test_testonly_mode_may_still_disable_the_cli_backend():
-    app = _app()
-    _load_mexc_and_trading(
-        app,
-        {"mexc_cli": {"enabled": False}, "trading": {
-            "mode": "testonly", "order_quote_amount": 10,
-        }},
-        {},
-    )
-    assert app.mexc.cli_enabled is False
-    assert app.trading.mode == "testonly"

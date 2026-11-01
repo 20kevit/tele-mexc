@@ -13,7 +13,7 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
   reserves the right to suspend or revoke API access "in cases of abuse"
   (clause repeated across API announcements; User Agreement governs). Whether
   this specific signal-driven workflow is acceptable **must be confirmed by
-  the account owner / MEXC support before live mode** — no code can confirm it.
+  the account owner / MEXC support before live trading** — no code can confirm it.
 - **[OWNER]** API access is per-pair and can be revoked by announcement
   (documented Jan/Mar 2026 spot-pair API suspensions). Before enabling a pair:
   check https://www.mexc.com/announcements/api-updates for the pair.
@@ -98,24 +98,25 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
 
 | Control | State |
 | --- | --- |
-| Execution disabled by default | Yes — `trading.mode = "sim"` (default), no client constructed (`test_sim_mode_builds_no_network_client_and_rejects_live_submission`) |
-| Single explicit enable gate | Yes — `mode` + `live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`; config refuses to boot in live mode otherwise |
-| Kill switch | Yes — emergency stop at evaluation and pre-submission time; operator cancel tooling remains available, but the bot never cancels or adopts pre-existing external orders automatically |
-| Order size | One explicit owner-approved fixed `order_quote_amount`; no software default, no signal-derived size, and no arbitrary daily/open-order caps |
+| Automatic execution | Yes — one MEXC Spot behaviour; no SIM/TESTONLY/LIVE product-mode split |
+| Single explicit enable gate | Yes — `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`; pipeline construction fails closed without it |
+| Submission-boundary pause/readiness | Yes — kernel file lock plus a transactional pause/readiness check inside the submission claim |
+| Kill switch | Yes — emergency stop at evaluation and pre-submission time; the owner can cancel in the MEXC web UI; the bot never cancels or adopts pre-existing external orders automatically |
+| Order size | One owner-configured fixed `order_quote_amount` (default 3 USDT, editable in the control menu); no signal-derived size, leverage, deposit percentage, or daily/open-order cap |
 | Per-order exchange-rule validation | Yes — registry TTL cache over exchangeInfo + local fail-closed checks |
 | Partial fills / cancel races | Yes — reconciliation + fill sync (durable `fill_sync_required` flag) |
 | Durable intents & reconciliation | Yes — SQLite (TradingStore) with migrations; idempotency key on Telegram identity |
 | Health checks without orders | Yes — ping/time/account/keyInfo are read-only; no write call exists outside the order/cancel paths |
 | Log hygiene | Yes — typed errors carry no secrets; signed strings deleted before logging; test-enforced |
-| Dry-run vs live distinction | Yes — `sim` never builds a client; `testonly` uses only the official `/order/test` (validation, not a sandbox and not an order); `live` requires the token |
+| Test-only API primitive | Low-level `POST /api/v3/order/test` exists for contract tests only; it is not exposed as a product mode or CLI command |
 
 ## 7. Recovery procedures (owner runbook)
 
 1. **Kill switch**: set `trading.emergency_stop = true` (or stop the service:
    `systemctl stop tg-ingest`). Both instantly prevent NEW orders.
-2. **Cancel exposure**: `DELETE /api/v3/order/all` via the operator CLI path,
-   or manually in the web UI; then run `tg-ingest trading reconcile` and
-   review `intents`/`reconciliations` tables.
+2. **Cancel exposure**: cancel individual orders in the MEXC web UI (the
+   application does not expose a cancel-all CLI command); then run
+   `tg-ingest trading reconcile` and review `intents`/`reconciliations` tables.
 3. **Ambiguous orders**: any intent in `unknown_requires_reconciliation` is
    re-queried (by `orderId`, else `origClientOrderId`) — resolve manually; the
    system never resubmits by itself.
@@ -125,7 +126,7 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
    refuses to send while blocked), do not restart into the ban window, and
    move to the fallback IP only after reading `Retry-After`.
 
-## 8. Requirements before enabling live mode (checklist)
+## 8. Requirements before enabling automatic Spot trading (checklist)
 
 - [ ] **[OWNER]** Confirm automated-trading use is acceptable for the account
       (MEXC terms + support confirmation) — required, outside code scope.
@@ -133,12 +134,12 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
       (announcements + `exchangeInfo`) at enablement time.
 - [ ] **[OWNER]** Create the key with READ + SPOT_DEAL_WRITE only, IP-bound,
       renewal scheduled.
-- [ ] **[OWNER]** Set realistic exposure limits in `[trading]` config.
+- [ ] **[OWNER]** Set the fixed per-order `order_quote_amount` and verify spendable balance.
 - [ ] **[CODE]** Run `validate_credentials()` once credentials exist
       (read-only; safe).
-- [ ] **[CODE]** `testonly` mode first (official order/test), watching
+- [ ] **[CODE]** The official order/test primitive is validation only; it never proves matching-engine behavior. Watch
       signature/timestamp/clock behaviour on the real host clock.
-- [ ] **[CODE]** Then, and only then, `mode = "live"` with the
-      acknowledgement token.
+- [ ] **[CODE]** Then, and only then, set the exact
+      `execution_acknowledgement` and build the automatic Spot pipeline.
 - No step above may be skipped; the code fails closed on every missing gate,
   but policy confirmation (first two bullets) is not code-verifiable.

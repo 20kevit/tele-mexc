@@ -20,7 +20,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from ..control.bot_api import BotApiError, BotApiForbiddenError, BotApiRateLimitError
-from .store import TradingStore
+from .store import SEVERITY_LEVELS, TradingStore
 
 log = logging.getLogger("ingest.trading.notify")
 
@@ -32,6 +32,25 @@ TELEGRAM_CHUNK_SIZE = 4000
 # Backoff ceiling in seconds.  Retry-after values from Telegram are honored
 # and capped here so a stuck notification never starves the whole outbox.
 MAX_BACKOFF_S = 24 * 3600
+
+
+def classify_severity(category: str, event_key: str, explicit: str | None = None) -> str:
+    if explicit and explicit.upper() in SEVERITY_LEVELS:
+        return explicit.upper()
+    key = f"{category}:{event_key}".upper()
+    if "CRITICAL" in key or category == "critical":
+        return "CRITICAL"
+    if category == "notification_delivery" or any(
+        token in key for token in ("FAILED", "REJECTED", "ERROR", "MISMATCH")
+    ):
+        return "ERROR"
+    if category in ("reconciliation", "recovery") or any(
+        token in key for token in ("WARNING", "RECONCIL", "BLOCK", "UNPROTECTED", "STALE")
+    ):
+        return "WARNING"
+    if category == "diagnostic":
+        return "DEBUG"
+    return "INFO"
 
 
 class TradingNotifier:
@@ -72,6 +91,7 @@ class TradingNotifier:
         category: str = "signal_decision",
         event_type: str = "signal.decision",
         compact_text: str | None = None,
+        severity: str | None = None,
     ) -> int:
         """Persist one event for every selected recipient.
 
@@ -83,16 +103,10 @@ class TradingNotifier:
         targets = self._targets(roles)
         if not targets:
             return 0
-        # Route by persisted preference (falling back to code defaults).  The
-        # owner explicitly opts out of routine local signal rejections; the
-        # developer receives everything.
-        allowed_targets = [
-            (role, chat_id)
-            for role, chat_id in targets
-            if self.store.notification_enabled(role, category)
-        ]
-        if not allowed_targets:
+        level = classify_severity(category, event_key, severity)
+        if not self.store.notification_allowed(level):
             return 0
+        allowed_targets = targets
         # Chunk at enqueue time, one durable outbox row per chunk.  A retry
         # after a partial Telegram failure therefore resends only the chunks
         # that were not yet delivered, never the whole message again.
@@ -127,6 +141,7 @@ class TradingNotifier:
         category: str = "signal_decision",
         event_type: str = "signal.decision",
         compact_text: str | None = None,
+        severity: str | None = None,
     ) -> None:
         """Enqueue + best-effort immediate delivery (never raises to caller)."""
 
@@ -139,6 +154,7 @@ class TradingNotifier:
             category=category,
             event_type=event_type,
             compact_text=compact_text,
+            severity=severity,
         )
         try:
             self.flush()
@@ -155,21 +171,22 @@ class TradingNotifier:
         """Route a trade-lifecycle event to both owner and developer."""
         signal_id = trade.get("signal_id") if trade else None
         intent_id = trade.get("entry_intent_id") if trade else None
+        scope = (trade or {}).get("trade_id") or intent_id or "global"
         self.notify(
-            event_key=event_key,
+            event_key=f"{scope}:{event_key}",
             text=text,
             signal_id=signal_id,
             intent_id=intent_id,
             category="order_lifecycle",
         )
 
-    def notify_intent(
-        self, intent: dict[str, Any], event_key: str, text: str
-    ) -> None:
+    def notify_intent(self, intent: dict[str, Any], event_key: str, text: str) -> None:
         """Route an entry-intent event to both owner and developer."""
         self.notify(
-            event_key=event_key, text=text,
-            signal_id=intent.get("signal_id"), intent_id=intent.get("intent_id"),
+            event_key=event_key,
+            text=text,
+            signal_id=intent.get("signal_id"),
+            intent_id=intent.get("intent_id"),
             category="order_lifecycle",
         )
 
@@ -177,10 +194,7 @@ class TradingNotifier:
     def _chunks(text: str) -> list[str]:
         if len(text) <= TELEGRAM_CHUNK_SIZE:
             return [text]
-        return [
-            text[offset : offset + TELEGRAM_CHUNK_SIZE]
-            for offset in range(0, len(text), TELEGRAM_CHUNK_SIZE)
-        ]
+        return [text[offset : offset + TELEGRAM_CHUNK_SIZE] for offset in range(0, len(text), TELEGRAM_CHUNK_SIZE)]
 
     def flush(self, limit: int = 100) -> int:
         """Attempt pending/failed deliveries; return the number sent.
@@ -212,9 +226,7 @@ class TradingNotifier:
                 # The owner/developer blocked or deactivated the chat.  Never
                 # retry; record suppression and keep the outbox clean.
                 log.warning("notification suppressed for chat %s (%s)", row["chat_id"], exc)
-                self.store.finish_notification(
-                    int(row["notification_id"]), outcome="suppressed", error=str(exc)
-                )
+                self.store.finish_notification(int(row["notification_id"]), outcome="suppressed", error=str(exc))
             except BotApiRateLimitError as exc:
                 # Honor Telegram's ``retry_after`` but cap it so one chat cannot
                 # starve the whole outbox forever.

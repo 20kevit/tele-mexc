@@ -63,43 +63,97 @@ class TradeStore(TradingStore):
         now = self._ts()
         # Columns must match migration 13's ``trades`` table exactly.
         cols = [
-            "trade_id", "signal_id", "idempotency_key", "channel_id", "message_id",
-            "symbol", "side", "entry_mode", "requested_quote", "entry_price",
-            "trigger_offset_ticks", "trigger_price",
-            "trade_state", "tp1_price", "tp2_price",
-            "tp1_allocation_pct", "tp2_allocation_pct",
-            "acquired_base_qty", "acquired_quote_spent", "avg_entry_price", "fees_paid",
-            "tp1_allocated_qty", "tp1_sold_qty", "tp2_allocated_qty", "tp2_sold_qty",
-            "sl_price", "sl_state", "sl_order_id", "sl_executed_qty",
-            "unsold_residual_qty", "unsold_residual_reason",
+            "trade_id",
+            "signal_id",
+            "idempotency_key",
+            "channel_id",
+            "message_id",
+            "symbol",
+            "side",
+            "entry_mode",
+            "requested_quote",
+            "entry_price",
+            "trigger_offset_ticks",
+            "trigger_price",
+            "trade_state",
+            "tp1_price",
+            "tp2_price",
+            "tp1_allocation_pct",
+            "tp2_allocation_pct",
+            "acquired_base_qty",
+            "acquired_quote_spent",
+            "avg_entry_price",
+            "fees_paid",
+            "tp1_allocated_qty",
+            "tp1_sold_qty",
+            "tp2_allocated_qty",
+            "tp2_sold_qty",
+            "sl_price",
+            "sl_state",
+            "sl_order_id",
+            "sl_executed_qty",
+            "unsold_residual_qty",
+            "unsold_residual_reason",
             "entry_intent_id",
-            "entry_order_id", "entry_exchange_status", "entry_filled_qty",
-            "retry_count", "last_error", "last_error_category",
-            "activated_at", "closed_at", "created_at", "updated_at",
+            "entry_order_id",
+            "entry_exchange_status",
+            "entry_filled_qty",
+            "retry_count",
+            "last_error",
+            "last_error_category",
+            "activated_at",
+            "closed_at",
+            "created_at",
+            "updated_at",
         ]
         placeholders = ", ".join("?" for _ in cols)
         values = (
-            trade_id, signal_id, idempotency_key, channel_id, message_id,
-            symbol, side, entry_mode, dec_str(requested_quote),
+            trade_id,
+            signal_id,
+            idempotency_key,
+            channel_id,
+            message_id,
+            symbol,
+            side,
+            entry_mode,
+            dec_str(requested_quote),
             dec_str(entry_price),
             None if trigger_offset_ticks is None else str(trigger_offset_ticks),
             dec_str(trigger_price),
-            "pending_entry", dec_str(tp1_price), dec_str(tp2_price),
-            dec_str(tp1_allocation_pct), dec_str(tp2_allocation_pct),
-            "0", "0", None, "0",
-            "0", "0", "0", "0",
-            dec_str(sl_price), "dormant", None, "0",
-            None, None,
+            "pending_entry",
+            dec_str(tp1_price),
+            dec_str(tp2_price),
+            dec_str(tp1_allocation_pct),
+            dec_str(tp2_allocation_pct),
+            "0",
+            "0",
+            None,
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            dec_str(sl_price),
+            "dormant",
+            None,
+            "0",
+            None,
+            None,
             entry_intent_id,
-            None, None, "0", 0, None, None,
-            None, None,
-            now, now,
+            None,
+            None,
+            "0",
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+            now,
         )
         assert len(values) == len(cols), f"{len(values)} values for {len(cols)} columns"
         with self.db.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM trades WHERE idempotency_key = ?", (idempotency_key,)
-            ).fetchone()
+            existing = conn.execute("SELECT * FROM trades WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
             if existing is not None:
                 return dict(existing)
             # Atomic per-symbol check inside same DB transaction as INSERT.
@@ -109,7 +163,8 @@ class TradeStore(TradingStore):
             if symbol:
                 placeholders_c = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
                 conflict = conn.execute(
-                    f"SELECT trade_id, trade_state FROM trades WHERE symbol = ? AND trade_state IN ({placeholders_c}) LIMIT 1",
+                    "SELECT trade_id, trade_state FROM trades WHERE symbol = ? "
+                    f"AND trade_state IN ({placeholders_c}) LIMIT 1",
                     (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
                 ).fetchone()
                 if conflict is not None:
@@ -118,29 +173,19 @@ class TradeStore(TradingStore):
                         f"{conflict['trade_id']} in state {conflict['trade_state']}; "
                         "overlapping BUY not admitted"
                     )
-            conn.execute(
-                f"INSERT INTO trades ({', '.join(cols)}) VALUES ({placeholders})", values
-            )
+            conn.execute(f"INSERT INTO trades ({', '.join(cols)}) VALUES ({placeholders})", values)
             row = conn.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
             assert row is not None
             return dict(row)
 
     def get_trade(self, trade_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone())
 
     def get_trade_by_signal(self, signal_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute("SELECT * FROM trades WHERE signal_id = ?", (signal_id,)).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM trades WHERE signal_id = ?", (signal_id,)).fetchone())
 
     def get_trade_by_intent(self, intent_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute(
-                "SELECT * FROM trades WHERE entry_intent_id = ?", (intent_id,)
-            ).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM trades WHERE entry_intent_id = ?", (intent_id,)).fetchone())
 
     def list_trades(self, state: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         if state is not None:
@@ -149,9 +194,7 @@ class TradeStore(TradingStore):
                 (state, limit),
             ).fetchall()
         else:
-            rows = self.db.conn.execute(
-                "SELECT * FROM trades ORDER BY updated_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            rows = self.db.conn.execute("SELECT * FROM trades ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     def list_non_terminal_trades(self) -> list[dict[str, Any]]:
@@ -162,9 +205,7 @@ class TradeStore(TradingStore):
         """
 
         rows = self.db.conn.execute(
-            "SELECT * FROM trades WHERE trade_state NOT IN "
-            "('closed', 'tp2_completed') "
-            "ORDER BY updated_at"
+            "SELECT * FROM trades WHERE trade_state NOT IN ('closed', 'tp2_completed') ORDER BY updated_at"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -191,9 +232,7 @@ class TradeStore(TradingStore):
             params.append(now)
         params.append(trade_id)
         with self.db.transaction() as conn:
-            conn.execute(
-                f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params
-            )
+            conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params)
             conn.execute(
                 "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
                 "VALUES (?, 'lifecycle', ?, ?, ?)",
@@ -283,9 +322,7 @@ class TradeStore(TradingStore):
             params.append(last_error_category)
         params.append(trade_id)
         with self.db.transaction() as conn:
-            conn.execute(
-                f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params
-            )
+            conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params)
         return self.get_trade(trade_id)
 
     # ----------------------------------------------------------- trade orders
@@ -321,17 +358,43 @@ class TradeStore(TradingStore):
             if existing is not None:
                 return dict(existing)
             cols = [
-                "trade_order_id", "trade_id", "kind", "client_order_id", "symbol",
-                "side", "order_type", "price", "quantity", "allocated_qty",
-                "sold_qty", "state", "exchange_order_id", "exchange_status",
-                "stop_trigger_price", "created_at", "updated_at",
+                "trade_order_id",
+                "trade_id",
+                "kind",
+                "client_order_id",
+                "symbol",
+                "side",
+                "order_type",
+                "price",
+                "quantity",
+                "allocated_qty",
+                "sold_qty",
+                "state",
+                "exchange_order_id",
+                "exchange_status",
+                "stop_trigger_price",
+                "created_at",
+                "updated_at",
             ]
             placeholders = ", ".join("?" for _ in cols)
             values = (
-                trade_order_id, trade_id, kind, client_order_id, symbol, side,
-                order_type, dec_str(price), dec_str(quantity), dec_str(allocated_qty),
-                "0", "pending", None, None, dec_str(stop_trigger_price),
-                now, now,
+                trade_order_id,
+                trade_id,
+                kind,
+                client_order_id,
+                symbol,
+                side,
+                order_type,
+                dec_str(price),
+                dec_str(quantity),
+                dec_str(allocated_qty),
+                "0",
+                "pending",
+                None,
+                None,
+                dec_str(stop_trigger_price),
+                now,
+                now,
             )
             conn.execute(
                 f"INSERT INTO trade_orders ({', '.join(cols)}) VALUES ({placeholders})",
@@ -343,9 +406,7 @@ class TradeStore(TradingStore):
 
     def get_trade_order(self, trade_order_id: str) -> dict[str, Any] | None:
         return _row(
-            self.db.conn.execute(
-                "SELECT * FROM trade_orders WHERE trade_order_id = ?", (trade_order_id,)
-            ).fetchone()
+            self.db.conn.execute("SELECT * FROM trade_orders WHERE trade_order_id = ?", (trade_order_id,)).fetchone()
         )
 
     def get_trade_order_by_exchange(self, exchange_order_id: str) -> dict[str, Any] | None:
@@ -356,7 +417,9 @@ class TradeStore(TradingStore):
         )
 
     def list_trade_orders(
-        self, trade_id: str | None = None, kind: str | None = None,
+        self,
+        trade_id: str | None = None,
+        kind: str | None = None,
         state: str | None = None,
     ) -> list[dict[str, Any]]:
         where: list[str] = []
@@ -407,7 +470,8 @@ class TradeStore(TradingStore):
             return None
         placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
         rows = self.db.conn.execute(
-            f"SELECT * FROM trades WHERE symbol = ? AND trade_state IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+            "SELECT * FROM trades WHERE symbol = ? AND trade_state IN "
+            f"({placeholders}) ORDER BY updated_at DESC LIMIT 1",
             (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
         ).fetchall()
         return dict(rows[0]) if rows else None
@@ -476,9 +540,7 @@ class TradeStore(TradingStore):
                 params.append(dec_str(decimal))
         params.append(trade_order_id)
         with self.db.transaction() as conn:
-            conn.execute(
-                f"UPDATE trade_orders SET {', '.join(sets)} WHERE trade_order_id = ?", params
-            )
+            conn.execute(f"UPDATE trade_orders SET {', '.join(sets)} WHERE trade_order_id = ?", params)
         return self.get_trade_order(trade_order_id)
 
     # ------------------------------------------------------------ OCO groups
@@ -495,9 +557,7 @@ class TradeStore(TradingStore):
         now = self._ts()
         group_id = str(trade.get("oco_group_id") or f"oco-{trade['trade_id']}")
         with self.db.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM oco_groups WHERE trade_id = ?", (trade["trade_id"],)
-            ).fetchone()
+            existing = conn.execute("SELECT * FROM oco_groups WHERE trade_id = ?", (trade["trade_id"],)).fetchone()
             if existing is not None:
                 return str(existing["oco_group_id"])
             conn.execute(
@@ -505,14 +565,18 @@ class TradeStore(TradingStore):
                 "intended_config, protection_status, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, 'intended', ?, ?, ?, ?)",
                 (
-                    group_id, trade["trade_id"], trade.get("entry_intent_id"),
-                    str(trade["symbol"]).upper(), redact_payload(intended_config),
-                    protection_status, now, now,
+                    group_id,
+                    trade["trade_id"],
+                    trade.get("entry_intent_id"),
+                    str(trade["symbol"]).upper(),
+                    redact_payload(intended_config),
+                    protection_status,
+                    now,
+                    now,
                 ),
             )
             conn.execute(
-                "UPDATE trades SET oco_group_id = COALESCE(oco_group_id, ?), updated_at = ? "
-                "WHERE trade_id = ?",
+                "UPDATE trades SET oco_group_id = COALESCE(oco_group_id, ?), updated_at = ? WHERE trade_id = ?",
                 (group_id, now, trade["trade_id"]),
             )
         return group_id
@@ -542,11 +606,7 @@ class TradeStore(TradingStore):
                 )
 
     def get_oco_group(self, trade_id: str) -> dict[str, Any] | None:
-        return _row(
-            self.db.conn.execute(
-                "SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)
-            ).fetchone()
-        )
+        return _row(self.db.conn.execute("SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)).fetchone())
 
     def upsert_oco_leg(
         self,
@@ -610,16 +670,30 @@ class TradeStore(TradingStore):
                     updated_at = excluded.updated_at
                 """,
                 (
-                    leg_id, group_id, trade["trade_id"], order.get("trade_order_id"),
-                    kind, target, order.get("client_order_id"), order.get("exchange_order_id"),
+                    leg_id,
+                    group_id,
+                    trade["trade_id"],
+                    order.get("trade_order_id"),
+                    kind,
+                    target,
+                    order.get("client_order_id"),
+                    order.get("exchange_order_id"),
                     dec_str(_optional_decimal(order.get("price"))),
                     dec_str(_optional_decimal(order.get("stop_trigger_price"))),
                     dec_str(_optional_decimal(order.get("quantity"))),
-                    state, exchange_status,
+                    state,
+                    exchange_status,
                     dec_str(filled_qty or _optional_decimal(order.get("sold_qty")) or Decimal("0")),
-                    dec_str(filled_quote), dec_str(fee_amount), fee_asset,
-                    cancel_reason, canceled_by_leg, evidence_id, now,
-                    not_observed_reason, now, now,
+                    dec_str(filled_quote),
+                    dec_str(fee_amount),
+                    fee_asset,
+                    cancel_reason,
+                    canceled_by_leg,
+                    evidence_id,
+                    now,
+                    not_observed_reason,
+                    now,
+                    now,
                 ),
             )
         return leg_id
@@ -633,14 +707,11 @@ class TradeStore(TradingStore):
     def mark_trade_order_not_observed(self, trade_order_id: str, reason: str) -> None:
         with self.db.transaction() as conn:
             conn.execute(
-                "UPDATE trade_orders SET not_observed_reason = ?, updated_at = ? "
-                "WHERE trade_order_id = ?",
+                "UPDATE trade_orders SET not_observed_reason = ?, updated_at = ? WHERE trade_order_id = ?",
                 (reason[:500], self._ts(), trade_order_id),
             )
 
-    def attribute_sibling_cancel(
-        self, group_id: str, *, filled_target: str, canceled_target: str
-    ) -> None:
+    def attribute_sibling_cancel(self, group_id: str, *, filled_target: str, canceled_target: str) -> None:
         """Record that an OCO sibling was canceled *because* its peer filled."""
 
         now = self._ts()

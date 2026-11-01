@@ -1,12 +1,14 @@
 """Persisted owner amount: config precedence and restart behaviour.
 
-The Telegram management menu stores the per-order quote amount in
+The Telegram control menu stores the per-order quote amount in
 ``control_settings``.  Environment/TOML configuration must always win, while a
 built-in default may be replaced by the stored value.  These tests use a
 disposable SQLite database and never touch the network.
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 import pytest
 
@@ -108,9 +110,49 @@ def test_build_engine_applies_persisted_amount(cfg, repo):
     """The production builder must apply the stored amount before sizing."""
 
     _store(repo).set_setting("order_quote_amount", "6.5")
-    cfg.trading.mode = "sim"
 
-    engine = build_trading_engine(cfg, repo)
+    engine = build_trading_engine(cfg, repo, client=object())
 
     assert engine.cfg.trading.order_quote_amount == pytest.approx(6.5)
     assert engine.cfg.trading.order_quote_amount_source == "database (Telegram menu)"
+
+
+def test_persisted_buy_amount_reaches_a_real_spot_intent(cfg, repo):
+    from tests.test_trading_engine import FakeMexc, FakeRegistry, _item, _store_message
+    from tg_signal_ingest.trading.engine import TradingEngine
+
+    _store(repo).set_setting("order_quote_amount", "6.5")
+    assert apply_persisted_trading_settings(cfg, repo) is True
+    client = FakeMexc(
+        place_response={"orderId": "ex-owner-amount", "status": "NEW"},
+    )
+    engine = TradingEngine(cfg, repo, client=client, registry=FakeRegistry())
+    engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
+
+    intent = engine.process_item(
+        _item(100, 900),
+        _store_message(repo, 900, "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"),
+    )
+    assert intent is not None
+    assert Decimal(intent["quote_amount"]) == Decimal("6.5")
+    assert client.place_calls == 1
+
+
+def test_legacy_buy_quote_setting_is_read_only_as_fallback(cfg, repo):
+    cfg.trading.order_quote_amount = 3.0
+    cfg.trading.order_quote_amount_source = "default (3 USDT)"
+    _store(repo).set_setting("buy_quote_usd", "9.25")
+
+    assert apply_persisted_trading_settings(cfg, repo) is True
+    assert cfg.trading.order_quote_amount == pytest.approx(9.25)
+    assert cfg.trading.order_quote_amount_source == "legacy database (buy_quote_usd)"
+
+
+def test_canonical_setting_wins_over_legacy_buy_quote(cfg, repo):
+    store = _store(repo)
+    store.set_setting("buy_quote_usd", "9.25")
+    store.set_setting("order_quote_amount", "5.5")
+
+    assert apply_persisted_trading_settings(cfg, repo) is True
+    assert cfg.trading.order_quote_amount == pytest.approx(5.5)
+    assert cfg.trading.order_quote_amount_source == "database (Telegram menu)"

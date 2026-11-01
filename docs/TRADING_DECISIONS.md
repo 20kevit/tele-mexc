@@ -27,8 +27,8 @@ earlier local-only fallback remains available but is not the shipped live path.
 - No futures, margin, leverage, or short selling.
 - Never sell unrelated assets already held in the owner's MEXC account.
 - No withdrawal, transfer, or unrelated account-management functionality.
-- Preserve the existing Telegram signal extraction and analysis functionality.
-  Do not redesign it unless a concrete integration defect prevents trading.
+- Preserve the production Telegram signal extraction and parser. Do not
+  redesign it unless a concrete integration defect prevents trading.
 
 ---------------------------------------------------------------
 2. Position sizing and capital limits
@@ -40,9 +40,9 @@ earlier local-only fallback remains available but is not the shipped live path.
   (`order_quote_amount` in `[trading]`, overridable via the Telegram menu and
   persisted in the DB; precedence is env > Telegram menu/DB > `config.toml` >
   built-in default).
-- Preserve the owner-facing aggregate budget setting (`aggregate_budget_quote`),
-  default 50 USDT. It is a configurable reference value, not a hard-coded cap;
-  the owner may set any positive value. Never silently change it.
+- There is no owner-facing aggregate portfolio budget or spending cap. The
+  `trading_budget_ledger` is a technical, per-intent reservation/concurrency
+  guard, not a budget setting.
 - Calculate actual acquired quantity from **confirmed execution fills**,
   accounting for applicable fees and exchange precision.
 - All exit quantities are based on the **actual bot-owned position**
@@ -60,10 +60,10 @@ earlier local-only fallback remains available but is not the shipped live path.
 1. Current market price above E: submit a **LIMIT BUY at E** using the
    configured quote budget.
 2. Current market price below E: calculate the instrument's **actual tick size**
-   from exchange metadata and submit the conditional entry trigger at
-   `E - offset_ticks × tick_size` (five ticks below E when offset = 5). When the
-   trigger activates, submit a **LIMIT BUY at E** (entry price remains a hard
-   maximum; never converts to market).
+   from exchange metadata and place the conditional entry trigger at
+   `E - offset_ticks × tick_size`. The default is exactly **3 ticks** and remains
+   configurable. When the trigger activates, submit a **LIMIT BUY at E** (entry
+   price remains a hard maximum; never converts to market).
 3. Current price equals E: treated as case 1 (market is not below the entry), so
    a LIMIT BUY at E is submitted immediately. Deterministic: price == entry is
    not "below", so no conditional wait.
@@ -181,15 +181,15 @@ orders; request timeout after the exchange may have accepted it.
   polling iteration while no meaningful event is silently discarded.
 
 ---------------------------------------------------------------
-8. Operational state (observed at time of writing)
+8. Historical operational snapshot (not current behavior)
 ---------------------------------------------------------------
 
-- Service `tg-ingest` is running in `mode = "live"` with the explicit live
-  token present, `order_quote_amount = 3` USDT, `aggregate_budget_quote = 50`
-  USDT. Emergency stop is off.
-- Two spot BUY intents are in `filled` state (real exchange orders, fully
-  filled); aggregate spend is within the 50 USDT cap (~$6 spent, ~$44
-  remaining).
+- Historical snapshot only: service ran with the former mode/live-token
+  configuration and `order_quote_amount = 3` USDT. That mode split and the
+  former aggregate budget reference have been removed; the ledger is now a
+  technical reservation only.
+- Two spot BUY intents were in `filled` state (real exchange orders, fully
+  filled); their historical rows are retained.
 - **No TradeManager trade/exit rows exist for these filled positions, and the
   entry orders carry no attached take-profit/stop-loss triggers.** These two
   live positions therefore currently have no exit protection. This is a known
@@ -197,8 +197,8 @@ orders; request timeout after the exchange may have accepted it.
   left unprotected. No real order will be placed, canceled, or reconciled by
   this document's author to remediate it; the owner must apply the documented
   recovery procedure or enable the TradeManager exit path for future entries.
-- All 728 automated tests pass; lint and type checks are part of the dev
-  workflow (`docs/development.md`).
+- The test count in this historical snapshot is obsolete; run the current suite
+  as documented in `docs/development.md`.
 
 ---------------------------------------------------------------
 9. Change control

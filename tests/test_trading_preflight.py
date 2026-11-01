@@ -12,7 +12,7 @@ import tg_signal_ingest.main as main
 from tg_signal_ingest.mexc.cli import CliHealth
 
 
-def _cfg(mode: str = "sim") -> SimpleNamespace:
+def _cfg() -> SimpleNamespace:
     return SimpleNamespace(
         mexc=SimpleNamespace(
             cli_enabled=True,
@@ -20,8 +20,12 @@ def _cfg(mode: str = "sim") -> SimpleNamespace:
             cli_profile=None,
             cli_timeout_s=5.0,
             cli_min_version="0.0.22",
+            api_key=None,
+            api_secret=None,
         ),
-        trading=SimpleNamespace(mode=mode, live_enabled_token=None),
+        trading=SimpleNamespace(
+            execution_acknowledgement="I_UNDERSTAND_REAL_MONEY_AND_RISKS",
+        ),
     )
 
 
@@ -130,12 +134,11 @@ def test_preflight_fails_closed_when_cli_writes_are_disabled(monkeypatch, capsys
 # ---------------------------------------------------------------------------
 
 
-def _live_cfg(profile: str | None = None) -> SimpleNamespace:
-    cfg = _cfg(mode="live")
+def _rest_cfg(profile: str | None = None) -> SimpleNamespace:
+    cfg = _cfg()
     cfg.mexc.cli_profile = profile
     cfg.mexc.api_key = "rest-key"
     cfg.mexc.api_secret = "rest-secret"
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
     return cfg
 
 
@@ -183,7 +186,7 @@ def test_preflight_fails_when_no_cli_profile_is_saved(monkeypatch, capsys):
 
 
 def test_preflight_fails_when_configured_profile_is_not_saved(monkeypatch, capsys):
-    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _live_cfg("missing"))
+    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _rest_cfg("missing"))
     monkeypatch.setattr(
         "tg_signal_ingest.mexc.cli.MexcCliAdapter",
         _account_adapter({"active": "other", "profiles": ["other"]}),
@@ -195,7 +198,7 @@ def test_preflight_fails_when_configured_profile_is_not_saved(monkeypatch, capsy
 
 
 def test_preflight_fails_when_no_profile_is_active(monkeypatch, capsys):
-    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _live_cfg())
+    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _rest_cfg())
     monkeypatch.setattr(
         "tg_signal_ingest.mexc.cli.MexcCliAdapter",
         _account_adapter({"active": None, "profiles": ["one"]}),
@@ -231,7 +234,7 @@ def _install_rest(monkeypatch, rest_account: dict) -> None:
 
 
 def test_preflight_fails_when_cli_and_rest_accounts_differ(monkeypatch, capsys):
-    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _live_cfg())
+    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _rest_cfg())
     monkeypatch.setattr(
         "tg_signal_ingest.mexc.cli.MexcCliAdapter",
         _account_adapter(
@@ -248,7 +251,7 @@ def test_preflight_fails_when_cli_and_rest_accounts_differ(monkeypatch, capsys):
 
 
 def test_preflight_passes_when_cli_and_rest_accounts_match(monkeypatch, capsys):
-    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _live_cfg())
+    monkeypatch.setattr(main, "_load_or_exit", lambda **_kwargs: _rest_cfg())
     account = {"balances": [{"asset": "USDT", "free": "1.5", "locked": "0.5"}]}
     seen: list[str] = []
     monkeypatch.setattr(

@@ -6,7 +6,7 @@ focused document for the task.
 ## What this repository is
 
 Single-account, single-channel Telegram ingestion service with a local SQLite
-archive, a downstream processing queue, an offline signal-analysis pipeline, and
+archive, a downstream processing queue, and
 a durable MEXC Spot order-intent pipeline. One Python package, one CLI:
 `tg-ingest`.
 
@@ -14,9 +14,14 @@ a durable MEXC Spot order-intent pipeline. One Python package, one CLI:
 - Telegram and MEXC traffic is direct; proxy configuration is rejected.
 - No web server, no public network listener, no withdrawals, no futures,
   no short selling.
-- Default trading mode is `sim`; `testonly` uses the official order-test
-  endpoint; `live` requires an explicit token, a fixed order amount, and MEXC
-  credentials restricted to Spot.
+- MEXC Spot only, automatic execution of valid signals; there is no
+  SIM/TESTONLY/LIVE product-mode split, no symbol allowlist, and no per-signal
+  approval. Construction requires the exact owner acknowledgement, a fixed
+  quote amount, and MEXC credentials plus the CLI write backend restricted to
+  Spot.
+- Pause is enforced by a kernel file lock at the order-submission boundary;
+  readiness (Telegram, MEXC, channel, emergency stop, reconciliation)
+  is checked in the same transaction as the submission claim.
 
 ## Source-of-truth order
 
@@ -32,9 +37,9 @@ Do not silently change behavior to match an old doc.
 ## Safety rules for agents
 
 - Never place, cancel, test, or reconcile a real exchange order.
-- Never run `tg-ingest auth login`, `auth logout`, `serve`, `manage run`,
-  `control run`, `diagnostics telegram`, `trading verify`, `trading test-order`,
-  or `trading reconcile` unless the user explicitly asks and understands the
+- Never run `tg-ingest auth login`, `auth logout`, `serve`, `control run`,
+  `diagnostics telegram`, `trading verify`, or
+  `trading reconcile` unless the user explicitly asks and understands the
   side effects.
 - Never read, print, copy, or commit `.env`, `config/config.toml` values,
   Telegram session files, the SQLite database, or message contents. Use the
@@ -56,12 +61,11 @@ Do not silently change behavior to match an old doc.
 | `tg_signal_ingest/service.py` | live listener, recovery sweep, background workers |
 | `tg_signal_ingest/backfill.py` | resumable history import and checkpoints |
 | `tg_signal_ingest/processing.py` | bounded queue consumer with backoff |
-| `tg_signal_ingest/trading/` | parser, risk, sizing, intents, budget, execution, reconciliation, trade lifecycle, notifications |
+| `tg_signal_ingest/trading/` | parser, risk, intents, reservations, execution, reconciliation, trade lifecycle, notifications |
 | `tg_signal_ingest/mexc/` | MEXC Spot v3 client, typed errors, symbol metadata, depth parsing |
-| `tg_signal_ingest/management/` | two-operator management bot (no trading) |
-| `tg_signal_ingest/control/` | legacy owner controller and Bot API client |
-| `docs/` | operator, developer, architecture, trading, data, analysis docs |
-| `deploy/` | systemd units for `serve`, `manage`, and personal-session `manage` |
+| `tg_signal_ingest/control/` | owner/developer controller, setup store, and Bot API client |
+| `docs/` | operator, developer, architecture, trading, data docs |
+| `deploy/` | systemd unit for `serve` |
 | `tests/` | pytest suite, fakes, parser fixtures |
 
 ## Runtime invariants
@@ -76,23 +80,20 @@ Do not silently change behavior to match an old doc.
 - The activation boundary is persisted in
   `app_state['trading.activation_boundary_message_id']` and advances forward at
   every `serve` start. Messages at/below it, and every `source='backfill'`
-  message, are stored and audited but never traded in `testonly`/`live`.
-- `testonly`/`live` intents reserve their full quote notional plus the fee
-  buffer in `trading_budget_ledger` inside the intent-creation transaction. The
-  aggregate budget is a configurable reference value (default 50 USDT) and is
-  not hard-capped at 50; the owner chooses the value. The ledger is never reset
-  by restart.
+  message, are stored and audited but never traded.
+- Every intent reserves its full quote notional plus the fee buffer in
+  `trading_budget_ledger` inside the intent-creation transaction. This is a
+  technical/idempotency reservation, not a portfolio budget or spending cap.
+  The ledger is never reset by restart.
 - Uncertain live submission outcomes become
   `unknown_requires_reconciliation`; they are never retried automatically.
   Exchange `-2011` never terminalizes a non-terminal local intent.
 - Terminal fills are recovered through `fill_sync_required` until `myTrades`
   confirms the full executed quantity.
-- `serve` holds `<db>.serve.lock`; management/control holds control/serve
-  locks. Kernel `flock` makes the locks crash-safe.
-- `manage run` is a data-only bot: no parser, queue, MEXC client, risk, or
-  trading engine. It can perform one bounded validation sample.
-- The legacy `control` bot is not embedded in `serve`; only its Bot API client
-  is reused for durable notifications. Run it separately with `control run`.
+- `serve` holds `<db>.serve.lock`. When `cfg.control.enabled` is true, it also
+  acquires `<db>.control.lock` and runs the ControlBot task inside the same
+  process. `control run` is the standalone controller mode and takes only the
+  control lock. Never run both against the same database.
 - The live market-monitor → `TradeManager` path has wiring limitations
   documented in `docs/trading.md`. Do not assume TP/SL or conditional entries
   are production-ready without validation.
@@ -105,9 +106,7 @@ Do not silently change behavior to match an old doc.
 .venv/bin/tg-ingest status
 .venv/bin/tg-ingest backfill status
 .venv/bin/tg-ingest trading status
-.venv/bin/tg-ingest manage status
 .venv/bin/tg-ingest control status
-.venv/bin/tg-ingest analyze summary
 
 # Quality gates
 .venv/bin/pytest
@@ -120,7 +119,8 @@ Do not silently change behavior to match an old doc.
 .venv/bin/tg-ingest auth login
 .venv/bin/tg-ingest channels list
 .venv/bin/tg-ingest channel select <id-or-@username-or-title>
-.venv/bin/tg-ingest serve
+.venv/bin/tg-ingest serve                 # ingestion + optional integrated control bot
+.venv/bin/tg-ingest control run           # standalone controller only
 ```
 
 ## Change guidelines
@@ -128,12 +128,13 @@ Do not silently change behavior to match an old doc.
 - Preserve API/state compatibility unless the task explicitly changes behavior.
 - Add a new migration; never rewrite an applied migration. Migrations must stay
   idempotent and ordered.
-- Use `Decimal` for prices, quantities, fees, and budget arithmetic. Do not let
+- Use `Decimal` for prices, quantities, fees, and reservation arithmetic. Do not let
   binary floats reach an exchange call.
 - Keep DB writes inside `Database.transaction()` and preserve the
   intent-before-submission ordering.
-- Never add a code path that retries an uncertain exchange submission, widens
-  the budget cap, trusts Telegram usernames, or derives size from signal text.
+- Never add a code path that retries an uncertain exchange submission,
+  introduces a portfolio spending cap, trusts Telegram usernames, or derives
+  size from signal text.
 - Add or update tests for behavior changes. Parser changes usually require a
   replay/reprocess test.
 - Keep docs concise: link to authoritative detail instead of duplicating it.
@@ -146,7 +147,7 @@ Update docs in the same change as behavior:
 | --- | --- |
 | CLI commands/options, locks, service startup | `docs/operations.md`, `README.md` |
 | Ingestion, recovery, process layout | `docs/architecture.md` |
-| Trading modes, risk, budget, states, reconciliation | `docs/trading.md` |
+| Trading risk, reservations, states, reconciliation | `docs/trading.md` |
 | Schema, enums, migration, retention | `docs/data-model.md` |
 | Test/lint/typecheck/setup workflow | `docs/development.md` |
 | Doc ownership or status | `docs/documentation-index.md` |

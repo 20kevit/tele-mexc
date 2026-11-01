@@ -113,8 +113,9 @@ class IngestService:
         notifier = getattr(self.trading, "notifier", None)
         if notifier is None:
             return
+        roles = ("developer",) if category == "recovery" else None
         try:
-            notifier.notify(event_key=event_key, text=text, category=category)
+            notifier.notify(event_key=event_key, text=text, category=category, roles=roles)
         except Exception as exc:  # noqa: BLE001 - service events must not affect ingestion
             log.warning("service event notification failed (%s)", exc.__class__.__name__)
 
@@ -127,13 +128,17 @@ class IngestService:
         exit_code = 0
         self.install_signal_handlers(asyncio.get_running_loop())
         self.trading.store.audit(
-            "serve_start", "lifecycle", "serve_started", "serve process starting",
-            event_type="lifecycle.serve_started", severity="INFO",
+            "serve_start",
+            "lifecycle",
+            "serve_started",
+            "serve process starting",
+            event_type="lifecycle.serve_started",
+            severity="INFO",
         )
         self._notify_service_event(
             event_key="service:serve_started",
             text=(
-                f"tg-ingest serve started (mode={self.cfg.trading.mode}); "
+                "tg-ingest serve started (MEXC Spot, automatic execution); "
                 "new signals are evaluated automatically, no owner approval required"
             ),
             category="critical",
@@ -188,8 +193,12 @@ class IngestService:
                 await self._sleep_with_stop(delay)
         await self._shutdown_tasks()
         self.trading.store.audit(
-            "serve_stopped", "lifecycle", "serve_stopped", "serve process stopped",
-            event_type="lifecycle.serve_stopped", severity="INFO",
+            "serve_stopped",
+            "lifecycle",
+            "serve_stopped",
+            "serve process stopped",
+            event_type="lifecycle.serve_stopped",
+            severity="INFO",
         )
         self._notify_service_event(
             event_key="service:serve_stopped",
@@ -212,7 +221,10 @@ class IngestService:
         if recovered:
             log.info("re-queued %s item(s) left in 'processing' state by a previous crashed run", recovered)
         log.info("telegram session verified; transport=direct TCP/TLS")
+        self._refresh_trading_readiness()
+        await self._verify_mexc_readiness()
         await self._resolve_channel_entity()
+        self._refresh_trading_readiness()
         # Capture the newest already-stored id *before* live handlers are
         # attached.  Messages that arrive afterwards are genuinely new and must
         # stay above the boundary; recovered downtime traffic is separately
@@ -254,6 +266,38 @@ class IngestService:
         self._selected_marked_id = marked_channel_id(selected.channel_id)
         log.info("listening to channel: id=%s marked=%s title=%r", selected.channel_id, self._selected_marked_id, title)
 
+    def _refresh_trading_readiness(self) -> None:
+        """Expose the live process's verified state to the submission gate."""
+
+        setter = getattr(self.trading, "set_runtime_readiness", None)
+        if not callable(setter):
+            return
+        client = self._client
+
+        def telegram_ready() -> bool:
+            connected = getattr(client, "is_connected", None)
+            try:
+                return bool(connected()) if callable(connected) else False
+            except Exception:  # noqa: BLE001 - readiness must fail closed
+                return False
+
+        def channel_ready() -> bool:
+            return bool(self._selected_channel_id)
+
+        setter(telegram=telegram_ready, channel=channel_ready)
+
+    async def _verify_mexc_readiness(self) -> None:
+        verifier = getattr(self.trading, "verify_mexc_readiness", None)
+        if not callable(verifier):
+            return
+        try:
+            verified = await asyncio.to_thread(verifier)
+        except Exception as exc:  # noqa: BLE001 - report, let the gate fail closed
+            log.error("MEXC readiness verification failed (%s)", exc.__class__.__name__)
+            return
+        if not verified:
+            log.error("MEXC account readiness could not be verified; new entries will be blocked")
+
     def _arm_trading_boundary(self, startup_max: int) -> int | None:
         """Advance the activation boundary to the pre-handler stored maximum.
 
@@ -264,17 +308,14 @@ class IngestService:
         can.
         """
 
-        if self.cfg.trading.mode not in ("testonly", "live"):
-            return None
         store = getattr(self.trading, "store", None)
         if store is None or self._selected_channel_id is None:
             return None
-        boundary = store.ensure_activation_boundary(
-            self._selected_channel_id, minimum=startup_max
-        )
+        boundary = store.ensure_activation_boundary(self._selected_channel_id, minimum=startup_max)
         log.info(
             "trading activation boundary armed at message id %s (startup max %s)",
-            boundary, startup_max,
+            boundary,
+            startup_max,
         )
         return int(boundary)
 
@@ -318,19 +359,17 @@ class IngestService:
             result = self.repo.upsert_message(rec)
             self.repo.record_live_event(self._selected_channel_id, int(message.id))
             if result.outcome.value == "inserted":
-                log.info(
-                    "live message %s stored (media=%s)", message.id, rec.media_type or "text-only"
-                )
+                log.info("live message %s stored (media=%s)", message.id, rec.media_type or "text-only")
             elif result.outcome.value == "updated":
                 log.info(
                     "live edit of %s stored (version %s -> %s)",
-                    message.id, result.old_version, result.new_version,
+                    message.id,
+                    result.old_version,
+                    result.new_version,
                 )
             await self._download_media_if_requested(message)
         except Exception as exc:  # noqa: BLE001
-            log.error(
-                "failed to store live message %s: %s", getattr(message, "id", "?"), exc.__class__.__name__
-            )
+            log.error("failed to store live message %s: %s", getattr(message, "id", "?"), exc.__class__.__name__)
 
     async def _download_media_if_requested(self, message: Any) -> None:
         """Optional, default-off media download (only when explicitly configured)."""
@@ -341,7 +380,8 @@ class IngestService:
             path = await self._client.download_media(message, file=str(self.cfg.media_dir))
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "media download failed for message %s: %s", getattr(message, "id", "?"),
+                "media download failed for message %s: %s",
+                getattr(message, "id", "?"),
                 exc.__class__.__name__,
             )
             return
@@ -437,10 +477,9 @@ class IngestService:
             log.info("history import already done; skipping backfill")
         self._register_trading_handlers()
         self._queue_task = asyncio.create_task(self.proc_engine.run(self._stop))
-        if self.cfg.trading.mode == "live":
-            self._recon_task = asyncio.create_task(self._reconciliation_worker())
-            if self._trade_manager() is not None:
-                self._monitor_task = asyncio.create_task(self._market_worker())
+        self._recon_task = asyncio.create_task(self._reconciliation_worker())
+        if self._trade_manager() is not None:
+            self._monitor_task = asyncio.create_task(self._market_worker())
 
     def _register_trading_handlers(self) -> None:
         async def _handle(item, record):
@@ -525,12 +564,11 @@ class IngestService:
                 except Exception as exc:  # noqa: BLE001 - never kill the worker
                     log.error(
                         "trade tick failed for %s (%s); continuing",
-                        symbol, exc.__class__.__name__,
+                        symbol,
+                        exc.__class__.__name__,
                     )
 
-        self._tick_thread = threading.Thread(
-            target=_run, name="trade-tick-worker", daemon=True
-        )
+        self._tick_thread = threading.Thread(target=_run, name="trade-tick-worker", daemon=True)
         self._tick_thread.start()
 
     def _stop_tick_worker(self) -> None:
@@ -562,8 +600,7 @@ class IngestService:
         active = {
             str(trade.get("symbol") or "").upper()
             for trade in trades
-            if trade.get("trade_state")
-            not in ("closed", "tp2_completed", "needs_reconciliation")
+            if trade.get("trade_state") not in ("closed", "tp2_completed", "needs_reconciliation")
             and trade.get("symbol")
         }
         for symbol in sorted(active - self._subscribed_symbols):
@@ -616,6 +653,9 @@ class IngestService:
         while not self._stop.is_set():
             try:
                 await asyncio.to_thread(self.trading.reconcile_pending)
+                resume = getattr(self.trading, "resume_planned_intents", None)
+                if callable(resume):
+                    await asyncio.to_thread(resume)
                 if trade_manager is not None:
                     await asyncio.to_thread(trade_manager.reconcile_all_open)
                 notifier = getattr(self.trading, "notifier", None)
@@ -637,15 +677,17 @@ class IngestService:
                 if report.completed:
                     log.info(
                         "history import done: discovered=%s inserted=%s updated=%s unchanged=%s failed=%s",
-                        report.discovered, report.inserted, report.updated, report.unchanged, report.failed,
+                        report.discovered,
+                        report.inserted,
+                        report.updated,
+                        report.unchanged,
+                        report.failed,
                     )
                     return
                 if report.abort_reason:
                     log.error("history import aborted: %s", report.abort_reason)
                     return
-                log.warning(
-                    "history import pass ended without completion; retrying (checkpoint preserved)"
-                )
+                log.warning("history import pass ended without completion; retrying (checkpoint preserved)")
                 await self._sleep_with_stop(30)
                 continue
             except FloodWaitError as exc:
@@ -653,9 +695,7 @@ class IngestService:
                 # Honor the server-provided wait exactly; normal backoff caps do
                 # not apply to FloodWait.
                 delay = exc.seconds + random.uniform(0, 1)
-                log.error(
-                    "backfill attempt %s hit FloodWait; retrying in %.0fs", attempt, delay
-                )
+                log.error("backfill attempt %s hit FloodWait; retrying in %.0fs", attempt, delay)
                 await self._sleep_with_stop(delay)
                 continue
             except (BackfillError, RPCError) as exc:
@@ -682,9 +722,7 @@ class IngestService:
             raise
         disconnect_done = asyncio.create_task(self._wait_for_task(disconnect_task))
         try:
-            done, _ = await asyncio.wait(
-                {stop_task, disconnect_done}, return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _ = await asyncio.wait({stop_task, disconnect_done}, return_when=asyncio.FIRST_COMPLETED)
             if stop_task in done and self._stop.is_set():
                 with contextlib.suppress(Exception):
                     await self._client.disconnect()

@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # Git Branch Consolidation Report
 
 **Project:** tele-mexc (tg-signal-ingest) — Telegram-to-MEXC Spot signal bot  
@@ -17,8 +22,8 @@
   * **Original/full history** (local `main`, `ui-audit`, `public-review`, tag `pre-publication-backup`): rooted at `2076ec9`.
   * **Public/squashed history** (`public/main`, `public/arena/*`, `fix/sl-stop-loss-trigger-offset`): rooted at `42692a8` "Initial public snapshot". This history removed many pre-publication docs/tests but added important trading fixes.
 * Existing worktrees:
-  * `/opt/projects/akha1` → `fix/sl-stop-loss-trigger-offset`
-  * `/opt/projects/akha1-ui-audit` → `ui-audit`
+  * `<repo-root>` → `fix/sl-stop-loss-trigger-offset`
+  * `<repo-root>-ui-audit` → `ui-audit`
   * `/root/.local/share/opencode/worktree/42692a/baseline-a79e6a9` → detached `a79e6a9` (prunable)
   * `/root/.local/share/opencode/worktree/42692a/glowing-engine` → original detached HEAD
 
@@ -234,8 +239,8 @@ Reason: missing TELEGRAM_API_ID / TELEGRAM_API_HASH in environment
 | Branch / Ref | Reason |
 |---|---|
 | `main` | Updated to integration result; canonical project branch. |
-| `fix/sl-stop-loss-trigger-offset` | Has active worktree at `/opt/projects/akha1`; branch retained. |
-| `ui-audit` | Has active worktree at `/opt/projects/akha1-ui-audit`; branch retained. |
+| `fix/sl-stop-loss-trigger-offset` | Has active worktree at `<repo-root>`; branch retained. |
+| `ui-audit` | Has active worktree at `<repo-root>-ui-audit`; branch retained. |
 | `remotes/public/*` | Remote branches left untouched per policy. |
 | `pre-publication-backup` tag | Historical checkpoint; retained. |
 | `refs/backup/*` | Recovery references created before any mutation. |
@@ -297,7 +302,7 @@ git checkout refs/backup/initial-HEAD
 2. **Telegram credentials for full test suite:** Provide `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` (or a test-only `.env`) so `tests/test_auth_logout.py::test_logout_refused_while_service_running` can run.
 3. **Median-of-three MEXC clock sync:** Decide whether to implement or source the missing implementation. The current code uses `recvWindow=5000` and a single server-time query, which satisfies the other approved decisions but not the median-of-three requirement.
 4. **Remote branch cleanup:** Review `remotes/public/arena/*` and `remotes/public/fix/sl-stop-loss-trigger-offset`; delete from remote if/when they are no longer needed.
-5. **Worktree cleanup:** The worktrees at `/opt/projects/akha1` and `/opt/projects/akha1-ui-audit` are still checked out to branches that are now fully in `main`; owner can remove them when convenient.
+5. **Worktree cleanup:** The worktrees at `<repo-root>` and `<repo-root>-ui-audit` are still checked out to branches that are now fully in `main`; owner can remove them when convenient.
 6. **Push `main`:** This task performed only local integration. Pushing to `public/main` requires explicit owner authorization.
 
 ---

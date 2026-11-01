@@ -1,15 +1,12 @@
-"""Default-disabled execution tests, verified OFFLINE (no credentials needed).
+"""Pipeline-construction and acknowledgement gates, verified OFFLINE.
 
 Guarantees under test:
-- ``sim`` mode (the default) constructs NO exchange client at all.
-- ``_execute_live`` raises AccidentalOrderRiskError unless mode == "live"
-  AND the explicit acknowledgement token is configured.
+- The pipeline cannot be constructed without the exact owner acknowledgement.
+- The MEXC CLI write backend is required for the automatic Spot pipeline.
+- An unacknowledged/wrongly acknowledged engine refuses every exchange write.
 - A client without credentials refuses every authenticated call locally.
-- Config refused to boot in live mode without the token (fail closed).
-
-Docs checked 2026-10-23: testing uses the OFFICIAL ``POST /api/v3/order/test``
-.openapi ``/order/test`` is validation only and never reaches the matching
-engine; there is NO MEXC sandbox (mexc.com/mexc-api FAQ).
+- The official /order/test REST primitive remains validation-only and is not
+  exposed as a product execution mode.
 """
 
 from __future__ import annotations
@@ -26,7 +23,7 @@ from tg_signal_ingest.mexc import (
     MexcSpotClient,
     WeightedRateGate,
 )
-from tg_signal_ingest.trading.runtime import build_trading_engine
+from tg_signal_ingest.trading.runtime import build_mexc_client, build_trading_engine
 
 
 @pytest.fixture(autouse=True)
@@ -49,53 +46,62 @@ class RefusingTransport:
         raise AssertionError("live HTTP transport was invoked during offline tests")
 
 
-def test_sim_mode_builds_no_network_client_and_rejects_live_submission(repo, cfg):
-    cfg.trading.mode = "sim"
-    engine = build_trading_engine(cfg, repo)
-    assert engine.client is None
+class MinimalClient:
+    symbols = object()
+
+
+def test_pipeline_refuses_to_build_without_acknowledgement(repo, cfg):
+    cfg.trading.execution_acknowledgement = None
+    with pytest.raises(ConfigError, match="acknowledgement"):
+        build_trading_engine(cfg, repo, client=MinimalClient())
+
+
+def test_pipeline_refuses_to_build_with_wrong_acknowledgement(repo, cfg):
+    cfg.trading.execution_acknowledgement = "wrong"
+    with pytest.raises(ConfigError, match="acknowledgement"):
+        build_trading_engine(cfg, repo, client=MinimalClient())
+
+
+def test_pipeline_requires_the_cli_write_backend(cfg):
+    cfg.mexc.api_key = "k"
+    cfg.mexc.api_secret = "s"
+    cfg.mexc.cli_enabled = False
+    with pytest.raises(ConfigError, match="CLI"):
+        build_mexc_client(cfg, for_live_writes=True)
+
+
+def test_unacknowledged_engine_blocks_every_live_submission(repo, cfg):
+    engine = build_trading_engine(cfg, repo, client=MinimalClient())
+    engine.cfg.trading.execution_acknowledgement = "wrong-token"
     with pytest.raises(AccidentalOrderRiskError):
         engine._execute_live({"intent_id": "x", "symbol": "BTCUSDT"})
 
 
-def test_live_refuses_to_run_without_the_explicit_token(repo, cfg):
-    engine = build_trading_engine(cfg, repo)
-    engine.cfg.trading.mode = "live"  # token still None -> not armed
+def test_acknowledged_engine_still_needs_a_client(repo, cfg):
+    engine = build_trading_engine(cfg, repo, client=MinimalClient())
     engine.client = None
     with pytest.raises(AccidentalOrderRiskError):
         engine._execute_live({"intent_id": "x"})
 
 
-def test_armed_live_mode_with_wrong_token_is_still_blocked(repo, cfg):
-    engine = build_trading_engine(cfg, repo)
-    engine.cfg.trading.mode = "live"
-    engine.cfg.trading.live_enabled_token = "wrong-token"
-    engine.client = MexcSpotClient("k", "s", transport=RefusingTransport())
-    with pytest.raises(AccidentalOrderRiskError):
-        engine._execute_live({"intent_id": "x"})
-
-
-def test_live_mode_config_refused_to_boot_without_token():
-    """Fail closed at config load, matching the documented safety model."""
-
+def test_legacy_mode_config_refuses_to_load():
     from tg_signal_ingest.config import AppConfig, _load_mexc_and_trading
 
     app = AppConfig(api_id=1, api_hash="a" * 32, data_dir="/tmp/x", db_path="/tmp/x/db.sqlite3")
-    toml: dict = {"trading": {"mode": "live"}}
-    env: dict = {}
-    with pytest.raises(ConfigError):
-        _load_mexc_and_trading(app, toml, env)
+    with pytest.raises(ConfigError, match="mode"):
+        _load_mexc_and_trading(app, {"trading": {"mode": "live"}}, {})
 
 
 def test_client_without_credentials_refuses_all_signed_calls_locally():
     client = MexcSpotClient("", "", transport=RefusingTransport())
     with pytest.raises(MexcConfigError):
-        client.place_order(symbol="BTCUSDT", side="BUY", order_type="LIMIT",
-                           quantity=Decimal("1"), price=Decimal("1"))
+        client.place_order(symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=Decimal("1"), price=Decimal("1"))
     with pytest.raises(MexcConfigError):
         client.account()
     with pytest.raises(MexcConfigError):
-        client.place_test_order(symbol="BTCUSDT", side="BUY", order_type="LIMIT",
-                                quantity=Decimal("1"), price=Decimal("1"))
+        client.place_test_order(
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT", quantity=Decimal("1"), price=Decimal("1")
+        )
 
 
 def test_test_order_is_officially_validation_only():
@@ -120,10 +126,51 @@ def test_test_order_is_officially_validation_only():
         general_gate=WeightedRateGate(100, 1.0),
     )
     assert client.place_test_order(
-        symbol="MXUSDT", side="BUY", order_type="LIMIT",
-        quantity=Decimal("50"), price=Decimal("0.1"),
+        symbol="MXUSDT",
+        side="BUY",
+        order_type="LIMIT",
+        quantity=Decimal("50"),
+        price=Decimal("0.1"),
     )
     url, method, body = transport.calls[0]
     assert url == "https://api.mexc.com/api/v3/order/test"
     assert method == "POST"
     assert b"symbol=MXUSDT" in body and json.loads(b"{}") == {}
+
+
+def test_rest_client_rejects_market_orders_before_transport():
+    class RecordingTransport:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("transport must not be reached for MARKET")
+
+    transport = RecordingTransport()
+    client = MexcSpotClient(
+        "k",
+        "s",
+        transport=transport,
+        clock=lambda: 1700000000000,
+        general_gate=WeightedRateGate(100, 1.0),
+        uid_gate=WeightedRateGate(100, 1.0),
+        order_gate=WeightedRateGate(100, 1.0),
+    )
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
+        client.place_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("0.1"),
+            price=None,
+        )
+    with pytest.raises(MexcConfigError, match="only LIMIT"):
+        client.place_test_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("0.1"),
+            price=None,
+        )
+    assert transport.calls == []

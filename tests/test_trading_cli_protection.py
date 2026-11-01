@@ -21,8 +21,14 @@ ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
 
 def _item(mid: int) -> QueueItem:
     return QueueItem(
-        queue_id=0, channel_id=100, message_id=mid, item_type="message",
-        status="processing", targets_version=0, attempts=0, available_at="",
+        queue_id=0,
+        channel_id=100,
+        message_id=mid,
+        item_type="message",
+        status="processing",
+        targets_version=0,
+        attempts=0,
+        available_at="",
         created_at="",
     )
 
@@ -86,8 +92,7 @@ class FakeCliClient:
         self.place_kwargs = kwargs
         if self.place_error is not None:
             raise self.place_error
-        return {"orderId": "ex-1", "status": "NEW", "executedQty": "0",
-                "cumulativeQuoteQty": "0"}
+        return {"orderId": "ex-1", "status": "NEW", "executedQty": "0", "cumulativeQuoteQty": "0"}
 
     def account(self):
         return {
@@ -100,8 +105,7 @@ class FakeCliClient:
         }
 
     def query_order(self, **kwargs):
-        return {"orderId": "ex-1", "status": "NEW", "executedQty": "0",
-                "cumulativeQuoteQty": "0"}
+        return {"orderId": "ex-1", "status": "NEW", "executedQty": "0", "cumulativeQuoteQty": "0"}
 
     def verify_protection(self, **kwargs):
         self.verify_calls += 1
@@ -112,13 +116,9 @@ class FakeCliClient:
 
 
 def _engine(cfg, repo, client):
-    cfg.trading.mode = "live"
-    cfg.trading.live_enabled_token = LIVE_TOKEN
     cfg.trading.order_quote_amount = 10.0
     cfg.trading.order_quote_amount_source = "test"
-    engine = TradingEngine(
-        cfg, repo, client=client, registry=FakeRegistry(), now=lambda: NOW
-    )
+    engine = TradingEngine(cfg, repo, client=client, registry=FakeRegistry(), now=lambda: NOW)
     engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
     return engine
 
@@ -171,15 +171,17 @@ def test_duplicate_placement_is_unknown_and_never_retried(cfg, repo):
 def test_market_entry_has_no_attached_protection_prices(cfg, repo):
     client = FakeCliClient()
     engine = _engine(cfg, repo, client)
-    tp, sl = engine._protection_prices({
-        "intent_id": "intent-x",
-        "signal_id": "100:1:0",
-        "side": "buy",
-        "order_type": "market",
-        "limit_price": None,
-        "client_order_id": "tsi-x",
-        "symbol": "BTCUSDT",
-    })
+    tp, sl = engine._protection_prices(
+        {
+            "intent_id": "intent-x",
+            "signal_id": "100:1:0",
+            "side": "buy",
+            "order_type": "market",
+            "limit_price": None,
+            "client_order_id": "tsi-x",
+            "symbol": "BTCUSDT",
+        }
+    )
     assert tp is None and sl is None
 
 
@@ -193,8 +195,7 @@ def test_verified_exchange_protection_suppresses_local_tp_sl():
     entered: list[str] = []
     tm._enter_tp1 = lambda trade: entered.append("tp1")
     tm._enter_stop_loss = lambda trade, price: entered.append("sl")
-    trade = {"trade_id": "t1", "entry_intent_id": "intent-1",
-             "tp1_price": "110", "sl_price": "95"}
+    trade = {"trade_id": "t1", "entry_intent_id": "intent-1", "tp1_price": "110", "sl_price": "95"}
     tm._check_tp_sl(trade, Decimal("110"))
     tm._check_tp_sl(trade, Decimal("90"))
     assert entered == []
@@ -210,7 +211,6 @@ def test_unverified_protection_leaves_local_management_in_control():
     entered: list[str] = []
     tm._enter_tp1 = lambda trade: entered.append("tp1")
     tm._enter_stop_loss = lambda trade, price: entered.append("sl")
-    trade = {"trade_id": "t1", "entry_intent_id": "intent-1",
-             "tp1_price": "110", "sl_price": "95"}
+    trade = {"trade_id": "t1", "entry_intent_id": "intent-1", "tp1_price": "110", "sl_price": "95"}
     tm._check_tp_sl(trade, Decimal("110"))
     assert entered == ["tp1"]

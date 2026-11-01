@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
+
+import pytest
 
 from tg_signal_ingest.control.service import ControlBot
 from tg_signal_ingest.control.store import ControlStore
-from tg_signal_ingest.normalize import message_to_record
 
 OWNER = 4242
 DEVELOPER = 7777
@@ -28,9 +29,7 @@ class FakeBot:
         return {"message_id": len(self.sent)}
 
     def edit_message_text(self, chat_id, message_id, text, *, reply_markup=None):
-        self.edited.append(
-            {"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup}
-        )
+        self.edited.append({"chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": reply_markup})
         return {}
 
     def answer_callback_query(self, callback_id, text=None):
@@ -134,7 +133,7 @@ def _callback(update_id: int, data: str, *, user: int = OWNER):
     }
 
 
-def _full_setup(store: ControlStore, *, completed: bool = True) -> None:
+def _full_setup(store: ControlStore) -> None:
     store.update_setup(
         telegram_state="authenticated",
         telegram_account_label="Owner",
@@ -142,8 +141,6 @@ def _full_setup(store: ControlStore, *, completed: bool = True) -> None:
         mexc_label="Spot trade + read",
         selected_channel_id=CHANNEL,
         selected_channel_title="Signals",
-        learning_state="completed" if completed else "in_progress",
-        learning_streak=5 if completed else 0,
     )
     store.refresh_setup_state()
 
@@ -205,7 +202,6 @@ async def test_start_requires_owner_and_resumes_persisted_setup(cfg, repo):
     text = fake.sent[-1]["text"]
     assert "وضعیت سیستم" in text
     assert "کانال: Signals" in text
-    assert "یادگیری: 5 از 5" in text
     assert store.setup()["effective_state"] == before["effective_state"]
     assert store.flow()["state"] == "idle"
 
@@ -304,31 +300,6 @@ async def test_chat_login_is_disabled_and_stale_challenge_is_discarded(cfg, repo
     assert "12345" not in persisted
 
 
-async def test_learning_requires_five_valid_examples_before_ready_state(cfg, repo):
-    _add_channel(repo)
-    for index in range(1, 6):
-        repo.upsert_message(
-            message_to_record(
-                CHANNEL,
-                Msg(index, f"BUY BTCUSDT ENTRY 100 TP 110 SL 95 #{index}"),
-                "live",
-            )
-        )
-    store = ControlStore(repo.db)
-    _full_setup(store, completed=False)
-    control, fake, _engine = _bot(cfg, repo)
-
-    for index in range(5):
-        await control.handle_update(_callback(100 + index * 2, "m:learn_next"))
-        approve = next(btn for btn in fake.last_buttons() if btn["callback_data"].startswith("lr:y:"))
-        await control.handle_update(_callback(101 + index * 2, approve["callback_data"]))
-
-    setup = store.setup()
-    assert setup["learning_streak"] == 5
-    assert setup["learning_state"] == "completed"
-    assert setup["effective_state"] == "automatic"
-
-
 async def test_legacy_order_approval_callback_is_inert_and_tick_is_safe(cfg, repo):
     """Legacy order-approval callbacks cannot execute orders; tick stays inert."""
     _add_channel(repo)
@@ -357,8 +328,8 @@ async def test_version_command_reports_runtime_info(cfg, repo):
     assert "نسخه برنامه:" in text
     assert "commit SHA:" in text
     assert "شاخه:" in text
-    assert "حالت معامله:" in text
-    assert "مجوز لایو:" in text
+    assert "حالت معامله:" not in text
+    assert "مجوز لایو:" not in text
     # No secrets leaked.
     assert "api_key" not in text.lower()
     assert "secret" not in text.lower()
@@ -485,14 +456,18 @@ async def test_disconnect_requires_explicit_second_confirmation(cfg, repo, monke
     assert store.setup()["telegram_state"] == "unauthenticated"
 
 
-def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo):
+def test_cli_control_runtime_no_longer_installs_approval_hooks(cfg, repo, monkeypatch):
     from tg_signal_ingest import main as main_module
 
     cfg.control.bot_token = "123:test-token"
     cfg.control.owner_user_id = OWNER
     cfg.control.secret_key = "test-control-secret"
     cfg.control.enabled = True
-    cfg.trading.mode = "sim"
+
+    def _fake_builder(_cfg, _repo):
+        return FakeEngine(_repo)
+
+    monkeypatch.setattr("tg_signal_ingest.trading.build_trading_engine", _fake_builder)
     bot, engine = main_module._build_control_runtime(cfg, repo)
     assert bot._engine is engine
     assert not hasattr(engine, "approval_gate")
@@ -586,3 +561,99 @@ async def test_developer_is_blocked_when_not_configured(cfg, repo):
 
     await control.handle_update(_message(1, "/start", user=DEVELOPER))
     assert "دسترسی مجاز نیست" in fake.sent[-1]["text"]
+
+
+async def test_learning_workflow_is_removed_from_control_bot(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_message(1, "/start"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert not any(callback in ("m:learn", "m:learn_next") or callback.startswith("lr:") for callback in callbacks)
+    assert "یادگیری" not in fake.sent[-1]["text"]
+
+    await control.handle_update(_callback(2, "lr:y:legacy-sample"))
+    assert any("دکمه نامعتبر" in item["text"] for item in fake.sent)
+
+
+async def test_notification_severity_is_one_selected_level(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "n:settings"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert {f"n:set:{level}" for level in store.NOTIFICATION_LEVELS} <= set(callbacks)
+    assert not any(callback.startswith("n:toggle:") for callback in callbacks)
+
+    await control.handle_update(_callback(2, "n:set:WARNING"))
+    assert store.notification_min_severity() == "WARNING"
+    assert any("WARNING" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_writes_the_execution_setting(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:buy"))
+    await control.handle_update(_message(2, "7.25"))
+
+    assert store.get_setting("order_quote_amount") == "7.25"
+    assert control.cfg.trading.order_quote_amount == pytest.approx(7.25)
+    assert control.cfg.trading.order_quote_amount_source == "database (Telegram menu)"
+    assert store.get_setting("buy_quote_usd") is None
+    assert any("ذخیره شد" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_invalid_values_do_not_change_execution(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+    original = control.cfg.trading.order_quote_amount
+
+    await control.handle_update(_callback(1, "m:buy"))
+    for value in ("0", "-3", "nan", "inf", "not-a-number"):
+        await control.handle_update(_message(2, value))
+        assert store.get_setting("order_quote_amount") is None
+        assert control.cfg.trading.order_quote_amount == original
+        assert any("معتبر" in item["text"] or "بزرگ‌تر" in item["text"] for item in fake.sent)
+
+
+async def test_control_sizing_ui_has_no_sell_percentage_flow(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:sizing"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert "m:sell" not in callbacks
+    assert not any("فروش" in item["text"] for item in fake.sent[-1:])
+
+    await control.handle_update(_callback(2, "m:sell"))
+    assert any("گزینه نامعتبر" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_respects_environment_precedence(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    cfg.trading.order_quote_amount = 4.25
+    cfg.trading.order_quote_amount_source = "env"
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:buy"))
+    await control.handle_update(_message(2, "9.5"))
+
+    assert store.get_setting("order_quote_amount") is None
+    assert control.cfg.trading.order_quote_amount == 4.25
+    assert any("TRADING_ORDER_QUOTE_AMOUNT" in item["text"] for item in fake.sent)

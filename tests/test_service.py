@@ -52,12 +52,14 @@ class FakeClient:
         def decorator(fn):
             self.handlers.append(fn)
             return fn
+
         return decorator
 
     def run_until_disconnected(self):
         async def _run():
             self.running_event.set()
             await self.stop_remote.wait()
+
         return _run()
 
 
@@ -70,10 +72,31 @@ class FakeChannelEntity:
     is_channel = True
 
 
+class FakeTrading:
+    """No-exchange trading double for ingestion-only service tests."""
+
+    def __init__(self, repo, cfg):
+        from tg_signal_ingest.trading.store import TradingStore
+
+        self.store = TradingStore(repo.db, cfg.trading)
+        self.notifier = None
+        self.trade_manager = None
+
+    def process_item(self, item, record):
+        return None
+
+    def reconcile_pending(self, limit=50):
+        return None
+
+    def resume_planned_intents(self, limit=100):
+        return 0
+
+
 def stub_backfill(repo, cfg):
     async def runner(client, repo_arg, cfg_arg, channel_bare_id=None, **kw):
         repo_arg.complete_backfill(channel_bare_id, None)
         return BackfillReport(completed=True)
+
     return runner
 
 
@@ -94,7 +117,9 @@ def selected_repo(repo):
 class TestServiceLifecycle:
     async def test_auth_missing_returns_code_3(self, cfg, repo):
         client = FakeClient(authorized=False)
-        svc = IngestService(cfg, repo, client=client, backfill_runner=stub_backfill(repo, cfg))
+        svc = IngestService(
+            cfg, repo, client=client, backfill_runner=stub_backfill(repo, cfg), trading_engine=FakeTrading(repo, cfg)
+        )
         code = await svc.run()
         assert code == 3
         await client.disconnect()
@@ -102,14 +127,27 @@ class TestServiceLifecycle:
     async def test_channel_inaccessible_returns_code_4(self, cfg, selected_repo):
         def broken(peer):
             raise ValueError("could not find the input entity")
+
         client = FakeClient(on_get_entity=broken)
-        svc = IngestService(cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg))
+        svc = IngestService(
+            cfg,
+            selected_repo,
+            client=client,
+            backfill_runner=stub_backfill(selected_repo, cfg),
+            trading_engine=FakeTrading(selected_repo, cfg),
+        )
         code = await svc.run()
         assert code == 4
 
     async def test_graceful_shutdown(self, cfg, selected_repo):
         client = FakeClient()
-        svc = IngestService(cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg))
+        svc = IngestService(
+            cfg,
+            selected_repo,
+            client=client,
+            backfill_runner=stub_backfill(selected_repo, cfg),
+            trading_engine=FakeTrading(selected_repo, cfg),
+        )
         task = asyncio.ensure_future(svc.run())
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(client.running_event.wait(), timeout=3)
@@ -128,7 +166,13 @@ class TestServiceLifecycle:
                 markers.append("ran")
 
         client = Probe()
-        svc = IngestService(cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg))
+        svc = IngestService(
+            cfg,
+            selected_repo,
+            client=client,
+            backfill_runner=stub_backfill(selected_repo, cfg),
+            trading_engine=FakeTrading(selected_repo, cfg),
+        )
         task = asyncio.ensure_future(svc.run())
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(client.running_event.wait(), timeout=3)
@@ -147,9 +191,11 @@ class TestServiceLifecycle:
 
             def iter_messages(self, ref, **kw):
                 msgs = self.gap_msgs
+
                 async def gen():
                     for m in msgs:
                         yield m
+
                 return gen()
 
         # Watermark from a previous run: last live id 1004; gap = 1005, 1006
@@ -158,7 +204,13 @@ class TestServiceLifecycle:
         svc_repo.upsert_message(message_to_record(100, FakeMsg(1004, "before outage"), "live"))
 
         client = SweepingClient()
-        svc = IngestService(cfg, svc_repo, client=client, backfill_runner=stub_backfill(svc_repo, cfg))
+        svc = IngestService(
+            cfg,
+            svc_repo,
+            client=client,
+            backfill_runner=stub_backfill(svc_repo, cfg),
+            trading_engine=FakeTrading(svc_repo, cfg),
+        )
         task = asyncio.ensure_future(svc.run())
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(client.running_event.wait(), timeout=3)
@@ -181,7 +233,13 @@ class TestServiceLifecycle:
 
     async def test_live_message_insert_via_handler(self, cfg, selected_repo):
         client = FakeClient()
-        svc = IngestService(cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg))
+        svc = IngestService(
+            cfg,
+            selected_repo,
+            client=client,
+            backfill_runner=stub_backfill(selected_repo, cfg),
+            trading_engine=FakeTrading(selected_repo, cfg),
+        )
         task = asyncio.ensure_future(svc.run())
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(client.running_event.wait(), timeout=3)
@@ -212,7 +270,11 @@ async def test_recovery_sweep_honors_full_flood_wait(cfg, selected_repo):
 
     client = FloodClient()
     svc = IngestService(
-        cfg, selected_repo, client=client, backfill_runner=stub_backfill(selected_repo, cfg)
+        cfg,
+        selected_repo,
+        client=client,
+        backfill_runner=stub_backfill(selected_repo, cfg),
+        trading_engine=FakeTrading(selected_repo, cfg),
     )
     waits: list[float] = []
 
@@ -232,7 +294,7 @@ def test_service_notifications_are_delivered_once_per_recipient(cfg, selected_re
 
     from tg_signal_ingest.trading.notify import TradingNotifier
 
-    svc = IngestService(cfg, selected_repo, client=FakeClient())
+    svc = IngestService(cfg, selected_repo, client=FakeClient(), trading_engine=FakeTrading(selected_repo, cfg))
 
     class FakeBot:
         def __init__(self) -> None:

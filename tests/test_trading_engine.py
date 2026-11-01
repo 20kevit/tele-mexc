@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from tg_signal_ingest.mexc.errors import (
+    AccidentalOrderRiskError,
     MexcCliConfirmationRequired,
     MexcNetworkError,
     MexcOrderNotFound,
@@ -34,8 +37,15 @@ class Msg:
 
 def _item(channel_id: int, message_id: int, item_type: str = "message") -> QueueItem:
     return QueueItem(
-        queue_id=0, channel_id=channel_id, message_id=message_id, item_type=item_type,
-        status="processing", targets_version=0, attempts=0, available_at="", created_at="",
+        queue_id=0,
+        channel_id=channel_id,
+        message_id=message_id,
+        item_type=item_type,
+        status="processing",
+        targets_version=0,
+        attempts=0,
+        available_at="",
+        created_at="",
     )
 
 
@@ -46,16 +56,19 @@ def _store_message(repo, mid: int, text: str, edit_date=None, source: str = "liv
     return record
 
 
-def _engine(cfg, repo, client=None, mode="sim") -> TradingEngine:
-    cfg.trading.mode = mode
-    cfg.trading.live_enabled_token = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+def _engine(cfg, repo, client=None, mode=None, boundary="0") -> TradingEngine:
+    # ``mode`` is accepted only to keep old call sites readable; the product has
+    # one automatic Spot behaviour and every test uses a fake exchange.
+    del mode
     cfg.trading.order_quote_amount = 10.0
     cfg.trading.order_quote_amount_source = "test"
+    if client is None:
+        client = FakeMexc()
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW)
-    if mode in ("testonly", "live"):
+    if boundary is not None:
         # General lifecycle tests use a zero boundary so every stored message
         # is considered new; dedicated replay tests set a real boundary.
-        engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
+        engine.store.set_app_state_once("trading.activation_boundary_message_id", boundary)
     return engine
 
 
@@ -130,7 +143,14 @@ class FakeMexc:
         if self.query_error:
             raise self.query_error
         if not self.query_results:
-            raise AssertionError("unexpected query_order call")
+            # Generic lifecycle tests only need a stable open-order observation.
+            return {
+                "orderId": kwargs.get("order_id") or "ex-1",
+                "symbol": kwargs.get("symbol") or "BTCUSDT",
+                "status": "NEW",
+                "executedQty": "0",
+                "cumulativeQuoteQty": "0",
+            }
         return self.query_results.pop(0)
 
     def account(self):
@@ -190,18 +210,18 @@ def test_fetch_market_prices_uses_one_all_symbol_call(cfg, repo):
     assert client.calls == 1
 
 
-def test_sim_alert_creates_one_filled_intent(cfg, repo):
+def test_alert_creates_one_spot_intent_and_submits_exactly_once(cfg, repo):
     engine = _engine(cfg, repo)
     record = _store_message(repo, 1, ALERT)
 
     intent = engine.process_item(_item(100, 1), record)
 
     assert intent is not None
-    assert intent["state"] == "filled"
-    assert intent["exchange_status"] == "SIMULATED_FILLED"
-    assert intent["base_quantity"] == "0.1"
-    assert Decimal(intent["cumulative_quote"]) == Decimal("10")
-    assert engine.client is None
+    assert intent["state"] in ("open", "submitted", "filled")
+    assert intent["mode"] == "live"
+    assert intent["exchange_order_id"]
+    assert engine.client is not None
+    assert engine.client.place_calls == 1
 
 
 def test_edit_reuses_message_identity_and_never_places_second_order(cfg, repo):
@@ -252,7 +272,7 @@ def test_no_arbitrary_daily_or_open_order_caps(cfg, repo):
     # distinct symbols and complete mandatory fields (SL/TP1/TP2).
     engine = _engine(cfg, repo)
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-    for mid, sym in zip((6, 7, 8), symbols):
+    for mid, sym in zip((6, 7, 8), symbols, strict=False):
         intent = engine.process_item(
             _item(100, mid),
             _store_message(repo, mid, f"BUY {sym}\nENTRY {100 + mid}\nSL 90\nTP1 120\nTP2 130"),
@@ -287,11 +307,20 @@ def test_network_uncertainty_never_retries_and_reconciles_to_filled(cfg, repo):
     assert still is not None and still["state"] == "unknown_requires_reconciliation"
 
     client.query_error = None
-    client.query_results.append({
-        "orderId": "ex-1", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0.1",
-        "cumulativeQuoteQty": "10", "status": "FILLED", "time": 1,
-    })
+    client.query_results.append(
+        {
+            "orderId": "ex-1",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "price": "100",
+            "origQty": "0.1",
+            "executedQty": "0.1",
+            "cumulativeQuoteQty": "10",
+            "status": "FILLED",
+            "time": 1,
+        }
+    )
     stats = engine.reconcile_pending()
     assert stats.resolved == 1
     final = engine.store.get_intent(intent["intent_id"])
@@ -316,8 +345,7 @@ def test_cli_confirmation_required_is_terminal_budget_neutral_and_not_retried(cf
     assert client.place_calls == 1
 
     ledger = repo.db.conn.execute(
-        "SELECT reserved_quote, spent_quote, fee_quote, active, state "
-        "FROM trading_budget_ledger WHERE intent_id = ?",
+        "SELECT reserved_quote, spent_quote, fee_quote, active, state FROM trading_budget_ledger WHERE intent_id = ?",
         (intent["intent_id"],),
     ).fetchone()
     assert ledger is not None
@@ -351,9 +379,16 @@ def test_cli_success_without_exchange_order_id_is_unknown_not_accepted(cfg, repo
 
 def test_submitted_requires_exchange_order_evidence(cfg, repo):
     open_order = {
-        "orderId": "ex-evidence", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-evidence",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-evidence", "status": "NEW"},
@@ -372,19 +407,35 @@ def test_submitted_requires_exchange_order_evidence(cfg, repo):
 
 def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     partial = {
-        "orderId": "ex-2", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0.04",
-        "cumulativeQuoteQty": "4", "status": "PARTIALLY_FILLED", "time": 1,
+        "orderId": "ex-2",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0.04",
+        "cumulativeQuoteQty": "4",
+        "status": "PARTIALLY_FILLED",
+        "time": 1,
     }
     canceled = {**partial, "status": "CANCELED"}
     client = FakeMexc(
         place_response={"orderId": "ex-2", "status": "NEW"},
         query_results=[partial],
-        trades=[{
-            "id": "t1", "price": "100", "qty": "0.04", "quoteQty": "4", "orderId": "ex-2",
-            "commission": "0.004", "commissionAsset": "USDT", "time": 123,
-            "isBuyer": True, "isMaker": False,
-        }],
+        trades=[
+            {
+                "id": "t1",
+                "price": "100",
+                "qty": "0.04",
+                "quoteQty": "4",
+                "orderId": "ex-2",
+                "commission": "0.004",
+                "commissionAsset": "USDT",
+                "time": 123,
+                "isBuyer": True,
+                "isMaker": False,
+            }
+        ],
     )
     engine = _engine(cfg, repo, client, mode="live")
     intent = engine.process_item(_item(100, 9), _store_message(repo, 9, ALERT))
@@ -419,20 +470,39 @@ def test_partial_fill_is_preserved_then_canceled(cfg, repo):
 
 
 def test_restart_reconciles_intent_left_submitting(cfg, repo):
-    client = FakeMexc(query_results=[{
-        "orderId": "ex-3", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0", "cumulativeQuoteQty": "0",
-        "status": "NEW", "time": 1,
-    }])
+    client = FakeMexc(
+        query_results=[
+            {
+                "orderId": "ex-3",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "100",
+                "origQty": "0.1",
+                "executedQty": "0",
+                "cumulativeQuoteQty": "0",
+                "status": "NEW",
+                "time": 1,
+            }
+        ]
+    )
     engine = _engine(cfg, repo, client, mode="live")
     store = TradingStore(repo.db, cfg.trading)
     parsed = SignalParser().parse(ALERT)
     signal_id, _ = store.record_signal(parsed, channel_id=100, message_id=10, edit_version=0)
     intent, _ = store.create_intent(
-        signal=parsed, signal_id=signal_id, channel_id=100, message_id=10, edit_version=0,
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=10,
+        edit_version=0,
         idempotency_key=TradingEngine.idempotency_key(100, 10, parsed),
-        client_order_id="tsirestart", mode="live", order_type="limit",
-        quote_amount=Decimal("10"), base_quantity=Decimal("0.1"), limit_price=Decimal("100"),
+        client_order_id="tsirestart",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
     )
     store.transition_intent(intent["intent_id"], "submitting", note="process crashed after submit")
 
@@ -450,20 +520,34 @@ def test_local_filled_is_not_downgraded_by_exchange_open():
     assert "refusing to un-fill" in note
 
 
-def test_testonly_uses_official_test_endpoint_not_real_order(cfg, repo):
+def test_legacy_testonly_intent_can_never_become_a_real_order(cfg, repo):
     class NoRealOrders(FakeMexc):
         def place_order(self, **kwargs):
-            raise AssertionError("real place_order must never be called in testonly mode")
+            raise AssertionError("legacy test-only rows must never reach place_order")
 
     client = NoRealOrders()
-    engine = _engine(cfg, repo, client, mode="testonly")
-    intent = engine.process_item(_item(100, 12), _store_message(repo, 12, ALERT))
-
-    assert intent is not None
-    assert client.test_calls == 1
-    assert intent["state"] == "canceled_local"
-    assert intent["exchange_status"] == "TEST_ONLY_ACCEPTED"
-    assert intent["terminal_at"] is not None
+    engine = _engine(cfg, repo, client)
+    store = engine.store
+    parsed = SignalParser().parse(ALERT)
+    sid, _ = store.record_signal(parsed, channel_id=100, message_id=12, edit_version=0)
+    intent, _ = store.create_intent(
+        signal=parsed,
+        signal_id=sid,
+        channel_id=100,
+        message_id=12,
+        edit_version=0,
+        idempotency_key="legacy-testonly",
+        client_order_id="tsi-legacy-testonly",
+        mode="testonly",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    result = engine._execute_intent(intent["intent_id"])
+    assert result["state"] == "rejected"
+    assert "legacy" in (result["reject_reason"] or "").lower()
+    assert client.place_calls == 0
 
 
 def test_database_failure_after_submit_does_not_resubmit(cfg, repo):
@@ -471,11 +555,20 @@ def test_database_failure_after_submit_does_not_resubmit(cfg, repo):
 
     client = FakeMexc(
         place_response={"orderId": "ex-5", "status": "NEW"},
-        query_results=[{
-            "orderId": "ex-5", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-            "price": "100", "origQty": "0.1", "executedQty": "0", "cumulativeQuoteQty": "0",
-            "status": "NEW", "time": 1,
-        }],
+        query_results=[
+            {
+                "orderId": "ex-5",
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "100",
+                "origQty": "0.1",
+                "executedQty": "0",
+                "cumulativeQuoteQty": "0",
+                "status": "NEW",
+                "time": 1,
+            }
+        ],
     )
     engine = _engine(cfg, repo, client, mode="live")
     record = _store_message(repo, 13, ALERT)
@@ -512,7 +605,9 @@ def test_edit_changing_action_cannot_create_second_order(cfg, repo):
     assert first is not None
 
     edited = _store_message(
-        repo, 20, "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105",
+        repo,
+        20,
+        "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105",
         edit_date=NOW - timedelta(seconds=5),
     )
     second = engine.process_item(_item(100, 20, "edit"), edited)
@@ -526,9 +621,16 @@ def test_edit_changing_action_cannot_create_second_order(cfg, repo):
 
 def test_cancel_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     open_order = {
-        "orderId": "ex-edit", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-edit",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     canceled = {**open_order, "status": "CANCELED"}
     client = FakeMexc(
@@ -540,15 +642,16 @@ def test_cancel_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     assert intent is not None and intent["state"] == "open"
 
     edited = _store_message(
-        repo, 21, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5),
+        repo,
+        21,
+        ALERT + "\nTP2: 120",
+        edit_date=NOW - timedelta(seconds=5),
     )
     engine.process_item(_item(100, 21, "edit"), edited)
     old_signal = engine.store.get_signal("100:21:0")
     assert old_signal is not None and old_signal["status"] == "superseded"
 
-    engine.process_item(
-        _item(100, 22), _store_message(repo, 22, "CANCEL BTCUSDT")
-    )
+    engine.process_item(_item(100, 22), _store_message(repo, 22, "CANCEL BTCUSDT"))
     final = engine.store.get_intent(intent["intent_id"])
     assert client.cancel_calls == 1
     assert final is not None and final["state"] == "canceled"
@@ -556,9 +659,16 @@ def test_cancel_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
 
 def test_delete_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     open_order = {
-        "orderId": "ex-del", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-del",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     canceled = {**open_order, "status": "CANCELED"}
     client = FakeMexc(
@@ -570,7 +680,10 @@ def test_delete_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     assert intent is not None and intent["state"] == "open"
 
     edited = _store_message(
-        repo, 23, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5),
+        repo,
+        23,
+        ALERT + "\nTP2: 120",
+        edit_date=NOW - timedelta(seconds=5),
     )
     engine.process_item(_item(100, 23, "edit"), edited)
     engine.handle_delete(100, 23)
@@ -582,9 +695,16 @@ def test_delete_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
 
 def test_rate_limited_submit_is_unknown_and_reconciled_not_resubmitted(cfg, repo):
     filled = {
-        "orderId": "ex-rate", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0.1",
-        "cumulativeQuoteQty": "10", "status": "FILLED", "time": 1,
+        "orderId": "ex-rate",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0.1",
+        "cumulativeQuoteQty": "10",
+        "status": "FILLED",
+        "time": 1,
     }
     client = FakeMexc(
         place_error=MexcRateLimitError("429 after send", retry_after_s=5),
@@ -608,9 +728,7 @@ def test_later_cancel_processed_first_blocks_older_queued_alert(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
 
-    cancel = engine.process_item(
-        _item(100, 31), _store_message(repo, 31, "CANCEL BTCUSDT")
-    )
+    cancel = engine.process_item(_item(100, 31), _store_message(repo, 31, "CANCEL BTCUSDT"))
     assert cancel is None
 
     result = engine.process_item(_item(100, 30), _store_message(repo, 30, ALERT))
@@ -624,9 +742,16 @@ def test_later_cancel_processed_first_blocks_older_queued_alert(cfg, repo):
 
 def test_not_found_for_open_intent_never_becomes_terminal_failed(cfg, repo):
     new_order = {
-        "orderId": "ex-missing", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-missing",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-missing", "status": "NEW"},
@@ -645,9 +770,16 @@ def test_not_found_for_open_intent_never_becomes_terminal_failed(cfg, repo):
 
 def test_old_cancel_processed_late_does_not_cancel_newer_order(cfg, repo):
     open_order = {
-        "orderId": "ex-newer", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-newer",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-newer", "status": "NEW"},
@@ -735,9 +867,7 @@ def test_terminal_rejected_intent_synchronizes_signal_status(cfg, repo):
     assert signal is not None and signal["status"] == "rejected"
 
     # A later edit also cannot create or resubmit an order.
-    edited = _store_message(
-        repo, 60, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5)
-    )
+    edited = _store_message(repo, 60, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5))
     assert engine.process_item(_item(100, 60, "edit"), edited) is not None
     assert client.place_calls == 1
     assert len(engine.store.list_intents(limit=10)) == 1
@@ -747,9 +877,16 @@ def test_terminal_rejected_intent_synchronizes_signal_status(cfg, repo):
 
 def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
     open_order = {
-        "orderId": "ex-live", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-live",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-live", "status": "NEW"},
@@ -766,9 +903,7 @@ def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
     assert final is not None and final["state"] == "open"
 
     # The ignored historical cancel must not block an older live message either.
-    older = engine.process_item(
-        _item(100, 49), _store_message(repo, 49, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
-    )
+    older = engine.process_item(_item(100, 49), _store_message(repo, 49, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120"))
     assert older is not None
 
 
@@ -821,9 +956,16 @@ def test_balance_api_failure_rejects_without_submitting(cfg, repo):
 
 def test_balance_preflight_retries_timestamp_error_once_then_succeeds(cfg, repo):
     open_order = {
-        "orderId": "ex-1", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-1",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         account_response=_account(),
@@ -856,16 +998,23 @@ def test_persistent_timestamp_error_rejects_with_zero_order_submissions(cfg, rep
 def test_balance_preflight_counts_competing_local_intents(cfg, repo):
     client = FakeMexc(account_response=_account(usdt="15"))
     engine = _engine(cfg, repo, client, mode="live")
-    cfg.trading.remaining_balance_reserve_pct = 0.0
 
     store = TradingStore(repo.db, cfg.trading)
     parsed = SignalParser().parse(ALERT)
     signal_id, _ = store.record_signal(parsed, channel_id=100, message_id=73, edit_version=0)
     store.create_intent(
-        signal=parsed, signal_id=signal_id, channel_id=100, message_id=73, edit_version=0,
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=73,
+        edit_version=0,
         idempotency_key=TradingEngine.idempotency_key(100, 73, parsed),
-        client_order_id="tsicompeting", mode="live", order_type="limit",
-        quote_amount=Decimal("10"), base_quantity=Decimal("0.1"), limit_price=Decimal("100"),
+        client_order_id="tsicompeting",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
     )
 
     second = engine.process_item(
@@ -883,9 +1032,16 @@ def test_balance_preflight_counts_competing_local_intents(cfg, repo):
 
 def test_balance_preflight_refetches_for_each_live_order(cfg, repo):
     new_a = {
-        "orderId": "ex-a", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-a",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     new_b = {**new_a, "orderId": "ex-b"}
     client = FakeMexc(query_results=[new_a, new_b])
@@ -901,9 +1057,16 @@ def test_balance_preflight_refetches_for_each_live_order(cfg, repo):
 
 def test_transient_my_trades_failure_keeps_fill_sync_pending_then_recovers(cfg, repo):
     new_order = {
-        "orderId": "ex-fill", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-fill",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     filled = {**new_order, "executedQty": "0.1", "cumulativeQuoteQty": "10", "status": "FILLED"}
     client = FakeMexc(
@@ -925,11 +1088,19 @@ def test_transient_my_trades_failure_keeps_fill_sync_pending_then_recovers(cfg, 
     assert client.place_calls == 1  # failure never resubmits
 
     client.trades_error = None
-    client.trades = [{
-        "id": "t-fill", "price": "100", "qty": "0.1", "quoteQty": "10",
-        "commission": "0.01", "commissionAsset": "USDT", "time": 7,
-        "isBuyer": True, "isMaker": False,
-    }]
+    client.trades = [
+        {
+            "id": "t-fill",
+            "price": "100",
+            "qty": "0.1",
+            "quoteQty": "10",
+            "commission": "0.01",
+            "commissionAsset": "USDT",
+            "time": 7,
+            "isBuyer": True,
+            "isMaker": False,
+        }
+    ]
     recovered = engine.reconcile_pending()
     final = engine.store.get_intent(intent["intent_id"])
     assert recovered.checked == 1
@@ -945,23 +1116,45 @@ def test_restart_recovers_terminal_order_with_pending_fills(cfg, repo):
     parsed = SignalParser().parse(ALERT)
     signal_id, _ = store.record_signal(parsed, channel_id=100, message_id=81, edit_version=0)
     intent, _ = store.create_intent(
-        signal=parsed, signal_id=signal_id, channel_id=100, message_id=81, edit_version=0,
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=81,
+        edit_version=0,
         idempotency_key=TradingEngine.idempotency_key(100, 81, parsed),
-        client_order_id="tsirestart-fills", mode="live", order_type="limit",
-        quote_amount=Decimal("10"), base_quantity=Decimal("0.1"), limit_price=Decimal("100"),
+        client_order_id="tsirestart-fills",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
     )
     # Simulate a crash after the order became terminal but before fills were read.
     store.transition_intent(
-        intent["intent_id"], "filled", note="crash boundary",
-        exchange_order_id="ex-restart", exchange_status="FILLED",
-        executed_qty=Decimal("0.1"), cumulative_quote=Decimal("10"),
-        category="reconcile", fill_sync_required=True,
+        intent["intent_id"],
+        "filled",
+        note="crash boundary",
+        exchange_order_id="ex-restart",
+        exchange_status="FILLED",
+        executed_qty=Decimal("0.1"),
+        cumulative_quote=Decimal("10"),
+        category="reconcile",
+        fill_sync_required=True,
     )
 
-    client = FakeMexc(trades=[{
-        "id": "t-restart", "price": "100", "qty": "0.1", "quoteQty": "10",
-        "commission": "0.01", "commissionAsset": "USDT", "time": 9,
-    }])
+    client = FakeMexc(
+        trades=[
+            {
+                "id": "t-restart",
+                "price": "100",
+                "qty": "0.1",
+                "quoteQty": "10",
+                "commission": "0.01",
+                "commissionAsset": "USDT",
+                "time": 9,
+            }
+        ]
+    )
     engine = _engine(cfg, repo, client, mode="live")  # new engine == restart
     stats = engine.reconcile_pending()
 
@@ -1000,9 +1193,16 @@ def test_concurrent_duplicate_delivery_creates_exactly_one_intent(cfg, repo):
 
 def test_preexisting_external_orders_are_never_adopted_cancelled_or_counted(cfg, repo):
     own_order = {
-        "orderId": "ex-1", "symbol": "BTCUSDT", "side": "BUY",
-        "type": "LIMIT", "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-1",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(query_results=[own_order])
     engine = _engine(cfg, repo, client, mode="live")
@@ -1020,9 +1220,16 @@ def test_preexisting_external_orders_are_never_adopted_cancelled_or_counted(cfg,
 
 def test_planned_intent_resumes_after_crash_without_duplicate_submission(cfg, repo):
     open_order = {
-        "orderId": "ex-resume", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-resume",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-resume", "status": "NEW"},
@@ -1030,15 +1237,21 @@ def test_planned_intent_resumes_after_crash_without_duplicate_submission(cfg, re
     )
     engine = _engine(cfg, repo, client, mode="live")
     parsed = engine.parser.parse(ALERT)
-    signal_id, _ = engine.store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0
-    )
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
     key = engine.idempotency_key(100, 1, parsed)
     intent, inserted = engine.store.create_intent(
-        signal=parsed, signal_id=signal_id, channel_id=100, message_id=1,
-        edit_version=0, idempotency_key=key, client_order_id="tsi" + key[:28],
-        mode="live", order_type="limit", quote_amount=Decimal("10"),
-        base_quantity=Decimal("0.1"), limit_price=Decimal("100"),
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi" + key[:28],
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
     )
     assert inserted is True and intent["state"] == "planned"
 
@@ -1058,15 +1271,21 @@ def test_claimed_submitting_intent_is_never_retried(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client, mode="live")
     parsed = engine.parser.parse(ALERT)
-    signal_id, _ = engine.store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0
-    )
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
     key = engine.idempotency_key(100, 1, parsed)
     intent, _ = engine.store.create_intent(
-        signal=parsed, signal_id=signal_id, channel_id=100, message_id=1,
-        edit_version=0, idempotency_key=key, client_order_id="tsi" + key[:28],
-        mode="live", order_type="limit", quote_amount=Decimal("10"),
-        base_quantity=Decimal("0.1"), limit_price=Decimal("100"),
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi" + key[:28],
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
     )
     # Crash after the atomic claim: an exchange call may be in flight.
     engine.store.claim_intent_for_submission(intent["intent_id"], note="test claim")
@@ -1078,9 +1297,16 @@ def test_claimed_submitting_intent_is_never_retried(cfg, repo):
 
 def test_duplicate_delivery_of_open_intent_does_not_submit_again(cfg, repo):
     open_order = {
-        "orderId": "ex-dup", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
-        "price": "100", "origQty": "0.1", "executedQty": "0",
-        "cumulativeQuoteQty": "0", "status": "NEW", "time": 1,
+        "orderId": "ex-dup",
+        "symbol": "BTCUSDT",
+        "side": "BUY",
+        "type": "LIMIT",
+        "price": "100",
+        "origQty": "0.1",
+        "executedQty": "0",
+        "cumulativeQuoteQty": "0",
+        "status": "NEW",
+        "time": 1,
     }
     client = FakeMexc(
         place_response={"orderId": "ex-dup", "status": "NEW"},
@@ -1095,3 +1321,84 @@ def test_duplicate_delivery_of_open_intent_does_not_submit_again(cfg, repo):
     assert client.place_calls == 1
     signal = engine.store.get_signal("100:1:0")
     assert signal is not None and signal["status"] == "planned"
+
+
+class CapturingMexc(FakeMexc):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.place_kwargs: list[dict] = []
+
+    def place_order(self, **kwargs):
+        self.place_kwargs.append(dict(kwargs))
+        return super().place_order(**kwargs)
+
+
+def test_market_signal_is_converted_to_limit_entry(cfg, repo):
+    client = CapturingMexc(
+        place_response={"orderId": "ex-mkt", "status": "NEW"},
+    )
+    engine = _engine(cfg, repo, client)
+    text = "MARKET BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+    intent = engine.process_item(_item(100, 401), _store_message(repo, 401, text))
+
+    assert intent is not None
+    assert intent["order_type"] == "limit"
+    assert len(client.place_kwargs) == 1
+    payload = client.place_kwargs[0]
+    assert payload["order_type"] == "LIMIT"
+    assert payload["price"] is not None
+    assert "quote_order_qty" not in payload
+
+
+def test_market_signal_without_entry_is_rejected_before_exchange(cfg, repo):
+    client = CapturingMexc()
+    engine = _engine(cfg, repo, client)
+    text = "MARKET BUY BTCUSDT\nSL: 95\nTP1: 110\nTP2: 120"
+    result = engine.process_item(_item(100, 402), _store_message(repo, 402, text))
+
+    assert result is None
+    assert client.place_kwargs == []
+    signal = engine.store.get_signal("100:402:0")
+    assert signal is not None and signal["status"] == "rejected"
+    assert "entry" in signal["rejection_reason"].lower()
+
+
+def test_recovered_market_intent_cannot_reach_exchange(cfg, repo):
+    client = CapturingMexc()
+    engine = _engine(cfg, repo, client)
+    parsed = SignalParser().parse(ALERT)
+    sid, _ = engine.store.record_signal(parsed, channel_id=100, message_id=403, edit_version=0)
+    intent, _ = engine.store.create_intent(
+        signal=parsed,
+        signal_id=sid,
+        channel_id=100,
+        message_id=403,
+        edit_version=0,
+        idempotency_key="recovered-market",
+        client_order_id="tsi-recovered-market",
+        mode="live",
+        order_type="market",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=None,
+    )
+    result = engine._execute_intent(intent["intent_id"])
+    assert result["state"] == "rejected"
+    assert "LIMIT" in (result["reject_reason"] or "")
+    assert client.place_kwargs == []
+
+
+def test_market_payload_is_rejected_at_the_payload_boundary(cfg, repo):
+    engine = _engine(cfg, repo)
+    with pytest.raises(AccidentalOrderRiskError, match="LIMIT"):
+        engine._order_payload(
+            {
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "order_type": "market",
+                "client_order_id": "x",
+                "quote_amount": "10",
+                "base_quantity": None,
+                "limit_price": None,
+            }
+        )

@@ -28,7 +28,7 @@ either file.
 ```bash
 .venv/bin/pytest                 # full suite
 .venv/bin/pytest -q tests/test_trading_engine.py
-.venv/bin/pytest -q -k "budget or reconcile"
+.venv/bin/pytest -q -k "reservation or reconcile"
 .venv/bin/ruff check .           # lint + import order
 .venv/bin/mypy tg_signal_ingest  # configured type check
 ```
@@ -53,20 +53,20 @@ newer releases.
 
 | Area | Tests |
 | --- | --- |
-| Config precedence/caps | `test_config.py`, `test_trading_config.py` |
+| Config precedence/validation | `test_config.py`, `test_trading_config.py` |
 | Schema/migrations | `test_db_migrations.py` |
 | Message/queue semantics | `test_repository.py`, `test_processing.py`, `test_backfill.py` |
-| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_channel_trading_boundary.py`, `test_service_activation_boundary.py` |
-| Parser/risk/sizing | `test_signals.py`, `test_sizing.py` |
-| Intent/budget/execution | `test_trading_engine.py`, `test_trading_budget.py`, `test_trading_live_gates.py`, `test_mexc_execution_gates.py` |
+| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_service_activation_boundary.py`, `test_full_history_archive.py` |
+| Parser/risk/Futures ingestion | `test_signals.py`, `test_futures_signals.py` |
+| Intent/reservation/execution | `test_trading_engine.py`, `test_trading_budget.py`, `test_trading_live_gates.py`, `test_mexc_execution_gates.py` |
 | Reconciliation/fills | `test_trading_live_gates.py`, `test_balance.py` |
-| Trade lifecycle (simulated) | `test_trading_conditional_entry.py`, `test_trading_tp_sl.py`, `test_trading_monitor.py` |
+| Trade lifecycle (mocked exchange) | `test_trading_conditional_entry.py`, `test_trading_tp_sl.py`, `test_trading_monitor.py` |
 | MEXC contract | `test_mexc_client.py`, `test_mexc_official_contract.py`, `test_symbols.py` |
 | MEXC rate limits/hybrid | `test_mexc_client.py`, `test_mexc_hybrid.py`, `test_trading_monitor.py` |
 | MEXC CLI adapter/preflight | `test_mexc_cli_adapter.py`, `test_trading_preflight.py`, `test_trading_cli_protection.py`, `test_config_mexc_cli.py` |
-| Management/control | `test_management_*.py`, `test_control_*.py` |
+| Control bot | `test_control_*.py`, `test_resume_atomicity.py`, `test_submission_gate.py` |
 
-Do not "fix" a failing test by weakening a safety assertion (budget, replay
+Do not "fix" a failing test by weakening a safety assertion (reservation, replay
 boundary, no-retry-on-uncertainty) without an explicit product decision.
 
 ## Changing the schema
@@ -90,7 +90,6 @@ in `schema_migrations`. It refuses to migrate a read-only connection.
 - Parser changes affect new messages only. To re-evaluate old messages:
   - `tg-ingest queue reprocess --id <message_id>` or `--all` re-enqueues the
     current processing path;
-  - `tg-ingest analyze replay ...` re-runs the separate offline analyzer.
 - Backfill must keep `enqueue_processing=False`; historical traffic is never
   tradeable.
 - Ingestion gap recovery does not make historical messages tradeable. Trade
@@ -102,18 +101,21 @@ in `schema_migrations`. It refuses to migrate a read-only connection.
 
 Treat these as invariants unless the task explicitly changes the safety model:
 
-- Intent before submission; atomic budget reservation before any exchange call.
+- Intent before submission; atomic technical reservation before any exchange call.
 - One idempotency key per Telegram message.
 - No blind retry after network/5xx/unknown submission.
 - `-2011` leaves non-terminal state non-terminal and flagged.
 - Spot BUY only; sell exists only for trade-lifecycle exits.
-- Fixed `order_quote_amount`, never signal-derived size.
-- Aggregate budget is a configurable reference (default 50 USDT); no hard ceiling.
+- Fixed `order_quote_amount`, never signal-derived size; owner menu writes
+  `control_settings.order_quote_amount` and env keeps precedence.
+- LIMIT-only entries; conditional entry defaults to 3 ticks below Entry.
+- There is no aggregate portfolio budget or spending cap; the reservation
+  ledger is a technical idempotency/concurrency guard.
 - Fresh balance preflight for live submission.
 - Durable fills and notifications.
 
 Update `docs/trading.md` in the same change. If you touch the trade lifecycle,
-add an end-to-end service-level test, not only a simulation test.
+add an end-to-end service-level test, not only a fake-exchange unit test.
 
 ## Manual offline smoke checks
 
@@ -124,11 +126,10 @@ Safe without credentials or network:
 .venv/bin/python -c 'from tg_signal_ingest.config import load_config; print("import ok")'
 ```
 
-Use only disposable configuration and data when testing status or analysis
-commands. `status`, `backfill status`, `trading status`, `control status`, and
-analysis commands open the configured or selected database and run migrations;
-these are not strictly read-only. `manage status` opens an existing database
-read-only. Commands using SQLite may contend with the running service.
+Use only disposable configuration and data when testing status commands.
+`status`, `backfill status`, `trading status`, and `control status` open the
+configured database and run migrations; these are not strictly read-only.
+Commands using SQLite may contend with the running service.
 
 ## Debugging notes
 

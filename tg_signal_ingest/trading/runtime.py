@@ -6,10 +6,11 @@ import logging
 import math
 from typing import Any
 
-from ..config import AppConfig, ConfigError
+from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig, ConfigError
 from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..repository import Repository
 from .engine import TradingEngine
+from .gate import SubmissionGate
 from .store import TradingStore
 from .trade_manager import TradeManager
 from .trade_store import TradeStore
@@ -31,9 +32,14 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     if source == "env":
         return False
     try:
-        row = repo.db.conn.execute(
-            "SELECT value FROM control_settings WHERE key = 'order_quote_amount'"
-        ).fetchone()
+        row = repo.db.conn.execute("SELECT value FROM control_settings WHERE key = 'order_quote_amount'").fetchone()
+        legacy = False
+        if row is None:
+            # Compatibility: older control menus wrote buy_quote_usd.  Read it
+            # only when the canonical setting is absent; it is never written
+            # again and the new menu stores order_quote_amount.
+            row = repo.db.conn.execute("SELECT value FROM control_settings WHERE key = 'buy_quote_usd'").fetchone()
+            legacy = row is not None
     except Exception:  # noqa: BLE001 - a missing/old schema must not block startup
         return False
     if row is None:
@@ -45,9 +51,9 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     if not math.isfinite(value) or value <= 0:
         return False
     cfg.trading.order_quote_amount = value
-    cfg.trading.order_quote_amount_source = "database (Telegram menu)"
+    cfg.trading.order_quote_amount_source = "legacy database (buy_quote_usd)" if legacy else "database (Telegram menu)"
     cfg.trading.amount_configured = True
-    log.info("applied persisted order amount %.8g USDT from the Telegram menu", value)
+    log.info("applied persisted order amount %.8g USDT from the control database", value)
     return True
 
 
@@ -107,7 +113,11 @@ def build_mexc_client(cfg: AppConfig, *, for_live_writes: bool = False) -> Any:
             state_path=state_dir / "mexc-rate-limit-order.json",
         ),
     )
-    if for_live_writes and cfg.mexc.cli_enabled:
+    if for_live_writes:
+        if not cfg.mexc.cli_enabled:
+            raise ConfigError(
+                "the MEXC CLI execution backend is required for automatic Spot writes; set [mexc_cli] enabled = true"
+            )
         from ..mexc.cli import MexcCliAdapter
         from ..mexc.hybrid import HybridMexcClient
 
@@ -121,9 +131,7 @@ def build_mexc_client(cfg: AppConfig, *, for_live_writes: bool = False) -> Any:
         )
         health = cli.check()
         if not health.ok:
-            raise ConfigError(
-                "MEXC CLI is not compatible with this build: " + "; ".join(health.problems)
-            )
+            raise ConfigError("MEXC CLI is not compatible with this build: " + "; ".join(health.problems))
         return HybridMexcClient(rest, cli)
     return rest
 
@@ -133,24 +141,30 @@ def build_trading_engine(
     repo: Repository,
     *,
     client: Any | None = None,
-    require_client: bool = False,
+    require_client: bool = True,
     price_provider: Any | None = None,
 ) -> TradingEngine:
-    """Build the pipeline.
+    """Build the single automatic MEXC Spot pipeline.
 
-    ``sim`` never constructs a network client. ``testonly``/``live`` require
-    credentials; live additionally needs the explicit configuration token.
+    Construction is fail-closed: the owner acknowledgement must match exactly,
+    MEXC credentials must be present, and the CLI write backend must be enabled
+    and healthy.  There is no simulated/test-only product path.
     """
 
-    if client is None and (require_client or cfg.trading.mode in ("testonly", "live")):
-        client = build_mexc_client(cfg, for_live_writes=cfg.trading.mode == "live")
+    if cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
+        raise ConfigError(
+            "execution acknowledgement is not configured; set "
+            "execution_acknowledgement = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS' "
+            "(or TRADING_EXECUTION_ACKNOWLEDGEMENT) before building the pipeline."
+        )
+    if client is None:
+        client = build_mexc_client(cfg, for_live_writes=True)
     # Owner-selected per-order amount persisted by the Telegram menu.  Env/TOML
     # values always win; the database only replaces the built-in default.
     apply_persisted_trading_settings(cfg, repo)
-    registry = None
-    if client is not None and cfg.trading.mode in ("testonly", "live"):
-        registry = SymbolRegistry(client)
+    registry = SymbolRegistry(client) if client is not None else None
     trade_store = TradeStore(repo.db, cfg.trading)
+    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
     engine = TradingEngine(
         cfg,
         repo,
@@ -158,13 +172,14 @@ def build_trading_engine(
         registry=registry,
         price_provider=price_provider,
         notifier=None,
+        submission_gate=gate,
     )
     # Durable owner/developer reporting.  The notifier is attached to both the
     # engine and the trade manager so lifecycle events are never dropped.
     notifier = _build_notifier(cfg, engine.store)
     engine.notifier = notifier
-    # Trade lifecycle coordinator wires into the engine.  In live mode it owns
-    # conditional entry, TP1/TP2 and stop-loss; in other modes it is inert.
+    # Trade lifecycle coordinator wires into the engine.  It owns conditional
+    # entry, TP1/TP2 and stop-loss for every intent.
     trade_manager = TradeManager(
         cfg.trading,
         trade_store,

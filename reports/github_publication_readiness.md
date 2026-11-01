@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # GitHub Publication Readiness Report
 
 **Project:** tele-mexc (`tg-signal-ingest`)  
@@ -105,10 +110,10 @@ it has now been implemented (see §7).
 
 ### Local worktree uncommitted work
 
-* `/opt/projects/akha1` (`fix/sl-stop-loss-trigger-offset`): contained the
+* `<repo-root>` (`fix/sl-stop-loss-trigger-offset`): contained the
   RTT-aware clock and global buy-block implementation. **Integrated** into
   main as commits `57c0e79`, `1ee023f`, `d7f3902`, with tests and docs.
-* `/opt/projects/akha1-ui-audit` (`ui-audit`): uncommitted files were
+* `<repo-root>-ui-audit` (`ui-audit`): uncommitted files were
   inspected and found to be **older duplicate content** (missing
   `market_monitor`, approval gate, service notifications, `max_message_id`,
   etc. that main already has). **Not integrated**; the worktree was left

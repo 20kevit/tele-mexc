@@ -19,7 +19,6 @@ class _FakeTrading:
 
 
 def _service(cfg, repo) -> tuple[IngestService, FakeClient]:
-    cfg.trading.mode = "live"
     client = FakeClient(entity=FakeChannelEntity())
     svc = IngestService(
         cfg,

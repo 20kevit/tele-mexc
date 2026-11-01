@@ -61,9 +61,7 @@ from .errors import (
 
 DEFAULT_MIN_VERSION = "0.0.22"
 DEFAULT_TIMEOUT_S = 20.0
-KNOWN_LINUX_BINARY = (
-    "/usr/lib/node_modules/@mexc-ai/cli/node_modules/@mexc-ai/cli-linux-x64/bin/mexc"
-)
+KNOWN_LINUX_BINARY = "/usr/lib/node_modules/@mexc-ai/cli/node_modules/@mexc-ai/cli-linux-x64/bin/mexc"
 CLIENT_ORDER_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,32}$")
 PROFILE_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -217,8 +215,7 @@ def _looks_like_type_mismatch(exc: MexcError) -> bool:
 
     text = str(exc).lower()
     return any(
-        token in text
-        for token in ("order type", "ordertype", "order_type", "not exist", "not found", "no order")
+        token in text for token in ("order type", "ordertype", "order_type", "not exist", "not found", "no order")
     )
 
 
@@ -235,9 +232,7 @@ def _decimal_string(value: Decimal | str | int | None, field_name: str) -> str |
     decimals = max(0, -int(exponent))
     integer_digits = max(0, len(digits) + int(exponent))
     if integer_digits > 35 or decimals > 30:
-        raise MexcPrecisionError(
-            f"{field_name} exceeds the CLI decimal bounds (35 integer / 30 decimal digits)"
-        )
+        raise MexcPrecisionError(f"{field_name} exceeds the CLI decimal bounds (35 integer / 30 decimal digits)")
     return format(dec, "f")
 
 
@@ -327,9 +322,7 @@ class MexcCliAdapter:
         if timeout_s <= 0:
             raise MexcConfigError("MEXC CLI timeout must be positive")
         if profile is not None and not PROFILE_RE.match(profile):
-            raise MexcConfigError(
-                "MEXC CLI profile name may only contain letters, digits, '.', '_' and '-'"
-            )
+            raise MexcConfigError("MEXC CLI profile name may only contain letters, digits, '.', '_' and '-'")
         self.binary = discover_binary(binary)
         self.profile = profile
         self.timeout_s = float(timeout_s)
@@ -341,14 +334,8 @@ class MexcCliAdapter:
 
     # ------------------------------------------------------------- execution
 
-    def _default_runner(
-        self, argv: Sequence[str], timeout: float
-    ) -> subprocess.CompletedProcess[str]:
-        env = {
-            key: value
-            for key, value in self._environ.items()
-            if key not in _PROXY_ENV and key not in _SECRET_ENV
-        }
+    def _default_runner(self, argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        env = {key: value for key, value in self._environ.items() if key not in _PROXY_ENV and key not in _SECRET_ENV}
         env.setdefault("NO_COLOR", "1")
         try:
             return subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -362,13 +349,9 @@ class MexcCliAdapter:
                 stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
-            raise MexcNetworkError(
-                f"MEXC CLI timed out after {timeout:g}s; outcome is unknown"
-            ) from exc
+            raise MexcNetworkError(f"MEXC CLI timed out after {timeout:g}s; outcome is unknown") from exc
         except OSError as exc:
-            raise MexcCliUnavailable(
-                f"MEXC CLI could not be started ({exc.__class__.__name__})"
-            ) from exc
+            raise MexcCliUnavailable(f"MEXC CLI could not be started ({exc.__class__.__name__})") from exc
 
     def _argv(
         self,
@@ -419,8 +402,7 @@ class MexcCliAdapter:
             message = _sanitize(stderr or stdout) or f"exit code {result.returncode}"
             if "confirm" in message.lower() or "--yes" in message:
                 raise MexcCliConfirmationRequired(
-                    "MEXC CLI refused the write without explicit non-interactive "
-                    "confirmation; no order was sent"
+                    "MEXC CLI refused the write without explicit non-interactive confirmation; no order was sent"
                 )
             if write:
                 # Writes are non-idempotent.  A non-zero exit without a
@@ -428,8 +410,7 @@ class MexcCliAdapter:
                 # the process, so it is never a terminal rejection: the caller
                 # must reconcile the client order id before doing anything else.
                 raise MexcNetworkError(
-                    f"MEXC CLI write exited {result.returncode} without a JSON "
-                    f"envelope; outcome is unknown ({message})"
+                    f"MEXC CLI write exited {result.returncode} without a JSON envelope; outcome is unknown ({message})"
                 )
             raise MexcOrderRejected(f"MEXC CLI failed: {message}")
         if payload is None:
@@ -471,9 +452,7 @@ class MexcCliAdapter:
             error = payload
         subtype = str(error.get("subtype") or "").strip().lower()
         etype = str(error.get("type") or "").strip().lower()
-        message = _sanitize(
-            str(error.get("message") or payload.get("msg") or "MEXC CLI operation failed")
-        )
+        message = _sanitize(str(error.get("message") or payload.get("msg") or "MEXC CLI operation failed"))
         hint = _sanitize(str(error.get("hint") or ""))
         haystack = f"{etype} {subtype} {message} {hint}".lower()
         code = _int_code(error.get("code", payload.get("code")))
@@ -483,17 +462,13 @@ class MexcCliAdapter:
         # credential failures even though the CLI envelope labels them
         # ``subtype=upstream_error``; never misreport them as server faults.
         if code in {400, 700001, 10072}:
-            raise MexcAuthError(
-                f"MEXC CLI authentication failed: {message}", code=code
-            )
+            raise MexcAuthError(f"MEXC CLI authentication failed: {message}", code=code)
 
         if "duplicate" in haystack or (
             "clientorderid" in haystack
             and any(token in haystack for token in ("exist", "already", "repeat", "used", "unique"))
         ):
-            raise MexcDuplicateOrder(
-                f"MEXC CLI refused a duplicate client order id: {message}"
-            )
+            raise MexcDuplicateOrder(f"MEXC CLI refused a duplicate client order id: {message}")
         if "confirm" in haystack or "--yes" in haystack:
             raise MexcCliConfirmationRequired(
                 "MEXC CLI requires explicit non-interactive confirmation; no order was sent"
@@ -504,10 +479,7 @@ class MexcCliAdapter:
             raise MexcAuthError(f"MEXC CLI authentication failed: {message}")
         if "rate" in haystack or "too many" in haystack or "banned" in haystack:
             raise MexcRateLimitError(f"MEXC CLI rate limited: {message}")
-        if any(
-            token in haystack
-            for token in ("precision", "decimal", "minimum", "invalid quantity", "invalid price")
-        ):
+        if any(token in haystack for token in ("precision", "decimal", "minimum", "invalid quantity", "invalid price")):
             raise MexcPrecisionError(f"MEXC CLI rejected the order values: {message}")
         if any(token in haystack for token in ("symbol", "market name", "pair")):
             raise MexcSymbolError(f"MEXC CLI rejected the symbol: {message}")
@@ -528,9 +500,7 @@ class MexcCliAdapter:
         if result.returncode != 0 or version is None:
             raise MexcCliIncompatible("MEXC CLI did not report a usable version")
         if _version_tuple(version) < _version_tuple(self.min_version):
-            raise MexcCliIncompatible(
-                f"MEXC CLI {version} is older than the required {self.min_version}"
-            )
+            raise MexcCliIncompatible(f"MEXC CLI {version} is older than the required {self.min_version}")
         return version
 
     def check(self, *, require_operations: bool = True) -> CliHealth:
@@ -558,14 +528,10 @@ class MexcCliAdapter:
                     found = isinstance(data, dict) and data.get("operation") == operation
                     if not found:
                         raise MexcUnexpectedResponse("schema response did not match the operation")
-                    checks.append(
-                        {"name": f"schema:{operation}", "status": "pass", "message": "present"}
-                    )
+                    checks.append({"name": f"schema:{operation}", "status": "pass", "message": "present"})
                 except MexcError as exc:
                     problems.append(f"{operation}: {exc}")
-                    checks.append(
-                        {"name": f"schema:{operation}", "status": "fail", "message": str(exc)}
-                    )
+                    checks.append({"name": f"schema:{operation}", "status": "fail", "message": str(exc)})
         return CliHealth(
             ok=not problems,
             binary=self.binary,
@@ -634,7 +600,9 @@ class MexcCliAdapter:
 
         data = self._run(
             self._argv(
-                "spot", "trade", "current-orders",
+                "spot",
+                "trade",
+                "current-orders",
                 query={"pageSize": 1, "needPage": "false"},
                 read_only=True,
             ),
@@ -665,9 +633,7 @@ class MexcCliAdapter:
         if client_order_id is None:
             return None
         if not CLIENT_ORDER_ID_RE.match(client_order_id):
-            raise MexcConfigError(
-                "client_order_id must be 1-32 characters of [0-9a-zA-Z_-]"
-            )
+            raise MexcConfigError("client_order_id must be 1-32 characters of [0-9a-zA-Z_-]")
         return client_order_id
 
     def build_place_body(
@@ -692,15 +658,8 @@ class MexcCliAdapter:
         if side_u not in ("BUY", "SELL"):
             raise MexcConfigError("side must be BUY or SELL")
         type_key = str(order_type).lower()
-        if type_key not in ("limit", "market"):
-            raise MexcConfigError("only LIMIT and MARKET Spot orders are supported")
-        if type_key == "market":
-            if take_profit_price is not None or stop_loss_price is not None:
-                raise MexcConfigError(
-                    "the CLI market-order operation cannot attach TP/SL; use a limit entry "
-                    "or manage the exit locally"
-                )
-            raise MexcConfigError("use place_market for market orders")
+        if type_key != "limit":
+            raise MexcConfigError("only LIMIT Spot orders are supported")
 
         base, quote = self._pair(symbol)
         price_s = _decimal_string(price, "price")
@@ -761,16 +720,8 @@ class MexcCliAdapter:
         """Place one live Spot order. Never retried, never auto-confirmed."""
 
         type_key = str(order_type).lower()
-        if type_key == "market":
-            return self.place_market(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                quote_order_qty=quote_order_qty,
-                client_order_id=client_order_id,
-                confirm=confirm,
-                dry_run=dry_run,
-            )
+        if type_key != "limit":
+            raise MexcConfigError("only LIMIT Spot orders are supported")
         body = self.build_place_body(
             symbol=symbol,
             side=side,
@@ -783,53 +734,12 @@ class MexcCliAdapter:
         )
         confirmed = self.confirm_writes if confirm is None else bool(confirm)
         argv = self._argv(
-            "spot", "trade", "place",
+            "spot",
+            "trade",
+            "place",
             data=body,
             # ``--read-only`` would block the write before --dry-run can print
             # the request, so a dry run uses --dry-run only.
-            dry_run=dry_run,
-            confirm=confirmed and not dry_run,
-        )
-        data = self._run(argv, write=not dry_run)
-        if dry_run:
-            return {"dry_run": True, "body": body}
-        return self._normalize_place(data, body)
-
-    def place_market(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        quantity: Decimal | str | None = None,
-        quote_order_qty: Decimal | str | None = None,
-        client_order_id: str | None = None,
-        confirm: bool | None = None,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        base, quote = self._pair(symbol)
-        qty_s = _decimal_string(quantity, "quantity")
-        quote_s = _decimal_string(quote_order_qty, "quote_order_qty")
-        if (qty_s is None) == (quote_s is None):
-            raise MexcConfigError(
-                "a MARKET order requires exactly one of quantity or quote_order_qty"
-            )
-        body: dict[str, Any] = {
-            "currency": base,
-            "market": quote,
-            "tradeType": str(side).upper(),
-            "orderType": "MARKET_ORDER",
-            "orderSource": "CLI",
-        }
-        if qty_s is not None:
-            body["quantity"] = qty_s
-        else:
-            body["amount"] = quote_s
-        if client_order_id:
-            body["clientOrderId"] = self._validate_client_order_id(client_order_id)
-        confirmed = self.confirm_writes if confirm is None else bool(confirm)
-        argv = self._argv(
-            "spot", "trade", "place-market",
-            data=body,
             dry_run=dry_run,
             confirm=confirmed and not dry_run,
         )
@@ -887,7 +797,9 @@ class MexcCliAdapter:
             body["clientOrderId"] = self._validate_client_order_id(client_order_id)
         confirmed = self.confirm_writes if confirm is None else bool(confirm)
         argv = self._argv(
-            "spot", "trade", "place-oco",
+            "spot",
+            "trade",
+            "place-oco",
             data=body,
             dry_run=dry_run,
             confirm=confirmed and not dry_run,
@@ -906,9 +818,7 @@ class MexcCliAdapter:
             data = {"orderId": data}
         order_id = _pick(data, "orderId", "order_id", "id")
         if order_id in (None, ""):
-            raise MexcUnexpectedResponse(
-                "MEXC CLI OCO placement returned no order id; reconcile by client order id"
-            )
+            raise MexcUnexpectedResponse("MEXC CLI OCO placement returned no order id; reconcile by client order id")
         status = _normalize_status(_pick(data, "state", "status"))
         if status == "UNKNOWN":
             status = "NEW"
@@ -916,29 +826,21 @@ class MexcCliAdapter:
             "orderId": str(order_id),
             "status": status,
             "executedQty": str(_pick(data, "executedQty", "dealtQty", "filledQty") or "0"),
-            "cumulativeQuoteQty": str(
-                _pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"
-            ),
+            "cumulativeQuoteQty": str(_pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"),
             "clientOrderId": body.get("clientOrderId"),
             "triggerPrice": _pick(data, "triggerPrice", "trigger_price"),
-            "triggerLimitPrice": _pick(
-                data, "triggerLimitPrice", "trigger_limit_price"
-            ),
+            "triggerLimitPrice": _pick(data, "triggerLimitPrice", "trigger_limit_price"),
             "raw": data,
         }
 
     def _normalize_place(self, data: Any, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(data, dict):
             if data in (None, ""):
-                raise MexcUnexpectedResponse(
-                    "MEXC CLI placement returned no order id; reconcile by client order id"
-                )
+                raise MexcUnexpectedResponse("MEXC CLI placement returned no order id; reconcile by client order id")
             data = {"orderId": data}
         order_id = _pick(data, "orderId", "order_id", "id")
         if order_id in (None, ""):
-            raise MexcUnexpectedResponse(
-                "MEXC CLI placement returned no order id; reconcile by client order id"
-            )
+            raise MexcUnexpectedResponse("MEXC CLI placement returned no order id; reconcile by client order id")
         status = _normalize_status(_pick(data, "state", "status"))
         if status == "UNKNOWN":
             status = "NEW"
@@ -946,9 +848,7 @@ class MexcCliAdapter:
             "orderId": str(order_id),
             "status": status,
             "executedQty": str(_pick(data, "executedQty", "dealtQty", "filledQty") or "0"),
-            "cumulativeQuoteQty": str(
-                _pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"
-            ),
+            "cumulativeQuoteQty": str(_pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"),
             "clientOrderId": body.get("clientOrderId"),
             "raw": data,
         }
@@ -990,7 +890,9 @@ class MexcCliAdapter:
             try:
                 data = self._run(
                     self._argv(
-                        "spot", "trade", "deal-detail",
+                        "spot",
+                        "trade",
+                        "deal-detail",
                         query={"orderId": order_id, "orderType": order_type},
                         read_only=True,
                     ),
@@ -1015,9 +917,7 @@ class MexcCliAdapter:
             "clientOrderId": _pick(data, "clientOrderId", "client_order_id"),
             "status": _normalize_status(_pick(data, "state", "status")),
             "executedQty": str(_pick(data, "executedQty", "dealtQty", "filledQty") or "0"),
-            "cumulativeQuoteQty": str(
-                _pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"
-            ),
+            "cumulativeQuoteQty": str(_pick(data, "cumulativeQuoteQty", "cumulativeQuote", "amount") or "0"),
             "price": _pick(data, "price"),
             "type": _normalize_order_type(_pick(data, "orderType", "order_type")),
             # Attached-protection path echoes profitTriggerPrice/loseTriggerPrice;
@@ -1027,7 +927,10 @@ class MexcCliAdapter:
                 data, "profitTriggerPrice", "profitTriggerprice", "triggerPrice", "trigger_price"
             ),
             "loseTriggerPrice": _pick(
-                data, "loseTriggerPrice", "loseTriggerprice", "triggerLimitPrice",
+                data,
+                "loseTriggerPrice",
+                "loseTriggerprice",
+                "triggerLimitPrice",
                 "trigger_limit_price",
             ),
             "raw": data,
@@ -1050,7 +953,9 @@ class MexcCliAdapter:
                 raise MexcOrderNotFound("MEXC CLI listing had no order id for the client id")
         data = self._run(
             self._argv(
-                "spot", "trade", "cancel",
+                "spot",
+                "trade",
+                "cancel",
                 query={"orderId": order_id},
                 confirm=self.confirm_writes,
             ),
@@ -1068,7 +973,9 @@ class MexcCliAdapter:
         operation = "current-orders" if open_only else "history-orders"
         data = self._run(
             self._argv(
-                "spot", "trade", operation,
+                "spot",
+                "trade",
+                operation,
                 query={
                     "currency": base,
                     "market": quote,
@@ -1081,21 +988,15 @@ class MexcCliAdapter:
         )
         return _extract_rows(data)
 
-    def _find_by_client_id(
-        self, base: str, quote: str, client_order_id: str
-    ) -> dict[str, Any]:
+    def _find_by_client_id(self, base: str, quote: str, client_order_id: str) -> dict[str, Any]:
         for open_only in (True, False):
             for row in self._list_orders(base=base, quote=quote, open_only=open_only):
                 candidate = _pick(row, "clientOrderId", "client_order_id", "clientOrderID")
                 if str(candidate or "") == client_order_id:
                     return row
-        raise MexcOrderNotFound(
-            f"MEXC CLI listings contain no order for client id {client_order_id}"
-        )
+        raise MexcOrderNotFound(f"MEXC CLI listings contain no order for client id {client_order_id}")
 
-    def _find_by_order_id(
-        self, base: str, quote: str, order_id: str
-    ) -> dict[str, Any] | None:
+    def _find_by_order_id(self, base: str, quote: str, order_id: str) -> dict[str, Any] | None:
         for open_only in (True, False):
             for row in self._list_orders(base=base, quote=quote, open_only=open_only):
                 candidate = _pick(row, "orderId", "order_id", "id")
@@ -1121,7 +1022,9 @@ class MexcCliAdapter:
             base, quote = self._pair(symbol)
         data = self._run(
             self._argv(
-                "spot", "trade", "current-orders",
+                "spot",
+                "trade",
+                "current-orders",
                 query={"currency": base, "market": quote, "pageSize": 100},
                 read_only=True,
             ),
