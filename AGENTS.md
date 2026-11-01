@@ -61,9 +61,9 @@ Do not silently change behavior to match an old doc.
 | `tg_signal_ingest/service.py` | live listener, recovery sweep, background workers |
 | `tg_signal_ingest/backfill.py` | resumable history import and checkpoints |
 | `tg_signal_ingest/processing.py` | bounded queue consumer with backoff |
-| `tg_signal_ingest/trading/` | parser, risk, sizing, intents, reservations, execution, reconciliation, trade lifecycle, notifications |
+| `tg_signal_ingest/trading/` | parser, risk, intents, reservations, execution, reconciliation, trade lifecycle, notifications |
 | `tg_signal_ingest/mexc/` | MEXC Spot v3 client, typed errors, symbol metadata, depth parsing |
-| `tg_signal_ingest/control/` | legacy owner controller and Bot API client |
+| `tg_signal_ingest/control/` | owner/developer controller, setup store, and Bot API client |
 | `docs/` | operator, developer, architecture, trading, data docs |
 | `deploy/` | systemd unit for `serve` |
 | `tests/` | pytest suite, fakes, parser fixtures |
@@ -90,10 +90,10 @@ Do not silently change behavior to match an old doc.
   Exchange `-2011` never terminalizes a non-terminal local intent.
 - Terminal fills are recovered through `fill_sync_required` until `myTrades`
   confirms the full executed quantity.
-- `serve` holds `<db>.serve.lock`; control holds control/serve locks. Kernel
-  `flock` makes the locks crash-safe.
-- The legacy `control` bot is not embedded in `serve`; only its Bot API client
-  is reused for durable notifications. Run it separately with `control run`.
+- `serve` holds `<db>.serve.lock`. When `cfg.control.enabled` is true, it also
+  acquires `<db>.control.lock` and runs the ControlBot task inside the same
+  process. `control run` is the standalone controller mode and takes only the
+  control lock. Never run both against the same database.
 - The live market-monitor → `TradeManager` path has wiring limitations
   documented in `docs/trading.md`. Do not assume TP/SL or conditional entries
   are production-ready without validation.
@@ -119,7 +119,8 @@ Do not silently change behavior to match an old doc.
 .venv/bin/tg-ingest auth login
 .venv/bin/tg-ingest channels list
 .venv/bin/tg-ingest channel select <id-or-@username-or-title>
-.venv/bin/tg-ingest serve
+.venv/bin/tg-ingest serve                 # ingestion + optional integrated control bot
+.venv/bin/tg-ingest control run           # standalone controller only
 ```
 
 ## Change guidelines
@@ -131,8 +132,9 @@ Do not silently change behavior to match an old doc.
   binary floats reach an exchange call.
 - Keep DB writes inside `Database.transaction()` and preserve the
   intent-before-submission ordering.
-- Never add a code path that retries an uncertain exchange submission, widens
-  a portfolio spending cap, trusts Telegram usernames, or derives size from signal text.
+- Never add a code path that retries an uncertain exchange submission,
+  introduces a portfolio spending cap, trusts Telegram usernames, or derives
+  size from signal text.
 - Add or update tests for behavior changes. Parser changes usually require a
   replay/reprocess test.
 - Keep docs concise: link to authoritative detail instead of duplicating it.

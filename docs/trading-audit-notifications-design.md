@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # Trading Audit, Notifications, and Read-Only Investigation — Design
 
 **Status:** proposed design only; not implemented.  It is not a description of
@@ -1187,7 +1192,7 @@ Update the canonical docs only once the behavior is implemented:
 - `docs/trading.md`: operation/ack/status/fill facets, OCO/position semantics,
   and what is still unverified.
 - `docs/architecture.md`, `docs/operations.md`, `AGENTS.md`,
-  `docs/CONTROL_BOT_FA.md`, `docs/MANAGEMENT_BOT_FA.md`: actual `serve` control
+  `docs/CONTROL_BOT_FA.md` and current `serve` source: actual `serve` control
   poller wiring, single-poller locks, read-only investigation boundaries, and
   notification worker.
 - `docs/documentation-index.md`: promote the implemented guides and remove

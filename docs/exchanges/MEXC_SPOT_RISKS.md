@@ -101,8 +101,8 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
 | Automatic execution | Yes — one MEXC Spot behaviour; no SIM/TESTONLY/LIVE product-mode split |
 | Single explicit enable gate | Yes — `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`; pipeline construction fails closed without it |
 | Submission-boundary pause/readiness | Yes — kernel file lock plus a transactional pause/readiness check inside the submission claim |
-| Kill switch | Yes — emergency stop at evaluation and pre-submission time; operator cancel tooling remains available, but the bot never cancels or adopts pre-existing external orders automatically |
-| Order size | One explicit owner-approved fixed `order_quote_amount`; no software default, no signal-derived size, and no arbitrary daily/open-order caps |
+| Kill switch | Yes — emergency stop at evaluation and pre-submission time; the owner can cancel in the MEXC web UI; the bot never cancels or adopts pre-existing external orders automatically |
+| Order size | One owner-configured fixed `order_quote_amount` (default 3 USDT, editable in the control menu); no signal-derived size, leverage, deposit percentage, or daily/open-order cap |
 | Per-order exchange-rule validation | Yes — registry TTL cache over exchangeInfo + local fail-closed checks |
 | Partial fills / cancel races | Yes — reconciliation + fill sync (durable `fill_sync_required` flag) |
 | Durable intents & reconciliation | Yes — SQLite (TradingStore) with migrations; idempotency key on Telegram identity |
@@ -114,9 +114,9 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
 
 1. **Kill switch**: set `trading.emergency_stop = true` (or stop the service:
    `systemctl stop tg-ingest`). Both instantly prevent NEW orders.
-2. **Cancel exposure**: `DELETE /api/v3/order/all` via the operator CLI path,
-   or manually in the web UI; then run `tg-ingest trading reconcile` and
-   review `intents`/`reconciliations` tables.
+2. **Cancel exposure**: cancel individual orders in the MEXC web UI (the
+   application does not expose a cancel-all CLI command); then run
+   `tg-ingest trading reconcile` and review `intents`/`reconciliations` tables.
 3. **Ambiguous orders**: any intent in `unknown_requires_reconciliation` is
    re-queried (by `orderId`, else `origClientOrderId`) — resolve manually; the
    system never resubmits by itself.
@@ -134,7 +134,7 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
       (announcements + `exchangeInfo`) at enablement time.
 - [ ] **[OWNER]** Create the key with READ + SPOT_DEAL_WRITE only, IP-bound,
       renewal scheduled.
-- [ ] **[OWNER]** Set realistic exposure limits in `[trading]` config.
+- [ ] **[OWNER]** Set the fixed per-order `order_quote_amount` and verify spendable balance.
 - [ ] **[CODE]** Run `validate_credentials()` once credentials exist
       (read-only; safe).
 - [ ] **[CODE]** The official order/test primitive is validation only; it never proves matching-engine behavior. Watch

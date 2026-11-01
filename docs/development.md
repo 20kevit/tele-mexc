@@ -53,14 +53,14 @@ newer releases.
 
 | Area | Tests |
 | --- | --- |
-| Config precedence/caps | `test_config.py`, `test_trading_config.py` |
+| Config precedence/validation | `test_config.py`, `test_trading_config.py` |
 | Schema/migrations | `test_db_migrations.py` |
 | Message/queue semantics | `test_repository.py`, `test_processing.py`, `test_backfill.py` |
-| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_channel_trading_boundary.py`, `test_service_activation_boundary.py` |
-| Parser/risk/sizing | `test_signals.py`, `test_sizing.py` |
+| Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_service_activation_boundary.py`, `test_full_history_archive.py` |
+| Parser/risk/Futures ingestion | `test_signals.py`, `test_futures_signals.py` |
 | Intent/reservation/execution | `test_trading_engine.py`, `test_trading_budget.py`, `test_trading_live_gates.py`, `test_mexc_execution_gates.py` |
 | Reconciliation/fills | `test_trading_live_gates.py`, `test_balance.py` |
-| Trade lifecycle (simulated) | `test_trading_conditional_entry.py`, `test_trading_tp_sl.py`, `test_trading_monitor.py` |
+| Trade lifecycle (mocked exchange) | `test_trading_conditional_entry.py`, `test_trading_tp_sl.py`, `test_trading_monitor.py` |
 | MEXC contract | `test_mexc_client.py`, `test_mexc_official_contract.py`, `test_symbols.py` |
 | MEXC rate limits/hybrid | `test_mexc_client.py`, `test_mexc_hybrid.py`, `test_trading_monitor.py` |
 | MEXC CLI adapter/preflight | `test_mexc_cli_adapter.py`, `test_trading_preflight.py`, `test_trading_cli_protection.py`, `test_config_mexc_cli.py` |
@@ -106,13 +106,16 @@ Treat these as invariants unless the task explicitly changes the safety model:
 - No blind retry after network/5xx/unknown submission.
 - `-2011` leaves non-terminal state non-terminal and flagged.
 - Spot BUY only; sell exists only for trade-lifecycle exits.
-- Fixed `order_quote_amount`, never signal-derived size.
-- There is no aggregate portfolio budget or spending cap.
+- Fixed `order_quote_amount`, never signal-derived size; owner menu writes
+  `control_settings.order_quote_amount` and env keeps precedence.
+- LIMIT-only entries; conditional entry defaults to 3 ticks below Entry.
+- There is no aggregate portfolio budget or spending cap; the reservation
+  ledger is a technical idempotency/concurrency guard.
 - Fresh balance preflight for live submission.
 - Durable fills and notifications.
 
 Update `docs/trading.md` in the same change. If you touch the trade lifecycle,
-add an end-to-end service-level test, not only a simulation test.
+add an end-to-end service-level test, not only a fake-exchange unit test.
 
 ## Manual offline smoke checks
 

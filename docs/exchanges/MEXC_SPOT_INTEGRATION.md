@@ -2,9 +2,10 @@
 
 How the adapter (`tg_signal_ingest/mexc/`) binds to the trading core
 (`tg_signal_ingest/trading/`) without touching signal ingestion, parsing, or
-bot workflows. **Execution stays disabled by default**; this document is the
-contract a future operator fulfills when credentials and policy confirmation
-exist.
+bot workflows. The product has one automatic Spot execution behaviour; the
+pipeline must be explicitly configured and acknowledged before construction.
+This document describes the adapter contract; current trading behavior is
+canonical in `docs/trading.md`.
 
 ## 1. Interface the core depends on
 
@@ -40,21 +41,19 @@ Construction is fail-closed and there is one execution behaviour:
 - a wrong or missing acknowledgement raises `AccidentalOrderRiskError` before
   any exchange call.
 
-## 2. From a reviewed signal to an exchange order intent
+## 2. From a parsed signal to an exchange order intent
 
-1. A human-reviewed signal row exists in SQLite (`record_signal`), parsed from
-   the message into (`symbol`, `action`, quantities) — the adapter receives
-   **only these normalized fields**, never Telegram text.
-2. `TradingEngine.process_item` computes risk (`RiskManager.evaluate`),
-   sizing, and symbol-rule quantization (`SymbolMeta.quantize_*` +
-   `validate_order`).
+1. A parsed signal row exists in SQLite (`record_signal`) — the adapter
+   receives **only normalized fields**, never Telegram text.
+2. `TradingEngine.process_item` computes risk (`RiskManager.evaluate`) with the
+   fixed owner quote amount and symbol-rule quantization
+   (`SymbolMeta.quantize_*` + `validate_order`).
 3. An approved decision becomes a durable `intent` row **before** any network
    call: `intent_id`, `client_order_id` = SHA-256 over
    `(channel_id, message_id, action, symbol)` — the idempotency handle that
    also reconciles ambiguous submissions.
-4. Order payload construction (`_order_payload`):
-   LIMIT → `quantity` + `price`; MARKET BUY → `quoteOrderQty`; MARKET SELL →
-   `quantity`. Nothing else is ever sent.
+4. Order payload construction (`_order_payload`): LIMIT only, with
+   `quantity` + `price`. A MARKET intent is rejected before any client call.
 
 ## 3. Symbol mapping & trading-rule validation
 
@@ -86,7 +85,9 @@ validates:
    leave an untracked submission.
 
 There is no daily/open-order cap, signal-age limit, price-deviation rejection,
-mandatory stop-loss check. No operator-maintained symbol allowlist is used; MEXC market metadata and exchange filters still validate each symbol.
+symbol allowlist, or aggregate budget. Entry, SL, TP1, and TP2 are mandatory;
+the LONG invariant `SL < Entry < TP1 <= TP2` is enforced. MEXC market metadata
+and exchange filters still validate each symbol. Entry orders are LIMIT-only.
 
 ## 5. Order-lifecycle state reconciliation
 
@@ -175,8 +176,8 @@ inside the CLI process cannot be counted by the application limiter.
 2. `validate_credentials()` pass: key VALID, not expired, permissions exactly
    READ/READ/`SPOT_DEAL_WRITE`.
 3. Pair is API-tradable (dynamic `exchangeInfo` + no suspension announcement).
-4. Owner-approved fixed `order_quote_amount` (no software default) and enough
-   spendable quote balance for that exact order.
+4. Owner-approved fixed `order_quote_amount` (default 3 USDT, configurable) and
+   enough spendable quote balance for that exact order.
 5. Manifest *policy* confirmation: automated-trading acceptance and region —
    cannot be verified by code (`MEXC_SPOT_RISKS.md` §8 checklist).
 6. Only then set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` and build the pipeline.

@@ -7,11 +7,14 @@ Spot signals, applies risk controls, and drives a durable order-intent state
 machine against the official MEXC Spot API.
 
 **Automatic MEXC Spot execution.** The product has one execution behaviour:
-valid BUY signals from the selected channel are executed automatically with the
-owner's fixed quote amount. There is no SIM/TESTONLY/LIVE product-mode split, no
-symbol allowlist, and no per-signal approval. The pipeline refuses to build
-without the exact owner acknowledgement, MEXC Spot credentials, and the MEXC CLI
-write backend. No withdrawals, no futures, no unofficial endpoints.
+valid LONG/BUY signals from the selected channel are executed automatically with
+the owner's fixed quote amount. Futures/Perpetual/leveraged messages may be
+ingested; eligible LONG signals are normalized to Spot BUY. SHORT/SELL signals
+never execute. There is no SIM/TESTONLY/LIVE product-mode split, no symbol
+allowlist, and no per-order approval. Entry orders are LIMIT-only. The pipeline
+refuses to build without the exact one-time owner acknowledgement, MEXC Spot
+credentials, and the MEXC CLI write backend. No withdrawals, no Futures/Margin
+execution, and no unofficial endpoints.
 
 - Pause/resume and readiness are enforced at the submission boundary with a
   kernel file lock and a transactional check, not only in the UI.
@@ -73,10 +76,11 @@ journalctl -u tg-ingest.service -f
 - Entry submission, fill synchronization, and OCO exit wiring are implemented
   for MEXC Spot. Live signal-to-order and live OCO behavior remain unverified
   until a genuine signal is observed and its exchange result is checked.
-- There is no withdrawal support, no futures/short selling, and no unofficial
-  exchange endpoint.
-- Two pre-existing exchange positions are intentionally outside the new trade
-  lifecycle and are never adopted automatically.
+- There is no withdrawal support, no Futures/Margin order execution, no SHORT
+  execution, and no unofficial exchange endpoint. Futures/Perpetual signal text
+  is ingested; eligible LONG signals execute as Spot BUY only.
+- Pre-existing external positions are outside the bot trade lifecycle and are
+  never adopted automatically.
 
 ## Trading safety model
 
@@ -96,9 +100,12 @@ journalctl -u tg-ingest.service -f
   MEXC Spot credentials, and a healthy MEXC CLI write backend. There is no
   fallback to a simulated or test-only mode.
 - The optional Telegram control bot authenticates the personal session, verifies
-  MEXC permissions, and selects the channel. Both the configured owner and the
-  configured developer have owner-equivalent access to every control-bot command
-  and administrative action. Notifications use one selectable minimum severity
+  MEXC permissions, and selects the channel. When `CONTROL_BOT_ENABLED` is true,
+  `tg-ingest serve` runs it inside the service process and holds both the serve
+  and control locks; `tg-ingest control run` is the standalone controller mode.
+  Both the configured owner and the configured developer have owner-equivalent
+  access to every control-bot command and administrative action. Notifications
+  use one selectable minimum severity
   (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`); role routing remains separate.
   Its `/pause` and `/resume` controls are enforced at the order-submission
   boundary with a kernel file lock and a transactional readiness check. See

@@ -27,8 +27,8 @@ earlier local-only fallback remains available but is not the shipped live path.
 - No futures, margin, leverage, or short selling.
 - Never sell unrelated assets already held in the owner's MEXC account.
 - No withdrawal, transfer, or unrelated account-management functionality.
-- Preserve the existing Telegram signal extraction and analysis functionality.
-  Do not redesign it unless a concrete integration defect prevents trading.
+- Preserve the production Telegram signal extraction and parser. Do not
+  redesign it unless a concrete integration defect prevents trading.
 
 ---------------------------------------------------------------
 2. Position sizing and capital limits
@@ -60,10 +60,10 @@ earlier local-only fallback remains available but is not the shipped live path.
 1. Current market price above E: submit a **LIMIT BUY at E** using the
    configured quote budget.
 2. Current market price below E: calculate the instrument's **actual tick size**
-   from exchange metadata and submit the conditional entry trigger at
-   `E - offset_ticks × tick_size` (five ticks below E when offset = 5). When the
-   trigger activates, submit a **LIMIT BUY at E** (entry price remains a hard
-   maximum; never converts to market).
+   from exchange metadata and place the conditional entry trigger at
+   `E - offset_ticks × tick_size`. The default is exactly **3 ticks** and remains
+   configurable. When the trigger activates, submit a **LIMIT BUY at E** (entry
+   price remains a hard maximum; never converts to market).
 3. Current price equals E: treated as case 1 (market is not below the entry), so
    a LIMIT BUY at E is submitted immediately. Deterministic: price == entry is
    not "below", so no conditional wait.
@@ -197,8 +197,8 @@ orders; request timeout after the exchange may have accepted it.
   left unprotected. No real order will be placed, canceled, or reconciled by
   this document's author to remediate it; the owner must apply the documented
   recovery procedure or enable the TradeManager exit path for future entries.
-- All 728 automated tests pass; lint and type checks are part of the dev
-  workflow (`docs/development.md`).
+- The test count in this historical snapshot is obsolete; run the current suite
+  as documented in `docs/development.md`.
 
 ---------------------------------------------------------------
 9. Change control

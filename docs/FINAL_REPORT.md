@@ -1,3 +1,8 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # Final Report — Wire Two Native OCO Exit Orders into the Live Trading Workflow
 
 Repository: local project checkout (branch `main`)

@@ -16,7 +16,9 @@ otherwise healthy sibling means partial, not full, protection.
 
 - Spot **BUY only** for signals. SHORT/SELL is parsed for reporting and then
   rejected. Sell orders exist only for TP1/TP2/stop-loss exits.
-- No futures, leverage, margin, withdrawals, or unofficial endpoints.
+- No Futures/Margin order execution, leverage, withdrawals, or unofficial
+  endpoints. Futures/Perpetual signal text is ingested but never executed as a
+  Futures/Margin order.
 - One fixed owner-configured quote amount per BUY. Signal deposit/balance/
   leverage text is never used for sizing.
 - One intent per Telegram message; conflicting edits cannot create a second.
@@ -175,11 +177,12 @@ enforced. The historical `trading_daily_spend` table is retained for compatibili
 
 - LONG is treated as BUY; SHORT/SELL is retained but rejected by risk.
 - Futures/perpetual/margin/leverage wording is ingested but never enables
-  Futures execution.  A LONG signal with a Spot-compatible symbol and complete
+  Futures execution. A LONG signal with a Spot-compatible symbol and complete
   Entry/SL/TP1/TP2 fields is executed as a Spot BUY; leverage/deposit text is
   ignored for sizing.
 - Missing/unsafe entry, symbol, or required fields fail closed.
-- A signal marked MARKET is converted to LIMIT only when it has a valid Entry price; otherwise it is rejected. MARKET orders are never submitted.
+- A signal marked MARKET is converted to LIMIT only when it has a valid Entry
+  price; otherwise it is rejected. MARKET orders are never submitted.
 - No OCR: media without usable caption text is not actionable.
 
 ## Risk and sizing
@@ -397,7 +400,7 @@ native MEXC OCO SELL orders against the **actual acquired base quantity**:
   market falls.
 - OCO 2: the remaining allocation at TP2, with the same split between the
   stop-limit execution price (configured stop-loss, unchanged) and the
-  activation trigger (five ticks above it).
+  activation trigger (the configured `stop_loss_trigger_offset_ticks`, default 3 ticks above it).
 - Each OCO is one exchange order with two linked legs; when one leg activates,
   the exchange cancels the other leg inside that OCO. The two OCO orders do not
   cancel each other.
@@ -552,9 +555,9 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
   Any residual remains recorded and is not silently dropped.
 - On restart, `serve` runs `recover_on_startup()` and periodically
   `reconcile_all_open()`. `stop_loss_executing` and `exit_pending` resume
-  cancellation/fill accounting before selling any remainder. A market exit that
-  partially filled, then canceled while offline, is completed with a new
-  order id for the remaining quantity.
+  cancellation/fill accounting before selling any remainder. A partially
+  filled order that was canceled while offline is completed with a new order id
+  for the remaining quantity, subject to the no-oversell checks.
 - A TP state that was persisted before its allocation/order was written is
   completed on recovery. A `pending` row (created locally, never sent) is
   resumed, and its quantity is rebased against current fills so a late fill
@@ -630,8 +633,9 @@ changes; audit events are written as `trading.buy_block`.
   (up to 100 rows) of `current-orders`, then `history-orders`. The live hybrid
   client delegates single-order queries to REST instead. Unresolved orders
   remain uncertain and are not blindly resubmitted.
-- Attached TP/SL is only available on `spot trade place` (limit). Market entries
-  rely on local management.
+- Attached TP/SL is only available on `spot trade place` (limit). Entry orders
+  are LIMIT-only; MARKET execution is rejected at configuration, risk, REST,
+  CLI, and payload boundaries.
 - Exchange-side protection is `active` only when the order detail echoes the
   requested trigger prices. Triggered attached-order listing behavior has not
   been validated with real credentials here.
@@ -710,8 +714,6 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 .venv/bin/tg-ingest trading intents --limit 20
 .venv/bin/tg-ingest trading parse <message_id>
 .venv/bin/tg-ingest trading reconcile
-.venv/bin/tg-ingest trading trades [--state <state>]
-.venv/bin/tg-ingest trading trade <trade-id>
 .venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
 .venv/bin/tg-ingest trading verify
 ```
@@ -741,11 +743,11 @@ modifies an order.
   remains a terminal local rejection and contributes no spend.
 
 
-## Live-enablement checklist (manual, separate approval)
+## Live-enablement checklist (owner-authorized)
 
 1. Run `trading preflight --network`; confirm the CLI profile is saved/active,
    the CLI and REST keys read the same Spot account, and exit monitoring paths
-   are validated with a separate explicit approval.
+   are validated under an explicit owner-approved live test plan.
 2. Use a MEXC key with Spot read + Spot trade only; enable IP allowlist; no
    withdrawal permission.
 3. Set `order_quote_amount` to an owner-approved positive value.

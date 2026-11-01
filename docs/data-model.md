@@ -10,8 +10,10 @@ SQLite schema and persistence invariants. Source of truth:
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
   `schema_migrations`. Current maximum version: **20**.
-- Commands that open a normal repository run migrations; read-only status commands open the database without writing. Help and commands that do not open a repository
-  do not necessarily run migrations.
+- Commands that open a normal repository run migrations, including `status`,
+  `backfill status`, `trading status`, and `control status`. Read-only inspection
+  of an existing database requires an external SQLite viewer or a disposable
+  copy; help/config commands that never open a repository do not migrate.
 - There is no automatic retention, pruning, or archival job. The database grows
   with messages, edits, signals, queue rows, audit events, notifications, and
   trades.
@@ -170,7 +172,7 @@ are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable
 | `audit_events.category` | `telegram`, `parse`, `validate`, `risk`, `mexc_request`, `lifecycle`, `reconcile`, `config`, `emergency` |
 | `trading_budget_ledger.state` | `reserved`, `uncertain`, `settled`, `released` |
 | `order_protection.status` | `not_requested`, `unverified`, `active`, `triggered`, `completed`, `rejected`, `unknown_requires_reconciliation` |
-| `trading_notifications.status` | `pending`, `sent`, `failed` |
+| `trading_notifications.status` | `pending`, `sending`, `sent`, `failed`, `ambiguous`, `suppressed`, `canceled` |
 
 ## Persistence invariants
 

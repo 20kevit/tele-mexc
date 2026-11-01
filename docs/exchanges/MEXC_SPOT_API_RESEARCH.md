@@ -1,5 +1,10 @@
 # MEXC Spot V3 API Research
 
+> **Historical research snapshot (2026-10-23).** This file records the exchange
+> API research and the adapter state at that date. It is not a current behavior
+> specification. Current execution policy is in `docs/trading.md`: automatic
+> MEXC Spot, LIMIT-only entries, no product-mode split, no allowlist.
+
 **Sources checked: 2026-10-23 (all links verified live on this date).**
 
 This document inventories the official MEXC Spot V3 REST API and maps each
@@ -43,7 +48,7 @@ adapter method, no plan, listed for completeness.
 | GET | `/api/v3/trades` | 5 | Recent trades (default 500, max 1000) | Documented-not-implemented (core has no use) |
 | GET | `/api/v3/klines` | 1 | Candlesticks (max 500) | Documented-not-implemented (core has no use) |
 | GET | `/api/v3/avgPrice`, `/api/v3/ticker/24hr`, `/api/v3/ticker/bookTicker` | n/d | Average price / stats / book ticker | Documented-not-implemented |
-| GET | `/api/v3/defaultSymbols` | n/d | Pairs with API access (FAQ) | Documented-not-implemented (allowlist mode covers this) |
+| GET | `/api/v3/defaultSymbols` | n/d | Pairs with API access (FAQ) | Documented-not-implemented; no allowlist feature exists |
 | GET | `/api/v3/announcements` | 5 req / 2 s | API announcements (change log 2026-06-16) | Documented-not-implemented |
 
 `exchangeInfo` symbol fields used by the registry (all verified against the
@@ -71,8 +76,8 @@ odd field name, ambiguity A4), `quoteAmountPrecisionMarket`,
 
 | Method | Path | Permission | Limit | Purpose | Implementation |
 | --- | --- | --- | --- | --- | --- |
-| POST | `/api/v3/order` | SPOT_DEAL_WRITE | 12 req/s shared with cancel (UID) | Place LIMIT/MARKET/IOC/FOK/LIMIT_MAKER order; `newClientOrderId` idempotency handle; optional `stpMode` | `place_order()` — implemented; local validation in `SymbolMeta.validate_order()`; LIMIT + MARKET only (adapter policy) |
-| POST | `/api/v3/order/test` | (as /order) | 1 | Validation without matching engine (response `{}`). NOT a sandbox and NOT an order | `place_test_order()` — implemented, used by `testonly` mode only |
+| POST | `/api/v3/order` | SPOT_DEAL_WRITE | 12 req/s shared with cancel (UID) | Place order; `newClientOrderId` idempotency handle; optional `stpMode` | `place_order()` — implemented; local validation in `SymbolMeta.validate_order()`; current product adapter accepts LIMIT only |
+| POST | `/api/v3/order/test` | (as /order) | 1 | Validation without matching engine (response `{}`). NOT a sandbox and NOT an order | Low-level `place_test_order()` exists for contract tests; no product mode or CLI command |
 | DELETE | `/api/v3/order` | SPOT_DEAL_WRITE | 12 req/s shared | Cancel one order by `orderId`/`origClientOrderId` | `cancel_order()` — implemented |
 | DELETE | `/api/v3/openOrders` | SPOT_DEAL_WRITE | 12 req/s shared | Cancel all open orders for ONE symbol (incl. OCO); `symbol` required | `cancel_all_orders(symbol=...)` — implemented (fixed: was called without a symbol) |
 | DELETE | `/api/v3/order/all` | SPOT_DEAL_WRITE | 12 req/s shared | Cancel ALL orders account-wide (added 2026-05-22) | `cancel_all_account_orders()` — implemented; kill-switch only |
@@ -220,9 +225,9 @@ endpoint in §2 marked "implemented".
 | Signed request construction, canonicalization, doc-example regression tests | Implemented + tested offline |
 | Public market data (time, exchangeInfo, depth, price ticker) | Implemented + tested offline |
 | Account/balances, key validation, open orders, order query, fills | Implemented + tested offline (transport mocked); **live read-only verified 2026-10-23** (masked balance/account check, apiKeyInfo VALID permanent, confirmed candidate symbols; no values disclosed) |
-| Order construction + symbol-filter validation (LIMIT/MARKET) | Implemented + tested offline |
-| Order submission / cancellation / kill switch | Implemented + tested offline; **disabled by default** (`mode=sim`), live requires an explicit token; additionally, planning a live intent without the owner approval gate is rejected (fail-closed guard, 2026-10-23) |
-| Official `POST /api/v3/order/test` exercise | **Verified live 2026-10-23**: one valid MARKET BUY check accepted (`{}`); no order placed; no intent row created |
+| Order construction + symbol-filter validation (LIMIT-only policy) | Implemented + tested offline |
+| Order submission / cancellation / kill switch | Implemented + tested offline; one automatic Spot behavior; construction requires the one-time acknowledgement, credentials, and CLI backend. No product mode or per-order approval. |
+| Official `POST /api/v3/order/test` exercise | Historical 2026-10-23 validation check accepted (`{}`); no order placed. The current product does not expose a test-order command. |
 | Ambiguous-timeout handling, duplicate prevention, reconciliation | Implemented in `trading/engine.py` + `trading/store.py` (SQLite durable intents), covered by that module's test suite |
 | WebSocket handling | Not implemented (documented decision, §2) |
-| Live connectivity / account validation | **Read-only authenticated access VERIFIED 2026-10-23** (apiKeyInfo/account/exchangeInfo); real order submission/cancellation remains NOT exercised — `mode=sim` and the empty allowlist stay until the owner explicitly changes them |
+| Live connectivity / account validation | **Read-only authenticated access was verified on 2026-10-23**; real order submission/cancellation remains NOT exercised. No mode/allowlist switch exists in current code. |

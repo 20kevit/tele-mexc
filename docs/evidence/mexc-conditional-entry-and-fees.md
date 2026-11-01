@@ -1,7 +1,12 @@
+> **Historical/archive status:** This document preserves dated evidence,
+> findings, or a design proposal. It is not a description of current behavior
+> or an operational instruction. Current documentation starts at
+> `docs/documentation-index.md`.
+
 # MEXC Spot Conditional Entry, Taker Fees, and CLI Capabilities — Evidence Dossier
 
 **Investigation date:** 2026-10-28
-**Environment:** Linux VPS, Python 3.12, venv at `/opt/projects/akha1/.venv`, working tree clean at HEAD `a79e6a9` (branch `fix/sl-stop-loss-trigger-offset`)
+**Environment:** Linux VPS, Python 3.12, venv at `<repo-root>/.venv`, working tree clean at HEAD `a79e6a9` (branch `fix/sl-stop-loss-trigger-offset`)
 **Remote:** `public` -> `git@github-akha1:20kevit/tele-mexc.git`
 **Repository commit:** `a79e6a9bf15fdb078e95d0a34bdd0252e0ff62c1`
 **Working-tree state:** clean (no uncommitted changes)
@@ -20,7 +25,7 @@ This dossier separates **verified facts** (live read-only evidence, official doc
 
 | Item | Value | Source |
 | --- | --- | --- |
-| Project CLI executable | `/opt/projects/akha1/.venv/bin/tg-ingest` | `which` |
+| Project CLI executable | `<repo-root>/.venv/bin/tg-ingest` | `which` |
 | MEXC CLI executable | `/usr/bin/mexc` -> `../lib/node_modules/@mexc-ai/cli/bin/launcher.cjs` | `ls -la` |
 | MEXC CLI version | `0.0.22 [public] (commit e633cabd8bc5, built 2026-09-29T16:02:58+08:00)` | `/usr/bin/mexc --version` |
 | MEXC CLI state dir | `/root/.mexc (mode 0700)` | `mexc doctor --json` |
