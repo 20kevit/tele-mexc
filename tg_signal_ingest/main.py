@@ -91,6 +91,8 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 # execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 # order_quote_amount = 3
 # order_type_policy = "limit"
+# Conditional LIMIT entry trigger distance (default exactly 3 ticks).
+# entry_trigger_offset_ticks = 3
 # recon_interval_s = 30
 # emergency_stop = false
 

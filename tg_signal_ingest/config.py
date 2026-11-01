@@ -87,9 +87,11 @@ class TradingConfig:
     order_quote_amount: float = 3.0
     order_quote_amount_source: str = "default (3 USDT)"
     amount_configured: bool = True
-    # Conditional entry: when set to an int >= 1, trades wait for an upward price
-    # trigger before submission. None or 0 disables conditional entry.
-    entry_trigger_offset_ticks: int | None = None
+    # Conditional LIMIT entry: wait for price to cross this many ticks below
+    # the signal Entry reference. The canonical strategy default is exactly 3.
+    # It remains configurable, but it cannot be disabled or turned into a
+    # silent direct-entry fallback.
+    entry_trigger_offset_ticks: int = 3
     entry_trigger_stale_threshold_s: float = 60.0
     # Take-profit allocation percentages.
     tp1_allocation_pct_of_acquired: float = 50.0
@@ -107,9 +109,22 @@ class TradingConfig:
     monitor_backoff_base_s: float = 1.0
 
     @property
+    def effective_entry_trigger_offset_ticks(self) -> int:
+        """Resolve the canonical trigger offset, treating legacy unset as 3.
+
+        Explicit invalid values are left visible so execution can fail closed
+        instead of silently falling back to direct entry.
+        """
+
+        value = self.entry_trigger_offset_ticks
+        if value is None:  # legacy/directly constructed configuration
+            return 3
+        return value
+
+    @property
     def conditional_entry_enabled(self) -> bool:
-        """Conditional entry is active when a positive trigger offset is configured."""
-        return self.entry_trigger_offset_ticks is not None and self.entry_trigger_offset_ticks >= 1
+        """Conditional entry is always the strategy; invalid offsets fail later."""
+        return self.effective_entry_trigger_offset_ticks >= 1
 
     @property
     def stop_loss_trigger_enabled(self) -> bool:
@@ -127,7 +142,7 @@ class TradingConfig:
             "order_quote_amount": self.order_quote_amount,
             "order_quote_amount_source": self.order_quote_amount_source,
             "amount_configured": self.amount_configured,
-            "entry_trigger_offset_ticks": self.entry_trigger_offset_ticks,
+            "entry_trigger_offset_ticks": self.effective_entry_trigger_offset_ticks,
             "entry_trigger_stale_threshold_s": self.entry_trigger_stale_threshold_s,
             "tp1_allocation_pct_of_acquired": self.tp1_allocation_pct_of_acquired,
             "tp2_allocation_pct_of_remaining": self.tp2_allocation_pct_of_remaining,
@@ -551,8 +566,8 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
     # ---- conditional entry trigger offset ----
     offset_val = tr_raw.get("entry_trigger_offset_ticks")
     if offset_val not in (None, ""):
-        if not isinstance(offset_val, int) or isinstance(offset_val, bool) or offset_val < 0:
-            raise ConfigError("trading.entry_trigger_offset_ticks must be a whole number >= 0.")
+        if not isinstance(offset_val, int) or isinstance(offset_val, bool) or offset_val < 1:
+            raise ConfigError("trading.entry_trigger_offset_ticks must be a whole number >= 1.")
         t.entry_trigger_offset_ticks = int(offset_val)
 
     stale_val = tr_raw.get("entry_trigger_stale_threshold_s")

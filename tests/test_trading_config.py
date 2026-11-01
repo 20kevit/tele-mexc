@@ -191,3 +191,23 @@ def test_legacy_allowlist_configuration_is_rejected(tmp_path):
     cfg = load_config(root=_root_with("", tmp_path=tmp_path / "clean"), environ={}, require_credentials=False)
     assert not hasattr(cfg.trading, "allowed_symbols")
     assert not hasattr(cfg.trading, "allowlist_mode")
+
+
+def test_entry_trigger_offset_defaults_to_three(tmp_path):
+    cfg = load_config(root=_root_with("", tmp_path=tmp_path), environ={}, require_credentials=False)
+    assert cfg.trading.entry_trigger_offset_ticks == 3
+    assert cfg.trading.effective_entry_trigger_offset_ticks == 3
+
+
+def test_entry_trigger_offset_explicit_override(tmp_path):
+    root = _root_with("[trading]\nentry_trigger_offset_ticks = 5", tmp_path=tmp_path)
+    cfg = load_config(root=root, environ={}, require_credentials=False)
+    assert cfg.trading.entry_trigger_offset_ticks == 5
+    assert cfg.trading.effective_entry_trigger_offset_ticks == 5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "'3'", "true", "3.5"])
+def test_entry_trigger_offset_invalid_values_are_rejected(tmp_path, value):
+    root = _root_with(f"[trading]\nentry_trigger_offset_ticks = {value}", tmp_path=tmp_path)
+    with pytest.raises(ConfigError, match="entry_trigger_offset_ticks"):
+        load_config(root=root, environ={}, require_credentials=False)

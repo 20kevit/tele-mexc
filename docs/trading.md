@@ -129,7 +129,7 @@ Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
 | `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
 | `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
-| `entry_trigger_offset_ticks` | unset | unset = direct entry; otherwise integer ≥1 enables conditional entry |
+| `entry_trigger_offset_ticks` | `3` | integer ≥1; conditional LIMIT entry waits for price to cross `Entry - offset × tick_size`. Missing resolves to 3; it cannot disable conditional entry or fall back to direct entry |
 | `entry_trigger_stale_threshold_s` | `60.0` | positive; a conditional-entry order is not triggered from an older price tick |
 | `tp1_allocation_pct_of_acquired` | `50.0` | 0–100 of actual acquired quantity |
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
@@ -152,7 +152,7 @@ change financial behaviour.
 | `balance_fee_buffer_pct` | The exact exchange fee is only visible after fills; the pre-trade requirement adds a small documented buffer so the quote/base balance is sufficient. |
 | `balance_max_age_s` | Prevents a decision based on a stale account snapshot. It is a freshness check, not portfolio polling. |
 | `entry_trigger_stale_threshold_s` | Prevents a conditional entry from triggering on an old market tick. |
-| `entry_trigger_offset_ticks` | Controls the conditional-entry downward trigger distance; owner-adjustable and defaults to the documented strategy when set. |
+| `entry_trigger_offset_ticks` | Conditional-entry trigger distance; default exactly 3 ticks, still owner-adjustable. |
 | `stop_loss_trigger_offset_ticks` | Controls the OCO stop activation trigger relative to the configured stop exit price. |
 
 
@@ -579,9 +579,11 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
 
-- All exit monitoring is active even when `entry_trigger_offset_ticks` is unset
-  (conditional entry disabled). New trade symbols are subscribed to the monitor
-  after startup, and the REST fallback fetches prices through the MEXC client.
+- Conditional LIMIT entry is always the strategy when market is below Entry;
+  the default trigger is exactly 3 exchange ticks below Entry.
+- All exit monitoring is active for every trade. New trade symbols are
+  subscribed to the monitor after startup, and the REST fallback fetches prices
+  through the MEXC client.
 
 ### Pre-BUY exit-protection gate and the new-BUY block
 

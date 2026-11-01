@@ -6,13 +6,14 @@ and background reconciliation cannot race each other.
 
 Entry modes
 -----------
-* ``direct`` — the current market is already at/above the signal entry price
-  (or conditional entry is disabled): submit a Limit Buy at the entry price
-  immediately, subject to risk/balance controls.
-* ``conditional`` — the current market is below the entry price and
-  ``entry_trigger_offset_ticks`` is configured: create a durable pending entry
-  and wait for an upward crossing of ``entry_price - offset * tick_size`` before
-  submitting the Limit Buy.  The Limit Buy always respects the entry price as a
+* ``direct`` — the current market is already at/above the signal entry price:
+  submit a Limit Buy at the entry price immediately, subject to risk/balance
+  controls.
+* ``conditional`` — the current market is below the entry price: create a
+  durable pending entry and wait for an upward crossing of
+  ``entry_price - offset * tick_size`` before submitting the Limit Buy.  The
+  default offset is 3 ticks and is configurable; a missing offset resolves to 3
+  rather than direct entry.  The Limit Buy always respects the entry price as a
   hard maximum; it is never converted to a market order.
 
 Take-profit: TP1 sells ``tp1_allocation_pct_of_acquired`` of the ACTUAL acquired
@@ -337,16 +338,21 @@ class TradeManager:
             return None
 
         tick_size = getattr(symbol_meta, "price_step", None) if symbol_meta else None
-        offset = self.cfg.entry_trigger_offset_ticks
+        offset = self.cfg.effective_entry_trigger_offset_ticks
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
+            self._reject_trade_intent(
+                intent,
+                "entry trigger offset is missing or invalid; refusing direct entry",
+            )
+            return None
         trigger_price = None
         entry_mode = "direct"
         current = reference_price
-        # Conditional entry is enabled when offset >= 1 (see TradingConfig).  We
-        # already verified current is not None; only engage the watcher when the
-        # market is below the entry and we can build a valid downward trigger.
+        # Conditional entry is the canonical strategy.  When the market is
+        # already at/above Entry, a Limit Buy at Entry is submitted directly;
+        # a missing/invalid offset can never select that path.
         if (
-            self.cfg.conditional_entry_enabled
-            and tick_size is not None
+            tick_size is not None
             and current is not None
             and current.is_finite()
             and current > 0
@@ -412,11 +418,13 @@ class TradeManager:
             raise
 
     def _compute_trigger(self, entry_price: Decimal, ticks: int, tick_size: Decimal) -> Decimal | None:
-        """Trigger = entry_price - ticks * tick_size, quantized down to tick size."""
+        """Trigger = entry_price - ticks * tick_size, floored to the tick grid."""
+
         raw = entry_price - (Decimal(ticks) * tick_size)
         try:
-            return raw.quantize(tick_size, rounding="ROUND_DOWN")
-        except InvalidOperation:
+            steps = (raw / tick_size).to_integral_value(rounding="ROUND_DOWN")
+            return steps * tick_size
+        except (InvalidOperation, ZeroDivisionError):
             return None
 
     # ===================================================================
