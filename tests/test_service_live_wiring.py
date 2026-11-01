@@ -98,12 +98,16 @@ async def _wait_for(predicate, timeout=3.0):
 
 
 async def test_market_worker_subscribes_and_dispatches_ticks(cfg, repo):
+    # F-04: only price-driven states are subscribed (conditional entry trigger
+    # and unprotected SL alerts); OCO-managed positions are reconciled, not
+    # polled.
     trades = [
-        {"symbol": "btcusdt", "trade_state": "entry_active"},
-        {"symbol": "ETHUSDT", "trade_state": "open"},
+        {"symbol": "btcusdt", "trade_state": "pending_entry"},
+        {"symbol": "ETHUSDT", "trade_state": "unprotected_critical"},
         {"symbol": "SOLUSDT", "trade_state": "closed"},
         {"symbol": "XRPUSDT", "trade_state": "needs_reconciliation"},
-        {"symbol": None, "trade_state": "entry_active"},
+        {"symbol": "ADAUSDT", "trade_state": "oco_active"},
+        {"symbol": None, "trade_state": "pending_entry"},
     ]
     trading = FakeTrading(trades)
     monitor = FakeMonitor()

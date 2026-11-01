@@ -29,10 +29,12 @@ the operator (``mexc profile set`` then ``mexc profile use``).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ from .errors import (
     MexcConfigError,
     MexcDuplicateOrder,
     MexcError,
+    MexcInsufficientBalance,
     MexcNetworkError,
     MexcOrderNotFound,
     MexcOrderRejected,
@@ -189,6 +192,25 @@ def parse_version(text: str) -> str | None:
 def _version_tuple(version: str) -> tuple[int, int, int]:
     parts = version.split(".")
     return tuple(int(p) for p in (parts + ["0", "0", "0"])[:3])  # type: ignore[return-value]
+
+
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    """Kill the CLI and any children, then bound the wait for the pipes."""
+
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError, OSError):
+        process.kill()
+    try:
+        process.communicate(timeout=2.0)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        # A surviving grandchild still holds a pipe: stop waiting.  The order
+        # outcome is already reported as unknown, so leaking the handle is
+        # strictly better than blocking the trading loop.
+        for stream in (process.stdout, process.stderr):
+            with contextlib.suppress(Exception):
+                if stream is not None:
+                    stream.close()
 
 
 def _sanitize(text: str, *, limit: int = 400) -> str:
@@ -335,23 +357,39 @@ class MexcCliAdapter:
     # ------------------------------------------------------------- execution
 
     def _default_runner(self, argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        """Run the CLI with a *total* time bound.
+
+        ``subprocess.run(timeout=...)`` only bounds the wait for the child; a
+        grandchild that keeps the stdout/stderr pipes open can block the second
+        ``communicate()`` far past the deadline (observed historically: a 5 s
+        timeout produced a 921 s call).  The child is therefore started in its
+        own session and the whole process group is killed on timeout, with a
+        second bounded wait for the pipes.
+        """
+
         env = {key: value for key, value in self._environ.items() if key not in _PROXY_ENV and key not in _SECRET_ENV}
         env.setdefault("NO_COLOR", "1")
         try:
-            return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
                 list(argv),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
-                check=False,
                 shell=False,  # explicit: never invoke a shell
                 env=env,
                 stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise MexcNetworkError(f"MEXC CLI timed out after {timeout:g}s; outcome is unknown") from exc
         except OSError as exc:
             raise MexcCliUnavailable(f"MEXC CLI could not be started ({exc.__class__.__name__})") from exc
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_tree(process)
+            raise MexcNetworkError(
+                f"MEXC CLI timed out after {timeout:g}s and its process tree was killed; outcome is unknown"
+            ) from exc
+        return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
 
     def _argv(
         self,
@@ -479,6 +517,31 @@ class MexcCliAdapter:
             raise MexcAuthError(f"MEXC CLI authentication failed: {message}")
         if "rate" in haystack or "too many" in haystack or "banned" in haystack:
             raise MexcRateLimitError(f"MEXC CLI rate limited: {message}")
+        # Deterministic exchange validations.  These can never succeed by
+        # retrying the same payload, so they must be reported as a definitive
+        # rejection instead of an ambiguous "server error" that leaves the
+        # caller waiting for a reconciliation that will never resolve.
+        if any(
+            token in haystack
+            for token in (
+                "limit price needs to be greater",
+                "limit price needs to be less",
+                "stop price needs to be",
+                "trigger price",
+                "price needs to be greater",
+                "price needs to be less",
+                "not within the min",
+                "below the minimum",
+                "exceed the maximum",
+                "order quantity",
+                "order value",
+                "amount is too small",
+                "invalid order",
+            )
+        ):
+            raise MexcOrderRejected(f"MEXC CLI rejected the order values: {message}")
+        if any(token in haystack for token in ("insufficient", "balance is not enough", "not enough balance")):
+            raise MexcInsufficientBalance(f"MEXC CLI reported insufficient balance: {message}")
         if any(token in haystack for token in ("precision", "decimal", "minimum", "invalid quantity", "invalid price")):
             raise MexcPrecisionError(f"MEXC CLI rejected the order values: {message}")
         if any(token in haystack for token in ("symbol", "market name", "pair")):

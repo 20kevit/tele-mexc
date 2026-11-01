@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import TradingEngine
@@ -188,32 +190,36 @@ def test_market_entry_has_no_attached_protection_prices(cfg, repo):
     assert tp is None and sl is None
 
 
-def test_verified_exchange_protection_suppresses_local_tp_sl():
+def test_standalone_tp_path_is_disabled():
+    """F-01: exits are OCO-only; the old TP path must never submit an order."""
+
     class Store:
-        def get_protection(self, intent_id):
-            return {"status": "active"}
+        def __init__(self):
+            self.states: list[tuple[str, str]] = []
+
+        def update_trade_state(self, trade_id, state, *, note=""):
+            self.states.append((trade_id, state))
 
     tm = object.__new__(TradeManager)
     tm.store = Store()
-    entered: list[str] = []
-    tm._enter_tp1 = lambda trade: entered.append("tp1")
-    tm._enter_stop_loss = lambda trade, price: entered.append("sl")
-    trade = {"trade_id": "t1", "entry_intent_id": "intent-1", "tp1_price": "110", "sl_price": "95"}
-    tm._check_tp_sl(trade, Decimal("110"))
-    tm._check_tp_sl(trade, Decimal("90"))
-    assert entered == []
+    notified: list[str] = []
+    tm._notify_trade = lambda trade, key, text, **kw: notified.append(key)
+    trade = {"trade_id": "t1", "symbol": "BTCUSDT", "tp1_price": "110", "sl_price": "95"}
+
+    tm._enter_tp1(trade)
+    tm._enter_tp2(trade)
+
+    assert tm.store.states == [("t1", "needs_reconciliation"), ("t1", "needs_reconciliation")]
+    assert notified == ["LEGACY_EXIT_DISABLED", "LEGACY_EXIT_DISABLED"]
 
 
-def test_unverified_protection_leaves_local_management_in_control():
-    class Store:
-        def get_protection(self, intent_id):
-            return {"status": "unverified"}
-
+def test_submit_tp_order_refuses_to_submit():
     tm = object.__new__(TradeManager)
-    tm.store = Store()
-    entered: list[str] = []
-    tm._enter_tp1 = lambda trade: entered.append("tp1")
-    tm._enter_stop_loss = lambda trade, price: entered.append("sl")
-    trade = {"trade_id": "t1", "entry_intent_id": "intent-1", "tp1_price": "110", "sl_price": "95"}
-    tm._check_tp_sl(trade, Decimal("110"))
-    assert entered == ["tp1"]
+    with pytest.raises(Exception, match="OCO"):
+        tm._submit_tp_order(
+            {"trade_id": "t1", "symbol": "BTCUSDT"},
+            "tp1",
+            {"trade_order_id": "x", "client_order_id": "c"},
+            Decimal("1"),
+            Decimal("1"),
+        )

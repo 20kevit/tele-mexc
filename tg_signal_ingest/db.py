@@ -7,10 +7,14 @@ database do not produce spurious failures.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
+
+log = logging.getLogger("ingest.db")
 
 MigrationStep = str | Callable[[sqlite3.Connection], None]
 
@@ -554,6 +558,45 @@ def _migration_21_second_owner_notifications(conn: sqlite3.Connection) -> None:
         "ON trading_notifications (intent_id)",
     ):
         conn.execute(sql)
+
+
+def _migration_22_remediation_columns(conn: sqlite3.Connection) -> None:
+    """Additive columns required by the remediation decisions.
+
+    * ``order_intents.deadline_at`` — N-01 signal validity deadline, persisted
+      so it survives restarts and can be enforced before every submission.
+    * ``trade_orders.attempt`` / ``next_attempt_at`` / ``retryable`` — F-02
+      bounded OCO retry schedule and definitive-rejection handling.
+    * ``oco_legs.attempt`` / ``verified`` — F-12 per-leg attempt counter and the
+      explicit "unverified fallback" marker used when MEXC is unreachable.
+
+    Additive only: existing rows keep their data with safe defaults.
+    """
+
+    _add_columns(conn, "order_intents", [("deadline_at", "TEXT")])
+    _add_columns(
+        conn,
+        "trade_orders",
+        [
+            ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "TEXT"),
+            ("retryable", "INTEGER NOT NULL DEFAULT 1"),
+        ],
+    )
+    _add_columns(
+        conn,
+        "oco_legs",
+        [
+            ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("verified", "INTEGER NOT NULL DEFAULT 1"),
+        ],
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trade_orders_retry ON trade_orders (state, next_attempt_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_order_intents_deadline ON order_intents (state, deadline_at)"
+    )
 
 
 MIGRATIONS: list[tuple[int, MigrationStep]] = [
@@ -1555,6 +1598,7 @@ MIGRATIONS: list[tuple[int, MigrationStep]] = [
     (19, _migration_19_trade_evidence_columns),
     (20, _migration_20_audit_evidence_notifications),
     (21, _migration_21_second_owner_notifications),
+    (22, _migration_22_remediation_columns),
 ]
 
 
@@ -1626,12 +1670,30 @@ class Database:
 
             def __enter__(self):
                 outer.lock.acquire()
-                try:
-                    self.conn.execute("BEGIN IMMEDIATE")
-                except Exception:
-                    outer.lock.release()
-                    raise
-                return self.conn
+                # A bounded retry makes short-lived contention (another process
+                # holding the write lock) invisible to callers instead of
+                # surfacing as a failed trade transition.  It is logged because
+                # repeated contention is an operational signal.
+                deadline = time.monotonic() + 10.0
+                attempt = 0
+                while True:
+                    try:
+                        self.conn.execute("BEGIN IMMEDIATE")
+                        return self.conn
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                            outer.lock.release()
+                            raise
+                        attempt += 1
+                        if time.monotonic() >= deadline:
+                            log.error("SQLite write lock still busy after %s attempts; failing", attempt)
+                            outer.lock.release()
+                            raise
+                        log.warning("SQLite write lock contention (attempt %s); retrying", attempt)
+                        time.sleep(min(0.05 * attempt, 0.5))
+                    except Exception:
+                        outer.lock.release()
+                        raise
 
             def __exit__(self, exc_type, exc, tb):
                 try:

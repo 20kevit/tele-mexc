@@ -118,7 +118,9 @@ def test_build_engine_applies_persisted_amount(cfg, repo):
 
 
 def test_persisted_buy_amount_reaches_a_real_spot_intent(cfg, repo):
-    from tests.test_trading_engine import FakeMexc, FakeRegistry, _item, _store_message
+    from datetime import timedelta
+
+    from tests.test_trading_engine import MSG_DATE, FakeMexc, FakeRegistry, _item, _store_message
     from tg_signal_ingest.trading.engine import TradingEngine
 
     _store(repo).set_setting("order_quote_amount", "6.5")
@@ -126,7 +128,13 @@ def test_persisted_buy_amount_reaches_a_real_spot_intent(cfg, repo):
     client = FakeMexc(
         place_response={"orderId": "ex-owner-amount", "status": "NEW"},
     )
-    engine = TradingEngine(cfg, repo, client=client, registry=FakeRegistry())
+    engine = TradingEngine(
+        cfg,
+        repo,
+        client=client,
+        registry=FakeRegistry(),
+        now=lambda: MSG_DATE + timedelta(seconds=10),
+    )
     engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
 
     intent = engine.process_item(

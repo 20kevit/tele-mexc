@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -108,7 +108,11 @@ class TradingEngine:
             self.store = _TradeStore(repo.db, cfg.trading, now=self._now)
         # Durable exchange evidence.  Every order/account call is recorded
         # before it is sent, so an ambiguous write is never guessed later.
-        self.evidence = ExchangeEvidence(self.store, clock_health=lambda: getattr(self, "_clock_health", None))
+        self.evidence = ExchangeEvidence(
+            self.store,
+            clock_health=lambda: getattr(self, "_clock_health", None),
+            wait_provider=lambda: getattr(getattr(self, "client", None), "pop_wait_ms", lambda: 0)(),
+        )
         self.parser = parser or SignalParser()
         self.risk = RiskManager(cfg.trading, self.store)
         self.client = client
@@ -205,11 +209,15 @@ class TradingEngine:
         self.submission_gate.runtime.update(self._runtime_ready)
 
     def mark_mexc_verified(self, verified: bool = True) -> None:
+        """Record the startup account check for status/diagnostics.
+
+        It is intentionally *not* a per-order gate: the check runs once at
+        startup, so gating every order on it would block trading after a single
+        transient failure until the process restarts.  Unreadable credentials
+        already fail closed when the client is constructed.
+        """
+
         self._mexc_verified = bool(verified)
-        # Always keep a callback installed.  Removing it on False would let a
-        # stale persisted ``mexc_state='verified'`` win, which is exactly the
-        # authority inversion this gate must prevent.
-        self.submission_gate.runtime["mexc"] = lambda: self._mexc_verified
 
     def verify_mexc_readiness(self) -> bool:
         """Read-only account check used once at service startup.
@@ -367,6 +375,17 @@ class TradingEngine:
             self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
+        deadline = self._signal_deadline(record)
+        if deadline is not None and self._now() > deadline:
+            reason = (
+                f"signal_expired: signal older than the configured validity window "
+                f"({int(self.cfg.trading.signal_validity_s)}s)"
+            )
+            self.store.update_signal(signal_id, "rejected", reason)
+            self.store.audit(signal_id, "lifecycle", "rejected_expired", reason)
+            self._notify_rejected(signal_id, parsed, reason, record=record)
+            return None
+
         idempotency_key = self.idempotency_key(item.channel_id, item.message_id, parsed)
         client_order_id = "tsi" + idempotency_key[:28]
         existing_intent = self.store.intent_for_message(item.channel_id, item.message_id)
@@ -441,6 +460,7 @@ class TradingEngine:
                 quote_amount=decision.quote_amount or Decimal(0),
                 base_quantity=decision.base_quantity,
                 limit_price=decision.limit_price,
+                deadline_at=deadline.isoformat() if deadline is not None else None,
             )
         except TradingError as exc:
             # DB/TradingError during intent admission — fail closed, do not submit
@@ -573,6 +593,9 @@ class TradingEngine:
             if boundary is None or message_id <= boundary:
                 self._cancel_stale_planned_intent(intent, boundary)
                 continue
+            if self._intent_expired(intent):
+                self._cancel_stale_planned_intent(intent, boundary, reason="signal_expired")
+                continue
             if self.trade_manager is None:
                 continue
             trade = self.store.get_trade_by_intent(intent["intent_id"])
@@ -593,11 +616,13 @@ class TradingEngine:
             self.trade_manager.on_intent_executed(result)
         return resumed
 
-    def _cancel_stale_planned_intent(self, intent: dict[str, Any], boundary: int | None) -> None:
+    def _cancel_stale_planned_intent(
+        self, intent: dict[str, Any], boundary: int | None, *, reason: str | None = None
+    ) -> None:
         """Cancel a pre-start planned intent locally; never submit it."""
 
         intent_id = str(intent["intent_id"])
-        reason = (
+        reason = reason or (
             "startup recovery: planned intent predates the durable activation boundary "
             f"({boundary}); it was not submitted before downtime and will not be "
             "submitted now"
@@ -803,6 +828,32 @@ class TradingEngine:
         """
 
         return parsed.kind in ("alert", "update", "ambiguous") and parsed.action in ("buy", "sell")
+
+    def _signal_deadline(self, record: dict[str, Any]) -> datetime | None:
+        """Return the absolute deadline of a signal, or None when unprovable."""
+
+        raw = record.get("datetime")
+        if not raw:
+            return None
+        try:
+            occurred = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if occurred.tzinfo is None:
+            occurred = occurred.replace(tzinfo=UTC)
+        return occurred + timedelta(seconds=float(self.cfg.trading.signal_validity_s))
+
+    def _intent_expired(self, intent: dict[str, Any]) -> bool:
+        raw = intent.get("deadline_at")
+        if not raw:
+            return False
+        try:
+            deadline = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        return self._now() > deadline
 
     def _source_ref(
         self,
@@ -1183,6 +1234,19 @@ class TradingEngine:
             self._cancel_stale_planned_intent(intent, boundary)
             result = self.store.get_intent(intent_id)
             assert result is not None
+            return result
+        if self._intent_expired(intent):
+            # N-01: an expired signal never starts a new order.  An order that
+            # was already accepted is untouched by expiry.
+            reason = "signal_expired: validity window elapsed before submission"
+            self.store.transition_intent(
+                intent_id, "rejected", note=reason, reject_reason=reason, category="risk"
+            )
+            self.store.update_signal(intent["signal_id"], "rejected", reason)
+            self.store.audit(intent_id, "risk", "rejected_expired", reason)
+            result = self.store.get_intent(intent_id)
+            assert result is not None
+            self._notify_intent_decision(result, status="REJECTED_LOCALLY", reason=reason)
             return result
         # Pause/readiness are checked inside the same transaction that flips
         # planned -> submitting, while the shared gate prevents pause from

@@ -317,8 +317,8 @@ def test_oco_position_recovers_after_restart(env):
     assert t["trade_state"] == "oco_active", t
 
 
-def test_oco_waits_for_terminal_entry_with_partial_fill(env):
-    """No exit may be placed while the entry order can still fill."""
+def test_oco_protects_partial_fill_immediately(env):
+    """F-05: acquired quantity is protected before the entry becomes terminal."""
     cfg, store, engine, client, notifier, tm = env
     tm._clock = lambda: 5000.0
     intent = _insert_intent(store)
@@ -346,19 +346,60 @@ def test_oco_waits_for_terminal_entry_with_partial_fill(env):
     )
     tm._reconcile_entry_fills(trade)
     trade = store.get_trade(trade["trade_id"])
-    assert trade["trade_state"] == "entry_active", trade
-    assert store.list_trade_orders(trade["trade_id"], kind="tp1") == []
-    assert store.list_trade_orders(trade["trade_id"], kind="tp2") == []
-    assert [c for c in client.place_calls if c.get("order_type") == "OCO_STOP_LIMIT_ORDER"] == []
 
-    # Cancel the remainder: the entry is now terminal and protection is placed.
-    engine.cancel_intent_order(intent)
-    tm._reconcile_entry_fills(trade)
-    trade = store.get_trade(trade["trade_id"])
-    assert trade["trade_state"] == "oco_active", trade
+    # Protection exists for the filled quantity while the remainder works.
+    assert trade["trade_state"] in ("oco_active", "oco_submitting", "oco_partial", "unprotected_critical"), trade
     assert Decimal(trade["acquired_base_qty"]) == Decimal("0.06")
     assert len(store.list_trade_orders(trade["trade_id"], kind="tp1")) == 1
-    assert len(store.list_trade_orders(trade["trade_id"], kind="tp2")) == 1
+    oco_calls = [c for c in client.place_calls if c.get("order_type") == "OCO_STOP_LIMIT_ORDER"]
+    assert oco_calls, "partial fill must be protected with an OCO"
+
+
+def test_partial_fill_cancels_entry_remainder_when_exited():
+    """F-05: an exited position cancels the still-working entry remainder."""
+    tm = object.__new__(TradeManager)
+
+    class Store:
+        def get_intent(self, _intent_id):
+            return {"state": "open", "intent_id": "i1"}
+
+        def audit(self, *args, **kwargs):
+            return None
+
+    tm.store = Store()
+    cancelled: list[dict] = []
+    tm._tp_done = lambda trade, target: True
+    tm._cancel_entry_remainder = lambda trade: cancelled.append(trade) or True
+    tm._record_error = lambda *a, **k: None
+    tm._refresh_buy_block = lambda: None
+    tm._notify_trade = lambda *a, **k: None
+
+    tm._cancel_entry_remainder_when_exited(
+        {"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"}
+    )
+    assert cancelled, "the unfilled entry remainder must be cancelled"
+
+
+def test_partial_fill_remainder_kept_while_position_open():
+    """F-05: the remainder keeps working while part of the position is held."""
+    tm = object.__new__(TradeManager)
+
+    class Store:
+        def get_intent(self, _intent_id):
+            return {"state": "open", "intent_id": "i1"}
+
+    tm.store = Store()
+    cancelled: list[dict] = []
+    tm._tp_done = lambda trade, target: False
+    tm._cancel_entry_remainder = lambda trade: cancelled.append(trade) or True
+    tm._record_error = lambda *a, **k: None
+    tm._refresh_buy_block = lambda: None
+    tm._notify_trade = lambda *a, **k: None
+
+    tm._cancel_entry_remainder_when_exited(
+        {"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"}
+    )
+    assert cancelled == []
 
 
 def test_oco_partial_rejection_retries_only_missing_leg(env):

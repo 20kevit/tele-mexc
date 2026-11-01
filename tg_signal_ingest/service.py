@@ -675,12 +675,23 @@ class IngestService:
         except Exception as exc:  # noqa: BLE001 - keep the monitor alive
             log.error("trade symbol lookup failed (%s)", exc.__class__.__name__)
             return
+        # Only two states need price ticks: a conditional entry waiting for its
+        # trigger, and an unprotected position that must alert when it crosses
+        # its stop-loss.  Native OCO exits are held by MEXC, so polling their
+        # symbols added weight without adding safety (F-04).
+        watched_states = {"pending_entry", "unprotected_critical"}
         active = {
             str(trade.get("symbol") or "").upper()
             for trade in trades
-            if trade.get("trade_state") not in ("closed", "tp2_completed", "needs_reconciliation")
-            and trade.get("symbol")
+            if trade.get("trade_state") in watched_states and trade.get("symbol")
         }
+        for symbol in sorted(self._subscribed_symbols - active):
+            try:
+                await monitor.unsubscribe(symbol)
+            except Exception as exc:  # noqa: BLE001
+                log.error("unsubscribe failed for %s (%s)", symbol, exc.__class__.__name__)
+                continue
+            self._subscribed_symbols.discard(symbol)
         for symbol in sorted(active - self._subscribed_symbols):
             try:
                 await monitor.subscribe(symbol)

@@ -55,13 +55,14 @@ class SubmissionGate:
         db: Any,
         cfg: AppConfig,
         *,
-        require_control_setup: bool = False,
         runtime: dict[str, Callable[[], bool | None]] | None = None,
         lock_timeout_s: float = 30.0,
     ):
         self.db = db
         self.cfg = cfg
-        self.require_control_setup = require_control_setup
+        # Diagnostic callbacks (Telegram connected, channel resolved, boundary
+        # armed).  Owner policy is explicit: these never block entries.  They are
+        # retained for status/diagnostics only and are not read by ``check``.
         self.runtime = dict(runtime or {})
         self.lock_timeout_s = max(0.1, float(lock_timeout_s))
         self._thread_lock = threading.RLock()
@@ -115,19 +116,25 @@ class SubmissionGate:
 
     # ----------------------------------------------------------- readiness
 
-    def _dimension_ok(self, name: str, persisted_ok: bool) -> bool:
-        """Resolve one readiness dimension.
+    def _buy_block_reason(self, conn: sqlite3.Connection) -> str | None:
+        """Return the persisted new-BUY block reason, or None when clear."""
 
-        An installed runtime callback is authoritative in both directions: a
-        False result must not be overridden by stale persisted state.  The
-        callback's exception propagates to the caller's fail-closed handler.
-        Persisted state is used only when no callback is installed.
-        """
-
-        callback = self.runtime.get(name)
-        if callback is not None:
-            return bool(callback())
-        return bool(persisted_ok)
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'trading.new_buys_blocked'"
+            ).fetchone()
+        except sqlite3.Error:
+            return "new-BUY block state is unreadable; failing closed"
+        if row is None or str(row[0]) != "1":
+            return None
+        try:
+            reason_row = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'trading.new_buys_block_reason'"
+            ).fetchone()
+        except sqlite3.Error:
+            reason_row = None
+        reason = str(reason_row[0]) if reason_row is not None and reason_row[0] else ""
+        return reason or "an open position lacks verified exit protection"
 
     @staticmethod
     def _setup_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -159,6 +166,13 @@ class SubmissionGate:
             pause_reason = self._pause_reason(conn)
             if pause_reason:
                 return pause_reason
+        if purpose == ENTRY:
+            # The persisted BUY block is a real entry gate: it stops every new
+            # BUY while an unprotected position exists.  It never touches
+            # protection/exit submissions, and it never cancels an order.
+            block_reason = self._buy_block_reason(conn)
+            if block_reason:
+                return f"new BUYs are blocked: {block_reason}"
         # There is intentionally no account-wide/history-wide entry lock here.
         # Historical trade reconciliation state is per-order/per-trade and must
         # never disable unrelated symbols.  New BUY entries are guarded by the

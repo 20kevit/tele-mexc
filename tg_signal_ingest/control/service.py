@@ -248,6 +248,9 @@ class ControlBot:
         if text.startswith("/version"):
             await self._show_version(chat_id)
             return
+        if text.startswith("/validity"):
+            await self._set_validity(chat_id, text)
+            return
 
         flow = self.store.flow()
         if flow["expired"]:
@@ -471,7 +474,8 @@ class ControlBot:
             "• /status: خلاصه وضعیت.\n"
             "• /pause: توقف فوری اجرای سفارش‌های جدید.\n"
             "• /resume: ادامه اجرا.\n"
-            "• /cancel: لغو فقط همان مرحله ورود یا ورودی جاری.\n\n"
+            "• /cancel: لغو فقط همان مرحله ورود یا ورودی جاری.\n"
+            "• /validity <hours>: مدت اعتبار سیگنال (پیش‌فرض ۱۲ ساعت).\n\n"
             "امنیت: ورود تلگرام فقط از ترمینال امن SSH انجام می‌شود؛ شماره، کد ورود "
             "و رمز دو مرحله‌ای را در هیچ چت تلگرامی نفرستید. کلید و رمز MEXC نیز "
             "نباید در چت یا لاگ نوشته شوند."
@@ -965,6 +969,36 @@ class ControlBot:
             return
         await self._send(chat_id, "عملیات اعلان نامعتبر است.", self._menu_kb())
 
+    async def _set_validity(self, chat_id: int, text: str) -> None:
+        """Owner-only: set how long a new signal stays actionable."""
+
+        parts = text.split()
+        current_hours = self.cfg.trading.signal_validity_s / 3600.0
+        if len(parts) == 1:
+            await self._send(
+                chat_id,
+                f"⏱ مدت اعتبار فعلی سیگنال: {current_hours:g} ساعت.\n"
+                "برای تغییر: /validity <ساعت> (بین ۰٫۵ تا ۱۶۸)",
+            )
+            return
+        try:
+            hours = float(parts[1].replace(",", "."))
+        except (IndexError, ValueError):
+            await self._send(chat_id, "⏱ مقدار نامعتبر است. نمونه: /validity 12")
+            return
+        if not 0.5 <= hours <= 168:
+            await self._send(chat_id, "⏱ مقدار باید بین ۰٫۵ و ۱۶۸ ساعت باشد.")
+            return
+        self.store.set_setting("signal_validity_hours", f"{hours:g}")
+        self.cfg.trading.signal_validity_s = hours * 3600.0
+        self.store.audit("validity_changed", f"signal validity set to {hours:g}h by owner")
+        await self._send(
+            chat_id,
+            f"✅ مدت اعتبار سیگنال روی {hours:g} ساعت تنظیم شد. "
+            "پس از این مدت هیچ سفارش جدیدی برای سیگنال ارسال نمی‌شود؛ "
+            "سفارش‌های پذیرفته‌شده لغو نمی‌شوند.",
+        )
+
     async def _show_version(self, chat_id: int) -> None:
         """Read-only runtime version report (owner only, no state changes)."""
 
@@ -975,7 +1009,7 @@ class ControlBot:
         gate = getattr(self._engine, "submission_gate", None) if self._engine else None
         if gate is not None:
             return gate
-        return SubmissionGate(self.repo.db, self.cfg, require_control_setup=True)
+        return SubmissionGate(self.repo.db, self.cfg)
 
     def _pause_atomically(self) -> str | None:
         """Set pause under the exclusive lock; return a failure reason or None."""

@@ -179,7 +179,7 @@ def test_unconfirmed_oco_marks_position_critical_but_does_not_globally_block(env
 
     assert trade["trade_state"] == UNPROTECTED_CRITICAL, trade
     assert "unprotected position" in (store.buy_block_reason() or "")
-    assert any(event[0] == "BUY_BLOCK_ACTIVE" for event in notifier.trade_events)
+    assert any(event[0].startswith("BUY_BLOCK_ACTIVE") for event in notifier.trade_events)
 
     # The global flag is diagnostic only: an unrelated lifecycle is admitted.
     second = _insert_intent(store, signal_id="sig-2", client_order_id="tsi-2")

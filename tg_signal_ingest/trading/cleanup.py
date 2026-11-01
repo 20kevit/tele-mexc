@@ -224,16 +224,29 @@ def run_initial_open_order_cleanup(
     report = CleanupReport(inspected=len(orders))
     report.candidates = [c for group in grouped.values() for c in group]
 
-    if not apply:
-        report.detail = "dry run; no orders were canceled"
-        for symbol, group in grouped.items():
-            if all(c.eligible for c in group):
-                report.canceled_symbols.append(symbol)
-            elif any(c.eligible for c in group):
-                report.left_untouched.append(symbol)
-            else:
-                report.left_untouched.append(symbol)
-        return report
+    # F-07: the bot must never cancel an order it cannot positively attribute.
+    # The historical implementation cancelled every open order below 5 USD,
+    # including bot-owned exit legs and manual orders.  Inspection is still
+    # useful, cancellation is not performed here at all.
+    report.detail = (
+        "inspection only: automatic order cancellation is permanently disabled. "
+        "No order was cancelled or modified; unattributed and manual orders are "
+        "left untouched by design."
+    )
+    for symbol in sorted(grouped):
+        report.left_untouched.append(symbol)
+    store.audit(
+        "initial-open-order-cleanup",
+        "lifecycle",
+        "open_order_cleanup_inspection",
+        _summary(report.candidates, [], [], report.left_untouched, threshold_usd)[:2000],
+        event_type="cleanup.initial_open_orders",
+        outcome="inspected",
+        payload={"canceled_symbols": [], "left_untouched": report.left_untouched},
+    )
+    if apply:
+        report.detail += " (apply requested but ignored)"
+    return report
 
     inflight_raw = store.get_app_state(INFLIGHT_KEY)
     inflight_symbol: str | None = None

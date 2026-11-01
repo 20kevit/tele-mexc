@@ -168,16 +168,34 @@ def test_live_signal_is_submitted_automatically_without_approval(cfg, repo):
     assert len(engine.store.list_intents(limit=5)) == 1
 
 
-def test_global_unprotected_flag_does_not_block_unrelated_new_buy(cfg, repo):
+def test_buy_block_prevents_new_entry_buy(cfg, repo):
+    """N-07: the persisted BUY block must really stop new entries."""
+
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
     engine.store.set_buy_block("unprotected position(s): OTHERUSDT:trade-old")
 
-    intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1))
 
-    assert intent is not None
-    assert intent["state"] in ("submitted", "canceled", "open", "filled")
-    assert fake.place_calls == 1
+    assert fake.place_calls == 0
+    # The intent is admitted but never submitted: it stays planned (like the
+    # pause gate) and expires with the signal validity window.
+    assert result is not None and result["state"] in ("planned", "rejected")
+    blocked = repo.db.conn.execute(
+        "SELECT reason_code, outcome FROM audit_events WHERE event_type = 'exchange.submission_blocked'"
+    ).fetchall()
+    assert blocked and blocked[-1][1] == "blocked"
+
+
+def test_buy_block_does_not_stop_protection_submissions(cfg, repo):
+    """N-07: exits/OCO protection continue while new BUYs are blocked."""
+
+    fake = FakeMexc()
+    engine = _engine(cfg, repo, fake, mode="spot")
+    engine.store.set_buy_block("unprotected position(s): OTHERUSDT:trade-old")
+    with repo.db.transaction() as conn:
+        assert engine.submission_gate.check(conn, purpose="protection") is None
+        assert "blocked" in (engine.submission_gate.check(conn, purpose="entry") or "")
 
 
 def test_live_replay_below_activation_boundary_is_rejected(cfg, repo):
@@ -225,12 +243,37 @@ def test_emergency_stop_blocks_intent_creation_and_existing_execution(cfg, repo,
     assert fake.place_calls == 0
 
 
-def test_no_signal_age_limit(cfg, repo):
+def test_signal_validity_rejects_expired_signal(cfg, repo):
+    """N-01: a signal older than the validity window never starts an order."""
+
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, seconds_old=3 * 24 * 3600))
-    assert result is not None
-    assert fake.place_calls == 1
+
+    assert result is None
+    assert fake.place_calls == 0
+    signal = engine.store.get_signal("100:1:0")
+    assert signal is not None and "signal_expired" in (signal["rejection_reason"] or "")
+
+
+def test_signal_expiry_does_not_cancel_an_accepted_order(cfg, repo):
+    """N-01: expiry is distinct from an accepted order's lifetime."""
+
+    fake = FakeMexc()
+    engine = _engine(cfg, repo, fake, mode="spot")
+    intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
+    assert intent is not None
+    places = int(fake.place_calls)
+
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE order_intents SET deadline_at = '2000-01-01T00:00:00+00:00' WHERE intent_id = ?",
+            (intent["intent_id"],),
+        )
+    engine.resume_planned_intents()
+
+    assert int(fake.place_calls) == places, "expiry must never submit a new order"
+    assert fake.cancel_calls == 0, "expiry must never cancel an accepted order"
 
 
 def test_no_manual_allowlist_blocks_dynamic_symbol(cfg, repo):

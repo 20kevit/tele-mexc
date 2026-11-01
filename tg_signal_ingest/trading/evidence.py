@@ -61,6 +61,7 @@ class ExchangeOperation:
             response_classification="success",
             response_status=str(status) if status is not None else None,
             exchange_order_id=_exchange_order_id(response),
+            rate_limit_wait_ms=self.evidence.take_wait_ms(),
         )
 
     def fail(
@@ -89,7 +90,7 @@ class ExchangeOperation:
             error_class=exc.__class__.__name__,
             error_message=f"{exc.__class__.__name__}: {exc}",
             uncertainty=uncertainty,
-            rate_limit_wait_ms=rate_limit_wait_ms,
+            rate_limit_wait_ms=rate_limit_wait_ms if rate_limit_wait_ms is not None else self.evidence.take_wait_ms(),
         )
 
     def uncertain(self, reason: str, *, uncertainty: str = "uncertain") -> None:
@@ -104,14 +105,36 @@ class ExchangeOperation:
             error_class="UncertainOutcome",
             error_message=reason,
             uncertainty=uncertainty,
+            rate_limit_wait_ms=self.evidence.take_wait_ms(),
         )
 
 
 class ExchangeEvidence:
-    def __init__(self, store: TradingStore, *, clock_health: Callable[[], str | None] | None = None):
+    def __init__(
+        self,
+        store: TradingStore,
+        *,
+        clock_health: Callable[[], str | None] | None = None,
+        wait_provider: Callable[[], int] | None = None,
+    ):
         self.store = store
         self._clock_health = clock_health
+        self._wait_provider = wait_provider
         self._classes: dict[str, str] = {}
+
+    def take_wait_ms(self) -> int | None:
+        """Return (and reset) the rate-gate wait for the current thread.
+
+        Recording the wait on the operation row is what makes rate pressure
+        observable later; a failed provider must never break an order call.
+        """
+
+        if self._wait_provider is None:
+            return None
+        try:
+            return int(self._wait_provider())
+        except Exception:  # noqa: BLE001 - accounting is advisory
+            return None
 
     def operation_class(self, operation_id: str) -> str:
         return self._classes.get(operation_id, "write")

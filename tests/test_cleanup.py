@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tg_signal_ingest.trading.cleanup import CLEANUP_KEY, INFLIGHT_KEY, run_initial_open_order_cleanup
+from tg_signal_ingest.trading.cleanup import CLEANUP_KEY, run_initial_open_order_cleanup
 from tg_signal_ingest.trading.store import TradingStore
 
 
@@ -46,7 +46,9 @@ def _store(repo, cfg) -> TradingStore:
     return TradingStore(repo.db, cfg.trading)
 
 
-def test_below_threshold_cancels_exactly_five_and_above_untouched(repo, cfg):
+def test_below_threshold_orders_are_never_cancelled(repo, cfg):
+    """F-07: small notional is not a licence to cancel an order."""
+
     client = CleanupClient(
         [
             _order("AAAUSDT", "below", qty="4.99", price="1"),
@@ -56,95 +58,68 @@ def test_below_threshold_cancels_exactly_five_and_above_untouched(repo, cfg):
     )
     report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
 
-    assert client.cancel_calls == ["AAAUSDT"]
-    assert report.canceled_symbols == ["AAAUSDT"]
-    assert set(report.left_untouched) == {"BBBUSDT", "CCCUSDT"}
-    assert not report.uncertain_symbols
-
-
-def test_mixed_symbol_is_left_entirely_untouched(repo, cfg):
-    client = CleanupClient(
-        [
-            _order("AAAUSDT", "small", qty="1", price="1"),
-            _order("AAAUSDT", "large", qty="10", price="1"),
-        ]
-    )
-    report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
     assert client.cancel_calls == []
-    assert "AAAUSDT" in report.left_untouched
+    assert report.canceled_symbols == []
+    assert set(report.left_untouched) == {"AAAUSDT", "BBBUSDT", "CCCUSDT"}
 
 
-def test_oco_legs_are_canceled_as_one_symbol_group(repo, cfg):
+def test_unknown_and_oco_orders_are_left_untouched(repo, cfg):
+    """F-07: unattributed / manual / OCO orders are never modified."""
+
     client = CleanupClient(
         [
-            _order("AAAUSDT", "oco-tp", qty="1", price="1", otype="OCO_STOP_LIMIT_ORDER"),
-            _order("AAAUSDT", "oco-sl", qty="1", price="1", otype="OCO_STOP_LIMIT_ORDER"),
+            _order("MYXUSDT", "oco-tp2", qty="26.68", price="0.0568", otype="OCO_LIMIT_ORDER"),
+            _order("GOLD(XAUT)USDT", "manual-buy", qty="2.9", price="3700", side="BUY"),
         ]
     )
     report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
-    assert client.cancel_calls == ["AAAUSDT"]
-    assert report.canceled_symbols == ["AAAUSDT"]
-    assert not report.uncertain_symbols
+
+    assert client.cancel_calls == []
+    assert report.left_untouched == ["GOLD(XAUT)USDT", "MYXUSDT"]
+    assert len(client.orders) == 2  # nothing removed from the exchange view
 
 
-def test_filled_orders_are_never_canceled(repo, cfg):
+def test_filled_orders_are_ignored(repo, cfg):
     client = CleanupClient([_order("AAAUSDT", "filled", qty="1", price="1", status="FILLED")])
     report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
     assert client.cancel_calls == []
-    assert "AAAUSDT" in report.left_untouched
+    assert report.left_untouched == ["AAAUSDT"]
 
 
 def test_unvalued_quote_or_missing_price_is_left_untouched(repo, cfg):
     client = CleanupClient(
         [
-            _order("AAABTC", "btc-quote", qty="1", price="1"),
-            {
-                "orderId": "no-price",
-                "symbol": "CCCUSDT",
-                "side": "SELL",
-                "type": "LIMIT",
-                "origQty": "1",
-                "executedQty": "0",
-            },
+            _order("BTCUSDT", "no-usd", qty="1", price="1"),
+            _order("ETHUSDT", "no-price", qty="1", price="0"),
         ]
     )
     report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
     assert client.cancel_calls == []
-    assert set(report.left_untouched) == {"AAABTC", "CCCUSDT"}
+    assert set(report.left_untouched) == {"BTCUSDT", "ETHUSDT"}
 
 
-def test_dry_run_never_cancels_or_persists(repo, cfg):
+def test_inspection_records_an_audit_trail(repo, cfg):
+    client = CleanupClient([_order("AAAUSDT", "below", qty="1", price="1")])
     store = _store(repo, cfg)
-    client = CleanupClient([_order("AAAUSDT", "small", qty="1", price="1")])
-    report = run_initial_open_order_cleanup(client, store, apply=False)
+    run_initial_open_order_cleanup(client, store, apply=False)
+    row = repo.db.conn.execute(
+        "SELECT outcome FROM audit_events WHERE event_type = 'cleanup.initial_open_orders' ORDER BY audit_id DESC"
+    ).fetchone()
+    assert row is not None and row[0] == "inspected"
+
+
+def test_repeated_runs_stay_non_destructive(repo, cfg):
+    client = CleanupClient([_order("AAAUSDT", "below", qty="1", price="1")])
+    store = _store(repo, cfg)
+    run_initial_open_order_cleanup(client, store, apply=True)
+    run_initial_open_order_cleanup(client, store, apply=True)
     assert client.cancel_calls == []
-    assert report.canceled_symbols == ["AAAUSDT"]
-    assert store.get_app_state(CLEANUP_KEY) is None
 
 
-def test_cleanup_is_not_repeated_after_completion(repo, cfg):
-    store = _store(repo, cfg)
-    client = CleanupClient([_order("AAAUSDT", "small", qty="1", price="1")])
-    first = run_initial_open_order_cleanup(client, store, apply=True)
-    assert not first.already_completed
-    client.orders = [_order("AAAUSDT", "new-small", qty="1", price="1")]
-    second = run_initial_open_order_cleanup(client, store, apply=True)
-    assert second.already_completed
-    assert client.cancel_calls == ["AAAUSDT"]
-
-
-def test_uncertain_cancellation_is_not_blindly_repeated(repo, cfg):
-    store = _store(repo, cfg)
-    client = CleanupClient([_order("AAAUSDT", "small", qty="1", price="1")])
-    client.fail_cancel = True
-    first = run_initial_open_order_cleanup(client, store, apply=True)
-    assert first.uncertain_symbols == ["AAAUSDT"]
-    assert store.get_app_state(CLEANUP_KEY) is None
-    assert store.get_app_state(INFLIGHT_KEY)
-
-    client.fail_cancel = False
-    second = run_initial_open_order_cleanup(client, store, apply=True)
-    assert second.uncertain_symbols == ["AAAUSDT"]
+def test_apply_flag_cannot_reenable_cancellation(repo, cfg):
+    client = CleanupClient([_order("AAAUSDT", "below", qty="1", price="1")])
+    report = run_initial_open_order_cleanup(client, _store(repo, cfg), apply=True)
+    assert "ignored" in report.detail
     assert client.cancel_calls == []
 
 

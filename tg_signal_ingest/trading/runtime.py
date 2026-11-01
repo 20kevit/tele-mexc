@@ -54,6 +54,29 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     cfg.trading.order_quote_amount_source = "legacy database (buy_quote_usd)" if legacy else "database (Telegram menu)"
     cfg.trading.amount_configured = True
     log.info("applied persisted order amount %.8g USDT from the control database", value)
+    _apply_persisted_signal_validity(cfg, repo)
+    return True
+
+
+def _apply_persisted_signal_validity(cfg: AppConfig, repo: Repository) -> bool:
+    """Apply the owner's signal-validity window stored by the Telegram menu."""
+
+    try:
+        row = repo.db.conn.execute(
+            "SELECT value FROM control_settings WHERE key = 'signal_validity_hours'"
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - a missing/old schema must not block startup
+        return False
+    if row is None:
+        return False
+    try:
+        hours = float(str(row["value"]))
+    except (TypeError, ValueError):
+        return False
+    if not 0.5 <= hours <= 168:
+        return False
+    cfg.trading.signal_validity_s = hours * 3600.0
+    log.info("applied persisted signal validity %.3g hours from the control database", hours)
     return True
 
 
@@ -159,7 +182,7 @@ def build_trading_engine(
     apply_persisted_trading_settings(cfg, repo)
     registry = SymbolRegistry(client) if client is not None else None
     trade_store = TradeStore(repo.db, cfg.trading)
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+    gate = SubmissionGate(repo.db, cfg)
     engine = TradingEngine(
         cfg,
         repo,

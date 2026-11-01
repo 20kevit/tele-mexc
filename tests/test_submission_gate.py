@@ -199,7 +199,7 @@ def _ready(repo: Repository) -> None:
 
 
 def _gate(cfg: AppConfig, repo: Repository) -> SubmissionGate:
-    return SubmissionGate(repo.db, cfg, require_control_setup=True)
+    return SubmissionGate(repo.db, cfg)
 
 
 def _reason(cfg: AppConfig, repo: Repository) -> str | None:
@@ -262,7 +262,7 @@ def test_entry_submits_even_with_stale_control_setup(cfg, repo):
     client = GatedClient()
     cfg.trading.order_quote_amount = 10.0
     store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+    gate = SubmissionGate(repo.db, cfg)
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, submission_gate=gate)
     engine.store = store
     with repo.db.transaction() as conn:

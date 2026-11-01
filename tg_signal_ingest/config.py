@@ -78,7 +78,10 @@ class TradingConfig:
     # per-order confirmation gate.
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
     balance_max_age_s: float = 5.0  # reject account snapshots older than this
-    recon_interval_s: float = 30.0
+    recon_interval_s: float = 60.0
+    # How long a Telegram signal stays actionable, independent of how long an
+    # accepted order lives. Default 12 hours; owner-adjustable via Telegram.
+    signal_validity_s: float = 43200.0
     emergency_stop: bool = False  # app_state runtime flag; config initial value
     # Fixed per-order quote amount (owner-approved, never inferred from signal text).
     order_quote_amount: float = 3.0
@@ -133,6 +136,7 @@ class TradingConfig:
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
             "balance_max_age_s": self.balance_max_age_s,
             "recon_interval_s": self.recon_interval_s,
+            "signal_validity_s": self.signal_validity_s,
             "emergency_stop": self.emergency_stop,
             "order_quote_amount": self.order_quote_amount,
             "order_quote_amount_source": self.order_quote_amount_source,
@@ -430,6 +434,21 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
     if isinstance(cli_confirm, bool):
         m.cli_confirm_noninteractive_writes = cli_confirm
 
+    # ---- shared MEXC weight budget (N-02) ----
+    # Configurable safety margin.  The historical value 60 was an internal cap,
+    # never a confirmed exchange hard limit, so raising it stays an explicit
+    # operator decision.
+    ip_cap = toml.get("max_ip_weight_per_10s")
+    if ip_cap not in (None, ""):
+        if not isinstance(ip_cap, int) or isinstance(ip_cap, bool) or not 1 <= ip_cap <= 300:
+            raise ConfigError("max_ip_weight_per_10s must be a whole number in [1, 300].")
+        m.max_ip_weight_per_10s = int(ip_cap)
+    uid_cap = toml.get("max_uid_weight_per_10s")
+    if uid_cap not in (None, ""):
+        if not isinstance(uid_cap, int) or isinstance(uid_cap, bool) or not 1 <= uid_cap <= 500:
+            raise ConfigError("max_uid_weight_per_10s must be a whole number in [1, 500].")
+        m.max_uid_weight_per_10s = int(uid_cap)
+
     trading_toml = toml.get("trading", {})
     tr_raw: dict[str, object] = dict(trading_toml) if isinstance(trading_toml, dict) else {}
 
@@ -527,6 +546,17 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         ):
             raise ConfigError("trading.recon_interval_s must be a finite number >= 5 seconds.")
         t.recon_interval_s = float(recon)
+
+    validity = tr_raw.get("signal_validity_s")
+    if validity not in (None, ""):
+        if (
+            not isinstance(validity, (int, float))
+            or isinstance(validity, bool)
+            or not math.isfinite(float(validity))
+            or not 1800 <= float(validity) <= 7 * 24 * 3600
+        ):
+            raise ConfigError("trading.signal_validity_s must be a finite number in [1800, 604800] seconds.")
+        t.signal_validity_s = float(validity)
 
     estop = tr_raw.get("emergency_stop")
     if isinstance(estop, bool):

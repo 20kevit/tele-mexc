@@ -112,8 +112,8 @@ def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypat
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS)
     applied = db.migrate()
-    assert applied == [17, 18, 19, 20, 21]
-    assert db.schema_version() == 21
+    assert applied == [17, 18, 19, 20, 21, 22]
+    assert db.schema_version() == 22
     assert db.migrate() == []  # idempotent
 
     audit = db.conn.execute("SELECT event_type, source_ref FROM audit_events").fetchone()

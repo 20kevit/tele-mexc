@@ -91,6 +91,15 @@ ENDPOINT_RULES: dict[tuple[str, str], tuple[str, int]] = {
 Transport = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, dict[str, str], bytes]]
 
 
+def _waited_s(value: Any) -> float:
+    """Normalise a gate return value; injected test gates may return None."""
+
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class WeightedRateGate:
     """Thread-safe sliding-window weight limiter.
 
@@ -121,11 +130,14 @@ class WeightedRateGate:
         while self._events and self._events[0][0] <= cutoff:
             self._events.popleft()
 
-    def acquire(self, weight: int = 1) -> None:
+    def acquire(self, weight: int = 1) -> float:
+        """Reserve ``weight`` in the window, returning the seconds spent waiting."""
+
         if weight < 1:
             raise ValueError("weight must be >= 1")
         if weight > self.max_weight:
             raise ValueError("request weight exceeds the configured bucket capacity")
+        waited = 0.0
         with self._lock:
             while True:
                 now = self._clock()
@@ -133,9 +145,11 @@ class WeightedRateGate:
                 used = sum(w for _ts, w in self._events)
                 if used + weight <= self.max_weight:
                     self._events.append((now, weight))
-                    return
+                    return waited
                 oldest = self._events[0][0]
-                self._sleep(max(0.01, (oldest + self.window_s) - now))
+                delay = max(0.01, (oldest + self.window_s) - now)
+                self._sleep(delay)
+                waited += delay
 
 
 class SharedWeightedRateGate(WeightedRateGate):
@@ -189,14 +203,14 @@ class SharedWeightedRateGate(WeightedRateGate):
             os.fsync(handle.fileno())
         os.replace(tmp, self.state_path)
 
-    def acquire(self, weight: int = 1) -> None:
+    def acquire(self, weight: int = 1) -> float:
         if self._local_fallback is not None:  # pragma: no cover - non-POSIX
-            self._local_fallback.acquire(weight)
-            return
+            return float(self._local_fallback.acquire(weight))
         if weight < 1:
             raise ValueError("weight must be >= 1")
         if weight > self.max_weight:
             raise ValueError("request weight exceeds the configured bucket capacity")
+        waited = 0.0
         while True:
             with self.lock_path.open("a+") as lock_file:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -208,11 +222,12 @@ class SharedWeightedRateGate(WeightedRateGate):
                     if used + weight <= self.max_weight:
                         events.append((now, weight))
                         self._write_events(events)
-                        return
-                    wait = max(0.01, (events[0][0] + self.window_s) - now)
+                        return waited
+                    delay = max(0.01, (events[0][0] + self.window_s) - now)
                 finally:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            self._sleep(wait)
+            self._sleep(delay)
+            waited += delay
 
     def _prune_events(self, now: float, events: deque[tuple[float, int]]) -> None:
         cutoff = now - self.window_s
@@ -286,6 +301,51 @@ class MexcSpotClient:
         self.symbols = symbol_registry or SymbolRegistry(self)
         self._blocked_until = 0.0
         self._block_lock = threading.Lock()
+        # Rate-limit accounting (N-02).  The wait is tracked per thread so a
+        # caller can attribute it to the exact recorded operation, and
+        # aggregated so operators can see pressure without guessing.
+        self._wait_local = threading.local()
+        self._rate_lock = threading.Lock()
+        self._rate_stats: dict[str, float] = {
+            "requests": 0.0,
+            "waited_requests": 0.0,
+            "total_wait_ms": 0.0,
+            "max_wait_ms": 0.0,
+        }
+
+    # ------------------------------------------------------ rate accounting
+
+    def _record_wait(self, waited_s: float, *, method: str, path: str) -> None:
+        waited_ms = int(round(max(0.0, waited_s) * 1000))
+        previous = int(getattr(self._wait_local, "waited_ms", 0) or 0)
+        self._wait_local.waited_ms = previous + waited_ms
+        with self._rate_lock:
+            self._rate_stats["requests"] += 1
+            if waited_ms > 0:
+                self._rate_stats["waited_requests"] += 1
+                self._rate_stats["total_wait_ms"] += waited_ms
+                self._rate_stats["max_wait_ms"] = max(self._rate_stats["max_wait_ms"], waited_ms)
+        if waited_ms >= 1000:
+            log.warning(
+                "MEXC rate gate deferred %s %s by %.1fs (weight budget saturated)",
+                method,
+                path,
+                waited_ms / 1000.0,
+            )
+
+    def pop_wait_ms(self) -> int:
+        """Return and reset the rate-gate wait accumulated by this thread."""
+
+        waited = int(getattr(self._wait_local, "waited_ms", 0) or 0)
+        self._wait_local.waited_ms = 0
+        return waited
+
+    def rate_stats(self) -> dict[str, float]:
+        with self._rate_lock:
+            stats = dict(self._rate_stats)
+        stats["ip_cap_per_10s"] = float(getattr(self.general_gate, "max_weight", 0))
+        stats["uid_cap_per_10s"] = float(getattr(self.uid_gate, "max_weight", 0))
+        return stats
 
     # ------------------------------------------------------------------ core
 
@@ -432,7 +492,8 @@ class MexcSpotClient:
             # for a full 10-second window; a timestamp taken earlier would then
             # be outside recvWindow (700003) even with a correct host clock.
             self._await_backoff()
-            self._acquire_bucket(method, path, signed=signed, bucket=bucket)
+            waited = self._acquire_bucket(method, path, signed=signed, bucket=bucket)
+            self._record_wait(waited, method=method, path=path)
             try:
                 return self._send_once(
                     method,
@@ -458,22 +519,23 @@ class MexcSpotClient:
         assert last_timestamp_error is not None
         raise last_timestamp_error
 
-    def _acquire_bucket(self, method: str, path: str, *, signed: bool, bucket: str) -> None:
+    def _acquire_bucket(self, method: str, path: str, *, signed: bool, bucket: str) -> float:
+        """Reserve endpoint weight and return the seconds spent waiting."""
+
         if bucket == "order":
             # Official POST/DELETE order bucket: 12 requests/second per UID.
-            self.order_gate.acquire(1)
-            return
+            return _waited_s(self.order_gate.acquire(1))
         limit_kind, weight = ENDPOINT_RULES.get((method, path), ("ip", DEFAULT_ENDPOINT_WEIGHT))
         try:
             if limit_kind == "uid":
-                self.uid_gate.acquire(weight)
-            else:
-                self.general_gate.acquire(weight)
-                if signed:
-                    # Signed endpoints are also account-scoped; tracking the
-                    # separate UID budget is conservative against the docs'
-                    # per-endpoint IP/UID wording change.
-                    self.uid_gate.acquire(1)
+                return _waited_s(self.uid_gate.acquire(weight))
+            waited = _waited_s(self.general_gate.acquire(weight))
+            if signed:
+                # Signed endpoints are also account-scoped; tracking the
+                # separate UID budget is conservative against the docs'
+                # per-endpoint IP/UID wording change.
+                waited += _waited_s(self.uid_gate.acquire(1))
+            return waited
         except ValueError as exc:
             raise MexcConfigError(
                 f"configured rate budget is too small for {method} {path} (weight {weight}): {exc}"

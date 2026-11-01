@@ -327,6 +327,9 @@ class TradeStore(TradingStore):
         quantity: Decimal | None,
         allocated_qty: Decimal | None,
         stop_trigger_price: Decimal | None = None,
+        attempt: int = 0,
+        oco_group_id: str | None = None,
+        leg_role: str | None = None,
     ) -> dict[str, Any]:
         """Insert a TP/SL order row in ``pending`` state.
 
@@ -359,6 +362,9 @@ class TradeStore(TradingStore):
                 "exchange_order_id",
                 "exchange_status",
                 "stop_trigger_price",
+                "attempt",
+                "oco_group_id",
+                "leg_role",
                 "created_at",
                 "updated_at",
             ]
@@ -379,6 +385,9 @@ class TradeStore(TradingStore):
                 None,
                 None,
                 dec_str(stop_trigger_price),
+                int(attempt),
+                oco_group_id,
+                leg_role,
                 now,
                 now,
             )
@@ -483,6 +492,9 @@ class TradeStore(TradingStore):
         fee_asset: str | None = None,
         oco_group_id: str | None = None,
         leg_role: str | None = None,
+        attempt: int | None = None,
+        next_attempt_at: str | None = None,
+        retryable: bool | None = None,
     ) -> dict[str, Any] | None:
         now = self._ts()
         sets = ["state = ?", "updated_at = ?"]
@@ -611,16 +623,14 @@ class TradeStore(TradingStore):
         filled_quote: Decimal | None = None,
         fee_amount: Decimal | None = None,
         fee_asset: str | None = None,
+        attempt: int | None = None,
+        verified: bool | None = None,
     ) -> str:
         """Upsert the per-leg projection for one OCO target (tp1/tp2)."""
 
         now = self._ts()
         target = str(order.get("target") or order.get("kind") or leg_role or "unknown")
-        kind = (
-            "stop_loss"
-            if target == "stop_loss"
-            else ("take_profit" if target in ("tp1", "tp2", "take_profit") else "take_profit")
-        )
+        kind = "stop_loss" if (target == "stop_loss" or target.endswith("_sl")) else "take_profit"
         leg_id = f"{group_id}:{target}"
         with self.db.transaction() as conn:
             conn.execute(
@@ -631,8 +641,8 @@ class TradeStore(TradingStore):
                     intended_trigger_price, intended_qty, state, exchange_status,
                     filled_qty, filled_quote, fee_amount, fee_asset, cancel_reason,
                     canceled_by_target, evidence_id, last_observed_at,
-                    not_observed_reason, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    not_observed_reason, attempt, verified, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(leg_id) DO UPDATE SET
                     trade_order_id = COALESCE(excluded.trade_order_id, oco_legs.trade_order_id),
                     client_order_id = COALESCE(excluded.client_order_id, oco_legs.client_order_id),
@@ -653,6 +663,8 @@ class TradeStore(TradingStore):
                     evidence_id = COALESCE(excluded.evidence_id, oco_legs.evidence_id),
                     last_observed_at = COALESCE(excluded.last_observed_at, oco_legs.last_observed_at),
                     not_observed_reason = COALESCE(excluded.not_observed_reason, oco_legs.not_observed_reason),
+                    attempt = COALESCE(excluded.attempt, oco_legs.attempt),
+                    verified = COALESCE(excluded.verified, oco_legs.verified),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -678,6 +690,8 @@ class TradeStore(TradingStore):
                     evidence_id,
                     now,
                     not_observed_reason,
+                    int(attempt) if attempt is not None else 0,
+                    1 if verified else 0 if verified is not None else 1,
                     now,
                     now,
                 ),
@@ -691,10 +705,22 @@ class TradeStore(TradingStore):
         return [dict(row) for row in rows]
 
     def mark_trade_order_not_observed(self, trade_order_id: str, reason: str) -> None:
+        """Record that the exchange could not confirm this order.
+
+        The corresponding OCO legs are marked ``verified = 0`` so a fallback
+        local state can never be mistaken for exchange-confirmed state (F-12).
+        """
+
+        now = self._ts()
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE trade_orders SET not_observed_reason = ?, updated_at = ? WHERE trade_order_id = ?",
-                (reason[:500], self._ts(), trade_order_id),
+                (reason[:500], now, trade_order_id),
+            )
+            conn.execute(
+                "UPDATE oco_legs SET verified = 0, not_observed_reason = ?, updated_at = ? "
+                "WHERE trade_order_id = ?",
+                (reason[:500], now, trade_order_id),
             )
 
     def attribute_sibling_cancel(self, group_id: str, *, filled_target: str, canceled_target: str) -> None:

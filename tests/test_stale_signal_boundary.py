@@ -64,8 +64,9 @@ def _select(repo, channel_id: int = 100) -> None:
 
 def _store(repo, channel_id: int, message_id: int, text: str = ALERT, source: str = "live", when=None):
     msg = FakeMsg(message_id, text)
-    if when is not None:
-        msg.date = when
+    # Default to a message inside the signal-validity window; historical cases
+    # must pass an explicit ``when``.
+    msg.date = when if when is not None else NOW - timedelta(seconds=30)
     repo.upsert_message(message_to_record(channel_id, msg, source))
     return repo.get_message_raw(channel_id, message_id)
 
@@ -256,7 +257,7 @@ def test_boundary_callback_does_not_create_a_global_gate(cfg, repo):
     from tests.test_submission_gate import _ready
 
     _ready(repo)
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+    gate = SubmissionGate(repo.db, cfg)
     gate.runtime["activation_boundary"] = lambda: False
     with repo.db.transaction() as conn:
         assert gate.check(conn) is None  # stale-message safety is enforced per message

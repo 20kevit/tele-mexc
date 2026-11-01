@@ -229,6 +229,7 @@ class TradingNotifier:
                 recovered = self.store.recover_ambiguous_sending()
                 if recovered:
                     log.info("recovered %d ambiguous notifications", recovered)
+                    self._report_ambiguous(recovered)
             except Exception:  # noqa: BLE001
                 log.warning("ambiguous-notification recovery failed", exc_info=True)
         sent = 0
@@ -278,6 +279,34 @@ class TradingNotifier:
                     error=f"{exc.__class__.__name__}",
                 )
         return sent
+
+    def _report_ambiguous(self, recovered: int) -> None:
+        """Tell both recipients that a delivery could not be confirmed.
+
+        Ambiguous rows are never resent automatically, so silence would mean a
+        trading event quietly never reached a human.  One durable alert per
+        affected notification is enqueued (the outbox key makes it idempotent).
+        """
+
+        lister = getattr(self.store, "list_ambiguous_notifications", None)
+        if not callable(lister):
+            return
+        try:
+            rows = lister(limit=max(1, recovered))
+        except Exception:  # noqa: BLE001 - alerting must never break delivery
+            return
+        for row in rows:
+            self.enqueue(
+                event_key=f"delivery-ambiguous:{row['notification_id']}",
+                text=(
+                    "⚠️ وضعیت تحویل یک پیام تلگرام نامشخص است و به‌طور خودکار ارسال مجدد نشد.\n"
+                    f"شناسه پیام: {row['notification_id']} — نقش: {row['role']} — "
+                    f"نوع: {row['event_type']} — تلاش: {row.get('attempts', 0)}\n"
+                    "این رخداد باید دستی بررسی شود."
+                ),
+                category="notification_delivery",
+                event_type="notification.ambiguous",
+            )
 
     def _deliver(self, row: dict[str, Any]) -> None:
         if self.bot is None:

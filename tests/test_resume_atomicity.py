@@ -191,7 +191,7 @@ async def test_readiness_change_while_waiting_for_exclusive_lock_is_observed(cfg
     release = threading.Event()
 
     def hold_shared() -> None:
-        gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+        gate = SubmissionGate(repo.db, cfg)
         with gate.shared():
             held.set()
             assert release.wait(timeout=5)
@@ -259,7 +259,7 @@ async def test_no_submission_enters_between_check_and_durable_unpause(cfg, repo,
     observed: list[int] = []
 
     def attempt_submission() -> None:
-        gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+        gate = SubmissionGate(repo.db, cfg)
         with gate.shared():
             entered.set()
             observed.append(_paused(repo))

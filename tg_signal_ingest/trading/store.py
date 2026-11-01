@@ -911,6 +911,7 @@ class TradingStore:
         quote_amount: Decimal,
         base_quantity: Decimal | None,
         limit_price: Decimal | None,
+        deadline_at: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically reserve limits and insert a planned intent.
 
@@ -957,8 +958,8 @@ class TradingStore:
                 INSERT INTO order_intents
                     (intent_id, signal_id, idempotency_key, client_order_id, symbol, side,
                      order_type, quote_amount, base_quantity, limit_price, mode, state,
-                     create_msg_id, create_channel_id, planned_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
+                     create_msg_id, create_channel_id, planned_at, updated_at, deadline_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)
                 """,
                 (
                     f"intent-{client_order_id}",
@@ -976,6 +977,7 @@ class TradingStore:
                     channel_id,
                     now,
                     now,
+                    deadline_at,
                 ),
             )
             conn.execute(
@@ -1829,6 +1831,20 @@ class TradingStore:
                 (self._ts(), cutoff),
             )
             return cur.rowcount
+
+    def list_ambiguous_notifications(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Undelivered-uncertain notifications, newest first.
+
+        Used to surface ambiguous deliveries to the recipients instead of
+        letting them disappear silently.
+        """
+
+        rows = self.db.conn.execute(
+            "SELECT * FROM trading_notifications WHERE status = 'ambiguous' "
+            "ORDER BY notification_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def finish_notification(
         self,
