@@ -34,12 +34,12 @@ Construction is centralized in `trading/runtime.py`:
 
 Construction is fail-closed and there is one execution behaviour:
 
-- the exact owner acknowledgement must match, otherwise `ConfigError`;
+- there is no acknowledgement token or product-mode gate;
 - MEXC credentials and the CLI write backend (`[mexc_cli] enabled = true`) are
   required, and CLI health is checked before returning the client;
-- every write path checks pause/readiness at the submission boundary;
-- a wrong or missing acknowledgement raises `AccidentalOrderRiskError` before
-  any exchange call.
+- every write path checks pause and emergency stop at the submission boundary;
+- a same-symbol BUY first queries actual MEXC open orders and fails closed for
+  that symbol if the query is unavailable.
 
 ## 2. From a parsed signal to an exchange order intent
 
@@ -180,7 +180,7 @@ inside the CLI process cannot be counted by the application limiter.
    enough spendable quote balance for that exact order.
 5. Manifest *policy* confirmation: automated-trading acceptance and region —
    cannot be verified by code (`MEXC_SPOT_RISKS.md` §8 checklist).
-6. Only then set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` and build the pipeline.
+6. Only then build/start the pipeline; there is no acknowledgement token.
 
 Health checks at every stage (ping/time/account/keyInfo) are read-only and
 place no orders.

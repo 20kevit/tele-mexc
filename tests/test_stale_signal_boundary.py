@@ -252,15 +252,14 @@ async def test_startup_boundary_failure_fails_closed(cfg, repo, failure):
     assert callbacks["activation_boundary"]() is False
 
 
-def test_boundary_readiness_callback_blocks_entries(cfg, repo):
+def test_boundary_callback_does_not_create_a_global_gate(cfg, repo):
     from tests.test_submission_gate import _ready
 
     _ready(repo)
     gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
     gate.runtime["activation_boundary"] = lambda: False
     with repo.db.transaction() as conn:
-        reason = gate.check(conn)
-    assert reason is not None and "boundary" in reason.lower()
+        assert gate.check(conn) is None  # stale-message safety is enforced per message
 
     gate.runtime["activation_boundary"] = lambda: True
     with repo.db.transaction() as conn:

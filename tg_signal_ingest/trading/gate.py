@@ -26,11 +26,11 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig
+from ..config import AppConfig
 
 # Purposes are intentionally explicit: protective exits must remain possible
 # when a *setup* prerequisite (channel/session) has changed, but they still
-# stop on pause, emergency stop, missing credentials or an unacknowledged
+# stop on pause or emergency stop; there is no acknowledgement gate.
 # pipeline.
 ENTRY = "entry"
 PROTECTION = "protection"
@@ -153,56 +153,16 @@ class SubmissionGate:
 
         if purpose not in ALL_PURPOSES:
             return f"unknown submission purpose {purpose!r}"
-        ack = self.cfg.trading.execution_acknowledgement
-        if ack != EXECUTION_ACKNOWLEDGEMENT:
-            return "execution acknowledgement is not configured (fail closed)"
         if self.cfg.trading.emergency_stop:
             return "emergency stop is active"
         if not ignore_pause:
             pause_reason = self._pause_reason(conn)
             if pause_reason:
                 return pause_reason
-
-        if not self.require_control_setup:
-            return None
-
-        row = self._setup_row(conn)
-        if row is None:
-            return "owner setup state is unavailable; failing closed"
-
-        try:
-            mexc_ok = self._dimension_ok("mexc", row["mexc_state"] == "verified")
-            if not mexc_ok:
-                return "MEXC credentials are not verified"
-            if purpose == PROTECTION:
-                return None
-
-            telegram_ok = self._dimension_ok("telegram", row["telegram_state"] == "authenticated")
-            if not telegram_ok:
-                return "Telegram session is not authenticated"
-            channel_ok = self._dimension_ok("channel", bool(row["selected_channel_id"]))
-            if not channel_ok:
-                return "no channel is selected"
-            # The live service installs this callback after it has established
-            # the per-channel stale-message boundary.  Absence of the callback
-            # keeps CLI/tests compatible; a present callback returning False is
-            # authoritative and fails closed.
-            boundary_callback = self.runtime.get("activation_boundary")
-            if boundary_callback is not None and not bool(boundary_callback()):
-                return "trading activation boundary is not established; stale signals cannot be ruled out"
-            unresolved = conn.execute(
-                "SELECT COUNT(*) AS n FROM order_intents WHERE state IN "
-                "('submitting', 'reconciling', 'unknown_requires_reconciliation')"
-            ).fetchone()
-            if unresolved is not None and int(unresolved["n"] or 0) > 0:
-                return "unresolved submission/reconciliation exists; operator review required"
-            blocked = conn.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE trade_state IN ('needs_reconciliation', 'unprotected_critical')"
-            ).fetchone()
-            if blocked is not None and int(blocked["n"] or 0) > 0:
-                return "a position still needs reconciliation or protection"
-        except Exception as exc:  # noqa: BLE001 - unreadable readiness fails closed
-            return f"readiness state is unreadable ({exc.__class__.__name__}); failing closed"
+        # There is intentionally no account-wide/history-wide entry lock here.
+        # Historical trade reconciliation state is per-order/per-trade and must
+        # never disable unrelated symbols.  New BUY entries are guarded by the
+        # exchange-backed same-symbol open-order check in the engine.
         return None
 
     def precheck(self, conn: sqlite3.Connection, *, purpose: str = ENTRY) -> str | None:

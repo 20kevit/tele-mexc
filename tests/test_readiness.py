@@ -56,24 +56,24 @@ def test_ready_report_is_ready_without_network(configured):
     assert "no exchange writes" in report.render()
 
 
-def test_missing_second_owner_blocks_startup(configured):
+def test_missing_second_owner_is_optional(configured):
     cfg, repo = configured
     cfg.control.owner_b_user_id = None
     report = build_readiness_report(cfg, repo, cli_checker=lambda: {"ok": True})
-    assert not report.ready
-    assert any("Owner B" in blocker.name for blocker in report.blockers)
+    assert report.ready, report.render()
+    assert _status(report, "Owner B") == "PASS"
 
 
-def test_missing_boundary_blocks_startup(configured):
+def test_missing_boundary_is_set_at_startup_not_a_manual_blocker(configured):
     cfg, repo = configured
     repo.db.conn.execute("DELETE FROM app_state WHERE key LIKE 'trading.activation_boundary%'")
     repo.db.conn.commit()
     report = build_readiness_report(cfg, repo, cli_checker=lambda: {"ok": True})
-    assert not report.ready
-    assert _status(report, "activation boundary") == "FAIL"
+    assert report.ready, report.render()
+    assert _status(report, "activation boundary") == "WARN"
 
 
-def test_unresolved_and_unprotected_state_blocks_startup(configured):
+def test_unresolved_and_unprotected_state_is_reported_but_not_a_global_blocker(configured):
     cfg, repo = configured
     store = TradingStore(repo.db, cfg.trading)
     from tg_signal_ingest.trading.parser import SignalParser
@@ -107,9 +107,9 @@ def test_unresolved_and_unprotected_state_blocks_startup(configured):
             (signal_id,),
         )
     report = build_readiness_report(cfg, repo, cli_checker=lambda: {"ok": True})
-    assert not report.ready
-    assert _status(report, "unresolved submissions") == "FAIL"
-    assert _status(report, "unprotected / uncertain positions") == "FAIL"
+    assert report.ready, report.render()
+    assert _status(report, "unresolved submissions") == "WARN"
+    assert _status(report, "unprotected / uncertain positions") == "WARN"
 
 
 def test_emergency_stop_and_pause_are_reported(configured):

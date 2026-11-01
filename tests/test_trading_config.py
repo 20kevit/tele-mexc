@@ -18,10 +18,10 @@ def _root_with(toml_text: str, env: dict[str, str] | None = None, tmp_path: Path
     return tmp
 
 
-def test_default_execution_is_unacknowledged_and_amount_is_3_usdt(tmp_path):
+def test_default_execution_has_no_acknowledgement_requirement_and_amount_is_3_usdt(tmp_path):
     root = _root_with("", tmp_path=tmp_path)
     cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.execution_acknowledgement is None
+    assert not hasattr(cfg.trading, "execution_acknowledgement")
     assert not hasattr(cfg.trading, "mode")
     assert not hasattr(cfg.trading, "live_enabled_token")
     assert cfg.trading.order_quote_amount == 3.0
@@ -68,23 +68,20 @@ def test_legacy_live_token_is_rejected(tmp_path):
         load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_execution_acknowledgement_loads_from_toml_and_env(tmp_path):
-    root = _root_with(
-        "[trading]\nexecution_acknowledgement = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS'",
-        tmp_path=tmp_path,
-    )
+def test_acknowledgement_is_optional_and_never_required(tmp_path):
+    root = _root_with("", tmp_path=tmp_path)
     cfg = load_config(root=root, environ={}, require_credentials=False)
-    assert cfg.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+    assert not hasattr(cfg.trading, "execution_acknowledgement")
     assert cfg.trading.order_quote_amount == 3.0
     assert cfg.trading.order_quote_amount_source == "default (3 USDT)"
 
-    root = _root_with("", tmp_path=tmp_path / "env")
-    cfg = load_config(
-        root=root,
-        environ={"TRADING_EXECUTION_ACKNOWLEDGEMENT": "I_UNDERSTAND_REAL_MONEY_AND_RISKS"},
-        require_credentials=False,
+    # An old key may remain in a private file; it is not a gate and is ignored.
+    root = _root_with(
+        "[trading]\nexecution_acknowledgement = 'anything'",
+        tmp_path=tmp_path / "legacy",
     )
-    assert cfg.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+    cfg = load_config(root=root, environ={}, require_credentials=False)
+    assert not hasattr(cfg.trading, "execution_acknowledgement")
 
 
 def test_default_amount_is_3_usdt_and_can_be_overridden(tmp_path):

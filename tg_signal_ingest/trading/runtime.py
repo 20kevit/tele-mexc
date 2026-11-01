@@ -6,7 +6,7 @@ import logging
 import math
 from typing import Any
 
-from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig, ConfigError
+from ..config import AppConfig, ConfigError
 from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..repository import Repository
 from .engine import TradingEngine
@@ -147,17 +147,11 @@ def build_trading_engine(
 ) -> TradingEngine:
     """Build the single automatic MEXC Spot pipeline.
 
-    Construction is fail-closed: the owner acknowledgement must match exactly,
-    MEXC credentials must be present, and the CLI write backend must be enabled
-    and healthy.  There is no simulated/test-only product path.
+    Construction is fail-closed on credentials and the CLI write backend, but
+    there is no acknowledgement token or product-mode gate: every valid new
+    signal is eligible for real execution subject to the trading constraints.
     """
 
-    if cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
-        raise ConfigError(
-            "execution acknowledgement is not configured; set "
-            "execution_acknowledgement = 'I_UNDERSTAND_REAL_MONEY_AND_RISKS' "
-            "(or TRADING_EXECUTION_ACKNOWLEDGEMENT) before building the pipeline."
-        )
     if client is None:
         client = build_mexc_client(cfg, for_live_writes=True)
     # Owner-selected per-order amount persisted by the Telegram menu.  Env/TOML

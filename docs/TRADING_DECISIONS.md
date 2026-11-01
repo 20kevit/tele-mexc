@@ -85,6 +85,16 @@ earlier local-only fallback remains available but is not the shipped live path.
   after downtime and is never submitted. Existing open entries, fills, and OCO
   exits are reconciled read-only; an ambiguous submission is never resubmitted.
 
+- Automatic real execution is permanent. There is no acknowledgement token,
+  mode selector, or per-order confirmation.
+- The only cross-trade entry restriction is an actual MEXC open-order query for
+  the same symbol. Open orders on other symbols, and unresolved historical
+  trades for other symbols, never block a new entry. The query must be actual
+  exchange state and must fail closed for that symbol if unavailable.
+- A one-time initialization cleanup may cancel open orders strictly below 5 USD
+  after verifying remaining notional; it never sells positions, never touches
+  orders at/above 5 USD, and records completion so it is not repeated.
+
 ---------------------------------------------------------------
 4. Exit strategy (two native OCO exits — implemented)
 ---------------------------------------------------------------

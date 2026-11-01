@@ -61,7 +61,6 @@ class TradeSim:
 
     def start(self, app_cfg: AppConfig | None = None) -> TradeSim:
         app_cfg = app_cfg or _app_config()
-        app_cfg.trading.execution_acknowledgement = LIVE_TOKEN
         app_cfg.trading.entry_trigger_offset_ticks = self.cfg.offset_ticks
         app_cfg.trading.entry_trigger_stale_threshold_s = self.cfg.stale_threshold_s
 

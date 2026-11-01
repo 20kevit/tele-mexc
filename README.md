@@ -12,8 +12,8 @@ the owner's fixed quote amount. Futures/Perpetual/leveraged messages may be
 ingested; eligible LONG signals are normalized to Spot BUY. SHORT/SELL signals
 never execute. There is no SIM/TESTONLY/LIVE product-mode split, no symbol
 allowlist, and no per-order approval. Entry orders are LIMIT-only. The pipeline
-refuses to build without the exact one-time owner acknowledgement, MEXC Spot
-credentials, and the MEXC CLI write backend. No withdrawals, no Futures/Margin
+requires MEXC Spot credentials and the MEXC CLI write backend; there is no
+acknowledgement token or mode gate. No withdrawals, no Futures/Margin
 execution, and no unofficial endpoints.
 
 - Pause/resume and readiness are enforced at the submission boundary with a
@@ -31,7 +31,7 @@ execution, and no unofficial endpoints.
 - Storage: SQLite with reproducible migrations.
 - Config: `.env` (secrets) + private `config.toml` (runtime paths/options).
 - CLI: `tg-ingest` (setup, auth, channels, backfill, serve, status, diagnostics,
-  trading status/signals/intents/parse/reconcile/repair-signals/readiness,
+  trading status/signals/intents/parse/reconcile/repair-signals/readiness/cleanup-open-orders,
   owner control bot).
 - Exchange: MEXC Spot v3 REST (HMAC-SHA256 signing, documented endpoint weights,
   process-shared rate gates, Decimal arithmetic, idempotent intents,
@@ -104,9 +104,10 @@ journalctl -u tg-ingest.service -f
 - Confirmed fills get two native OCO SELL exits (TP1 and TP2, each with the
   stop-loss); partial or uncertain protection is reported honestly and
   reconciled, never blindly resubmitted.
-- The pipeline refuses to build without the exact owner acknowledgement,
-  MEXC Spot credentials, and a healthy MEXC CLI write backend. There is no
-  fallback to a simulated or test-only mode.
+- The pipeline requires MEXC Spot credentials and a healthy MEXC CLI write
+  backend. There is no acknowledgement token and no simulated/test-only mode.
+- The only cross-trade entry restriction is an actual MEXC open-order check for
+  the same symbol. Unresolved historical trades do not block unrelated symbols.
 - The optional Telegram control bot authenticates the personal session, verifies
   MEXC permissions, and selects the channel. When `CONTROL_BOT_ENABLED` is true,
   `tg-ingest serve` runs it inside the service process and holds both the serve
@@ -117,10 +118,10 @@ journalctl -u tg-ingest.service -f
   not filtered by severity or perceived importance. Its `/pause` and `/resume`
   controls are enforced at the order-submission boundary with a kernel file lock
   and a transactional readiness check. See `docs/CONTROL_BOT_FA.md`.
-- Before the first controlled start, run the non-trading report
-  `tg-ingest trading readiness --network`; it never places, cancels, or modifies
-  an order and prints `READY FOR FIRST CONTROLLED STARTUP` or `NOT READY` with
-  every blocker.
+- Before the first controlled start, run the non-trading readiness report.
+  The authorized one-time initialization cleanup is
+  `tg-ingest trading cleanup-open-orders --apply` (open orders strictly below
+  5 USD only; never sells positions; recorded so it is not repeated).
 
 ## Known limitations (platform-imposed)
 

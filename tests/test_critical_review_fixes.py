@@ -78,6 +78,7 @@ class SpyMexc:
 
     def __init__(self, place_oco_result=None, place_error=None):
         self.place_oco_calls = []
+        self.place_order_calls = []
         self.market_sell_calls = []
         self.place_error = place_error
         self.place_oco_result = place_oco_result or {"orderId": "oco-1", "status": "NEW"}
@@ -96,6 +97,7 @@ class SpyMexc:
 
     def place_order(self, **kwargs):
         # Not used for OCO — OCO goes via CLI
+        self.place_order_calls.append(kwargs)
         return {"orderId": "ex-1", "status": "NEW"}
 
     def place_oco(self, **kwargs):
@@ -107,6 +109,9 @@ class SpyMexc:
     def ticker_price(self, symbol=None):
         self.ticker_calls += 1
         return {"symbol": symbol, "price": "100"}
+
+    def open_orders(self, symbol=None):
+        return []
 
     def account(self):
         return {
@@ -1485,11 +1490,9 @@ def test_no_market_sell_restart_missing_protection(cfg, repo):
 # ── §4 Per-symbol atomicity ───────────────────────────────────────────────
 
 
-def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
-    """Genuine contention: two engines share same DB, both try first trade for BTCUSDT via barrier.
-    SQLite BEGIN IMMEDIATE + TradingStore CONFLICTING_TRADE_STATES provides the guarantee;
-    Python RLock alone does not (two DB connections have separate locks)."""
-
+def test_two_engines_same_symbol_are_both_admitted_without_exchange_open_orders(cfg, repo):
+    """Local trade history is independent; the exchange open-order check is the
+    only cross-trade entry rule."""
     barrier = threading.Barrier(2)
     results = []
     errors = []
@@ -1503,7 +1506,6 @@ def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
                 db_path=cfg.db_path,
                 session_path=cfg.session_path,
             )
-            cfg2.trading.execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
             db2 = Database(cfg2.db_path)
             repo2 = Repository(db2)
             client = SpyMexc()
@@ -1520,8 +1522,7 @@ def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
                 _t.sleep(delay)
             rec = _store(repo2, mid, COMPLETE, source="live")
             item = _item(100, mid)
-            res = engine2.process_item(item, rec)
-            results.append((mid, res))
+            results.append((mid, engine2.process_item(item, rec)))
             db2.close()
         except Exception as e:
             errors.append((mid, repr(e)))
@@ -1533,52 +1534,10 @@ def test_per_symbol_atomic_two_engines_same_symbol_only_one_admitted(cfg, repo):
     t1.join(timeout=10)
     t2.join(timeout=10)
     assert not errors, f"concurrency threads raised: {errors}"
-    assert len(results) == 2, f"expected 2 results, got {results} errors {errors}"
+    assert len(results) == 2
+    assert all(res is not None for _mid, res in results)
     all_trades = repo.db.conn.execute("SELECT count(*) as c FROM trades WHERE symbol='BTCUSDT'").fetchone()["c"]
-    rows = list(repo.db.conn.execute("SELECT trade_id, trade_state FROM trades WHERE symbol='BTCUSDT'").fetchall())
-    assert all_trades == 1, f"exactly one BTCUSDT trade should be persisted, got {all_trades} trades: {rows}"
-    sigs = list(
-        repo.db.conn.execute(
-            "SELECT message_id, status, rejection_reason FROM signals "
-            "WHERE channel_id=100 AND message_id IN (201,202) ORDER BY message_id"
-        ).fetchall()
-    )
-    rejected_sigs = [s for s in sigs if s["status"] == "rejected"]
-    assert len(rejected_sigs) == 1, (
-        f"exactly one concurrent signal should be rejected for conflict, got sigs={sigs} results={results}"
-    )
-    assert (
-        "conflict" in rejected_sigs[0]["rejection_reason"].lower()
-        or "already has an active trade" in rejected_sigs[0]["rejection_reason"].lower()
-    )
-    assert repo.db.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal", (
-        "DB must be in WAL mode for concurrent BEGIN IMMEDIATE"
-    )
-    engine3, _, store3 = _engine_with_tm(cfg, repo, SpyMexc())
-    rec3 = _store(repo, 203, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120", source="live")
-    res3 = engine3.process_item(_item(100, 203), rec3)
-    assert res3 is not None, f"different symbol should be admitted, got {res3}"
-    store_fail = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
-    orig = store_fail.has_active_trade_for_symbol
-
-    def failing(sym):
-        raise RuntimeError("simulated DB failure")
-
-    store_fail.has_active_trade_for_symbol = failing  # type: ignore
-    engine_fail = TradingEngine(
-        cfg,
-        repo,
-        client=SpyMexc(),
-        now=lambda: NOW,
-        trade_manager=TradeManager(cfg.trading, store_fail, now=lambda: NOW),
-    )
-    engine_fail.store = store_fail
-    rec_fail = _store(repo, 204, COMPLETE, source="live")
-    res_fail = engine_fail.process_item(_item(100, 204), rec_fail)
-    assert res_fail is None, "DB failure must fail closed (no BUY)"
-    sig_fail = repo.db.conn.execute("SELECT status FROM signals WHERE channel_id=100 AND message_id=204").fetchone()
-    assert sig_fail["status"] == "rejected"
-    store_fail.has_active_trade_for_symbol = orig
+    assert all_trades == 2, f"independent lifecycles should coexist, got {all_trades}"
 
 
 def test_per_symbol_different_symbols_proceed_independently(cfg, repo):
@@ -1590,23 +1549,26 @@ def test_per_symbol_different_symbols_proceed_independently(cfg, repo):
         assert res is not None, f"{sym} should not be blocked by other symbol"
 
 
-def test_per_symbol_db_failure_never_permits_buy(cfg, repo):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    # Monkey patch has_active_trade_for_symbol to simulate DB failure
-    orig = store.has_active_trade_for_symbol
+def test_same_symbol_exchange_query_failure_blocks_only_that_symbol(cfg, repo):
+    class FailingOpenOrders(SpyMexc):
+        def open_orders(self, symbol=None):
+            if str(symbol).upper() == "BTCUSDT":
+                raise RuntimeError("exchange unavailable")
+            return []
 
-    def failing(sym):
-        raise RuntimeError("simulated DB failure")
-
-    store.has_active_trade_for_symbol = failing  # type: ignore
-    # Engine pre-check should fail closed
+    engine, tm, store = _engine_with_tm(cfg, repo, FailingOpenOrders())
     rec = _store(repo, 212, COMPLETE)
     res = engine.process_item(_item(100, 212), rec)
-    assert res is None
-    sig = repo.db.conn.execute("SELECT status FROM signals WHERE channel_id=100 AND message_id=212").fetchone()
+    assert res is not None and res["state"] == "rejected"
+    assert engine.client.place_order_calls == []
+    sig = repo.db.conn.execute(
+        "SELECT status, rejection_reason FROM signals WHERE channel_id=100 AND message_id=212"
+    ).fetchone()
     assert sig["status"] == "rejected"
-    # Restore
-    store.has_active_trade_for_symbol = orig
+    assert "open-order query failed" in sig["rejection_reason"].lower()
+
+    other = _store(repo, 213, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120")
+    assert engine.process_item(_item(100, 213), other) is not None
 
 
 def test_per_symbol_terminal_states_not_blocking(cfg, repo):

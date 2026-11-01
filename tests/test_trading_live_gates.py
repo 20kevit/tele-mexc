@@ -113,6 +113,9 @@ class FakeMexc:
         self.place_calls += 1
         return dict(self.place_response)
 
+    def open_orders(self, symbol=None):
+        return []
+
     def place_test_order(self, **kwargs):
         self.test_calls += 1
         return True
@@ -165,17 +168,16 @@ def test_live_signal_is_submitted_automatically_without_approval(cfg, repo):
     assert len(engine.store.list_intents(limit=5)) == 1
 
 
-def test_live_buy_is_blocked_when_exit_protection_flag_is_set(cfg, repo):
+def test_global_unprotected_flag_does_not_block_unrelated_new_buy(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
-    engine.store.set_buy_block("unprotected position(s): BTCUSDT:trade-1")
+    engine.store.set_buy_block("unprotected position(s): OTHERUSDT:trade-old")
 
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
 
     assert intent is not None
-    assert intent["state"] == "rejected"
-    assert "new BUYs are blocked" in (intent.get("reject_reason") or "")
-    assert fake.place_calls == 0
+    assert intent["state"] in ("submitted", "canceled", "open", "filled")
+    assert fake.place_calls == 1
 
 
 def test_live_replay_below_activation_boundary_is_rejected(cfg, repo):
@@ -253,15 +255,15 @@ def test_unknown_exchange_symbol_fails_closed(cfg, repo):
     assert fake.place_calls == 0
 
 
-def test_missing_acknowledgement_blocks_every_submission(cfg, repo):
+def test_missing_acknowledgement_does_not_block_submission(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
-    cfg.trading.execution_acknowledgement = None
+    assert not hasattr(cfg.trading, "execution_acknowledgement")
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1))
     assert intent is not None
     stored = engine.store.get_intent(intent["intent_id"])
-    assert stored is not None and stored["state"] == "planned"
-    assert fake.place_calls == 0 and fake.query_calls == 0 and fake.account_calls == 0
+    assert stored is not None and stored["state"] in ("submitted", "canceled", "open", "filled")
+    assert fake.place_calls == 1
 
 
 def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):

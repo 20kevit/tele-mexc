@@ -45,30 +45,23 @@ def test_cli_section_overrides_defaults():
     assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
-def test_acknowledgement_arms_noninteractive_cli_writes_by_default():
+def test_noninteractive_cli_writes_are_armed_without_any_acknowledgement():
     app = _app()
     _load_mexc_and_trading(
         app,
-        {
-            "trading": {
-                "execution_acknowledgement": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
-            }
-        },
+        {},
         {},
     )
-    assert app.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+    assert not hasattr(app.trading, "execution_acknowledgement")
     assert app.mexc.cli_confirm_noninteractive_writes is True
 
 
-def test_acknowledgement_preserves_an_explicit_noninteractive_opt_out():
+def test_explicit_noninteractive_opt_out_is_preserved():
     app = _app()
     _load_mexc_and_trading(
         app,
         {
             "mexc_cli": {"confirm_noninteractive_writes": False},
-            "trading": {
-                "execution_acknowledgement": "I_UNDERSTAND_REAL_MONEY_AND_RISKS",
-            },
         },
         {},
     )

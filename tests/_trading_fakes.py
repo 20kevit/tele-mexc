@@ -139,6 +139,17 @@ class FakeClient:
             "executedQty": "0", "cumulativeQuoteQty": "0",
         }
 
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        rows = []
+        wanted = str(symbol).upper() if symbol else None
+        for order in self.orders.values():
+            if str(order.get("status") or "").upper() in ("FILLED", "CANCELED", "PARTIALLY_CANCELED", "REJECTED"):
+                continue
+            if wanted and str(order.get("symbol") or "").upper() != wanted:
+                continue
+            rows.append(dict(order))
+        return rows
+
     def fill_order(self, order_id: str, qty: Decimal, quote: Decimal, price: Decimal) -> None:
         """Credit a fill against an existing exchange order id and mark status."""
         order = self.orders[order_id]

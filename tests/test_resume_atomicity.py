@@ -116,14 +116,14 @@ async def test_unauthorized_resume_cannot_unpause(cfg, repo):
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "expected"),
+    ("field", "value"),
     [
-        ("telegram_state", "unauthenticated", "Telegram"),
-        ("mexc_state", "not_configured", "MEXC"),
-        ("selected_channel_id", None, "channel"),
+        ("telegram_state", "unauthenticated"),
+        ("mexc_state", "not_configured"),
+        ("selected_channel_id", None),
     ],
 )
-async def test_resume_refuses_missing_setup_prerequisites(cfg, repo, field, value, expected):
+async def test_resume_ignores_stale_setup_fields(cfg, repo, field, value):
     _ready(repo)
     with repo.db.transaction() as conn:
         conn.execute(f"UPDATE control_setup SET {field} = ? WHERE id = 1", (value,))
@@ -131,9 +131,8 @@ async def test_resume_refuses_missing_setup_prerequisites(cfg, repo, field, valu
 
     await control._resume(OWNER)
 
-    assert _paused(repo) == 1
-    assert _refused(fake)
-    assert expected.lower() in fake.sent[-1]["text"].lower()
+    assert _paused(repo) == 0
+    assert _succeeded(fake)
 
 
 async def test_resume_refuses_emergency_stop(cfg, repo):
@@ -173,16 +172,15 @@ def _unresolved_intent(repo: Repository, cfg: AppConfig) -> None:
         )
 
 
-async def test_resume_refuses_unresolved_reconciliation(cfg, repo):
+async def test_resume_ignores_unresolved_reconciliation_for_other_orders(cfg, repo):
     _ready(repo)
     _unresolved_intent(repo, cfg)
     control, fake = _control(cfg, repo)
 
     await control._resume(OWNER)
 
-    assert _paused(repo) == 1
-    assert _refused(fake)
-    assert "reconciliation" in fake.sent[-1]["text"].lower()
+    assert _paused(repo) == 0
+    assert _succeeded(fake)
 
 
 async def test_readiness_change_while_waiting_for_exclusive_lock_is_observed(cfg, repo, monkeypatch):
@@ -213,16 +211,15 @@ async def test_readiness_change_while_waiting_for_exclusive_lock_is_observed(cfg
     task = asyncio.create_task(control._resume(OWNER))
     assert await asyncio.to_thread(attempted.wait, 2)
 
-    # Readiness changes while resume is blocked before taking the lock.
-    with repo.db.transaction() as conn:
-        conn.execute("UPDATE control_setup SET telegram_state='unauthenticated' WHERE id = 1")
+    # The only remaining resume blockers are pause itself and emergency stop.
+    cfg.trading.emergency_stop = True
     release.set()
     holder.join(timeout=5)
     await asyncio.wait_for(task, timeout=5)
 
     assert _paused(repo) == 1
     assert _refused(fake)
-    assert "Telegram" in fake.sent[-1]["text"]
+    assert "emergency" in fake.sent[-1]["text"].lower()
 
 
 async def test_transaction_failure_during_unpause_leaves_system_paused(cfg, repo, monkeypatch):

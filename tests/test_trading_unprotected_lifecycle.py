@@ -168,7 +168,7 @@ def test_live_buy_with_disordered_ladder_is_rejected_before_submission(env):
     assert client.place_calls == []
 
 
-def test_unconfirmed_oco_marks_position_critical_and_blocks_new_buys(env, monkeypatch):
+def test_unconfirmed_oco_marks_position_critical_but_does_not_globally_block(env, monkeypatch):
     cfg, store, engine, client, notifier, tm = env
 
     def reject_all(*args, **kwargs):
@@ -181,13 +181,13 @@ def test_unconfirmed_oco_marks_position_critical_and_blocks_new_buys(env, monkey
     assert "unprotected position" in (store.buy_block_reason() or "")
     assert any(event[0] == "BUY_BLOCK_ACTIVE" for event in notifier.trade_events)
 
-    # A later live signal is refused before any exchange call.
+    # The global flag is diagnostic only: an unrelated lifecycle is admitted.
     second = _insert_intent(store, signal_id="sig-2", client_order_id="tsi-2")
     before = len(client.place_calls)
     decision = tm.on_intent_planned(second, _parsed(), reference_price=Decimal("100"))
-    assert decision.rejected is True
+    assert decision.rejected is False
+    assert decision.trade is not None
     assert len(client.place_calls) == before
-    assert store.get_intent(second["intent_id"])["state"] == "rejected"
 
 
 def test_buy_block_clears_only_when_no_unsold_quantity_remains(env, monkeypatch):

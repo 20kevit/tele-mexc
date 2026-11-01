@@ -79,8 +79,9 @@ def _engine(cfg: AppConfig, repo: Repository, client: GatedClient) -> TradingEng
     return engine
 
 
-def _planned_intent(engine: TradingEngine, message_id: int) -> dict:
-    parsed = SignalParser().parse(ALERT)
+def _planned_intent(engine: TradingEngine, message_id: int, symbol: str = "BTCUSDT") -> dict:
+    text = ALERT if symbol == "BTCUSDT" else f"BUY {symbol}\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+    parsed = SignalParser().parse(text)
     sid, _ = engine.store.record_signal(parsed, channel_id=100, message_id=message_id, edit_version=0)
     intent, _ = engine.store.create_intent(
         signal=parsed,
@@ -143,6 +144,10 @@ def test_pause_waits_for_inflight_then_blocks_every_new_submission(cfg, repo):
     pauser.join(timeout=5)
     assert not errors, errors
     assert paused_ack.is_set()
+    # The first order is no longer open, so the same-symbol rule does not mask
+    # the pause-boundary assertion below.
+    for order in client.orders.values():
+        order["status"] = "CANCELED"
 
     # After the acknowledgement no new submission may reach the exchange.
     client.hold = False
@@ -203,48 +208,29 @@ def _reason(cfg: AppConfig, repo: Repository) -> str | None:
         return gate.check(conn)
 
 
-@pytest.mark.parametrize(
-    ("column", "value", "expected"),
-    [
-        ("telegram_state", "unauthenticated", "Telegram"),
-        ("mexc_state", "not_configured", "MEXC"),
-        ("selected_channel_id", None, "channel"),
-    ],
-)
-def test_readiness_prerequisites_are_checked_individually(cfg, repo, column, value, expected):
+def test_setup_fields_and_runtime_callbacks_do_not_block_entries(cfg, repo):
+    """Owner policy: no global setup/readiness gate. Only pause/emergency stop."""
     _ready(repo)
-    with repo.db.transaction() as conn:
-        conn.execute(f"UPDATE control_setup SET {column} = ? WHERE id = 1", (value,))
-    reason = _reason(cfg, repo)
-    assert reason is not None and expected.lower() in reason.lower()
-
-
-def test_readiness_combined_failures_and_state_transitions(cfg, repo):
-    _ready(repo)
-    assert _reason(cfg, repo) is None
-
+    gate = _gate(cfg, repo)
     with repo.db.transaction() as conn:
         conn.execute(
-            "UPDATE control_setup SET telegram_state='unauthenticated', mexc_state='not_configured' WHERE id = 1"
+            "UPDATE control_setup SET telegram_state='unauthenticated', "
+            "mexc_state='not_configured', selected_channel_id=NULL WHERE id = 1"
         )
-    reason = _reason(cfg, repo)
-    assert reason is not None and "MEXC" in reason  # first deterministic blocker
+    gate.runtime.update({"telegram": lambda: False, "mexc": lambda: False, "channel": lambda: False})
+    with repo.db.transaction() as conn:
+        assert gate.check(conn) is None
 
-    _ready(repo)
     _set_pause(repo, True)
     assert "paused" in (_reason(cfg, repo) or "").lower()
     _set_pause(repo, False)
-    assert _reason(cfg, repo) is None
-
     cfg.trading.emergency_stop = True
     assert "emergency" in (_reason(cfg, repo) or "").lower()
     cfg.trading.emergency_stop = False
-
-    cfg.trading.execution_acknowledgement = "wrong"
-    assert "acknowledgement" in (_reason(cfg, repo) or "").lower()
+    assert _reason(cfg, repo) is None
 
 
-def test_unresolved_reconciliation_blocks_entries_but_not_protection(cfg, repo):
+def test_unresolved_reconciliation_does_not_globally_block_entries(cfg, repo):
     _ready(repo)
     client = GatedClient()
     engine = _engine(cfg, repo, client)
@@ -254,11 +240,40 @@ def test_unresolved_reconciliation_blocks_entries_but_not_protection(cfg, repo):
             "UPDATE order_intents SET state='unknown_requires_reconciliation' WHERE intent_id=?",
             (intent["intent_id"],),
         )
-    reason = _reason(cfg, repo)
-    assert reason is not None and "reconciliation" in reason.lower()
+    assert _reason(cfg, repo) is None
     gate = _gate(cfg, repo)
     with repo.db.transaction() as conn:
         assert gate.check(conn, purpose="protection") is None
+
+
+def test_historical_trade_states_do_not_globally_block_entries(cfg, repo):
+    _ready(repo)
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO trades (trade_id, signal_id, idempotency_key, channel_id, message_id, "
+            "symbol, side, entry_mode, requested_quote, entry_price, trade_state, created_at, updated_at) "
+            "VALUES ('trade-old', 'sig-old', 'idem-old', 100, 1, 'OLDUSDT', 'buy', 'direct', "
+            "'10', '1', 'needs_reconciliation', datetime('now'), datetime('now'))"
+        )
+    assert _reason(cfg, repo) is None
+
+
+def test_entry_submits_even_with_stale_control_setup(cfg, repo):
+    client = GatedClient()
+    cfg.trading.order_quote_amount = 10.0
+    store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
+    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
+    engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, submission_gate=gate)
+    engine.store = store
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE control_setup SET telegram_state='unauthenticated', "
+            "mexc_state='not_configured', selected_channel_id=NULL, paused=0 WHERE id = 1"
+        )
+    intent = _planned_intent(engine, 60)
+    submitted = engine._execute_intent(intent["intent_id"])
+    assert submitted["state"] in ("submitting", "submitted", "open", "canceled")
+    assert len(client.place_calls) == 1
 
 
 def test_unreadable_pause_state_fails_closed(cfg, repo):
@@ -305,151 +320,6 @@ def test_protection_and_entry_routes_share_the_pause_boundary(cfg, repo):
         with pytest.raises(SubmissionBlocked):
             call()
     assert client.place_calls == []
-
-
-def test_runtime_callbacks_are_authoritative_over_persisted_state(cfg, repo):
-    _ready(repo)
-    gate = _gate(cfg, repo)
-
-    # Persisted Telegram is authenticated, but the installed live callback is
-    # false: the dimension must fail.
-    gate.runtime["telegram"] = lambda: False
-    with repo.db.transaction() as conn:
-        assert "Telegram" in (gate.check(conn) or "")
-
-    # Persisted MEXC is verified, but the installed live callback is false.
-    gate.runtime.pop("telegram")
-    gate.runtime["mexc"] = lambda: False
-    with repo.db.transaction() as conn:
-        assert "MEXC" in (gate.check(conn) or "")
-
-    # Persisted channel is selected, but the installed live callback is false.
-    gate.runtime.pop("mexc")
-    gate.runtime["channel"] = lambda: False
-    with repo.db.transaction() as conn:
-        assert "channel" in (gate.check(conn) or "").lower()
-
-    # Callback true is equally authoritative over stale negative persistence.
-    for column in ("telegram_state", "mexc_state"):
-        with repo.db.transaction() as conn:
-            conn.execute(
-                f"UPDATE control_setup SET {column} = ? WHERE id = 1",
-                ("unauthenticated" if column == "telegram_state" else "not_configured",),
-            )
-    with repo.db.transaction() as conn:
-        conn.execute("UPDATE control_setup SET selected_channel_id = NULL WHERE id = 1")
-    gate.runtime["telegram"] = lambda: True
-    gate.runtime["mexc"] = lambda: True
-    gate.runtime["channel"] = lambda: True
-    with repo.db.transaction() as conn:
-        assert gate.check(conn) is None
-
-
-@pytest.mark.parametrize("dimension", ["mexc", "telegram", "channel"])
-def test_readiness_callback_exception_fails_closed(cfg, repo, dimension):
-    _ready(repo)
-    gate = _gate(cfg, repo)
-
-    def boom():
-        raise RuntimeError("readiness source unavailable")
-
-    gate.runtime[dimension] = boom
-    with repo.db.transaction() as conn:
-        reason = gate.check(conn)
-    assert reason is not None and "unreadable" in reason.lower()
-
-
-def test_no_runtime_callback_uses_documented_persisted_fallback(cfg, repo):
-    _ready(repo)
-    gate = _gate(cfg, repo)
-    with repo.db.transaction() as conn:
-        assert gate.check(conn) is None
-
-    with repo.db.transaction() as conn:
-        conn.execute("UPDATE control_setup SET telegram_state='unauthenticated' WHERE id = 1")
-    with repo.db.transaction() as conn:
-        assert "Telegram" in (gate.check(conn) or "")
-
-
-def test_runtime_readiness_flip_blocks_the_next_submission_immediately(cfg, repo):
-    _ready(repo)
-    gate = _gate(cfg, repo)
-    state = {"telegram": True, "mexc": True, "channel": True}
-    gate.runtime.update({name: (lambda n=name: state[n]) for name in state})
-
-    with repo.db.transaction() as conn:
-        assert gate.check(conn) is None
-    state["telegram"] = False
-    with repo.db.transaction() as conn:
-        assert "Telegram" in (gate.check(conn) or "")
-
-    # False -> true progresses only when every other prerequisite also passes.
-    state["telegram"] = True
-    with repo.db.transaction() as conn:
-        assert gate.check(conn) is None
-    state["channel"] = False
-    with repo.db.transaction() as conn:
-        assert "channel" in (gate.check(conn) or "").lower()
-
-
-def test_engine_submission_flip_blocks_the_next_order(cfg, repo):
-    _ready(repo)
-    client = GatedClient()
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
-    engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, submission_gate=gate)
-    engine.store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
-    state = {"telegram": True, "mexc": True, "channel": True}
-    gate.runtime.update({name: (lambda n=name: state[n]) for name in state})
-
-    first = _planned_intent(engine, 70)
-    assert engine._execute_intent(first["intent_id"])["state"] in (
-        "submitting",
-        "submitted",
-        "open",
-    )
-    assert len(client.place_calls) == 1
-
-    state["mexc"] = False
-    second = _planned_intent(engine, 71)
-    blocked = engine._execute_intent(second["intent_id"])
-    assert blocked["state"] == "planned"
-    assert len(client.place_calls) == 1
-
-
-def test_mark_mexc_verified_false_does_not_remove_callback(cfg, repo):
-    _ready(repo)  # persisted MEXC is verified
-    client = GatedClient()
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
-    engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, submission_gate=gate)
-    engine.mark_mexc_verified(True)
-    engine.mark_mexc_verified(False)
-    assert "mexc" in engine.submission_gate.runtime
-    with repo.db.transaction() as conn:
-        assert "MEXC" in (engine.submission_gate.check(conn) or "")
-
-
-def test_entry_submission_requires_complete_setup_at_the_claim(cfg, repo):
-    client = GatedClient()
-    cfg.trading.order_quote_amount = 10.0
-    store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
-    gate = SubmissionGate(repo.db, cfg, require_control_setup=True)
-    engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, submission_gate=gate)
-    engine.store = store
-    intent = _planned_intent(engine, 60)
-
-    blocked = engine._execute_intent(intent["intent_id"])
-    assert blocked["state"] == "planned"
-    assert client.place_calls == []
-    audit = repo.db.conn.execute(
-        "SELECT event, detail FROM audit_events WHERE correlation=? AND event='submission_blocked'",
-        (intent["intent_id"],),
-    ).fetchone()
-    assert audit is not None and "MEXC" in audit["detail"]
-
-    _ready(repo)
-    submitted = engine._execute_intent(intent["intent_id"])
-    assert submitted["state"] in ("submitting", "submitted", "open")
-    assert len(client.place_calls) == 1
 
 
 def test_entry_via_queue_item_is_paused_before_the_exchange(cfg, repo):

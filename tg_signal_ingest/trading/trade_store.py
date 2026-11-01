@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .audit import redact_payload
-from .store import SymbolConflictError, TradingStore, _row, dec_str
+from .store import TradingStore, _row, dec_str
 
 
 def _optional_decimal(value: Any) -> Decimal | None:
@@ -156,23 +156,9 @@ class TradeStore(TradingStore):
             existing = conn.execute("SELECT * FROM trades WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
             if existing is not None:
                 return dict(existing)
-            # Atomic per-symbol check inside same DB transaction as INSERT.
-            # Prevents two concurrent intents for same symbol (both passed their
-            # create_intent check before either trade existed) from both inserting
-            # trades. BEGIN IMMEDIATE ensures second transaction sees first commit.
-            if symbol:
-                placeholders_c = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
-                conflict = conn.execute(
-                    "SELECT trade_id, trade_state FROM trades WHERE symbol = ? "
-                    f"AND trade_state IN ({placeholders_c}) LIMIT 1",
-                    (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
-                ).fetchone()
-                if conflict is not None:
-                    raise SymbolConflictError(
-                        f"per-symbol concurrency: {symbol.upper()} already has an active trade "
-                        f"{conflict['trade_id']} in state {conflict['trade_state']}; "
-                        "overlapping BUY not admitted"
-                    )
+            # No permanent per-symbol trade-history lock.  Independent trade
+            # lifecycles may coexist for one symbol; the submission boundary
+            # consults actual exchange open orders instead.
             conn.execute(f"INSERT INTO trades ({', '.join(cols)}) VALUES ({placeholders})", values)
             row = conn.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
             assert row is not None

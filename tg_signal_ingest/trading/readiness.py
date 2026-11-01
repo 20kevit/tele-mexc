@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig
+from ..config import AppConfig
 from ..repository import Repository
 from .store import TradingStore
 
@@ -142,16 +142,12 @@ def build_readiness_report(
     else:
         report.add(
             "database schema",
-            FAIL,
-            f"migration {version}; expected {LATEST_MIGRATION}. Run the documented migration/upgrade procedure.",
+            WARN,
+            f"migration {version}; normal startup/readiness applies pending migration {LATEST_MIGRATION}",
         )
 
     # ---------------------------------------------------------- configuration
     trading = cfg.trading
-    if trading.execution_acknowledgement == EXECUTION_ACKNOWLEDGEMENT:
-        report.add("execution acknowledgement", PASS, "explicit acknowledgement configured")
-    else:
-        report.add("execution acknowledgement", FAIL, "missing or incorrect; automatic entries are disabled")
     if trading.order_quote_amount and trading.order_quote_amount > 0:
         report.add(
             "fixed quote amount",
@@ -190,7 +186,7 @@ def build_readiness_report(
     if control.owner_b_user_id:
         report.add("Owner B", PASS, str(control.owner_b_user_id))
     else:
-        report.add("Owner B", FAIL, "CONTROL_OWNER_B_USER_ID is not configured; both owners must be reachable")
+        report.add("Owner B", PASS, "optional; Owner A is sufficient")
     if control.developer_user_id:
         report.add("programmer role", PASS, str(control.developer_user_id))
     else:
@@ -214,8 +210,8 @@ def build_readiness_report(
         if boundary is None:
             report.add(
                 "activation boundary",
-                FAIL,
-                "no per-channel boundary; start the service once with Telegram reachable to establish it",
+                WARN,
+                "not yet established; serve establishes it before registering live handlers",
             )
         else:
             report.add("activation boundary", PASS, f"channel {selected.channel_id} message id {boundary}")
@@ -223,7 +219,11 @@ def build_readiness_report(
         if setup is not None and setup["selected_channel_id"]:
             report.add("channel selection (setup)", PASS, "persisted")
         else:
-            report.add("channel selection (setup)", FAIL, "control_setup has no selected channel")
+            report.add(
+                "channel selection (setup)",
+                WARN,
+                "ControlBot setup state is stale; runtime uses channels.is_selected (authoritative)",
+            )
 
     # ------------------------------------------------------------- signals
     planned = _count(conn, "SELECT COUNT(*) FROM order_intents WHERE state='planned'")
@@ -243,21 +243,21 @@ def build_readiness_report(
     if unresolved:
         report.add(
             "unresolved submissions",
-            FAIL,
-            f"{unresolved} intent(s) are submitting/reconciling/unknown; reconcile and resolve before startup",
+            WARN,
+            f"{unresolved} intent(s) are submitting/reconciling/unknown; tracked per-order, not a global entry block",
         )
     else:
         report.add("unresolved submissions", PASS, "none")
     fill_sync = _count(conn, "SELECT COUNT(*) FROM order_intents WHERE fill_sync_required=1")
     if fill_sync:
-        report.add("fill synchronization", FAIL, f"{fill_sync} intent(s) still require fill synchronization")
+        report.add("fill synchronization", WARN, f"{fill_sync} intent(s) still require fill synchronization")
     else:
         report.add("fill synchronization", PASS, "complete")
 
     # -------------------------------------------------------------- trades
     open_trades = conn.execute(
         "SELECT trade_id, symbol, trade_state FROM trades WHERE trade_state NOT IN "
-        "('closed','canceled','rejected','failed') ORDER BY updated_at"
+        "('closed','tp2_completed','canceled','rejected','failed') ORDER BY updated_at"
     ).fetchall()
     if open_trades:
         states = ", ".join(f"{row['symbol']}:{row['trade_state']}" for row in open_trades[:10])
@@ -270,12 +270,16 @@ def build_readiness_report(
     ).fetchall()
     if unprotected:
         detail = "; ".join(f"{row['trade_id']} {row['symbol']} {row['trade_state']}" for row in unprotected[:10])
-        report.add("unprotected / uncertain positions", FAIL, detail)
+        report.add(
+            "unprotected / uncertain positions",
+            WARN,
+            f"tracked per-order; does not block unrelated symbols: {detail}",
+        )
     else:
         report.add("unprotected / uncertain positions", PASS, "none")
     block_reason = store.buy_block_reason()
     if block_reason:
-        report.add("new-BUY block", FAIL, block_reason)
+        report.add("new-BUY block", WARN, f"diagnostic only; global entry blocking is disabled: {block_reason}")
     else:
         report.add("new-BUY block", PASS, "cleared")
     oco_rows = conn.execute(

@@ -334,8 +334,8 @@ def test_per_symbol_concurrency_allows_different_symbol(cfg, repo):
     assert a["symbol"] != b["symbol"]
 
 
-def test_per_symbol_concurrency_blocks_same_symbol_via_trade(cfg, repo):
-    # Live mode with TradeManager: same symbol active trade blocks second BUY
+def test_same_symbol_local_trade_does_not_block_without_exchange_open_order(cfg, repo):
+    # Local trade history is independent; only an actual exchange open order blocks.
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("engine_test", "tests/test_trading_engine.py")
@@ -380,16 +380,13 @@ def test_per_symbol_concurrency_blocks_same_symbol_via_trade(cfg, repo):
 
     first_rec = _store(repo, 20, COMPLETE_LONG)
     first = engine.process_item(_item(100, 20), first_rec)
-    assert first is not None and first["state"] == "open"
-    # second same symbol should be blocked by per-symbol concurrency (trade pending_entry/entry_active)
+    assert first is not None
+    # No exchange open order exists for BTCUSDT in this fake, so a new signal is
+    # admitted even though the previous local trade is still active.
     second_rec = _store(repo, 21, COMPLETE_LONG)
     second = engine.process_item(_item(100, 21), second_rec)
-    assert second is None
-    sig = repo.db.conn.execute(
-        "SELECT status, rejection_reason FROM signals WHERE channel_id=100 AND message_id=21"
-    ).fetchone()
-    assert sig["status"] == "rejected"
-    assert "per-symbol concurrency" in sig["rejection_reason"].lower()
+    assert second is not None
+    assert engine.client.place_calls == 2
 
 
 # ── §5 OCO invariant ─────────────────────────────────────────────────────

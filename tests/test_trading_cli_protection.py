@@ -94,6 +94,9 @@ class FakeCliClient:
             raise self.place_error
         return {"orderId": "ex-1", "status": "NEW", "executedQty": "0", "cumulativeQuoteQty": "0"}
 
+    def open_orders(self, symbol=None):
+        return []
+
     def account(self):
         return {
             "canTrade": True,

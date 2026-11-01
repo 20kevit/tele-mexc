@@ -52,8 +52,6 @@ TELEGRAM_API_HASH=
 
 # Telegram traffic uses direct networking; no proxy settings are required.
 
-# One-time automatic-execution acknowledgement (must match exactly).
-# TRADING_EXECUTION_ACKNOWLEDGEMENT=I_UNDERSTAND_REAL_MONEY_AND_RISKS
 # Fixed owner quote amount; never taken from a signal.
 # TRADING_ORDER_QUOTE_AMOUNT=3
 # MEXC CLI write backend (required for automatic Spot writes).
@@ -87,8 +85,7 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 # simulated/test-only product mode.  Credentials belong in .env
 # (MEXC_API_KEY / MEXC_API_SECRET), never here.
 [trading]
-# One-time owner acknowledgement; required before the pipeline is constructed.
-# execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+# Permanent automatic execution; no acknowledgement/mode token.
 # order_quote_amount = 3
 # Conditional LIMIT entry trigger distance (default exactly 3 ticks).
 # entry_trigger_offset_ticks = 3
@@ -260,8 +257,6 @@ def cmd_config_check(_args) -> int:
     print(f"  trading: MEXC Spot automatic execution; MEXC credentials={mexc_state}")
     cli_write_state = "armed (--yes)" if cfg.mexc.cli_confirm_noninteractive_writes else "fail-closed (no --yes)"
     print(f"  MEXC CLI: enabled={cfg.mexc.cli_enabled} writes={cli_write_state}")
-    acknowledged = cfg.trading.execution_acknowledgement == "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
-    print(f"  execution acknowledgement: {'configured' if acknowledged else 'MISSING (pipeline refuses to build)'}")
     print(f"  order amount: {cfg.trading.order_quote_amount:g} USDT ({cfg.trading.order_quote_amount_source})")
     return 0
 
@@ -1089,10 +1084,7 @@ def cmd_trading_status(_args) -> int:
     recon = store.reconciliation_counts()
     t = cfg.trading
     print("MEXC Spot trading pipeline")
-    print(
-        "  execution: automatic Spot BUY-on-signal "
-        f"(acknowledged={t.execution_acknowledgement == 'I_UNDERSTAND_REAL_MONEY_AND_RISKS'})"
-    )
+    print("  execution: permanent automatic Spot BUY-on-signal (no acknowledgement token)")
     print(f"  order amount: {t.order_quote_amount:g} USDT (source: {t.order_quote_amount_source})")
     print("  risk gates: Spot BUY only; fixed owner quote; no symbol allowlist or order caps")
     print(f"  emergency_stop: {t.emergency_stop}")
@@ -1309,6 +1301,30 @@ def cmd_trading_readiness(args) -> int:
             print(f"owner notification enqueue failed ({exc.__class__.__name__})", file=sys.stderr)
     db.close()
     return 0 if report.ready else 1
+
+
+def cmd_trading_cleanup_open_orders(args) -> int:
+    """One-time initial open-order cleanup (never sells positions)."""
+
+    from .trading.cleanup import run_initial_open_order_cleanup
+    from .trading.runtime import build_mexc_client
+    from .trading.store import TradingStore
+
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+    try:
+        client = build_mexc_client(cfg)
+        store = TradingStore(repo.db, cfg.trading)
+        report = run_initial_open_order_cleanup(client, store, apply=bool(args.apply))
+        print(report.render())
+        if report.uncertain_symbols:
+            return 2
+        return 0
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
 
 
 def cmd_trading_preflight(args) -> int:
@@ -1580,6 +1596,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="run live doctor and read-only access checks (requires network)",
     )
     ts_preflight.set_defaults(func=cmd_trading_preflight)
+    ts_cleanup = ts_sub.add_parser(
+        "cleanup-open-orders",
+        help="one-time initial cleanup of open orders below 5 USD (never sells positions)",
+    )
+    ts_cleanup.add_argument("--apply", action="store_true", help="perform cancellations; default is dry-run")
+    ts_cleanup.set_defaults(func=cmd_trading_cleanup_open_orders)
     ts_readiness = ts_sub.add_parser(
         "readiness",
         help="non-trading first-startup readiness report (never places/cancels orders)",

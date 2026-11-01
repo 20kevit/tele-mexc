@@ -58,7 +58,7 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | `message_edits` | PK `(channel_id, message_id, edit_seq)`; append-only edit snapshots |
 | `processing_queue` | unique `(channel_id, message_id, item_type, targets_version)`; status, attempts, `available_at`, error |
 | `sync_state` | per-channel backfill checkpoint, live watermark, last event/recovery times |
-| `app_state` | key/value runtime state; holds one forward-only activation boundary per channel under `trading.activation_boundary.channel.<id>` (legacy global key is a fallback only) |
+| `app_state` | key/value runtime state; per-channel forward-only activation boundary, one-time cleanup completion/in-flight markers, and diagnostic new-BUY block state |
 
 `messages.source` is `backfill`, `live`, or `recovery`. Only `live` can be
 tradeable, and only above the activation boundary.
@@ -196,6 +196,8 @@ are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable
    even above the boundary.
 10. A planned intent at/below its channel boundary is canceled locally during
     startup recovery; it cannot become a submission after downtime.
+11. `trading.initial_open_order_cleanup` records completion of the one-time
+    <5 USD open-order cleanup; it is never repeated on normal restart.
 
 ## Backup and integrity
 

@@ -1,9 +1,9 @@
 """Pipeline-construction and acknowledgement gates, verified OFFLINE.
 
 Guarantees under test:
-- The pipeline cannot be constructed without the exact owner acknowledgement.
+- The pipeline has no acknowledgement/token prerequisite.
 - The MEXC CLI write backend is required for the automatic Spot pipeline.
-- An unacknowledged/wrongly acknowledged engine refuses every exchange write.
+- An engine still refuses exchange writes without a client.
 - A client without credentials refuses every authenticated call locally.
 - The official /order/test REST primitive remains validation-only and is not
   exposed as a product execution mode.
@@ -50,16 +50,10 @@ class MinimalClient:
     symbols = object()
 
 
-def test_pipeline_refuses_to_build_without_acknowledgement(repo, cfg):
-    cfg.trading.execution_acknowledgement = None
-    with pytest.raises(ConfigError, match="acknowledgement"):
-        build_trading_engine(cfg, repo, client=MinimalClient())
-
-
-def test_pipeline_refuses_to_build_with_wrong_acknowledgement(repo, cfg):
-    cfg.trading.execution_acknowledgement = "wrong"
-    with pytest.raises(ConfigError, match="acknowledgement"):
-        build_trading_engine(cfg, repo, client=MinimalClient())
+def test_pipeline_builds_without_any_acknowledgement(repo, cfg):
+    engine = build_trading_engine(cfg, repo, client=MinimalClient())
+    assert engine is not None
+    assert not hasattr(cfg.trading, "execution_acknowledgement")
 
 
 def test_pipeline_requires_the_cli_write_backend(cfg):
@@ -70,14 +64,7 @@ def test_pipeline_requires_the_cli_write_backend(cfg):
         build_mexc_client(cfg, for_live_writes=True)
 
 
-def test_unacknowledged_engine_blocks_every_live_submission(repo, cfg):
-    engine = build_trading_engine(cfg, repo, client=MinimalClient())
-    engine.cfg.trading.execution_acknowledgement = "wrong-token"
-    with pytest.raises(AccidentalOrderRiskError):
-        engine._execute_live({"intent_id": "x", "symbol": "BTCUSDT"})
-
-
-def test_acknowledged_engine_still_needs_a_client(repo, cfg):
+def test_engine_still_needs_a_client(repo, cfg):
     engine = build_trading_engine(cfg, repo, client=MinimalClient())
     engine.client = None
     with pytest.raises(AccidentalOrderRiskError):

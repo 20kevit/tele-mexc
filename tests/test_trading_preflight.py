@@ -23,9 +23,6 @@ def _cfg() -> SimpleNamespace:
             api_key=None,
             api_secret=None,
         ),
-        trading=SimpleNamespace(
-            execution_acknowledgement="I_UNDERSTAND_REAL_MONEY_AND_RISKS",
-        ),
     )
 
 

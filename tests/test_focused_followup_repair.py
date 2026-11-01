@@ -97,6 +97,9 @@ class SpyMexc:
         self.ticker_calls += 1
         return {"symbol": symbol, "price": "100"}
 
+    def open_orders(self, symbol=None):
+        return []
+
     def account(self):
         return {
             "canTrade": True,

@@ -40,10 +40,8 @@ MEXC_BASE_URL_ENV = "MEXC_BASE_URL"
 # Live trading always requires an explicit, separate user enablement step.
 DEFAULT_MEXC_BASE_URL = "https://api.mexc.com"  # verified against official docs
 
-# One-time owner acknowledgement required before the automatic Spot pipeline
-# can be constructed.  It is not a per-order approval and it does not select a
-# product mode; the product has exactly one execution behaviour.
-EXECUTION_ACKNOWLEDGEMENT = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
+# The product has one permanent execution behaviour: every valid new signal may
+# trade automatically.  There is no acknowledgement token or product-mode gate.
 
 
 class ConfigError(Exception):
@@ -75,9 +73,9 @@ class TradingConfig:
     """All financial limits are user-configurable; defaults are conservative
     software placeholders only (documented as such, not sanctioned values)."""
 
-    # Owner acknowledgement.  Absence leaves the pipeline unbuildable (fail
-    # closed); it never falls back to a simulated or test-only execution path.
-    execution_acknowledgement: str | None = None
+    # The product has one permanent execution behaviour: every valid new
+    # signal may trade.  There is no acknowledgement token, mode selector, or
+    # per-order confirmation gate.
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
     balance_max_age_s: float = 5.0  # reject account snapshots older than this
     recon_interval_s: float = 30.0
@@ -132,7 +130,6 @@ class TradingConfig:
 
     def as_dict_public(self) -> dict[str, object]:
         return {
-            "execution_acknowledged": self.execution_acknowledgement == EXECUTION_ACKNOWLEDGEMENT,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
             "balance_max_age_s": self.balance_max_age_s,
             "recon_interval_s": self.recon_interval_s,
@@ -456,12 +453,9 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
     legacy_token = tr_raw.get("live_enabled_token") or env.get("TRADING_LIVE_TOKEN")
     if legacy_token not in (None, ""):
         raise ConfigError(
-            "trading.live_enabled_token is no longer supported. Remove it and set "
-            "execution_acknowledgement (or TRADING_EXECUTION_ACKNOWLEDGEMENT) instead."
+            "trading.live_enabled_token is no longer supported. Remove it; automatic "
+            "execution has no enable token or acknowledgement prerequisite."
         )
-    acknowledgement = _optional_env(env, tr_raw, "TRADING_EXECUTION_ACKNOWLEDGEMENT", "execution_acknowledgement")
-    if acknowledgement:
-        t.execution_acknowledgement = acknowledgement.strip()
 
     # These controls belonged to the removed product-mode split or to the old
     # allowlist.  Silently ignoring them would change financial behaviour, so
@@ -488,9 +482,8 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
 
     if not cli_confirm_present:
         # Automatic execution is the product behaviour.  A service cannot
-        # answer the CLI's terminal prompt, so the one-time acknowledgement
-        # authorizes non-interactive writes.  An explicit false remains a
-        # fail-closed operator override.
+        # answer the CLI's terminal prompt, so non-interactive writes are
+        # armed by default.  An explicit false remains a fail-closed override.
         m.cli_confirm_noninteractive_writes = True
 
     # Mandatory invariants cannot be disabled via configuration.

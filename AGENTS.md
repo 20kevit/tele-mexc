@@ -15,13 +15,13 @@ a durable MEXC Spot order-intent pipeline. One Python package, one CLI:
 - No web server, no public network listener, no withdrawals, no futures,
   no short selling.
 - MEXC Spot only, automatic execution of valid signals; there is no
-  SIM/TESTONLY/LIVE product-mode split, no symbol allowlist, and no per-signal
-  approval. Construction requires the exact owner acknowledgement, a fixed
-  quote amount, and MEXC credentials plus the CLI write backend restricted to
-  Spot.
-- Pause is enforced by a kernel file lock at the order-submission boundary;
-  readiness (Telegram, MEXC, channel, emergency stop, reconciliation)
-  is checked in the same transaction as the submission claim.
+  SIM/TESTONLY/LIVE product-mode split, no symbol allowlist, no acknowledgement
+  token, and no per-signal approval. Construction requires a fixed quote amount
+  and MEXC credentials plus the CLI write backend restricted to Spot.
+- Pause and emergency stop are enforced by a kernel file lock at the
+  order-submission boundary. There is no account-wide readiness/history gate:
+  the only cross-trade entry rule is the exchange-backed same-symbol
+  open-order check.
 
 ## Source-of-truth order
 

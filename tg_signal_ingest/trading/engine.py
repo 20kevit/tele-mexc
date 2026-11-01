@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig
+from ..config import AppConfig
 from ..mexc.errors import (
     AccidentalOrderRiskError,
     MexcDuplicateOrder,
@@ -48,7 +48,6 @@ from .risk import RiskDecision, RiskManager
 from .store import (
     TERMINAL_INTENT_STATES,
     RiskLimitExceeded,
-    SymbolConflictError,
     TradingError,
     dec_str,
 )
@@ -117,7 +116,7 @@ class TradingEngine:
         self._price_provider = price_provider
         # Every exchange WRITE goes through this gate.  Production wiring passes
         # a gate that also requires complete owner setup; a direct construction
-        # (CLI/tests) still enforces pause, acknowledgement and emergency stop.
+        # (CLI/tests) still enforces pause and emergency stop.
         self.submission_gate = submission_gate or SubmissionGate(repo.db, cfg)
         # Runtime readiness callbacks can be installed by the service after it
         # has verified the Telegram session and resolved the selected channel.
@@ -143,6 +142,55 @@ class TradingEngine:
         # delivery/retry can call this from more than one thread. Serializing
         # the whole decision keeps the DB reservation and execution atomic.
         self._process_lock = threading.RLock()
+        # Per-symbol lock covers the exchange open-order check plus the BUY
+        # submission, so two concurrent same-symbol signals cannot both observe
+        # an empty book and submit duplicate entries.  Different symbols use
+        # independent locks.
+        self._symbol_locks: dict[str, threading.Lock] = {}
+        self._symbol_locks_guard = threading.Lock()
+
+    def _symbol_lock(self, symbol: str) -> threading.Lock:
+        key = str(symbol).upper()
+        with self._symbol_locks_guard:
+            lock = self._symbol_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._symbol_locks[key] = lock
+            return lock
+
+    def _same_symbol_open_order_blocker(self, intent: dict[str, Any]) -> str | None:
+        """Return why a BUY must not be submitted, using MEXC open orders.
+
+        This is the only cross-trade entry rule.  It must be an actual exchange
+        query, so manually created/third-party orders count too.  Any failure
+        or incomplete response fails closed for this symbol only.
+        """
+
+        client = self.client
+        if client is None or not callable(getattr(client, "open_orders", None)):
+            return "exchange open-order check is unavailable; refusing BUY"
+        symbol = str(intent.get("symbol") or "").upper()
+        if not symbol:
+            return "symbol is missing; refusing BUY"
+        try:
+            orders = client.open_orders(symbol=symbol)
+        except Exception as exc:  # noqa: BLE001 - a failed exchange query fails closed
+            return f"exchange open-order query failed for {symbol} ({exc.__class__.__name__}); refusing BUY"
+        if orders is None:
+            return f"exchange open-order query returned no result for {symbol}; refusing BUY"
+        open_rows = [
+            row
+            for row in orders
+            if isinstance(row, dict)
+            and str(row.get("symbol") or symbol).upper() == symbol
+            and str(row.get("status") or row.get("state") or "NEW").upper()
+            not in ("FILLED", "CANCELED", "PARTIALLY_CANCELED", "REJECTED", "EXPIRED")
+        ]
+        if open_rows:
+            ids = ", ".join(str(row.get("orderId") or row.get("order_id") or "?") for row in open_rows[:8])
+            return f"{symbol} already has {len(open_rows)} open order(s) on MEXC ({ids}); refusing new BUY"
+        return None
+
 
     # ----------------------------------------------------- execution readiness
 
@@ -360,44 +408,10 @@ class TradingEngine:
             self._notify_rejected(signal_id, parsed, decision.reason, record=record)
             return None
 
-        # ── Per-symbol concurrency (§3.2) ────────────────────────────
-        # A new BUY for a symbol that already has a non-terminal bot-owned
-        # trade must not be admitted.  Unrelated symbols are never blocked.
-        # This runs *after* the mandatory risk boundary so every rejection has
-        # a precise, auditable reason and the check is durable across restarts.
-        #
-        # The fast pre-check is advisory; the authoritative atomic check lives
-        # inside store.create_intent() (single DB transaction, safe across
-        # multiple processes).  A DB error here must never silently permit a
-        # BUY — fail closed and notify the developer.
-        if parsed.symbol:
-            has_trade_check = getattr(self.store, "has_active_trade_for_symbol", None)
-            if callable(has_trade_check):
-                try:
-                    conflicting = has_trade_check(parsed.symbol)
-                except Exception as exc:
-                    # DB failure must not permit BUY — fail closed
-                    reason = f"per-symbol concurrency check failed; rejecting safely: {exc}"
-                    self.store.update_signal(signal_id, "rejected", reason)
-                    self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
-                    self._notify_rejected(signal_id, parsed, reason, record=record)
-                    # Also alert developer explicitly (lifecycle failure)
-                    try:
-                        if self.notifier:
-                            self.notifier.notify_trade(None, "SYMBOL_CHECK_FAILED", reason)
-                    except Exception:
-                        pass
-                    return None
-                if conflicting is not None:
-                    reason = (
-                        f"per-symbol concurrency: {parsed.symbol} already has an active trade "
-                        f"{conflicting.get('trade_id')} in state {conflicting.get('trade_state')}; "
-                        "overlapping BUY not admitted"
-                    )
-                    self.store.update_signal(signal_id, "rejected", reason)
-                    self.store.audit(signal_id, "lifecycle", "rejected_symbol_conflict", reason)
-                    self._notify_rejected(signal_id, parsed, reason, record=record)
-                    return None
+        # There is no permanent per-symbol trade-history admission lock.  A new
+        # signal for a symbol is evaluated independently; the only cross-trade
+        # entry rule is the exchange-backed same-symbol open-order check at the
+        # submission boundary.
 
         quantized = self._quantize_decision(decision, meta, parsed.action or "")
         if quantized is None:
@@ -428,16 +442,9 @@ class TradingEngine:
                 base_quantity=decision.base_quantity,
                 limit_price=decision.limit_price,
             )
-        except SymbolConflictError as exc:
-            # Atomic per-symbol check inside create_intent rejected the BUY
-            reason = str(exc)
-            self.store.update_signal(signal_id, "rejected", reason)
-            self.store.audit(signal_id, "lifecycle", "rejected_symbol_conflict", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
-            return None
         except TradingError as exc:
-            # DB/TradingError during atomic admission — fail closed, do not submit
-            reason = f"symbol admission failed safely: {exc}"
+            # DB/TradingError during intent admission — fail closed, do not submit
+            reason = f"intent admission failed safely: {exc}"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
             self._notify_rejected(signal_id, parsed, reason, record=record)
@@ -1206,7 +1213,8 @@ class TradingEngine:
                         )
                     return result
                 try:
-                    return self._execute_live(intent)
+                    with self._symbol_lock(str(intent.get("symbol") or "")):
+                        return self._execute_live(intent)
                 except AccidentalOrderRiskError as exc:
                     self.store.transition_intent(
                         intent_id,
@@ -1370,8 +1378,6 @@ class TradingEngine:
         self.store.update_protection(intent_id, status="active")
 
     def _execute_live(self, intent: dict[str, Any]) -> dict[str, Any]:
-        if self.cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
-            raise AccidentalOrderRiskError("Spot order blocked: execution acknowledgement is not configured")
         if self.client is None:
             raise AccidentalOrderRiskError("Spot order blocked: no MEXC client configured")
 
@@ -1382,19 +1388,9 @@ class TradingEngine:
             )
 
         intent_id = intent["intent_id"]
-        # The trade manager persists a fail-closed block whenever any bot-owned
-        # position lacks verified exit protection.  Enforce it here as well so
-        # every live BUY path (including a retried queue item) is covered.
-        if str(intent.get("side") or "").lower() == "buy":
-            block_reason: str | None = None
-            getter = getattr(self.store, "buy_block_reason", None)
-            if getter is not None:
-                try:
-                    block_reason = getter()
-                except Exception as exc:  # noqa: BLE001 - an unreadable guard fails closed
-                    block_reason = f"new-BUY safety state is unreadable: {exc}"
-            if block_reason:
-                return self._reject_before_submit(intent, f"new BUYs are blocked: {block_reason}")
+        # Global historical-state blocking is intentionally gone.  Each order
+        # and trade is tracked independently; the only cross-trade entry rule is
+        # the exchange-backed same-symbol open-order check below.
         # Spend tracking is informational only: it never caps the owner's
         # per-order amount.  Pre-migration/legacy rows get a ledger row before
         # any exchange call.
@@ -1429,6 +1425,25 @@ class TradingEngine:
                 reason=f"balance preflight rejected the order: {balance_reason}",
             )
             return result
+
+        # Cross-trade entry restriction: the exchange must confirm there is no
+        # open order for this exact symbol.  This covers the bot's entry/exit
+        # orders, OCO legs, and manual/third-party orders.  Other symbols are
+        # never consulted.  The per-symbol lock is held across this check and
+        # the actual submission to prevent concurrent same-symbol duplicates.
+        if str(intent.get("side") or "").lower() == "buy":
+            same_symbol_reason = self._same_symbol_open_order_blocker(intent)
+            if same_symbol_reason:
+                self.store.audit(
+                    intent_id,
+                    "risk",
+                    "same_symbol_open_order_blocked",
+                    same_symbol_reason,
+                    event_type="exchange.same_symbol_open_order_blocked",
+                    outcome="blocked",
+                )
+                return self._reject_before_submit(intent, same_symbol_reason)
+
         tp_price, sl_price = self._protection_prices(intent)
         protection_requested = tp_price is not None or sl_price is not None
         if protection_requested:
@@ -1631,9 +1646,7 @@ class TradingEngine:
     # ---------------------------------------------------------- cancellation
 
     def _live_client(self):
-        """Fail closed: acknowledged pipeline + client present. Returns the client."""
-        if self.cfg.trading.execution_acknowledgement != EXECUTION_ACKNOWLEDGEMENT:
-            raise AccidentalOrderRiskError("Spot order blocked: execution acknowledgement is not configured")
+        """Fail closed: the pipeline must have a MEXC client. Returns the client."""
         if self.client is None:
             raise AccidentalOrderRiskError("Spot order blocked: no MEXC client configured")
         return self.client

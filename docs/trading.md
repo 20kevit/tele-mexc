@@ -33,7 +33,7 @@ approval.
 
 | Requirement | Behavior |
 | --- | --- |
-| Owner acknowledgement | `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` is required to construct the pipeline |
+| Execution policy | Permanent automatic real Spot execution; no acknowledgement token, mode selector, or per-order approval |
 | MEXC CLI backend | `[mexc_cli] enabled = true` and a healthy CLI profile are required for Spot writes |
 | Sizing | One fixed `order_quote_amount` chosen by the owner; signal text never changes it |
 | Submission boundary | Pause, emergency stop, Telegram/MEXC/channel readiness and reconciliation blockers are checked atomically with the `planned -> submitting` claim |
@@ -118,13 +118,11 @@ permission failures and require the key's Spot permissions to be corrected.
 
 ## Configuration (`[trading]` in `config/config.toml`)
 
-Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
-`TRADING_ORDER_QUOTE_AMOUNT`,
+Environment overrides: `TRADING_ORDER_QUOTE_AMOUNT`,
 `MEXC_CLI_BINARY`, `MEXC_CLI_PROFILE`.
 
 | Key | Default | Validation / meaning |
 | --- | --- | --- |
-| `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
 | `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (`control_settings.order_quote_amount`) > `[trading]` > default. A legacy `buy_quote_usd` value is read only when the canonical key is absent. |
 | Order type | LIMIT only | `order_type_policy`, `TRADING_ORDER_TYPE_POLICY`, and MARKET execution are rejected |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
@@ -150,7 +148,6 @@ change financial behaviour.
 
 | Setting | Why it is retained |
 | --- | --- |
-| `execution_acknowledgement` | One-time global construction gate proving the owner intends automatic real Spot execution. It is not per-order approval. |
 | `balance_fee_buffer_pct` | The exact exchange fee is only visible after fills; the pre-trade requirement adds a small documented buffer so the quote/base balance is sufficient. |
 | `balance_max_age_s` | Prevents a decision based on a stale account snapshot. It is a freshness check, not portfolio polling. |
 | `entry_trigger_stale_threshold_s` | Prevents a conditional entry from triggering on an old market tick. |
@@ -386,6 +383,47 @@ creation coherent. States:
 - Canceled: retain actual partial spend and fees.
 - Rejected/failed/canceled-locally: release.
 - Restart never resets the ledger.
+
+## Same-symbol entry rule
+
+There is exactly one cross-trade entry restriction. Before a BUY is submitted for
+a symbol, the engine queries MEXC's actual open orders for that symbol. A new BUY
+is permitted only when the exchange confirms there are no open orders for that
+same symbol. This includes bot entry/exit orders, OCO legs, manual orders, and
+third-party orders.
+
+Any open order for the same symbol blocks only that symbol. An unresolved or
+unprotected order on another symbol never blocks a new entry. If the exchange
+query fails, times out, or is incomplete, the BUY for that symbol fails closed.
+The check and the submission are serialized by a per-symbol lock so concurrent
+same-symbol signals cannot both observe an empty book.
+
+Historical trade states (`needs_reconciliation`, `oco_submitting`,
+`unknown_requires_reconciliation`) are tracked per order/trade and are not a
+global submission gate. They still prevent blind retries of the same uncertain
+order.
+
+## One-time initial open-order cleanup
+
+The production initialization has one explicitly authorized cleanup operation:
+open orders whose reliably calculated remaining value is strictly below 5 USD
+may be canceled once. The operation:
+
+- snapshots actual open orders first;
+- values remaining quantity × limit price for USDT/USD-quoted symbols;
+- leaves orders at/above 5 USD, filled orders, and orders without reliable
+  valuation untouched;
+- groups a symbol's open orders (including OCO legs) and cancels the symbol only
+  when every open order on it qualifies;
+- verifies the resulting exchange state;
+- never sells balances or closes positions;
+- records completion in `app_state['trading.initial_open_order_cleanup']` so a
+  normal restart does not repeat it;
+- records an in-flight symbol and never blindly repeats an uncertain
+  cancellation.
+
+`tg-ingest trading cleanup-open-orders` is a dry-run by default; `--apply`
+performs the one-time cancellation.
 
 ## Execution
 
@@ -797,15 +835,14 @@ balances. It never places, cancels or modifies an order.
 2. Use a MEXC key with Spot read + Spot trade only; enable IP allowlist; no
    withdrawal permission.
 3. Set `order_quote_amount` to an owner-approved positive value.
-4. Set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`.
-   This is a one-time global construction gate, not per-order approval.
-5. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
+4. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
    set it to `true`; never leave an explicit `false` when writes are intended.
-6. Complete owner setup: Telegram authenticated, MEXC verified, and channel
-   selected; configure Owner A, Owner B, and the programmer.
-7. Run `trading readiness --network` and require
-   `READY FOR FIRST CONTROLLED STARTUP`; resolve every blocker first.
-8. Restart once; confirm the per-channel activation boundary advanced and the
+5. Complete owner setup: Telegram authenticated, MEXC verified, and a channel
+   selected. Owner A is required; Owner B is optional.
+6. Run `trading readiness --network`; it must not report a genuine blocker.
+7. Confirm the fresh database has no historical trades/intents and the one-time
+   open-order cleanup is recorded.
+8. Start `serve`; confirm the per-channel activation boundary advanced and the
    service log reports it for the selected channel.
 9. Monitor `trading status`, `trading intents`, and the notification outbox.
 

@@ -6,9 +6,9 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
 ## Safety posture
 
 - One automatic MEXC Spot behaviour: no SIM/TESTONLY/LIVE product-mode split.
-- Pipeline construction requires the exact owner acknowledgement, MEXC Spot
-  credentials, a healthy MEXC CLI write backend, and a positive fixed
-  `order_quote_amount`.
+- Pipeline construction requires MEXC Spot credentials, a healthy MEXC CLI
+  write backend, and a positive fixed `order_quote_amount`. There is no
+  acknowledgement token or mode gate.
 - No withdrawals, Futures/Margin order execution, leverage, short selling, symbol
   allowlist, or per-signal approval gate. Futures/Perpetual signal text may be
   ingested; eligible LONG signals execute as Spot BUY only.
@@ -69,7 +69,6 @@ MEXC_BASE_URL=https://api.mexc.com
 Optional trading overrides (environment wins over DB/TOML):
 
 ```dotenv
-TRADING_EXECUTION_ACKNOWLEDGEMENT=I_UNDERSTAND_REAL_MONEY_AND_RISKS
 TRADING_ORDER_QUOTE_AMOUNT=3
 MEXC_CLI_BINARY=
 MEXC_CLI_PROFILE=
@@ -86,8 +85,8 @@ Validate without contacting anything:
 .venv/bin/tg-ingest config check
 ```
 
-It prints paths, credential presence, the acknowledgement state, and the
-effective fixed amount — not secret values.
+It prints paths, credential presence, and the effective fixed amount — not
+secret values.
 
 ### Credential and permission matrix
 
@@ -358,7 +357,9 @@ git pull --ff-only public opencode/tele-mexc-completion
 Start and verify:
 
 ```bash
-.venv/bin/tg-ingest trading readiness --network   # must print READY; never places orders
+.venv/bin/tg-ingest trading cleanup-open-orders          # dry-run snapshot
+.venv/bin/tg-ingest trading cleanup-open-orders --apply  # one-time, <5 USD only
+.venv/bin/tg-ingest trading readiness --network          # non-trading checks
 systemctl start tg-ingest
 systemctl is-active tg-ingest
 journalctl -u tg-ingest -n 100 --no-pager

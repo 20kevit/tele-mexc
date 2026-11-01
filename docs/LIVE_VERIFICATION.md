@@ -50,7 +50,9 @@ must be recorded by the operator performing them.
 
 | Check | Evidence level | Command/procedure |
 | --- | --- | --- |
-| First-startup readiness (all prerequisites, blockers, open/uncertain state) | Offline report tested; live result not yet recorded | `tg-ingest trading readiness` then `--network`; never places an order |
+| First-startup readiness (prerequisites, blockers) | Offline report tested; live result recorded per deployment | `tg-ingest trading readiness` then `--network`; never places an order |
+| One-time open-order cleanup (<5 USD, no position sales) | Unit-tested; live run recorded in deployment report | `tg-ingest trading cleanup-open-orders --apply` |
+| Same-symbol exchange open-order entry rule | Unit/integration-tested with fakes | `tests/test_same_symbol_open_orders.py` |
 | Direct DNS/TCP/TLS to Telegram | Not yet verified in this pass | `tg-ingest diagnostics network` |
 | Telegram session validity | Not yet verified in this pass | `tg-ingest auth check` |
 | Selected channel access without history download | Not yet verified in this pass | `tg-ingest diagnostics telegram` |
@@ -74,7 +76,7 @@ maintenance task. They require a specific owner-approved live test plan:
 - Real order cancellation or reconciliation that mutates exchange state.
 - Any check involving real funds, live positions, or withdrawal-capable keys.
 - Production deployment or service restart while orders/positions are active.
-- Changing `order_quote_amount`, pause state, or acknowledgement in production.
+- Changing `order_quote_amount`, pause state, or other owner-controlled settings in production.
 
 ## 4. Current live-verification status
 

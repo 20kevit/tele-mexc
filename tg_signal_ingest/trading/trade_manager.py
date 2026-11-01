@@ -329,14 +329,9 @@ class TradeManager:
             self._reject_trade_intent(intent, "signal has no valid entry price")
             return None
 
-        # Fail closed before any BUY: an executed entry must have a complete,
-        # ordered exit ladder and a working OCO path.  Discovering a missing
-        # TP/SL only after the fill is what leaves a position unprotected.
-        block = self._buy_block_reason()
-        if block:
-            self._reject_trade_intent(intent, f"new BUYs are blocked: {block}")
-            return None
-
+        # A complete, ordered exit ladder and a working OCO path are still
+        # required before a BUY.  Historical global new-BUY blocks are not an
+        # entry gate; unrelated symbols remain independent.
         tick_size = getattr(symbol_meta, "price_step", None) if symbol_meta else None
         offset = self.cfg.effective_entry_trigger_offset_ticks
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 1:
@@ -399,22 +394,7 @@ class TradeManager:
                 sl_price=sl_price,
                 entry_intent_id=intent["intent_id"],
             )
-        except Exception as exc:
-            # Per-symbol concurrency at trade INSERT — fail closed, reject signal
-            from tg_signal_ingest.trading.store import SymbolConflictError as _SCE
-
-            if isinstance(exc, _SCE):
-                self._reject_trade_intent(intent, str(exc))
-                try:
-                    self.store.db.conn.execute(
-                        "UPDATE signals SET status='rejected', rejection_reason=?, updated_at=? WHERE signal_id=?",
-                        (str(exc), self._ts(), intent["signal_id"]),
-                    )
-                    self.store.db.conn.commit()
-                except Exception:
-                    pass
-                self.store.audit(intent["signal_id"], "lifecycle", "rejected_symbol_conflict", str(exc))
-                return None
+        except Exception:
             raise
 
     def _compute_trigger(self, entry_price: Decimal, ticks: int, tick_size: Decimal) -> Decimal | None:

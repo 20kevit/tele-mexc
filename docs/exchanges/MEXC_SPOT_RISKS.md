@@ -99,7 +99,7 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
 | Control | State |
 | --- | --- |
 | Automatic execution | Yes — one MEXC Spot behaviour; no SIM/TESTONLY/LIVE product-mode split |
-| Single explicit enable gate | Yes — `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`; pipeline construction fails closed without it |
+| Explicit enable gate | No — permanent automatic execution; no acknowledgement token or mode selector |
 | Submission-boundary pause/readiness | Yes — kernel file lock plus a transactional pause/readiness check inside the submission claim |
 | Kill switch | Yes — emergency stop at evaluation and pre-submission time; the owner can cancel in the MEXC web UI; the bot never cancels or adopts pre-existing external orders automatically |
 | Order size | One owner-configured fixed `order_quote_amount` (default 3 USDT, editable in the control menu); no signal-derived size, leverage, deposit percentage, or daily/open-order cap |
@@ -139,7 +139,7 @@ Legend: **[CODE] = mitigated in adapter/trading code (offline-tested);
       (read-only; safe).
 - [ ] **[CODE]** The official order/test primitive is validation only; it never proves matching-engine behavior. Watch
       signature/timestamp/clock behaviour on the real host clock.
-- [ ] **[CODE]** Then, and only then, set the exact
-      `execution_acknowledgement` and build the automatic Spot pipeline.
+- [ ] **[CODE]** Then build/start the automatic Spot pipeline; there is no
+      acknowledgement token.
 - No step above may be skipped; the code fails closed on every missing gate,
   but policy confirmation (first two bullets) is not code-verifiable.

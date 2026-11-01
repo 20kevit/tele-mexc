@@ -40,7 +40,7 @@ Implemented in `tg_signal_ingest/service.py`.
 3. Connect to Telegram directly, verify the saved session, resolve the selected
    channel.
 4. Requeue queue items left in `processing` by a crashed run.
-5. Mark runtime Telegram/MEXC/channel readiness for the submission gate.
+5. Verify Telegram/MEXC connectivity for startup; runtime readiness is diagnostic, not a global entry gate.
 6. Snapshot Telegram's newest visible channel message id and the newest
    already-stored message id, before live handlers are attached.
 7. Persist/advance the **per-channel** tradeable activation boundary to the
@@ -120,7 +120,7 @@ raw message text
   → replay/activation-boundary guard
   → RiskManager (BUY only, fixed quote amount, symbol constraints)
   → order_intents row + atomic technical reservation
-  → submission gate (pause + readiness)
+  → submission gate (pause + emergency stop) + exchange same-symbol open-order check
   → LIMIT-only MEXC Spot execution
   → exchange_orders, order_status_history, order_fills
   → reconciliation and durable notifications

@@ -105,6 +105,8 @@ class FakeMexc:
         account_response=None,
         account_error=None,
         account_errors=None,
+        open_orders_results=None,
+        open_orders_error=None,
     ):
         self.price = price
         self.place_response = place_response or {"orderId": "ex-1", "status": "NEW"}
@@ -116,6 +118,8 @@ class FakeMexc:
         self.account_response = account_response
         self.account_error = account_error
         self.account_errors = list(account_errors or [])
+        self.open_orders_results = open_orders_results
+        self.open_orders_error = open_orders_error
         self.symbols = FakeRegistry()
         self.place_calls = 0
         self.test_calls = 0
@@ -182,6 +186,13 @@ class FakeMexc:
 
     def open_orders(self, symbol=None):
         self.open_orders_calls += 1
+        if self.open_orders_error is not None:
+            raise self.open_orders_error
+        if self.open_orders_results is not None:
+            rows = list(self.open_orders_results)
+            if symbol:
+                rows = [r for r in rows if str(r.get("symbol") or "").upper() == str(symbol).upper()]
+            return rows
         return [{"orderId": "external-1", "symbol": "GOLD(XAUT)USDT", "status": "NEW"}]
 
 
@@ -1210,7 +1221,7 @@ def test_preexisting_external_orders_are_never_adopted_cancelled_or_counted(cfg,
 
     assert intent is not None
     assert client.place_calls == 1
-    assert client.open_orders_calls == 0
+    assert client.open_orders_calls == 1  # same-symbol exchange check only
     assert client.cancel_calls == 0
     row = repo.db.conn.execute(
         "SELECT COUNT(*) AS n FROM exchange_orders WHERE exchange_order_id = 'external-1'"
