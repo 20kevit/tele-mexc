@@ -1,0 +1,486 @@
+{
+  "schema_version": "1.0",
+  "project": "tele-mexc",
+  "generated_at_utc": "2026-11-01T00:00:00Z",
+  "baseline": {
+    "tag": "tele-mexc-production-baseline-2026-11-01",
+    "tag_object": "d7dba4ef3f416a9fcab812a836396d082df5c403",
+    "commit": "d987c7febb90065cb148f643fea97c054e325fee",
+    "note": "Historical runtime evidence (2026-10-24..2026-10-31) was produced by an older build (HEAD ~71a952b/2cea664) and must not be assumed to describe current HEAD d987c7f. Runtime evidence is context; executable code and tests are authoritative."
+  },
+  "status_values": [
+    "pending",
+    "verified-existing",
+    "fixed",
+    "tested",
+    "deferred",
+    "intentionally-not-fixed",
+    "blocked"
+  ],
+  "evidence_classes": [
+    "runtime-confirmed",
+    "code-confirmed",
+    "risk-only",
+    "not-observed",
+    "not-verifiable"
+  ],
+  "decisions": [
+    {
+      "id": "N-01",
+      "title": "Signal validity window and delayed/ambiguous entry submission",
+      "historical_evidence": "One place_order call took ~921s with a 5s CLI timeout. Claim-to-submit delays of 34 and 65 minutes were observed. Two intents passed through unknown_requires_reconciliation and later resolved.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Signal validity is configurable from Telegram (default 12h) and is distinct from accepted-order lifetime. Entry submission may be retried only while the signal is valid. After expiry no new order is submitted for that signal, but an already accepted open order is never cancelled by expiry. Ambiguous submissions persist as UNKNOWN, survive restart, and are reconciled against MEXC before any further submission. Never resend after a timeout.",
+      "required_behavior": [
+        "signals older than the configured validity window are rejected before intent creation",
+        "a persisted intent deadline is enforced before every submission attempt and after restart",
+        "signal expiry never cancels an accepted open order",
+        "ambiguous submit outcomes persist as unknown_requires_reconciliation and are never auto-retried",
+        "the CLI write timeout bounds the whole call, not only the child process"
+      ],
+      "acceptance_criteria": [
+        "expired signal is rejected with signal_expired and no order is sent",
+        "an accepted open order survives signal expiry",
+        "unknown intent is never resubmitted automatically and is reconciled read-only",
+        "CLI write that exceeds timeout_s raises an uncertain error and returns control to the caller"
+      ],
+      "tests_required": [
+        "test_signal_validity_rejects_expired",
+        "test_signal_expiry_does_not_cancel_open_order",
+        "test_cli_timeout_bounds_call",
+        "test_unknown_intent_not_resubmitted"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Deadline is evaluated against the persisted signal deadline; clock skew between host and Telegram is not modelled."
+    },
+    {
+      "id": "N-02",
+      "title": "Centralized MEXC API rate limiting",
+      "historical_evidence": "192,994 operations / 57h (~0.92 ops/s). Estimated 70 weight/10s for one symbol and 110 for three against an internal cap of 60. No HTTP 429 observed.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "One simple centralized weighted limiter covers every MEXC request. Endpoint weights are applied, a configurable safety margin is kept, non-essential requests are briefly deferred near the cap, server retry timing is honoured on 429, and weight/wait/error data is recorded. No multi-tier queues, emergency capacity, adaptive schedulers or priority infrastructure. The historical 60 was an internal cap, not a proven exchange hard limit.",
+      "required_behavior": [
+        "every REST call passes through the shared weighted gate before being sent",
+        "gate wait time is measured, logged on contention, and persisted on recorded operations",
+        "per-10s caps remain configurable with validated bounds",
+        "429/Retry-After is honoured and never retried blindly"
+      ],
+      "acceptance_criteria": [
+        "gate returns the wait duration and exposes aggregate statistics",
+        "an operation that waited records rate_limit_wait_ms > 0",
+        "caps can be lowered/raised via config within validation bounds"
+      ],
+      "tests_required": [
+        "test_rate_gate_records_wait",
+        "test_rate_gate_blocks_over_cap",
+        "test_429_honours_retry_after"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Exchange-side hard limits are not measured; caps remain a local safety margin."
+    },
+    {
+      "id": "N-03",
+      "title": "MEXC WebSocket market data",
+      "historical_evidence": "9,798 disconnects, zero successful connections, invalid frame/mask and Pong handling.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "REST remains the market-data mechanism. WebSocket is not repaired or migrated now and no WebSocket complexity is added. Reconsider only if a demonstrated need appears.",
+      "required_behavior": [
+        "market data keeps using REST polling",
+        "no new WebSocket dependency or repair work is introduced",
+        "failed WebSocket attempts never block trading or monitoring"
+      ],
+      "acceptance_criteria": [
+        "polling feed delivers prices used by the monitor",
+        "no blocking call is made on the Telegram event loop for market data"
+      ],
+      "tests_required": [
+        "existing market-data tests continue to pass"
+      ],
+      "status": "deferred",
+      "commit": null,
+      "limitations": "WebSocket feed remains non-functional by design decision; only polling is used."
+    },
+    {
+      "id": "N-04",
+      "title": "Stale price handling in the tick queue",
+      "historical_evidence": "3,324 price events delayed over 60s with a single worker and a 1,000-entry queue that silently dropped the oldest events.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "No separate queue redesign. Periodic MEXC reconciliation reduces practical risk. Simple stale-price safeguards may remain. Freshness must still be checked before any immediate price decision; reconciliation is not a substitute for freshness.",
+      "required_behavior": [
+        "a price observation older than the stale threshold is never used to trigger an entry",
+        "tick work stays off the asyncio event loop",
+        "periodic reconciliation is the primary safety net for exchange state"
+      ],
+      "acceptance_criteria": [
+        "stale ticks are rejected before any submission path",
+        "no per-tick exchange polling remains in the price path"
+      ],
+      "tests_required": [
+        "test_stale_tick_ignored"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Queue backlog metrics remain unavailable; the queue stays bounded with drop-oldest semantics."
+    },
+    {
+      "id": "N-05",
+      "title": "Missed Telegram messages during downtime",
+      "historical_evidence": "Messages 19392-19446 were missed during a 10h33m outage.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "No historical backfill. On startup a fresh processing boundary is established and only signals published after the bot started monitoring are processed. Older messages are ignored even inside the validity window and are never replayed.",
+      "required_behavior": [
+        "per-channel forward-only activation boundary is persisted at startup",
+        "messages at or below the boundary never produce an intent",
+        "backfill/recovery sources never trade"
+      ],
+      "acceptance_criteria": [
+        "boundary is written before handlers register",
+        "a message at/below the boundary is stored/audited and never traded"
+      ],
+      "tests_required": [
+        "test_activation_boundary_blocks_replay"
+      ],
+      "status": "verified-existing",
+      "commit": null,
+      "limitations": "Messages posted during downtime remain absent from the archive (by decision)."
+    },
+    {
+      "id": "N-06",
+      "title": "Same-symbol duplicate BUY protection",
+      "historical_evidence": "has_active_trade_for_symbol / has_active_intent_for_symbol were unused. Five same-symbol overlaps: APE x1, ICP x3, LPT x1.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Do not block a new signal merely because a prior same-symbol trade is open. Before every BUY, verify MEXC has no open order for that symbol, using a fresh reconciliation snapshot when available and a direct query otherwise. Unverifiable state blocks the entry. No artificial per-symbol trade-count limits.",
+      "required_behavior": [
+        "every BUY passes the exchange open-order check for its symbol",
+        "a failed/unavailable check fails closed for that symbol only",
+        "dead per-symbol guard functions are removed rather than left misleading"
+      ],
+      "acceptance_criteria": [
+        "BUY rejected when MEXC reports an open order for the symbol",
+        "BUY allowed on unrelated symbols while another symbol is open"
+      ],
+      "tests_required": [
+        "test_same_symbol_open_order_blocks_buy",
+        "test_other_symbol_not_blocked"
+      ],
+      "status": "verified-existing",
+      "commit": null,
+      "limitations": "A held position with no open orders is intentionally not blocked (matches decision)."
+    },
+    {
+      "id": "N-07",
+      "title": "BUY Block enforcement",
+      "historical_evidence": "new_buys_blocked was diagnostic-only; SubmissionGate never enforced it while notifications claimed BUYs were blocked.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "The existing Telegram BUY Block must actually prevent all new entry BUY submissions. Existing positions and their TP/SL/OCO management continue. Enabling it never cancels or modifies existing orders. Telegram status must reflect the enforced state.",
+      "required_behavior": [
+        "entry submissions are refused while the persisted BUY block is active",
+        "protection submissions (OCO/cancel) are unaffected",
+        "status/readiness text states the block is enforced"
+      ],
+      "acceptance_criteria": [
+        "entry submission raises SubmissionBlocked with the block reason",
+        "OCO protection still succeeds while the block is active"
+      ],
+      "tests_required": [
+        "test_buy_block_blocks_entry_submission",
+        "test_buy_block_allows_protection"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "None identified."
+    },
+    {
+      "id": "N-08",
+      "title": "SQLite concurrency correctness",
+      "historical_evidence": "check_same_thread=False, reads outside the shared lock, WAL, BEGIN IMMEDIATE, 10s busy timeout, no observed lock errors.",
+      "evidence_class": "risk-only",
+      "decision": "Keep SQLite. Critical trading state changes stay atomic; lock contention is logged; bounded retries are used where appropriate. No replacement or new concurrency infrastructure.",
+      "required_behavior": [
+        "write transactions are atomic and serialized",
+        "lock contention is retried a bounded number of times and logged",
+        "no partially updated order/trade state is observable"
+      ],
+      "acceptance_criteria": [
+        "a locked database retries then raises a clear error",
+        "contention produces a log line with the operation"
+      ],
+      "tests_required": [
+        "test_transaction_retries_on_lock"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Reads still use the shared connection; no per-thread connections were introduced."
+    },
+    {
+      "id": "N-09",
+      "title": "Minimum order notional",
+      "historical_evidence": "OCO legs around 1.5 USDT; no confirmed minimum-notional rejects.",
+      "evidence_class": "risk-only",
+      "decision": "Not a priority. No complex subsystem without evidence. Existing symbol validation is kept.",
+      "required_behavior": [
+        "existing symbol filter validation remains active before submission"
+      ],
+      "acceptance_criteria": [
+        "symbol validation failures remain fail-closed"
+      ],
+      "tests_required": [
+        "existing symbol validation tests continue to pass"
+      ],
+      "status": "deferred",
+      "commit": null,
+      "limitations": "Exchange filters are not cached locally; exact per-symbol minimums require a live read."
+    },
+    {
+      "id": "N-10",
+      "title": "Existing protective controls",
+      "historical_evidence": "max_ip_weight / max_uid_weight existed only in code; require_control_setup and _dimension_ok were unused in expected paths.",
+      "evidence_class": "code-confirmed",
+      "decision": "No new control features. Ensure existing controls work, only the designated owner account executes administrative commands, BUY Block is enforced, Telegram status matches reality, and misleading no-op controls are removed. No new roles, emergency stop or approval workflow.",
+      "required_behavior": [
+        "owner-only administrative commands are enforced by numeric user id",
+        "status output matches enforced behaviour",
+        "dead control parameters are removed rather than silently ignored"
+      ],
+      "acceptance_criteria": [
+        "developer role cannot execute owner commands",
+        "no unused readiness/control parameter remains in the submission gate"
+      ],
+      "tests_required": [
+        "test_control_owner_authorization",
+        "test_gate_has_no_dead_control_flags"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "No second-owner/admin expansion is introduced."
+    },
+    {
+      "id": "F-01",
+      "title": "Standalone TP order path",
+      "historical_evidence": "_enter_tp1 -> _submit_tp_order remained reachable while OCO exits existed.",
+      "evidence_class": "code-confirmed",
+      "decision": "Exit management uses native OCO orders only. Obsolete standalone TP submission paths are removed or disabled and never silently used as a fallback.",
+      "required_behavior": [
+        "no code path submits a standalone TP limit order",
+        "exits are submitted as OCO pairs only"
+      ],
+      "acceptance_criteria": [
+        "standalone TP helpers raise or are removed",
+        "only OCO submission remains reachable"
+      ],
+      "tests_required": [
+        "test_no_standalone_tp_submission"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Legacy rows in old databases are left untouched."
+    },
+    {
+      "id": "F-02",
+      "title": "OCO retry policy and per-attempt reporting",
+      "historical_evidence": "Three attempts instead of the agreed schedule; attempt-level notification tracking insufficient; uniqueness key suppressed repeats.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "One initial OCO attempt plus eight retries with delays 5,10,15,30,30,30,30,30 seconds. Definitive validation errors are not retried. Ambiguous outcomes are persisted UNKNOWN and reconciled, never blindly replaced. State survives restarts. No automatic Market Sell after exhaustion. No automatic price changes. Each important attempt and outcome is traceable and notified to both recipients.",
+      "required_behavior": [
+        "retry schedule is persisted per leg and honoured across restarts",
+        "definitive rejections are terminal for that leg",
+        "each attempt produces its own durable notification row per recipient",
+        "exhaustion produces a critical unprotected notification"
+      ],
+      "acceptance_criteria": [
+        "attempt counter and next-attempt time are persisted",
+        "ninth failure stops retrying",
+        "two recipients each have one row per attempt"
+      ],
+      "tests_required": [
+        "test_oco_retry_schedule",
+        "test_oco_attempt_notifications_unique_per_attempt",
+        "test_oco_retry_stops_after_nine"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Retries are driven by the periodic reconciliation worker."
+    },
+    {
+      "id": "F-04",
+      "title": "Excessive per-tick OCO leg polling",
+      "historical_evidence": "Two PENDLE OCO legs polled every ~2s for ~53h; ~57,339 checks per leg.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Use the shared periodic MEXC reconciliation process for open orders, fills, OCO groups, child legs and local trade states. MEXC is the source of truth when available. Record and notify discrepancies. Block dependent actions while critical discrepancies remain. No separate OCO reconciliation subsystem. The interval is validated against endpoint weights before being fixed.",
+      "required_behavior": [
+        "no exchange order queries from the price-tick path",
+        "open orders/legs are reconciled by the periodic worker",
+        "interval is derived from measured weight budget"
+      ],
+      "acceptance_criteria": [
+        "tick handling performs no REST order query",
+        "reconciliation interval produces a documented weight estimate"
+      ],
+      "tests_required": [
+        "test_tick_does_not_query_exchange",
+        "test_periodic_reconcile_interval"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Reconciliation latency is bounded by the configured interval."
+    },
+    {
+      "id": "F-05",
+      "title": "Partial entry fill protection",
+      "historical_evidence": "No real partial entry fill observed; protection was only placed after the intent became terminal.",
+      "evidence_class": "not-observed",
+      "decision": "Protect acquired quantity immediately even while the entry order is still open, in proportion to the filled amount. Keep the unfilled remainder working. If SL closes the acquired position, cancel the unfilled remainder so it cannot create an unwanted position. If TP1 executes, cancel the unfilled remainder. Manage the remaining position to TP2/SL. Validate against MEXC capabilities without real orders.",
+      "required_behavior": [
+        "OCO protection is submitted as soon as a non-zero fill is confirmed",
+        "protection quantity equals the acquired quantity, split for TP1/TP2",
+        "unfilled entry remainder is cancelled when SL or TP1 executes"
+      ],
+      "acceptance_criteria": [
+        "partial fill produces OCO coverage for the filled quantity",
+        "cancelling the remainder never resubmits the entry"
+      ],
+      "tests_required": [
+        "test_partial_fill_protected_before_terminal",
+        "test_partial_fill_cancels_remainder_on_tp1"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Exchange-side OCO quantity constraints are respected by the existing symbol validation."
+    },
+    {
+      "id": "F-06",
+      "title": "Manual entry cancellation",
+      "historical_evidence": "One manual cancellation detected after ~3m41s.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Periodically read entry-order status. A manual cancellation is accepted, never resubmitted, and notified to both recipients. Any already-filled quantity is protected per the partial-fill rules. Manual sales are not detected or managed.",
+      "required_behavior": [
+        "manual cancel transitions the intent/trade without resubmission",
+        "acquired quantity remains protected",
+        "both recipients are notified"
+      ],
+      "acceptance_criteria": [
+        "cancel detected on the next reconciliation produces a notification and no new order"
+      ],
+      "tests_required": [
+        "test_manual_entry_cancel_not_resubmitted"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Detection latency equals the reconciliation interval."
+    },
+    {
+      "id": "F-07",
+      "title": "Manual sales and unknown exchange orders",
+      "historical_evidence": "Manual PENDLE/LINK sales undetected; an MYX order existed on the exchange but not in the DB; startup cleanup cancelled a real MYX order because its value was below $5.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Owner interference is the owner's responsibility; no manual-sale detection subsystem. However, startup cleanup and unknown-order handling must never cancel or modify an order merely because it is missing locally or small. Unknown real orders are never cancelled automatically.",
+      "required_behavior": [
+        "startup cleanup performs no automatic cancellation",
+        "unattributed orders are reported and left untouched",
+        "only explicitly attributed bot orders may ever be cancelled by bot logic"
+      ],
+      "acceptance_criteria": [
+        "cleanup run leaves every exchange order in place",
+        "report lists unattributed orders"
+      ],
+      "tests_required": [
+        "test_cleanup_never_cancels_unknown_orders"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Manual sales remain invisible by design decision."
+    },
+    {
+      "id": "F-09",
+      "title": "100-trade monitoring limit",
+      "historical_evidence": "list_trades(limit=100) with 20 trades in production.",
+      "evidence_class": "not-observed",
+      "decision": "100 is sufficient. No pagination or new subsystem now. Revisit only if usage approaches the limit.",
+      "required_behavior": [
+        "existing limit is retained"
+      ],
+      "acceptance_criteria": [
+        "no behaviour change"
+      ],
+      "tests_required": [
+        "existing trade listing tests continue to pass"
+      ],
+      "status": "deferred",
+      "commit": null,
+      "limitations": "Above 100 trades the oldest non-terminal trades would leave the tick/monitor window."
+    },
+    {
+      "id": "F-10",
+      "title": "Telegram notification reliability",
+      "historical_evidence": "313 notifications, none pending/failed at audit end, 21 failed attempts later succeeded, ambiguous outcomes not handled, some global BUY_BLOCK keys allowed only one notification.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Both configured recipients receive important trading and system notifications. Delivery state is tracked per recipient; success for one never masks failure for the other. Failed deliveries retry in a controlled manner. Ambiguous outcomes are preserved and reported safely. Important attempts are individually traceable. Recipient configuration is verified, not assumed. No credentials in reports.",
+      "required_behavior": [
+        "one durable row per recipient per event",
+        "ambiguous delivery is surfaced to recipients, not silently dropped",
+        "event keys are scoped so identical events for different trades are not deduplicated"
+      ],
+      "acceptance_criteria": [
+        "failure for one recipient leaves the other unaffected",
+        "an ambiguous delivery produces a visible alert"
+      ],
+      "tests_required": [
+        "test_notifications_recipient_isolation",
+        "test_ambiguous_delivery_reported",
+        "test_buy_block_events_not_globally_deduplicated"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Owner B delivery depends on the configured chat id; absence is reported, never invented."
+    },
+    {
+      "id": "F-12",
+      "title": "OCO local database consistency",
+      "historical_evidence": "30/30 oco_group_id NULL; 18 take_profit rows and zero stop_loss rows; MYX local/exchange contradiction; LPT order-id mismatch.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "No separate OCO reconciliation subsystem. Shared periodic reconciliation covers OCO groups, both legs, fills and local state. MEXC is the source of truth when available; otherwise the latest local state is used but explicitly marked unverified/stale, and reconciled again when the exchange is reachable.",
+      "required_behavior": [
+        "both OCO legs (take-profit and stop-loss) are persisted with group attribution",
+        "trade orders carry their oco_group_id",
+        "fallback state is marked unverified"
+      ],
+      "acceptance_criteria": [
+        "a submitted OCO yields one group and two legs with attribution",
+        "when the exchange is unreachable the leg is marked unverified, not confirmed"
+      ],
+      "tests_required": [
+        "test_oco_legs_persist_both_legs",
+        "test_oco_trade_order_group_attribution",
+        "test_unverified_fallback_marker"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Historical rows are not rewritten."
+    },
+    {
+      "id": "F-13",
+      "title": "Incorrect MEXC error classification",
+      "historical_evidence": "\"limit price needs to be greater than the latest price\" became MexcServerError then UNKNOWN; two cases.",
+      "evidence_class": "runtime-confirmed",
+      "decision": "Definitive validation/rejection errors are classified as rejected with the real reason, not UNKNOWN. Network/timeout ambiguity stays UNKNOWN and is reconciled before any replacement. Both recipients are notified accurately. Prefer a minimal correction over a new error framework.",
+      "required_behavior": [
+        "deterministic exchange validation errors are terminal rejections",
+        "ambiguous transport errors remain uncertain",
+        "notifications state the real reason"
+      ],
+      "acceptance_criteria": [
+        "price-relationship rejection maps to a rejection, not uncertainty",
+        "timeout still maps to uncertainty"
+      ],
+      "tests_required": [
+        "test_cli_price_rejection_not_uncertain",
+        "test_cli_timeout_still_uncertain"
+      ],
+      "status": "pending",
+      "commit": null,
+      "limitations": "Classification is text-based on the CLI envelope; unknown messages keep the conservative uncertain mapping."
+    }
+  ]
+}
