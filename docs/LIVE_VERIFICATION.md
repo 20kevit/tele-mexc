@@ -55,7 +55,7 @@ must be recorded by the operator performing them.
 | Telegram session validity | Not yet verified in this pass | `tg-ingest auth check` |
 | Selected channel access without history download | Not yet verified in this pass | `tg-ingest diagnostics telegram` |
 | Selected channel ingestion/backfill | Not yet verified in this pass | `tg-ingest status`, `tg-ingest backfill status`, `queue list` |
-| ControlBot starts and authorizes owner/developer | Not yet verified in this pass | `tg-ingest control status`; `/start`; inspect logs |
+| ControlBot starts and authorizes both owners + programmer | Not yet verified in this pass | `tg-ingest control status`; `/start`; inspect logs |
 | MEXC read-only credential verification | Not yet verified in this pass | `tg-ingest trading verify` |
 | CLI profile/REST account identity | Not yet verified in this pass | `tg-ingest trading preflight --network` |
 | Notification delivery | Not yet verified in this pass | Trigger one approved non-trading control event; inspect outbox |

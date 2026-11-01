@@ -123,6 +123,51 @@ def test_critical_threshold_still_receives_every_owner_event(cfg, repo):
     assert len(bot.sent) == 4
 
 
+def test_two_workers_never_deliver_the_same_outbox_row(cfg, repo):
+    import threading
+    import time
+
+    engine = _engine(cfg, repo)
+    sent: list[tuple[int, str]] = []
+    lock = threading.Lock()
+
+    class SlowBot:
+        def send_message(self, chat_id: int, text: str):
+            time.sleep(0.01)
+            with lock:
+                sent.append((int(chat_id), str(text)))
+            return {"message_id": len(sent)}
+
+    notifier_a = TradingNotifier(engine.store, SlowBot(), owner_id=OWNER, developer_id=DEVELOPER)
+    notifier_b = TradingNotifier(engine.store, SlowBot(), owner_id=OWNER, developer_id=DEVELOPER)
+    notifier_a.notify(event_key="concurrent", text="one event", category="critical")
+    # Immediate flush during notify may already have delivered it; enqueue a
+    # fresh row and race two workers over the same outbox.
+    notifier_a.store.enqueue_notification(
+        event_key="concurrent-2",
+        signal_id=None,
+        intent_id=None,
+        role="owner",
+        chat_id=OWNER,
+        text="raced",
+        category="critical",
+        event_type="test.concurrent",
+    )
+    barrier = threading.Barrier(2)
+
+    def run(notifier):
+        barrier.wait()
+        notifier.flush()
+
+    threads = [threading.Thread(target=run, args=(n,)) for n in (notifier_a, notifier_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert [text for _, text in sent].count("raced") == 1
+
+
 def test_distinct_trades_never_suppress_each_other(cfg, repo):
     engine = _engine(cfg, repo)
     bot = FlakyBot()

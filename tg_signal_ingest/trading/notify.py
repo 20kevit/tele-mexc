@@ -16,6 +16,7 @@ Delivery outcomes:
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -232,10 +233,18 @@ class TradingNotifier:
                 log.warning("ambiguous-notification recovery failed", exc_info=True)
         sent = 0
         for row in self.store.pending_notifications(limit=limit):
+            notification_id = int(row["notification_id"])
+            # Claim atomically before any network call.  Two workers (serve's
+            # reconciliation loop and the control bot tick) must never deliver
+            # the same outbox row concurrently.
+            token = uuid.uuid4().hex
+            claim = getattr(self.store, "claim_notification", None)
+            if callable(claim) and not claim(notification_id, token):
+                continue
             try:
                 self._deliver(row)
                 self.store.finish_notification(
-                    int(row["notification_id"]),
+                    notification_id,
                     outcome="sent",
                     telegram_message_id=None,
                 )
@@ -244,27 +253,27 @@ class TradingNotifier:
                 # The owner/developer blocked or deactivated the chat.  Never
                 # retry; record suppression and keep the outbox clean.
                 log.warning("notification suppressed for chat %s (%s)", row["chat_id"], exc)
-                self.store.finish_notification(int(row["notification_id"]), outcome="suppressed", error=str(exc))
+                self.store.finish_notification(notification_id, outcome="suppressed", error=str(exc))
             except BotApiRateLimitError as exc:
                 # Honor Telegram's ``retry_after`` but cap it so one chat cannot
                 # starve the whole outbox forever.
                 retry_after = max(1, min(int(exc.retry_after or 30), MAX_BACKOFF_S))
                 log.warning("rate limited notifying chat %s; retry in %ss", row["chat_id"], retry_after)
                 self.store.finish_notification(
-                    int(row["notification_id"]),
+                    notification_id,
                     outcome="retry",
                     error=f"rate_limited retry_after={retry_after}",
                     retry_after_s=retry_after,
                 )
             except BotApiError as exc:
                 self.store.finish_notification(
-                    int(row["notification_id"]),
+                    notification_id,
                     outcome="failed",
                     error=f"BotApiError: {exc}",
                 )
             except Exception as exc:  # noqa: BLE001 - transport boundary
                 self.store.finish_notification(
-                    int(row["notification_id"]),
+                    notification_id,
                     outcome="retry",
                     error=f"{exc.__class__.__name__}",
                 )

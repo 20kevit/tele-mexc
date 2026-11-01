@@ -638,7 +638,7 @@ protected:
 - The execution engine must offer a working OCO submission path.
 
 Any failure rejects the intent locally (`rejected`, category `risk`) with zero
-exchange calls and an owner/developer notification.
+exchange calls and a notification to both owners + the programmer.
 
 After an entry fills, `TradeManager._place_oco_exits()` places two native OCO
 SELL orders (TP1 + stop-loss, TP2 + stop-loss) against the actual acquired base
@@ -741,7 +741,7 @@ single-use, time-limited tokens in `notification_callbacks` and are consumed
 once per role.
 
 If `CONTROL_BOT_TOKEN` is set, `serve` sends notices to the configured
-owner/developer ids; otherwise they stay pending in the outbox. The notifier
+owner/programmer ids; otherwise they stay pending in the outbox. The notifier
 tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 
 ## Inspect and operate
