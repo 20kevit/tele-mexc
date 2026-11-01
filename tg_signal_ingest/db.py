@@ -468,6 +468,94 @@ def _migration_20_audit_evidence_notifications(conn: sqlite3.Connection) -> None
         )
 
 
+def _migration_21_second_owner_notifications(conn: sqlite3.Connection) -> None:
+    """Allow the durable outbox to address Owner A, Owner B, and programmer.
+
+    The v20 role CHECK only allowed ``owner`` and ``developer``.  Rebuilding the
+    table is required because SQLite cannot alter a CHECK constraint.  Existing
+    rows are preserved exactly, including ambiguous/failed delivery state.
+    """
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='trading_notifications'"
+    ).fetchone()
+    table_sql = str(row["sql"] if row is not None else "")
+    if "'owner_b'" in table_sql:
+        return
+    conn.execute("ALTER TABLE trading_notifications RENAME TO trading_notifications_v21")
+    conn.execute(
+        """
+        CREATE TABLE trading_notifications (
+            notification_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key         TEXT NOT NULL,
+            signal_id         TEXT,
+            intent_id         TEXT,
+            category          TEXT NOT NULL DEFAULT 'legacy',
+            event_type        TEXT NOT NULL DEFAULT 'legacy',
+            role              TEXT NOT NULL CHECK (role IN ('owner', 'owner_b', 'developer')),
+            chat_id           INTEGER NOT NULL,
+            text              TEXT NOT NULL,
+            compact_text      TEXT,
+            expanded_text     TEXT,
+            status            TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sending', 'sent', 'failed',
+                                  'ambiguous', 'suppressed', 'canceled')),
+            attempts          INTEGER NOT NULL DEFAULT 0,
+            last_error        TEXT,
+            next_attempt_at   TEXT,
+            claim_token       TEXT,
+            claimed_at        TEXT,
+            telegram_message_id INTEGER,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            sent_at           TEXT,
+            UNIQUE (event_key, role)
+        )
+        """
+    )
+    columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(trading_notifications_v21)")}
+    shared = [
+        "notification_id",
+        "event_key",
+        "signal_id",
+        "intent_id",
+        "category",
+        "event_type",
+        "role",
+        "chat_id",
+        "text",
+        "compact_text",
+        "expanded_text",
+        "status",
+        "attempts",
+        "last_error",
+        "next_attempt_at",
+        "claim_token",
+        "claimed_at",
+        "telegram_message_id",
+        "created_at",
+        "updated_at",
+        "sent_at",
+    ]
+    present = [name for name in shared if name in columns]
+    conn.execute(
+        f"INSERT INTO trading_notifications ({', '.join(present)}) "
+        f"SELECT {', '.join(present)} FROM trading_notifications_v21"
+    )
+    conn.execute("DROP TABLE trading_notifications_v21")
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_status "
+        "ON trading_notifications (status, next_attempt_at, notification_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_event_key "
+        "ON trading_notifications (event_key)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_signal "
+        "ON trading_notifications (signal_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trading_notifications_intent "
+        "ON trading_notifications (intent_id)",
+    ):
+        conn.execute(sql)
+
+
 MIGRATIONS: list[tuple[int, MigrationStep]] = [
     (
         1,
@@ -1466,6 +1554,7 @@ MIGRATIONS: list[tuple[int, MigrationStep]] = [
     (18, _migration_18_audit_journal),
     (19, _migration_19_trade_evidence_columns),
     (20, _migration_20_audit_evidence_notifications),
+    (21, _migration_21_second_owner_notifications),
 ]
 
 

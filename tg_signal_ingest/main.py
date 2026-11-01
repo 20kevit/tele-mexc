@@ -595,7 +595,9 @@ def cmd_control_status(_args) -> int:
         print("Telegram control bot")
         print(f"  configured: {'yes' if cfg.control.configured else 'no'}")
         print(f"  enabled: {'yes' if cfg.control.enabled else 'no'}")
-        print(f"  owner user id: {cfg.control.owner_user_id or 'MISSING'}")
+        print(f"  owner A user id: {cfg.control.owner_user_id or 'MISSING'}")
+        print(f"  owner B user id: {cfg.control.owner_b_user_id or 'MISSING'}")
+        print(f"  programmer user id: {cfg.control.developer_user_id or 'MISSING'}")
         print(f"  bot token: {'set' if cfg.control.bot_token else 'MISSING'}")
         encryption = "ready" if SecretBox(cfg.control.secret_key).available else "MISSING CONTROL_SECRET_KEY"
         print(f"  credential encryption: {encryption}")
@@ -604,7 +606,7 @@ def cmd_control_status(_args) -> int:
         print(f"  MEXC: {setup['mexc_state']} — {setup['mexc_label'] or '-'}")
         print(f"  channel: {setup['selected_channel_title'] or 'not selected'}")
         print(f"  execution paused: {bool(int(setup['paused'] or 0))}")
-        print(f"  notification minimum: {store.notification_min_severity()}")
+        print(f"  legacy notification minimum: {store.notification_min_severity()} (never suppresses owners)")
         print("  valid signals execute automatically when setup is ready and execution is not paused.")
     finally:
         db.close()
@@ -1257,6 +1259,58 @@ def cmd_trading_verify(args) -> int:
     return code
 
 
+def cmd_trading_readiness(args) -> int:
+    """Non-trading first-startup readiness report.
+
+    Never places, cancels, replaces, or modifies an exchange order.  With
+    ``--network`` it performs ordinary read-only Telegram/MEXC checks.
+    """
+
+    import hashlib
+
+    from .trading.readiness import build_readiness_report, report_as_json
+
+    cfg = _load_or_exit(require_credentials=False)
+    db, repo = _new_repo(cfg)
+    report = build_readiness_report(cfg, repo, network=bool(getattr(args, "network", False)))
+    if getattr(args, "json", False):
+        print(report_as_json(report))
+    else:
+        print(report.render())
+
+    if report.blockers and cfg.control.bot_token and (
+        cfg.control.owner_user_id or cfg.control.owner_b_user_id
+    ):
+        try:
+            from .control.bot_api import BotApiClient
+            from .trading.notify import TradingNotifier
+            from .trading.store import TradingStore
+
+            notifier = TradingNotifier(
+                TradingStore(repo.db, cfg.trading),
+                BotApiClient(cfg.control.bot_token, api_base=cfg.control.api_base),
+                owner_id=cfg.control.owner_user_id,
+                owner_b_id=cfg.control.owner_b_user_id,
+                developer_id=cfg.control.developer_user_id,
+            )
+            summary = hashlib.sha256(
+                "|".join(f"{check.name}:{check.detail}" for check in report.blockers).encode("utf-8")
+            ).hexdigest()[:12]
+            notifier.notify(
+                event_key=f"readiness:blockers:{summary}",
+                text=(
+                    "⚠️ گزارش آمادگی اولین استارت: NOT READY\n"
+                    + "\n".join(f"- {check.name}: {check.detail}" for check in report.blockers[:12])
+                ),
+                category="critical",
+                event_type="readiness.not_ready",
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not hide the local report
+            print(f"owner notification enqueue failed ({exc.__class__.__name__})", file=sys.stderr)
+    db.close()
+    return 0 if report.ready else 1
+
+
 def cmd_trading_preflight(args) -> int:
     """Preflight checks for the MEXC CLI execution backend.
 
@@ -1526,6 +1580,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="run live doctor and read-only access checks (requires network)",
     )
     ts_preflight.set_defaults(func=cmd_trading_preflight)
+    ts_readiness = ts_sub.add_parser(
+        "readiness",
+        help="non-trading first-startup readiness report (never places/cancels orders)",
+    )
+    ts_readiness.add_argument(
+        "--network",
+        action="store_true",
+        help="also verify Telegram session and read-only REST/CLI account identity",
+    )
+    ts_readiness.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    ts_readiness.set_defaults(func=cmd_trading_readiness)
 
     return parser
 

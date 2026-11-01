@@ -18,13 +18,21 @@ execution, and no unofficial endpoints.
 
 - Pause/resume and readiness are enforced at the submission boundary with a
   kernel file lock and a transactional check, not only in the UI.
+- Every process start establishes a durable **per-channel** activation boundary
+  from Telegram's newest visible message id plus the newest already-stored row,
+  before live handlers are attached. Messages at/below it, and every
+  backfill/recovery row, are stored and audited but never traded. If the boundary
+  cannot be established, new entries fail closed.
+- A planned intent that predates the current start is canceled locally and is
+  never submitted after downtime. Existing open entries, fills, and OCO exits
+  are reconciled read-only; an uncertain submission is never resubmitted.
 
 - Runtime: Python 3.12 + Telethon (MTProto) with direct Telegram networking.
 - Storage: SQLite with reproducible migrations.
 - Config: `.env` (secrets) + private `config.toml` (runtime paths/options).
 - CLI: `tg-ingest` (setup, auth, channels, backfill, serve, status, diagnostics,
-  trading status/signals/intents/parse/reconcile/repair-signals, owner control
-  bot).
+  trading status/signals/intents/parse/reconcile/repair-signals/readiness,
+  owner control bot).
 - Exchange: MEXC Spot v3 REST (HMAC-SHA256 signing, documented endpoint weights,
   process-shared rate gates, Decimal arithmetic, idempotent intents,
   partial-fill tracking/reconciliation). Market monitoring batches all symbols
@@ -103,13 +111,16 @@ journalctl -u tg-ingest.service -f
   MEXC permissions, and selects the channel. When `CONTROL_BOT_ENABLED` is true,
   `tg-ingest serve` runs it inside the service process and holds both the serve
   and control locks; `tg-ingest control run` is the standalone controller mode.
-  Both the configured owner and the configured developer have owner-equivalent
-  access to every control-bot command and administrative action. Notifications
-  use one selectable minimum severity
-  (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`); role routing remains separate.
-  Its `/pause` and `/resume` controls are enforced at the order-submission
-  boundary with a kernel file lock and a transactional readiness check. See
-  `docs/CONTROL_BOT_FA.md`.
+  Two configured owners (Owner A and Owner B) have full owner-level controls.
+  The configured programmer has read-only technical/diagnostic access and is
+  never an owner. Both owners receive every operational event; notifications are
+  not filtered by severity or perceived importance. Its `/pause` and `/resume`
+  controls are enforced at the order-submission boundary with a kernel file lock
+  and a transactional readiness check. See `docs/CONTROL_BOT_FA.md`.
+- Before the first controlled start, run the non-trading report
+  `tg-ingest trading readiness --network`; it never places, cancels, or modifies
+  an order and prints `READY FOR FIRST CONTROLLED STARTUP` or `NOT READY` with
+  every blocker.
 
 ## Known limitations (platform-imposed)
 

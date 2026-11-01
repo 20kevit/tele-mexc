@@ -207,22 +207,49 @@ The engine re-validates immediately before submission.
 
 ## Replay boundary and idempotency
 
-The activation boundary is `app_state['trading.activation_boundary_message_id']`.
-At each `serve` start, **before live handlers are registered**, the engine
-snapshots the selected channel's newest stored message id and persists
-`max(existing boundary, snapshot)`. The boundary is forward-only.
+The activation boundary is persisted **per channel** in
+`app_state['trading.activation_boundary.channel.<channel_id>']`. The legacy
+global `trading.activation_boundary_message_id` key is retained only as a
+read-only compatibility fallback for the first start after an upgrade; every
+start rewrites the channel-scoped key.
+
+At each `serve` start, **before live handlers are registered**, the service:
+
+1. asks Telegram for the channel's newest visible message id;
+2. reads the newest already-stored message id for the same channel;
+3. persists `max(existing boundary, Telegram latest, stored latest)`.
+
+The boundary is forward-only. If Telegram's newest id cannot be established
+(network error, unreadable client, persistence error), the boundary is left
+unarmed and new entries fail closed; ingestion may continue for observation and
+audit only.
 
 Always:
 
-- a message at or below the boundary is rejected as historical;
+- a message at or below its channel boundary is rejected as historical;
 - `source='backfill'` and `source='recovery'` rows are non-tradeable regardless
   of their message id;
-- a live row delivered after the snapshot, including while the recovery sweep
-  is running, remains above the boundary and can trade.
+- a message delivered live after the snapshot, including while the recovery
+  sweep is running, remains above the boundary and can trade;
+- a duplicate Telegram update and an edit of a historical message cannot create
+  a new intent.
 
 The persisted boundary can therefore be lower than the newest recovered/backfill
 row. That is intentional: source is the primary guard for downtime traffic, and
-the boundary protects against identity/replay confusion.
+the per-channel boundary protects against identity/replay confusion and delayed
+delivery.
+
+Restart behavior distinguishes lifecycle recovery from stale work:
+
+- existing open entries, fills, cancellation requests, and OCO exits are
+  reconciled read-only;
+- an `unknown_requires_reconciliation` or `submitting` intent is queried, never
+  resubmitted;
+- a `planned` intent whose message is at/below its channel boundary (i.e. it
+  predates this start) is canceled locally, releases its reservation, and is
+  reported to both owners — it is never submitted after downtime;
+- conditional-entry trades created after the current start resume only through
+  a live, fresh market tick.
 
 Idempotency:
 
@@ -580,9 +607,19 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - Every OCO transition writes an audit event (`oco.intended`, `oco.state`,
   `oco.sibling_canceled`) and a notification (`OCO_PROTECTION_ACTIVE`,
   `OCO_PROTECTION_PARTIAL`, `OCO_PROTECTION_UNCERTAIN`, `OCO_PROTECTION_FAILED`)
-  routed by recipient role and the selected minimum severity below.
+  routed to both owners and the programmer; severity never suppresses them.
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
+- Each OCO order is tracked as its own target (`tp1`, `tp2`) with its own
+  take-profit price, stop-loss activation trigger, exchange order id, fill
+  quantity, and cancellation evidence. The two orders are reconciled
+  independently: a healthy OCO1 never implies OCO2 is healthy.
+- **Verified limitation:** the documented MEXC/CLI surface exposes the OCO
+  order's aggregate status and fills, not a separate authoritative child-order
+  state for the TP branch versus the SL branch. This repository therefore
+  records the OCO-level state and infers a sibling cancellation only from
+  exchange evidence (peer canceled with zero sells while its sibling filled). It
+  does not invent a branch-level child state that the API does not expose.
 
 - Conditional LIMIT entry is always the strategy when market is below Entry;
   the default trigger is exactly 3 exchange ticks below Entry.
@@ -657,24 +694,29 @@ changes; audit events are written as `trading.buy_block`.
 
 ## Notifications
 
-Owner/developer notices are written to `trading_notifications` before delivery
-and retried independently of order execution. The outbox key is
-`(event_key, role)`; long text is split into chunks. A notification failure can
-never resubmit an order. Each event carries a severity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, or
-`CRITICAL`). The control bot exposes one selectable minimum severity:
+Owner-level notices are written to `trading_notifications` before delivery
+and retried independently of order execution. The current schema (migration 21)
+stores one durable row per `(event_key, role)` with roles `owner`, `owner_b`, and
+`developer`; long text is split into chunks. A notification failure can never
+resubmit an order.
 
-| Selected level | Delivered |
+Recipient routing is deliberately simple:
+
+| Recipient | Receives |
 | --- | --- |
-| DEBUG | DEBUG and above |
-| INFO | INFO and above |
-| WARNING | WARNING and above |
-| ERROR | ERROR and above |
-| CRITICAL | CRITICAL only |
+| Owner A (`CONTROL_OWNER_USER_ID`) | Every operational event, including parser results, ignored/rejected signals, diagnostics, service lifecycle, and all trading/OCO/cancellation/reconciliation events |
+| Owner B (`CONTROL_OWNER_B_USER_ID`) | The same complete owner event stream |
+| Programmer (`CONTROL_DEVELOPER_USER_ID`) | The same event stream plus technical diagnostics; read-only control-bot access only |
 
-Recipient routing is separate from severity: genuine signals go to owner and
-developer, routine local rejections/diagnostics go to the developer, and
-recovery notices default to the developer. The obsolete per-role/per-category
-`notification_preferences` table is historical and is no longer read or written.
+The legacy `notification_min_severity` setting is retained for compatibility but
+**never suppresses owner-level events**. A signal being routine, a rejection
+being local, or an event being DEBUG does not remove it from either owner's
+stream. Distinct event identities are never collapsed; retries use the stable
+event key and role so the same event is not duplicated.
+
+The programmer is not a third owner: it cannot pause/resume, change the quote
+amount, change MEXC credentials, select a channel, or alter notification
+settings. It can read status/version/help and inspect diagnostics.
 
 ### Delivery outcomes and ambiguous recovery
 
@@ -715,15 +757,19 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 .venv/bin/tg-ingest trading parse <message_id>
 .venv/bin/tg-ingest trading reconcile
 .venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
+.venv/bin/tg-ingest trading readiness --network
 .venv/bin/tg-ingest trading verify
 ```
 
 `verify` and `reconcile` touch MEXC. Never run them without explicit
-authorization. `preflight` performs local binary/version/schema and CLI-profile
-checks; with `--network` it also runs the CLI doctor, one signed read-only
-`current-orders` query, a signed `spot asset account` read, REST key validation,
-and compares the CLI and REST account balances. It never places, cancels or
-modifies an order.
+authorization. `readiness` is non-trading: it reads local state and, with
+`--network`, performs read-only Telegram/MEXC identity checks. It never places,
+cancels, replaces, or modifies an order and prints `READY FOR FIRST CONTROLLED
+STARTUP` or `NOT READY` with every blocker. `preflight` performs local
+binary/version/schema and CLI-profile checks; with `--network` it also runs the
+CLI doctor, one signed read-only `current-orders` query, a signed `spot asset
+account` read, REST key validation, and compares the CLI and REST account
+balances. It never places, cancels or modifies an order.
 
 ### CLI protection: verified limits
 
@@ -756,9 +802,12 @@ modifies an order.
 5. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
    set it to `true`; never leave an explicit `false` when writes are intended.
 6. Complete owner setup: Telegram authenticated, MEXC verified, and channel
-   selected.
-7. Restart once; confirm the activation boundary advanced.
-8. Monitor `trading status`, `trading intents`, and the notification outbox.
+   selected; configure Owner A, Owner B, and the programmer.
+7. Run `trading readiness --network` and require
+   `READY FOR FIRST CONTROLLED STARTUP`; resolve every blocker first.
+8. Restart once; confirm the per-channel activation boundary advanced and the
+   service log reports it for the selected channel.
+9. Monitor `trading status`, `trading intents`, and the notification outbox.
 
 ### OCO certainty follow-up review
 

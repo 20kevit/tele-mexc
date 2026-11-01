@@ -57,6 +57,8 @@ newer releases.
 | Schema/migrations | `test_db_migrations.py` |
 | Message/queue semantics | `test_repository.py`, `test_processing.py`, `test_backfill.py` |
 | Live/recovery behavior | `test_service.py`, `test_live_recovery.py`, `test_service_activation_boundary.py`, `test_full_history_archive.py` |
+| Stale-signal boundary / downtime / restart quarantine | `test_stale_signal_boundary.py`, `test_service_activation_boundary.py` |
+| First-startup readiness report | `test_readiness.py` |
 | Parser/risk/Futures ingestion | `test_signals.py`, `test_futures_signals.py` |
 | Intent/reservation/execution | `test_trading_engine.py`, `test_trading_budget.py`, `test_trading_live_gates.py`, `test_mexc_execution_gates.py` |
 | Reconciliation/fills | `test_trading_live_gates.py`, `test_balance.py` |

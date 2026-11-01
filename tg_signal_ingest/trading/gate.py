@@ -183,6 +183,13 @@ class SubmissionGate:
             channel_ok = self._dimension_ok("channel", bool(row["selected_channel_id"]))
             if not channel_ok:
                 return "no channel is selected"
+            # The live service installs this callback after it has established
+            # the per-channel stale-message boundary.  Absence of the callback
+            # keeps CLI/tests compatible; a present callback returning False is
+            # authoritative and fails closed.
+            boundary_callback = self.runtime.get("activation_boundary")
+            if boundary_callback is not None and not bool(boundary_callback()):
+                return "trading activation boundary is not established; stale signals cannot be ruled out"
             unresolved = conn.execute(
                 "SELECT COUNT(*) AS n FROM order_intents WHERE state IN "
                 "('submitting', 'reconciling', 'unknown_requires_reconciliation')"

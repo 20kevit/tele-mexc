@@ -21,7 +21,7 @@ the document.
 | `README.md` | Everyone | Product summary, quick start, safety model, limitations |
 | `docs/architecture.md` | Developers, operators | Processes, locks, `serve`/`control` lifecycle, ingestion, queue, trading wiring |
 | `docs/operations.md` | Operators | Install, credentials, service, backup, upgrade/rollback, recovery, troubleshooting |
-| `docs/trading.md` | Operators, developers | Parsing, risk, fixed sizing, LIMIT execution, conditional entry, exits, reconciliation, notifications |
+| `docs/trading.md` | Operators, developers | Parsing, risk, fixed sizing, LIMIT execution, conditional entry, per-channel stale-signal boundary, two native OCO exits, restart recovery, reconciliation, readiness, notifications |
 | `docs/data-model.md` | Developers | Active and historical tables, migrations, enums, persistence invariants |
 | `docs/development.md` | Developers | Setup, test areas, lint/typecheck, migrations, change workflow |
 | `docs/documentation-index.md` | Everyone | This index |
@@ -31,7 +31,7 @@ the document.
 | Document | Audience | Covers |
 | --- | --- | --- |
 | `docs/CONTROL_BOT_FA.md` | Owner/developer (Persian) | ControlBot menus, MEXC setup, channel selection, BUY amount, notification severity, pause/resume, troubleshooting |
-| `docs/LIVE_VERIFICATION.md` | Owner/operator | Evidence levels and non-trading live checklist; no claim of current live exchange verification |
+| `docs/LIVE_VERIFICATION.md` | Owner/operator | Evidence levels and non-trading live checklist, including `trading readiness`; no claim of current live exchange verification |
 | `docs/TRADING_DECISIONS.md` | Owner/developers | Dated trading decision record; current sections are limited by later owner decisions |
 | `docs/NON_NEGOTIABLE_TRADING_RULES_EN.md` | Owner/developers | Owner-confirmed safety rules (English) |
 | `docs/NON_NEGOTIABLE_TRADING_RULES_FA.md` | Owner/developers | Owner-confirmed safety rules (Persian) |

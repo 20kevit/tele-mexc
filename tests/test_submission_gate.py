@@ -178,10 +178,11 @@ def test_resume_planned_intents_is_gated_and_conditional_entries_stay_deferred(c
 
     _set_pause(repo, False)
     assert engine.resume_planned_intents() == 0
-    # Without a trade lifecycle row it is deliberately not submitted.
+    # A pre-start planned intent without a per-channel boundary is stale by
+    # definition and is canceled locally, never submitted.
     assert client.place_calls == []
     stored = engine.store.get_intent(intent["intent_id"])
-    assert stored is not None and stored["state"] == "planned"
+    assert stored is not None and stored["state"] == "canceled_local"
 
 
 def _ready(repo: Repository) -> None:

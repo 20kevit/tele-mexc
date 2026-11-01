@@ -56,14 +56,14 @@ Do not silently change behavior to match an old doc.
 | --- | --- |
 | `tg_signal_ingest/main.py` | CLI commands, process startup, locks, `serve` orchestration |
 | `tg_signal_ingest/config.py` | process env > `.env` > TOML > defaults, validation, trading safety caps |
-| `tg_signal_ingest/db.py` | SQLite connection, WAL, embedded migrations 1–20 |
+| `tg_signal_ingest/db.py` | SQLite connection, WAL, embedded migrations 1–21 |
 | `tg_signal_ingest/repository.py` | message upsert, edits, queue transitions, sync state |
 | `tg_signal_ingest/service.py` | live listener, recovery sweep, background workers |
 | `tg_signal_ingest/backfill.py` | resumable history import and checkpoints |
 | `tg_signal_ingest/processing.py` | bounded queue consumer with backoff |
 | `tg_signal_ingest/trading/` | parser, risk, intents, reservations, execution, reconciliation, trade lifecycle, notifications |
 | `tg_signal_ingest/mexc/` | MEXC Spot v3 client, typed errors, symbol metadata, depth parsing |
-| `tg_signal_ingest/control/` | owner/developer controller, setup store, and Bot API client |
+| `tg_signal_ingest/control/` | two-owner/programmer controller, setup store, and Bot API client |
 | `docs/` | operator, developer, architecture, trading, data docs |
 | `deploy/` | systemd unit for `serve` |
 | `tests/` | pytest suite, fakes, parser fixtures |
@@ -77,10 +77,21 @@ Do not silently change behavior to match an old doc.
 - Order idempotency is SHA-256 of
   `(channel_id, message_id, action, symbol)`; one Telegram message can produce
   at most one intent, and a conflicting edit is refused.
-- The activation boundary is persisted in
-  `app_state['trading.activation_boundary_message_id']` and advances forward at
-  every `serve` start. Messages at/below it, and every `source='backfill'`
-  message, are stored and audited but never traded.
+- The activation boundary is persisted **per channel** under
+  `app_state['trading.activation_boundary.channel.<channel_id>']` (with the
+  legacy global key kept only as a migration fallback). Each `serve` start
+  records Telegram's newest visible message id plus the newest stored id before
+  registering live handlers; the value only moves forward. Messages at/below it,
+  and every `source='backfill'`/`'recovery'` row, are stored and audited but never
+  traded. If the boundary cannot be established, new entries fail closed.
+- A `planned` intent that predates the current process start is canceled locally
+  during restart recovery and is never submitted after downtime. Open entries,
+  fills, and OCO exits are reconciled read-only; uncertain submissions are never
+  resubmitted.
+- Two owners (Owner A, Owner B) have owner-level controls. The programmer has
+  read-only technical/diagnostic access and is never an owner. Every recorded
+  operational event is routed to both owners and the programmer; severity or
+  category never suppresses the owners' event stream.
 - Every intent reserves its full quote notional plus the fee buffer in
   `trading_budget_ledger` inside the intent-creation transaction. This is a
   technical/idempotency reservation, not a portfolio budget or spending cap.
@@ -106,6 +117,7 @@ Do not silently change behavior to match an old doc.
 .venv/bin/tg-ingest status
 .venv/bin/tg-ingest backfill status
 .venv/bin/tg-ingest trading status
+.venv/bin/tg-ingest trading readiness          # non-trading, safe
 .venv/bin/tg-ingest control status
 
 # Quality gates

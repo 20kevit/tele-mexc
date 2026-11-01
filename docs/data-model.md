@@ -9,7 +9,7 @@ SQLite schema and persistence invariants. Source of truth:
 - WAL journal mode, `foreign_keys=ON`, 10-second busy timeout, `BEGIN IMMEDIATE`
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
-  `schema_migrations`. Current maximum version: **20**.
+  `schema_migrations`. Current maximum version: **21**.
 - Commands that open a normal repository run migrations, including `status`,
   `backfill status`, `trading status`, and `control status`. Read-only inspection
   of an existing database requires an external SQLite viewer or a disposable
@@ -45,6 +45,7 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 18 | normalized `audit_events` v2 schema (event_type, dedupe_key, indexes) |
 | 19 | `trade_orders` per-leg evidence columns; `trades` OCO/outcome columns; `reconciliation_results`/`messages`/`signals` `source_ref` |
 | 20 | `exchange_operations`, `oco_groups`, `oco_legs`, `notification_preferences`, `notification_callbacks`, `notification_delivery_attempts` |
+| 21 | notification outbox role check widened to `owner`, `owner_b`, `developer`; existing rows preserved |
 
 ## Table groups
 
@@ -57,7 +58,7 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | `message_edits` | PK `(channel_id, message_id, edit_seq)`; append-only edit snapshots |
 | `processing_queue` | unique `(channel_id, message_id, item_type, targets_version)`; status, attempts, `available_at`, error |
 | `sync_state` | per-channel backfill checkpoint, live watermark, last event/recovery times |
-| `app_state` | key/value runtime state; holds the trading activation boundary |
+| `app_state` | key/value runtime state; holds one forward-only activation boundary per channel under `trading.activation_boundary.channel.<id>` (legacy global key is a fallback only) |
 
 `messages.source` is `backfill`, `live`, or `recovery`. Only `live` can be
 tradeable, and only above the activation boundary.
@@ -92,7 +93,7 @@ signals 1 ── * order_intents 1 ── * order_fills
 | `trading_budget_ledger` | one row per executable intent: reserved/spent/fee quote, active flag, state (`reserved`, `uncertain`, `settled`, `released`) |
 | `trading_notifications` | durable outbox; unique `(event_key, role)`, status `pending`/`sending`/`sent`/`failed`/`ambiguous`/`suppressed`/`canceled`, `category`/`event_type`, attempts/error/next attempt |
 
-The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. Notification severity is one global minimum (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`); recipient role routing remains separate.
+The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. The legacy global notification severity value is retained only for compatibility and never suppresses the two owners' event stream; roles are `owner`, `owner_b`, and `developer`.
 The notification outbox is independent of order state.
 
 ### Exchange evidence and OCO lifecycle
@@ -189,9 +190,12 @@ are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable
 7. Fills are idempotent by exchange trade id. `fill_sync_required` keeps terminal
    intents in the reconciliation set until fills match executed quantity.
 8. Notifications are idempotent by `(event_key, role)` and never gate execution.
-9. `app_state` activation boundary is forward-only; each `serve` cycle snapshots
-   the newest pre-handler message id, and `source='recovery'/'backfill'` remains
-   non-tradeable even above the boundary.
+9. `app_state` activation boundaries are per channel and forward-only; each
+   `serve` cycle snapshots Telegram's newest visible id plus the newest
+   pre-handler stored id, and `source='recovery'/'backfill'` remains non-tradeable
+   even above the boundary.
+10. A planned intent at/below its channel boundary is canceled locally during
+    startup recovery; it cannot become a submission after downtime.
 
 ## Backup and integrity
 

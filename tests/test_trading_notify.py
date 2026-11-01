@@ -92,34 +92,35 @@ def test_notification_events_are_idempotent(cfg, repo):
     assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
 
 
-def test_minimum_severity_filters_events(cfg, repo):
+def test_owner_event_stream_is_never_suppressed_by_minimum_severity(cfg, repo):
     engine = _engine(cfg, repo)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
 
+    # The legacy severity preference must not hide owner-level events.
     notifier.notify(event_key="diag", text="debug detail", category="diagnostic")
-    assert bot.sent == []  # default minimum is INFO
-
-    notifier.store.set_notification_min_severity("WARNING")
-    notifier.notify(event_key="info", text="routine info", category="order_lifecycle")
-    assert bot.sent == []
-
-    notifier.notify(event_key="warn", text="reconcile warning", category="reconciliation")
     assert len(bot.sent) == 2
     assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
 
+    notifier.store.set_notification_min_severity("WARNING")
+    notifier.notify(event_key="info", text="routine info", category="order_lifecycle")
+    assert len(bot.sent) == 4
 
-def test_critical_threshold_receives_only_critical(cfg, repo):
+    notifier.notify(event_key="warn", text="reconcile warning", category="reconciliation")
+    assert len(bot.sent) == 6
+
+
+def test_critical_threshold_still_receives_every_owner_event(cfg, repo):
     engine = _engine(cfg, repo)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
     notifier.store.set_notification_min_severity("CRITICAL")
 
     notifier.notify(event_key="err", text="failed", category="order_lifecycle")
-    assert bot.sent == []
+    assert len(bot.sent) == 2
 
     notifier.notify(event_key="crit", text="unprotected", category="critical")
-    assert len(bot.sent) == 2
+    assert len(bot.sent) == 4
 
 
 def test_distinct_trades_never_suppress_each_other(cfg, repo):
@@ -134,3 +135,77 @@ def test_distinct_trades_never_suppress_each_other(cfg, repo):
     assert len(texts) == 4  # two trades x two roles
     assert texts.count("first") == 2
     assert texts.count("second") == 2
+
+
+def test_both_owners_and_programmer_receive_every_event_category(cfg, repo):
+    from tg_signal_ingest.trading.notify import TradingNotifier
+
+    engine = _engine(cfg, repo)
+    bot = FlakyBot()
+    owner_b = 100000003
+    notifier = TradingNotifier(
+        engine.store,
+        bot,
+        owner_id=OWNER,
+        owner_b_id=owner_b,
+        developer_id=DEVELOPER,
+    )
+    engine.notifier = notifier
+
+    required = [
+        "signal.received",
+        "signal.ignored",
+        "signal.rejected",
+        "signal.duplicate",
+        "signal.historical_rejected",
+        "parser.result",
+        "validation.result",
+        "risk.evaluation",
+        "intent.created",
+        "entry.submission_started",
+        "exchange.acknowledgement",
+        "submission.timeout",
+        "submission.uncertain",
+        "order.accepted",
+        "order.rejected",
+        "fill.partial",
+        "fill.full",
+        "fill.synchronized",
+        "oco.creation_attempt",
+        "oco.acknowledged.tp1",
+        "oco.acknowledged.tp2",
+        "oco.rejected",
+        "oco.partial_protection",
+        "oco.full_protection",
+        "stop.activation",
+        "tp.activation",
+        "cancel.request",
+        "cancel.confirmation",
+        "cancel.failure",
+        "reconciliation.started",
+        "reconciliation.result",
+        "restart.recovery",
+        "conditional_entry.state",
+        "api.error",
+        "telegram.connectivity",
+        "mexc.connectivity",
+        "rate_limit",
+        "database.error",
+        "worker.failure",
+        "service.startup",
+        "service.shutdown",
+        "readiness.change",
+        "pause.state",
+    ]
+    for index, event_key in enumerate(required):
+        notifier.notify(event_key=f"evt:{index}:{event_key}", text=f"event {event_key}", category="diagnostic")
+
+    recipients = [chat for chat, _ in bot.sent]
+    for chat_id in (OWNER, owner_b, DEVELOPER):
+        assert recipients.count(chat_id) == len(required)
+    for event_key in required:
+        assert any(event_key in text for _, text in bot.sent)
+    # Independent per-recipient outbox rows, not one broadcast row.
+    rows = repo.db.conn.execute("SELECT role, COUNT(*) AS n FROM trading_notifications GROUP BY role").fetchall()
+    assert {row["role"] for row in rows} == {"owner", "owner_b", "developer"}
+    assert all(int(row["n"]) == len(required) for row in rows)

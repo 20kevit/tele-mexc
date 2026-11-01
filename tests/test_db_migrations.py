@@ -77,7 +77,7 @@ def test_v5_control_tables_and_setup_singleton(tmp_path):
     db.close()
 
 
-def test_v16_database_upgrades_to_v20_and_preserves_rows(tmp_path, monkeypatch):
+def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypatch):
     """Upgrade a populated v16 schema to v20 without losing legacy evidence."""
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS[:16])
@@ -112,8 +112,8 @@ def test_v16_database_upgrades_to_v20_and_preserves_rows(tmp_path, monkeypatch):
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS)
     applied = db.migrate()
-    assert applied == [17, 18, 19, 20]
-    assert db.schema_version() == 20
+    assert applied == [17, 18, 19, 20, 21]
+    assert db.schema_version() == 21
     assert db.migrate() == []  # idempotent
 
     audit = db.conn.execute("SELECT event_type, source_ref FROM audit_events").fetchone()
@@ -138,4 +138,22 @@ def test_v16_database_upgrades_to_v20_and_preserves_rows(tmp_path, monkeypatch):
         for row in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert {"exchange_operations", "oco_groups", "oco_legs", "notification_preferences"} <= tables
+    db.close()
+
+
+def test_current_schema_tracks_two_owner_notification_recipients(tmp_path):
+    db = Database(tmp_path / "db.sqlite3")
+    db.migrate()
+    with db.transaction() as conn:
+        for role in ("owner", "owner_b", "developer"):
+            conn.execute(
+                "INSERT INTO trading_notifications "
+                "(event_key, role, chat_id, text, status, created_at, updated_at) "
+                "VALUES (?, ?, 1, 'x', 'pending', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')",
+                (f"event:{role}", role),
+            )
+    rows = db.conn.execute(
+        "SELECT role FROM trading_notifications WHERE event_key LIKE 'event:%' ORDER BY role"
+    ).fetchall()
+    assert [row["role"] for row in rows] == ["developer", "owner", "owner_b"]
     db.close()

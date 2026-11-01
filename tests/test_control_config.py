@@ -22,15 +22,44 @@ def test_control_env_is_loaded_and_enables_configured_bot(tmp_path):
         environ={
             "CONTROL_BOT_TOKEN": "123:token",
             "CONTROL_OWNER_USER_ID": "4242",
+            "CONTROL_OWNER_B_USER_ID": "4243",
+            "CONTROL_DEVELOPER_USER_ID": "4244",
             "CONTROL_SECRET_KEY": "secret-key-value",
         },
         require_credentials=False,
     )
     assert cfg.control.bot_token == "123:token"
     assert cfg.control.owner_user_id == 4242
+    assert cfg.control.owner_b_user_id == 4243
+    assert cfg.control.developer_user_id == 4244
+    assert cfg.control.owner_ids == (4242, 4243)
     assert cfg.control.secret_key == "secret-key-value"
     assert cfg.control.enabled is True
     assert cfg.control.configured is True
+    assert cfg.control.owners_configured is True
+
+
+def test_control_roles_must_be_distinct(tmp_path):
+    with pytest.raises(ConfigError, match="different"):
+        load_config(
+            root=_root(tmp_path),
+            environ={
+                "CONTROL_BOT_TOKEN": "123:token",
+                "CONTROL_OWNER_USER_ID": "4242",
+                "CONTROL_OWNER_B_USER_ID": "4242",
+            },
+            require_credentials=False,
+        )
+    with pytest.raises(ConfigError, match="different"):
+        load_config(
+            root=_root(tmp_path),
+            environ={
+                "CONTROL_BOT_TOKEN": "123:token",
+                "CONTROL_OWNER_USER_ID": "4242",
+                "CONTROL_DEVELOPER_USER_ID": "4242",
+            },
+            require_credentials=False,
+        )
 
 
 def test_control_can_be_explicitly_disabled(tmp_path):

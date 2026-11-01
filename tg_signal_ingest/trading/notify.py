@@ -61,14 +61,28 @@ class TradingNotifier:
         *,
         owner_id: int | None,
         developer_id: int | None,
+        owner_b_id: int | None = None,
     ):
         self.store = store
         self.bot = bot
         self.recipients: list[tuple[str, int]] = []
-        if owner_id:
-            self.recipients.append(("owner", int(owner_id)))
-        if developer_id:
-            self.recipients.append(("developer", int(developer_id)))
+        seen: set[int] = set()
+
+        def _add(role: str, chat_id: int | None) -> None:
+            if not chat_id:
+                return
+            value = int(chat_id)
+            if value in seen:
+                return
+            seen.add(value)
+            self.recipients.append((role, value))
+
+        # Both owners receive the complete owner-level event stream.  The
+        # programmer receives the same durable event stream *plus* technical
+        # diagnostics; it is never treated as a third owner for authorization.
+        _add("owner", owner_id)
+        _add("owner_b", owner_b_id)
+        _add("developer", developer_id)
 
     @property
     def configured(self) -> bool:
@@ -77,8 +91,13 @@ class TradingNotifier:
     def _targets(self, roles: Iterable[str] | None) -> list[tuple[str, int]]:
         if roles is None:
             return list(self.recipients)
-        allowed = {str(role) for role in roles}
-        return [(role, chat_id) for role, chat_id in self.recipients if role in allowed]
+        requested = {str(role) for role in roles}
+        # ``owner`` is a compatibility alias for "every owner": explicit
+        # owner-level routing must never silently exclude Owner B.
+        if "owner" in requested or "owners" in requested:
+            requested.add("owner")
+            requested.add("owner_b")
+        return [(role, chat_id) for role, chat_id in self.recipients if role in requested]
 
     def enqueue(
         self,
@@ -95,16 +114,15 @@ class TradingNotifier:
     ) -> int:
         """Persist one event for every selected recipient.
 
-        ``roles`` is the central routing boundary: owner-only, developer-only,
-        or both.  The outbox uniqueness key is ``(event_key, role)`` so retries
-        and restarts cannot duplicate an event.
+        ``roles`` selects recipients, not event importance.  Owner-level
+        routing is never filtered by the legacy minimum-severity preference:
+        every recorded operational event reaches both owners.  The outbox
+        uniqueness key is ``(event_key, role)`` so retries and restarts cannot
+        duplicate an event.
         """
 
         targets = self._targets(roles)
         if not targets:
-            return 0
-        level = classify_severity(category, event_key, severity)
-        if not self.store.notification_allowed(level):
             return 0
         allowed_targets = targets
         # Chunk at enqueue time, one durable outbox row per chunk.  A retry

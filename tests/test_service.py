@@ -307,7 +307,8 @@ def test_service_notifications_are_delivered_once_per_recipient(cfg, selected_re
     bot = FakeBot()
     svc.trading.notifier = TradingNotifier(svc.trading.store, bot, owner_id=1, developer_id=2)
 
-    # Critical events go to owner + developer and are deduplicated by event key.
+    # Every service event goes to both owners/programmer and is deduplicated
+    # by event key, not hidden by category or severity.
     svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
     svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
 
@@ -315,7 +316,6 @@ def test_service_notifications_are_delivered_once_per_recipient(cfg, selected_re
     assert {chat for chat, _ in bot.sent} == {1, 2}
     assert all("serve started" in text for _, text in bot.sent)
 
-    # Recovery is developer-only by default (owner opts in).
     svc._notify_service_event(event_key="svc:recovery", text="recovery done", category="recovery")
-    assert len(bot.sent) == 3
-    assert bot.sent[-1] == (2, "recovery done")
+    assert len(bot.sent) == 4
+    assert {chat for chat, _ in bot.sent} == {1, 2}

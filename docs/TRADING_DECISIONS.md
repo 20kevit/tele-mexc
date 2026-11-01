@@ -76,8 +76,14 @@ earlier local-only fallback remains available but is not the shipped live path.
 - Idempotency: `sha256(channel_id:message_id:action:symbol)` → `client_order_id`;
   one Telegram message yields at most one intent; a conflicting edit is refused.
 - Backfilled, recovery-sourced, and at/below-boundary messages are stored and
-  audited but never traded (activation boundary persists in
-  `app_state['trading.activation_boundary_message_id']`).
+  audited but never traded. The boundary is durable **per channel**
+  (`app_state['trading.activation_boundary.channel.<channel_id>']`) and is
+  established from Telegram's newest visible message id plus the newest stored
+  row before live handlers start. If it cannot be established, new entries fail
+  closed.
+- A planned intent that predates the current process start is canceled locally
+  after downtime and is never submitted. Existing open entries, fills, and OCO
+  exits are reconciled read-only; an ambiguous submission is never resubmitted.
 
 ---------------------------------------------------------------
 4. Exit strategy (two native OCO exits — implemented)
@@ -162,12 +168,18 @@ orders; request timeout after the exchange may have accepted it.
 
 - Centralized durable outbox (`trading_notifications`) written before delivery;
   retry is independent of order execution and can never resubmit an order.
-- Both recipients (owner + developer) are notified for genuine signal and
-  trading events; ordinary non-signal diagnostics go to the developer only.
-- Configured destinations are reused (`CONTROL_BOT_TOKEN`, owner/developer user
-  ids). No usernames, IDs, or contact details are invented; if the developer
-  destination is not configured, the missing configuration is identified with
-  exact setup instructions.
+- Two configured owners (Owner A and Owner B) receive **every** operational
+  event, including parser results, ignored/rejected signals, diagnostics,
+  service lifecycle, and all trading/OCO/cancellation/reconciliation events.
+  Severity or perceived importance never suppresses the owners' stream.
+- One configured programmer receives the same durable event stream plus
+  technical diagnostics and has read-only control-bot access. The programmer is
+  not an owner and cannot pause/resume or change trading/channel/credential
+  settings.
+- Configured destinations are reused (`CONTROL_BOT_TOKEN`,
+  `CONTROL_OWNER_USER_ID`, `CONTROL_OWNER_B_USER_ID`,
+  `CONTROL_DEVELOPER_USER_ID`). No usernames, IDs, or contact details are
+  invented; missing destinations are reported as readiness blockers.
 - Persian for owner-facing messages; clear technical English for
   developer-facing messages.
 - Each notification includes timestamp, symbol/signal reference, event and
@@ -177,8 +189,8 @@ orders; request timeout after the exchange may have accepted it.
   credentials. Private signal contents are not exposed to the developer unless
   explicitly authorized by configuration.
 - Undelivered notifications are logged, retried through a bounded durable
-  mechanism, and deduplicated so unchanged states are not repeated on every
-  polling iteration while no meaningful event is silently discarded.
+  mechanism, and deduplicated by `(event_key, role)` so unchanged states are not
+  repeated while no distinct event is silently discarded.
 
 ---------------------------------------------------------------
 8. Historical operational snapshot (not current behavior)

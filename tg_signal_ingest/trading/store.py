@@ -1655,38 +1655,67 @@ class TradingStore:
         assert row is not None
         return str(row["value"])
 
-    def activation_boundary(self) -> int | None:
-        raw = self.get_app_state("trading.activation_boundary_message_id")
+    # Per-channel durable activation boundaries.  The legacy single key is
+    # kept as a read-only compatibility fallback for databases created before
+    # channel-scoped boundaries existed; new starts always write the channel
+    # key.  No restart may ever move a channel boundary backwards.
+    BOUNDARY_PREFIX = "trading.activation_boundary.channel."
+    LEGACY_BOUNDARY_KEY = "trading.activation_boundary_message_id"
+
+    def activation_boundary_key(self, channel_id: int) -> str:
+        return f"{self.BOUNDARY_PREFIX}{int(channel_id)}"
+
+    def activation_boundary(self, channel_id: int | None = None) -> int | None:
+        """Return the durable first-non-tradeable boundary.
+
+        With ``channel_id`` the channel-scoped key is authoritative.  The
+        legacy global key is only a compatibility fallback for the first start
+        after an upgrade; a service start rewrites the channel-scoped key.
+        """
+
+        if channel_id is None:
+            raw = self.get_app_state(self.LEGACY_BOUNDARY_KEY)
+        else:
+            raw = self.get_app_state(self.activation_boundary_key(channel_id))
+            if raw in (None, ""):
+                raw = self.get_app_state(self.LEGACY_BOUNDARY_KEY)
         try:
             return int(raw) if raw not in (None, "") else None
         except (TypeError, ValueError):
             return None
 
     def ensure_activation_boundary(self, channel_id: int, *, minimum: int | None = None) -> int:
-        """Persist a safe first-tradeable Telegram message id.
+        """Persist a safe first-tradeable Telegram message id per channel.
 
         Only message ids greater than this boundary may create orders.  On the
-        first live start the boundary is the newest stored/recovered channel
-        message, so a downtime backlog is never replayed as fresh orders.  A
-        later startup may move the boundary *forward* (never backwards) to keep
-        the same guarantee after a restart.
+        first live start the boundary is the newest message visible on Telegram
+        (or already stored, whichever is higher), so a downtime backlog is never
+        replayed as fresh orders.  A later startup may move the boundary
+        *forward* (never backwards) to keep the same guarantee after a restart.
         """
 
-        existing = self.activation_boundary()
+        channel_id = int(channel_id)
+        key = self.activation_boundary_key(channel_id)
+        raw = self.get_app_state(key)
+        try:
+            existing = int(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            existing = None
         if existing is not None:
             if minimum is not None and int(minimum) > existing:
                 with self.db.transaction() as conn:
                     conn.execute(
-                        "UPDATE app_state SET value = ?, updated_at = ? "
-                        "WHERE key = 'trading.activation_boundary_message_id'",
-                        (str(int(minimum)), self._ts()),
+                        "UPDATE app_state SET value = ?, updated_at = ? WHERE key = ?",
+                        (str(int(minimum)), self._ts(), key),
                     )
+                self._advance_legacy_boundary(int(minimum))
                 return int(minimum)
+            self._advance_legacy_boundary(existing)
             return existing
         if minimum is not None:
-            # The startup caller captured the newest pre-handler id.  Use that
-            # exact snapshot: a message delivered during handler registration
-            # is newer and must remain above the boundary.
+            # The startup caller captured the newest pre-handler Telegram id.
+            # Use that exact snapshot: a message delivered during handler
+            # registration is newer and must remain above the boundary.
             boundary = max(0, int(minimum))
         else:
             row = self.db.conn.execute(
@@ -1694,8 +1723,33 @@ class TradingStore:
                 (channel_id,),
             ).fetchone()
             boundary = int(row["m"] or 0)
-        effective = self.set_app_state_once("trading.activation_boundary_message_id", str(boundary))
-        return int(effective)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, str(boundary), self._ts()),
+            )
+            row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
+        effective = int(row["value"]) if row is not None else boundary
+        self._advance_legacy_boundary(effective)
+        return effective
+
+    def _advance_legacy_boundary(self, boundary: int) -> None:
+        """Keep the legacy global key at the highest channel boundary.
+
+        This is a compatibility mirror only; execution checks always resolve
+        the boundary for the message's own channel.
+        """
+
+        current = self.activation_boundary()
+        if current is not None and current >= int(boundary):
+            return
+        now = self._ts()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (self.LEGACY_BOUNDARY_KEY, str(int(boundary)), now),
+            )
 
     # -------------------------------------------------------- notifications
 

@@ -42,9 +42,8 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
     assert "سیگنال جدید دریافت شد" not in _joined(bot)
 
 
-def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, repo):
-    """Owner policy: routine local signal rejections go to the developer only,
-    never to the owner; this is explicit role routing, not a severity preference."""
+def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
+    """Every genuine signal decision reaches both owners and the programmer."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -55,8 +54,8 @@ def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, rep
 
     assert result is None
     assert client.place_calls == 0
-    assert len(bot.sent) == 1
-    assert {chat for chat, _ in bot.sent} == {DEVELOPER}
+    assert len(bot.sent) == 2
+    _assert_both(bot)
     joined = _joined(bot)
     assert "status: IGNORED_SELL_SPOT_BUY_ONLY" in joined
     assert "Spot BUY only" in joined
@@ -65,8 +64,8 @@ def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, rep
     assert "ACCEPTED_OPEN" not in joined and "SUBMISSION_REJECTED" not in joined
 
 
-def test_locally_rejected_genuine_buy_notifies_developer_only_with_reason(cfg, repo):
-    """A genuine signal rejected locally is reported to the developer only."""
+def test_locally_rejected_genuine_buy_notifies_both_owners_with_reason(cfg, repo):
+    """A genuine signal rejected locally is reported to both owners."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -77,8 +76,8 @@ def test_locally_rejected_genuine_buy_notifies_developer_only_with_reason(cfg, r
 
     assert result is None
     assert client.place_calls == 0
-    assert len(bot.sent) == 1
-    assert {chat for chat, _ in bot.sent} == {DEVELOPER}
+    assert len(bot.sent) == 2
+    _assert_both(bot)
     joined = _joined(bot)
     assert "status: REJECTED_LOCALLY" in joined
     assert "no entry price" in joined
@@ -302,7 +301,7 @@ def test_partial_fill_then_full_fill_sends_meaningful_updates(cfg, repo):
     assert client.place_calls == 1
 
 
-def test_not_a_signal_goes_to_developer_only_with_exact_text(cfg, repo):
+def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -316,10 +315,9 @@ def test_not_a_signal_goes_to_developer_only_with_exact_text(cfg, repo):
     for message_id, text in enumerate(cases, 1):
         engine.process_item(_item(100, message_id), _store_message(repo, message_id, text))
 
-    assert len(bot.sent) == len(cases)
-    assert {chat for chat, _ in bot.sent} == {DEVELOPER}
-    assert all(chat != OWNER for chat, _ in bot.sent)
-    for (_, sent_text), original in zip(bot.sent, cases, strict=True):
+    assert len(bot.sent) == len(cases) * 2
+    _assert_both(bot)
+    for (_, sent_text), original in zip(bot.sent[::2], cases, strict=True):
         assert original in sent_text
         assert "status: NOT_A_SIGNAL" in sent_text
         assert "original message:" in sent_text

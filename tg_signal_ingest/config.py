@@ -154,25 +154,40 @@ class TradingConfig:
 
 @dataclass
 class ControlConfig:
-    """Telegram bot settings for one owner and one developer operator.
+    """Telegram bot settings for two owners and one programmer.
 
-    The owner and developer are separate, explicitly configured numeric
-    Telegram user IDs. Usernames are never used for authorization. Secrets are
-    supplied through the process environment (or the private ``.env``); they
-    are never written to config.toml, logs, or the database in plaintext.
+    Owner A (``owner_user_id``) and Owner B (``owner_b_user_id``) have full
+    owner-level controls.  The programmer (``developer_user_id``) is *not* an
+    owner: it receives every operational event and technical diagnostics but
+    may only run read-only diagnostic commands.  All three are separate,
+    explicitly configured numeric Telegram user IDs. Usernames are never used
+    for authorization. Secrets are supplied through the process environment (or
+    the private ``.env``); they are never written to config.toml, logs, or the
+    database in plaintext.
     """
 
     enabled: bool = False
     bot_token: str | None = None
     owner_user_id: int | None = None
+    owner_b_user_id: int | None = None
     developer_user_id: int | None = None
     secret_key: str | None = None  # encrypts MEXC credentials at rest
     api_base: str = "https://api.telegram.org"
     poll_timeout_s: int = 25
 
     @property
+    def owner_ids(self) -> tuple[int, ...]:
+        """Configured owner ids, in stable Owner A -> Owner B order."""
+
+        return tuple(value for value in (self.owner_user_id, self.owner_b_user_id) if value)
+
+    @property
     def configured(self) -> bool:
         return bool(self.bot_token and self.owner_user_id)
+
+    @property
+    def owners_configured(self) -> bool:
+        return bool(self.owner_user_id and self.owner_b_user_id)
 
 
 @dataclass
@@ -654,6 +669,7 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
 
     token = env.get("CONTROL_BOT_TOKEN") or section.get("bot_token")
     owner = env.get("CONTROL_OWNER_USER_ID") or section.get("owner_user_id")
+    owner_b = env.get("CONTROL_OWNER_B_USER_ID") or section.get("owner_b_user_id")
     developer = env.get("CONTROL_DEVELOPER_USER_ID") or section.get("developer_user_id")
     secret = env.get("CONTROL_SECRET_KEY") or section.get("secret_key")
     enabled = env.get("CONTROL_BOT_ENABLED")
@@ -670,6 +686,11 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
             c.owner_user_id = int(str(owner).strip())
         except ValueError as exc:
             raise ConfigError("CONTROL_OWNER_USER_ID must be a numeric Telegram user id.") from exc
+    if owner_b not in (None, ""):
+        try:
+            c.owner_b_user_id = int(str(owner_b).strip())
+        except ValueError as exc:
+            raise ConfigError("CONTROL_OWNER_B_USER_ID must be a numeric Telegram user id.") from exc
     if developer not in (None, ""):
         try:
             c.developer_user_id = int(str(developer).strip())
@@ -685,11 +706,14 @@ def _load_control(cfg: AppConfig, toml: dict[str, object], env: dict[str, str]) 
         c.api_base = base.rstrip("/")
     if c.owner_user_id is not None and c.owner_user_id <= 0:
         raise ConfigError("CONTROL_OWNER_USER_ID must be a positive numeric Telegram user id.")
+    if c.owner_b_user_id is not None and c.owner_b_user_id <= 0:
+        raise ConfigError("CONTROL_OWNER_B_USER_ID must be a positive numeric Telegram user id.")
     if c.developer_user_id is not None and c.developer_user_id <= 0:
         raise ConfigError("CONTROL_DEVELOPER_USER_ID must be a positive numeric Telegram user id.")
-    if c.owner_user_id is not None and c.developer_user_id is not None and c.owner_user_id == c.developer_user_id:
+    configured_ids = [value for value in (c.owner_user_id, c.owner_b_user_id, c.developer_user_id) if value is not None]
+    if len(configured_ids) != len(set(configured_ids)):
         raise ConfigError(
-            "CONTROL_OWNER_USER_ID and CONTROL_DEVELOPER_USER_ID must be different; "
+            "Owner A, Owner B, and the programmer must have different numeric Telegram user ids; "
             "roles must remain distinguishable in authorization and audit records."
         )
     if c.enabled and not c.configured:

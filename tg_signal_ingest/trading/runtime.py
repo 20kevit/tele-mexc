@@ -61,7 +61,7 @@ def _build_notifier(cfg: AppConfig, store: TradingStore) -> Any | None:
     """Build the durable owner/developer notifier when Bot API is configured."""
 
     control = cfg.control
-    if not control.bot_token or not (control.owner_user_id or control.developer_user_id):
+    if not control.bot_token or not (control.owner_user_id or control.owner_b_user_id or control.developer_user_id):
         return None
     try:
         from ..control.bot_api import BotApiClient
@@ -72,6 +72,7 @@ def _build_notifier(cfg: AppConfig, store: TradingStore) -> Any | None:
             store,
             bot,
             owner_id=control.owner_user_id,
+            owner_b_id=control.owner_b_user_id,
             developer_id=control.developer_user_id,
         )
     except Exception as exc:  # noqa: BLE001 - notifications must never block trading

@@ -373,7 +373,7 @@ def test_control_status_cli_is_offline_and_redacts_secrets(cfg, repo, monkeypatc
     assert main_module.cmd_control_status(None) == 0
     out = capsys.readouterr().out
     assert "state: automatic" in out
-    assert f"owner user id: {OWNER}" in out
+    assert f"owner A user id: {OWNER}" in out
     assert "bot token: set" in out
     assert "execution paused: False" in out
     assert "valid signals execute automatically" in out
@@ -485,39 +485,78 @@ def _bot_with_developer(cfg, repo, probe=("valid", "Owner")) -> tuple[ControlBot
     return control, fake, engine
 
 
-async def test_developer_receives_owner_equivalent_start_and_version(cfg, repo):
+async def test_developer_receives_read_only_start_and_version(cfg, repo):
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
     control, fake, _engine = _bot_with_developer(cfg, repo)
 
-    # Developer /start is accepted (not rejected) and shows system status.
+    # Programmer /start is accepted (not rejected) and shows system status.
     await control.handle_update(_message(1, "/start", user=DEVELOPER))
     text = fake.sent[-1]["text"]
     assert "دسترسی مجاز نیست" not in text
     assert "وضعیت سیستم" in text
 
-    # Developer /version is accepted and returns runtime info.
+    # Programmer /version is accepted and returns runtime info.
     await control.handle_update(_message(2, "/version", user=DEVELOPER))
     text = fake.sent[-1]["text"]
     assert "دسترسی مجاز نیست" not in text
     assert "نسخه اجرا" in text
 
 
-async def test_developer_can_pause_and_resume(cfg, repo):
+async def test_developer_cannot_pause_or_resume(cfg, repo):
     _add_channel(repo)
     store = ControlStore(repo.db)
     _full_setup(store)
     control, fake, _engine = _bot_with_developer(cfg, repo)
+    before = int(store.setup()["paused"])
 
-    # Developer can pause execution.
+    # The programmer is not an owner: state-changing callbacks are refused.
     await control.handle_update(_callback(100, "m:pause", user=DEVELOPER))
-    assert int(store.setup()["paused"]) == 1
-    assert store.setup()["effective_state"] == "paused"
-
-    # Developer can resume execution.
+    assert int(store.setup()["paused"]) == before
     await control.handle_update(_callback(101, "m:resume", user=DEVELOPER))
+    assert int(store.setup()["paused"]) == before
+
+    # Text commands that change execution state are refused too.
+    await control.handle_update(_message(102, "/pause", user=DEVELOPER))
+    assert int(store.setup()["paused"]) == before
+    assert "فقط برای مالکان" in fake.sent[-1]["text"]
+
+
+async def test_second_owner_has_owner_level_controls(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+    cfg.control.owner_b_user_id = 8888
+
+    await control.handle_update(_message(1, "/start", user=8888))
+    assert "دسترسی مجاز نیست" not in fake.sent[-1]["text"]
+    await control.handle_update(_callback(2, "m:pause", user=8888))
+    assert int(store.setup()["paused"]) == 1
+    await control.handle_update(_callback(3, "m:resume", user=8888))
     assert int(store.setup()["paused"]) == 0
+
+
+async def test_wrong_chat_and_replayed_callbacks_are_refused(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot_with_developer(cfg, repo)
+    before = int(store.setup()["paused"])
+
+    # An owner identity outside its own private chat cannot pause the system.
+    forged = _callback(100, "m:pause", user=OWNER)
+    forged["callback_query"]["message"]["chat"] = {"id": 999999, "type": "group"}
+    await control.handle_update(forged)
+    assert int(store.setup()["paused"]) == before
+
+    # Replaying the same Telegram update_id is a no-op.
+    pause = _callback(101, "m:pause", user=OWNER)
+    await control.handle_update(pause)
+    assert int(store.setup()["paused"]) == 1
+    await control.handle_update(pause)
+    assert int(store.setup()["paused"]) == 1
 
 
 async def test_stranger_remains_blocked_for_all_control_commands(cfg, repo):

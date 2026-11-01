@@ -119,6 +119,17 @@ class ControlBot:
     def attach_engine(self, engine: Any) -> None:
         self._engine = engine
 
+    def _notify_control_event(self, event_key: str, text: str, *, category: str = "critical") -> None:
+        """Route a control-plane state transition to both owners + programmer."""
+
+        notifier = getattr(self._engine, "notifier", None) if self._engine is not None else None
+        if notifier is None:
+            return
+        try:
+            notifier.notify(event_key=event_key, text=text, category=category, event_type=event_key)
+        except Exception:  # noqa: BLE001 - notification failure never blocks controls
+            log.warning("control event notification failed", exc_info=True)
+
     # -------------------------------------------------------- bot transport
 
     async def _send(self, chat_id: int, text: str, kb: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -153,16 +164,36 @@ class ControlBot:
     async def _handle_message(self, message: dict[str, Any]) -> None:
         user_id = _from_id(message)
         chat_id = int((message.get("chat") or {}).get("id") or 0)
-        if not self._authorized(user_id):
+        role = self._role(user_id)
+        if role is None:
             if chat_id:
                 await self._send(chat_id, "⛔ دسترسی مجاز نیست.")
             return
         if not chat_id:
             return
+        chat_type = str((message.get("chat") or {}).get("type") or "")
+        if chat_id != int(user_id or 0) or (chat_type and chat_type != "private"):
+            self.store.audit(
+                "wrong_chat_rejected",
+                "control command refused outside the operator's private chat",
+            )
+            await self._send(chat_id, "⛔ این ربات فقط در چت خصوصی همان اپراتور مجاز است.")
+            return
         text = (message.get("text") or "").strip()
         message_id = int(message.get("message_id") or 0)
         if not text:
             await self._send(chat_id, "فقط پیام متنی پشتیبانی می‌شود. /help")
+            return
+        if role == "developer" and not self._developer_command_allowed(text):
+            self.store.audit(
+                "developer_restricted",
+                f"programmer role denied owner-level command {text.split(maxsplit=1)[0][:40]!r}",
+            )
+            await self._send(
+                chat_id,
+                "⛔ این عملیات فقط برای مالکان مجاز است. نقش برنامه‌نویس تنها "
+                "دسترسی تشخیصی/فنی دارد: /status، /version، /help.",
+            )
             return
 
         # Login from chat is not supported. Discard any challenge persisted by
@@ -244,23 +275,39 @@ class ControlBot:
         else:
             await self._send(chat_id, "از منوی زیر انتخاب کنید یا /start را بزنید.", self._menu_kb())
 
-    def _authorized(self, user_id: int | None) -> bool:
-        """Return True for the configured owner or the configured developer.
+    def _role(self, user_id: int | None) -> str | None:
+        """Resolve the configured role for a Telegram user id.
 
-        Both operators have owner-equivalent access to every control-bot command
-        and administrative action (start/status, pause/resume, version, MEXC
-        setup, channel selection, sizing, notifications, disconnect, adopt).
-        Usernames are never used for authorization. The owner
-        account and its permissions are preserved; the developer is added as an
-        additional explicitly configured numeric Telegram user id.
+        ``owner`` covers BOTH configured owners; ``developer`` is the single
+        programmer.  Usernames are never authorization inputs.
         """
+
         if user_id is None:
-            return False
-        owner = self.cfg.control.owner_user_id
+            return None
+        if int(user_id) in self.cfg.control.owner_ids:
+            return "owner"
         developer = self.cfg.control.developer_user_id
-        if user_id == owner:
-            return True
-        return developer is not None and user_id == developer
+        if developer is not None and int(user_id) == developer:
+            return "developer"
+        return None
+
+    def _authorized(self, user_id: int | None) -> bool:
+        """Return True for either owner or the configured programmer."""
+
+        return self._role(user_id) is not None
+
+    @staticmethod
+    def _developer_command_allowed(text: str) -> bool:
+        """Only read-only diagnostic commands for the programmer role."""
+
+        head = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+        return head in ("/start", "/status", "/menu", "/help", "/version")
+
+    @staticmethod
+    def _developer_callback_allowed(data: str) -> bool:
+        """Read-only callbacks only; never pause/resume/config/setup."""
+
+        return data in ("m:status", "m:help")
 
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = str(callback.get("id") or "")
@@ -268,10 +315,26 @@ class ControlBot:
         message = callback.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = int(chat.get("id") or user_id or 0)
-        if not self._authorized(user_id):
+        role = self._role(user_id)
+        if role is None:
             await self._answer(callback_id, "دسترسی مجاز نیست")
             return
+        chat_type = str(chat.get("type") or "")
+        if chat_id != int(user_id or 0) or (chat_type and chat_type != "private"):
+            self.store.audit(
+                "wrong_chat_rejected",
+                "control callback refused outside the operator's private chat",
+            )
+            await self._answer(callback_id, "این عملیات فقط در چت خصوصی مجاز است")
+            return
         data = str(callback.get("data") or "")
+        if role == "developer" and not self._developer_callback_allowed(data):
+            self.store.audit(
+                "developer_restricted",
+                f"programmer role denied owner-level callback {data[:40]!r}",
+            )
+            await self._answer(callback_id, "این عملیات فقط برای مالکان مجاز است")
+            return
         await self._answer(callback_id)
         try:
             await self._route_callback(chat_id, data)
@@ -964,11 +1027,16 @@ class ControlBot:
         # Locks and SQLite are blocking; keep the control bot's event loop free.
         failure = await asyncio.to_thread(self._pause_atomically)
         if failure:
+            self._notify_control_event(
+                "control:pause_not_acknowledged",
+                f"⏸ توقف اجرا تأیید نشد: {failure}",
+            )
             await self._send(
                 chat_id,
                 "⏸ درخواست توقف ثبت شد اما سفارش در حال ارسال تمام نشد. وضعیت توقف تأیید نشد؛ لطفاً دوباره تلاش کنید.",
             )
             return
+        self._notify_control_event("control:paused", "⏸ اجرای سفارش‌های جدید توسط مالک متوقف شد.")
         await self._send(chat_id, "⏸ اجرای سفارش‌های جدید متوقف شد.")
         await self._show_start(chat_id)
 
@@ -976,6 +1044,10 @@ class ControlBot:
         blocker, failure = await asyncio.to_thread(self._resume_atomically)
 
         if blocker:
+            self._notify_control_event(
+                "control:resume_refused",
+                f"▶️ ادامه اجرا رد شد؛ پیش‌نیاز ناقص است: {blocker}",
+            )
             await self._send(
                 chat_id,
                 f"▶️ ادامه اجرا ممکن نیست تا زمانی که شرایط آماده‌سازی کامل شود:\n{blocker}",
@@ -984,6 +1056,7 @@ class ControlBot:
         if failure:
             with contextlib.suppress(Exception):
                 self.store.audit("resume_failed", failure)
+            self._notify_control_event("control:resume_failed", f"▶️ ادامه اجرا انجام نشد: {failure}")
             await self._send(
                 chat_id,
                 f"▶️ ادامه اجرا انجام نشد و سیستم در حالت توقف باقی ماند. دلیل: {failure}",
@@ -994,6 +1067,7 @@ class ControlBot:
         if callable(resume):
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(resume)
+        self._notify_control_event("control:resumed", "▶️ اجرای خودکار توسط مالک ادامه یافت.")
         await self._send(chat_id, "▶️ اجرای خودکار ادامه یافت.")
         await self._show_start(chat_id)
 

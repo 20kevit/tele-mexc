@@ -57,9 +57,13 @@ log = logging.getLogger("ingest.trading")
 
 EXCHANGE_TERMINAL = {"FILLED", "CANCELED", "PARTIALLY_CANCELED"}
 
-# Central notification routing.  Genuine signals go to both recipients; only
-# non-signal diagnostics go to the developer alone.
-NOTIFY_BOTH = ("owner", "developer")
+# Central notification routing.  Every owner-level event (including ordinary
+# local rejections and "not a signal" parser results) goes to both owners and
+# the programmer.  Technical diagnostics are an additional stream, never a
+# replacement for the owners' event stream.
+NOTIFY_ALL: tuple[str, ...] | None = None
+# Retained for backwards-compatible imports in integrations; it is intentionally
+# not used to hide events from the owners.
 NOTIFY_DEVELOPER = ("developer",)
 
 
@@ -228,7 +232,7 @@ class TradingEngine:
         historical = self._is_historical(item, record)
         if historical:
             if parsed.kind in ("alert", "update", "ambiguous", "cancel"):
-                boundary = self.store.activation_boundary()
+                boundary = self.store.activation_boundary(item.channel_id)
                 if record.get("source") == "backfill":
                     reason = "historical backfill message; only new Telegram messages can trade"
                 elif record.get("source") == "recovery":
@@ -293,7 +297,7 @@ class TradingEngine:
                 "message recovered while bridging an outage; only messages delivered live after startup can trade"
             )
         else:
-            boundary = self.store.activation_boundary()
+            boundary = self.store.activation_boundary(item.channel_id)
             if boundary is None:
                 replay_reason = "trading activation boundary is not set; refusing to trade"
             elif item.message_id <= boundary:
@@ -539,18 +543,30 @@ class TradingEngine:
         return result
 
     def resume_planned_intents(self, limit: int = 100) -> int:
-        """Resume intents left ``planned`` by pause/crash, never test rows.
+        """Resume intents left ``planned`` by pause, never stale downtime work.
 
-        Only intents that already own a trade row are resumed.  A conditional
-        entry remains deferred to its price trigger.  Anything else is left for
-        operator review rather than submitted without lifecycle protection.
+        A planned intent whose Telegram message is at/below the channel's
+        persisted activation boundary predates this process start.  It must
+        never be executed after downtime: the signal is historical by identity
+        even though no exchange write was attempted.  Such rows are canceled
+        locally (with an owner notification) and release their reservation.
+
+        Only a planned intent created *after* this start (message id above the
+        boundary) is eligible, and only when it already owns a trade row.  A
+        conditional entry remains deferred to its live price trigger.
         """
 
         resumed = 0
-        if self.trade_manager is None:
-            return 0
         for intent in self.store.list_planned_intents(limit=limit):
             if intent.get("mode") != "live":
+                continue
+            channel_id = int(intent.get("create_channel_id") or 0)
+            message_id = int(intent.get("create_msg_id") or 0)
+            boundary = self.store.activation_boundary(channel_id)
+            if boundary is None or message_id <= boundary:
+                self._cancel_stale_planned_intent(intent, boundary)
+                continue
+            if self.trade_manager is None:
                 continue
             trade = self.store.get_trade_by_intent(intent["intent_id"])
             if trade is None:
@@ -570,8 +586,62 @@ class TradingEngine:
             self.trade_manager.on_intent_executed(result)
         return resumed
 
+    def _cancel_stale_planned_intent(self, intent: dict[str, Any], boundary: int | None) -> None:
+        """Cancel a pre-start planned intent locally; never submit it."""
+
+        intent_id = str(intent["intent_id"])
+        reason = (
+            "startup recovery: planned intent predates the durable activation boundary "
+            f"({boundary}); it was not submitted before downtime and will not be "
+            "submitted now"
+        )
+        try:
+            self.store.transition_intent(
+                intent_id,
+                "canceled_local",
+                note=reason,
+                reject_reason=reason,
+                category="lifecycle",
+            )
+            signal_id = intent.get("signal_id")
+            if signal_id:
+                self.store.update_signal(str(signal_id), "canceled", reason)
+            trade = self.store.get_trade_by_intent(intent_id)
+            if trade is not None and trade.get("trade_state") in ("pending_entry", "entry_active"):
+                self.store.update_trade_state(
+                    trade["trade_id"],
+                    "closed",
+                    note=reason,
+                    sl_state="canceled",
+                )
+            self.store.audit(
+                intent_id,
+                "lifecycle",
+                "stale_planned_intent_canceled",
+                reason,
+                event_type="recovery.stale_planned_canceled",
+                signal_id=signal_id,
+                intent_id=intent_id,
+                symbol=intent.get("symbol"),
+                outcome="canceled_local",
+                dedupe_key=f"stale-plan:{intent_id}",
+            )
+            self._notify(
+                event_key=f"{intent_id}:recovery:stale_plan_canceled",
+                signal_id=signal_id,
+                intent_id=intent_id,
+                text=(
+                    f"{intent.get('symbol')}: سفارش برنامه‌ریزی‌شده پیش از توقف/ری‌استارت "
+                    f"اجرا نشد (مرز فعال‌سازی {boundary}). هیچ سفارش واقعی ارسال نشد."
+                ),
+                category="recovery",
+                event_type="recovery.stale_planned_canceled",
+            )
+        except Exception as exc:  # noqa: BLE001 - recovery must continue
+            log.error("failed to cancel stale planned intent %s: %s", intent_id, exc)
+
     def _is_at_or_below_boundary(self, item: QueueItem) -> bool:
-        boundary = self.store.activation_boundary()
+        boundary = self.store.activation_boundary(item.channel_id)
         return boundary is None or item.message_id <= boundary
 
     def _is_historical(self, item: QueueItem, record: dict[str, Any]) -> bool:
@@ -796,7 +866,7 @@ class TradingEngine:
         intent: dict[str, Any] | None = None,
         submission_attempted: bool = False,
         diagnostics: str | None = None,
-        roles: Iterable[str] | None = NOTIFY_BOTH,
+        roles: Iterable[str] | None = NOTIFY_ALL,
         category: str = "signal_decision",
         event_type: str | None = None,
     ) -> None:
@@ -833,7 +903,7 @@ class TradingEngine:
         *,
         record: dict[str, Any] | None = None,
     ) -> None:
-        """Developer-only diagnostic for a message that is not a trading signal."""
+        """Report a parser result / non-signal to both owners and the programmer."""
 
         if parsed.kind == "result":
             reason = "result/take-profit follow-up, not a new trading signal"
@@ -853,7 +923,7 @@ class TradingEngine:
             record=record,
             signal_id=signal_id,
             diagnostics=parsed.reason_text or None,
-            roles=NOTIFY_DEVELOPER,
+            roles=NOTIFY_ALL,
             category="signal_decision",
             event_type="signal.not_a_signal",
         )
@@ -888,7 +958,7 @@ class TradingEngine:
             record=record,
             signal_id=signal_id,
             diagnostics=parsed.reason_text or None,
-            roles=NOTIFY_DEVELOPER,
+            roles=NOTIFY_ALL,
             category="signal_decision",
             event_type="signal.rejected_locally",
         )
@@ -1093,6 +1163,17 @@ class TradingEngine:
                 reject_reason="legacy non-executable intent",
                 category="risk",
             )
+            result = self.store.get_intent(intent_id)
+            assert result is not None
+            return result
+        # Identity/replay guard at the last possible local boundary.  A planned
+        # row whose message predates this process start must never be submitted,
+        # even if a queue retry or operator command reaches execute_intent().
+        channel_id = int(intent.get("create_channel_id") or 0)
+        message_id = int(intent.get("create_msg_id") or 0)
+        boundary = self.store.activation_boundary(channel_id)
+        if boundary is not None and message_id <= boundary:
+            self._cancel_stale_planned_intent(intent, boundary)
             result = self.store.get_intent(intent_id)
             assert result is not None
             return result

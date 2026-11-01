@@ -18,8 +18,9 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
   a missing offset resolves to 3, never direct entry.
 - `/pause` is enforced at the exchange-submission boundary; `/resume` rechecks
   readiness and cannot bypass emergency stop or reconciliation blockers.
-- Notifications use one minimum severity: DEBUG, INFO, WARNING, ERROR, or
-  CRITICAL. Recipient routing for owner/developer remains separate.
+- Both owners receive every operational event. The legacy minimum-severity
+  setting is retained for compatibility but never suppresses the owners' stream.
+  The programmer receives the same event stream plus technical diagnostics.
 - Balance checks verify sufficiency for the exact order; no percentage of the
   account is reserved.
 - The service opens no inbound ports and exposes no HTTP API.
@@ -95,7 +96,7 @@ effective fixed amount — not secret values.
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | private `.env` | Telegram application credentials for MTProto |
 | Telegram session file | `config/tg_session.session` or `$TG_SESSION_PATH.session`, mode `0600` | Personal-account session; never commit or copy into chat |
 | `CONTROL_BOT_TOKEN` | private `.env` | BotFather token for the single ControlBot |
-| `CONTROL_OWNER_USER_ID` / `CONTROL_DEVELOPER_USER_ID` | private `.env` | Numeric Telegram user IDs; mutually distinct |
+| `CONTROL_OWNER_USER_ID` / `CONTROL_OWNER_B_USER_ID` / `CONTROL_DEVELOPER_USER_ID` | private `.env` | Numeric Telegram user IDs; all distinct. Owner A and Owner B have full owner controls; the programmer has read-only technical/diagnostic access and receives every event |
 | `CONTROL_SECRET_KEY` | private `.env` | Encrypts MEXC credentials stored by the control menu |
 | `MEXC_API_KEY` / `MEXC_API_SECRET` | private `.env` | Spot account read + Spot trade; never withdrawal |
 | MEXC CLI profile | CLI-owned `~/.mexc/profiles` | Same Spot account/key as REST; used for writes |
@@ -200,13 +201,15 @@ systemctl is-active tg-ingest
 journalctl -u tg-ingest -n 50 --no-pager
 ```
 
-A restart advances the trading activation boundary to the newest message
-already stored **before live handlers are registered**. Everything at or below
-that snapshot becomes non-tradeable history. Messages recovered during the
-startup sweep remain above the snapshot but are non-tradeable by
-`source='recovery'`; a genuinely new live message delivered after the snapshot
-is still tradeable. Expect the boundary to advance on every restart, and do not
-rewrite it manually.
+A restart establishes the **per-channel** activation boundary from Telegram's
+newest visible message id plus the newest message already stored **before live
+handlers are registered**. Everything at or below that boundary becomes
+non-tradeable history. Messages recovered during the startup sweep remain above
+the snapshot but are non-tradeable by `source='recovery'`; a genuinely new live
+message delivered after the snapshot is still tradeable. If Telegram's newest id
+cannot be established, new entries fail closed. Expect the boundary to advance on
+every restart, and do not rewrite it manually. A planned intent that predates
+the restart is canceled locally and is never submitted after downtime.
 
 MEXC REST calls are protected by a shared, file-backed weight limiter. The
 defaults are `60` IP weight/10 s and `100` UID weight/10 s (official limits are
@@ -231,10 +234,12 @@ both `<db>.serve.lock` and `<db>.control.lock`. If control is disabled,
 
 `control run` starts the same controller without ingestion, backfill, queue,
 trading, or market-monitor workers and takes only `<db>.control.lock`. Never run
-it against a database already served by `serve`. Authorization covers the
-configured owner (`CONTROL_OWNER_USER_ID`) and developer
-(`CONTROL_DEVELOPER_USER_ID`) with owner-equivalent access. Owner guide:
-`docs/CONTROL_BOT_FA.md`.
+it against a database already served by `serve`. Authorization covers Owner A
+(`CONTROL_OWNER_USER_ID`) and Owner B (`CONTROL_OWNER_B_USER_ID`) with full
+owner-level access. The programmer (`CONTROL_DEVELOPER_USER_ID`) is not an
+owner: it receives every operational event and technical diagnostics but can
+only use read-only diagnostic commands (`/status`, `/version`, `/help`). Owner
+guide: `docs/CONTROL_BOT_FA.md`.
 
 ### Telegram session revoked
 
@@ -353,6 +358,7 @@ git pull --ff-only public opencode/tele-mexc-completion
 Start and verify:
 
 ```bash
+.venv/bin/tg-ingest trading readiness --network   # must print READY; never places orders
 systemctl start tg-ingest
 systemctl is-active tg-ingest
 journalctl -u tg-ingest -n 100 --no-pager

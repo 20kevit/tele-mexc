@@ -34,9 +34,12 @@ Run from the repository root:
 | Conditional entry default 3 ticks and symbol tick rounding | Unit-tested | `tests/test_trading_conditional_entry.py` |
 | TP1/TP2/OCO lifecycle, partial fills, recovery, idempotency | Integration-tested with disposable SQLite and fakes | trading lifecycle/focused repair suites |
 | Pause/resume and submission readiness | Integration-tested with fake exchange and file locks | `tests/test_submission_gate.py`, `tests/test_resume_atomicity.py` |
-| Schema/migration compatibility | Integration-tested on disposable DBs | `tests/test_db_migrations.py` |
+| Per-channel stale-signal boundary, 1/6/24h downtime, delayed delivery, backfill, edits/duplicates | Integration-tested with disposable SQLite and fake Telegram/MEXC | `tests/test_stale_signal_boundary.py`, `tests/test_service_activation_boundary.py` |
+| Planned-intent quarantine after restart; open/uncertain lifecycle recovery | Integration-tested with fakes | `tests/test_stale_signal_boundary.py`, lifecycle/recovery suites |
+| First-startup readiness report (non-trading) | Unit/integration-tested | `tests/test_readiness.py` |
+| Schema/migration compatibility | Integration-tested on disposable DBs | `tests/test_db_migrations.py` (current migration 21) |
 | CLI/config validation | Unit-tested | `tests/test_config*.py`, CLI parser tests |
-| Notification severity and recipient routing | Unit/integration-tested | `tests/test_trading_notify.py`, routing tests |
+| Two-owner + programmer notification routing; no severity suppression | Unit/integration-tested | `tests/test_trading_notify.py`, routing tests, `tests/test_control_service.py` |
 | MEXC REST/CLI request shapes | Mocked/contract-tested | `tests/test_mexc_*`; not live exchange proof |
 
 ## 2. Non-trading live checks
@@ -47,6 +50,7 @@ must be recorded by the operator performing them.
 
 | Check | Evidence level | Command/procedure |
 | --- | --- | --- |
+| First-startup readiness (all prerequisites, blockers, open/uncertain state) | Offline report tested; live result not yet recorded | `tg-ingest trading readiness` then `--network`; never places an order |
 | Direct DNS/TCP/TLS to Telegram | Not yet verified in this pass | `tg-ingest diagnostics network` |
 | Telegram session validity | Not yet verified in this pass | `tg-ingest auth check` |
 | Selected channel access without history download | Not yet verified in this pass | `tg-ingest diagnostics telegram` |
@@ -84,3 +88,18 @@ maintenance task. They require a specific owner-approved live test plan:
 A green test suite proves repository logic and mocked integration only. It does
 not prove exchange acceptance, fill quality, fee behavior, account permissions,
 or production readiness.
+
+## 5. Code readiness vs live verification
+
+| Area | Code status | Evidence level | Live verification |
+| --- | --- | --- | --- |
+| Stale-signal boundary and restart quarantine | Implemented | Integration-tested with mocks | Not verified against live Telegram downtime |
+| Entry idempotency and uncertain submissions | Implemented | Unit/integration-tested with mocks | Not verified against a real MEXC timeout |
+| Two native OCO exits | Implemented | Mocked lifecycle and CLI contract tests | **No live OCO has been placed from this repository** |
+| Two-owner + programmer roles | Implemented | Unit/integration-tested | Not verified with the real Bot API/accounts |
+| Durable event journal/outbox | Implemented | Unit/integration-tested | Delivery to real chats not verified in this pass |
+| First-startup readiness report | Implemented | Offline tests pass | Owner must run `--network` before authorizing startup |
+
+The `trading readiness` command is the authoritative pre-start gate for this
+repository. A successful code/test pass does not replace its live account,
+Telegram, CLI, and open-position checks.

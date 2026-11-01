@@ -81,6 +81,11 @@ class IngestService:
         self._entity: Any = None
         self._selected_channel_id: int | None = None
         self._selected_marked_id: int | None = None
+        # Fail closed until the startup boundary has been established from
+        # Telegram's newest visible message plus the newest pre-handler stored
+        # row for the selected channel.
+        self._boundary_ready = False
+        self._boundary_error: str | None = "activation boundary not established yet"
 
     # ------------------------------------------------------------- control
 
@@ -113,9 +118,11 @@ class IngestService:
         notifier = getattr(self.trading, "notifier", None)
         if notifier is None:
             return
-        roles = ("developer",) if category == "recovery" else None
         try:
-            notifier.notify(event_key=event_key, text=text, category=category, roles=roles)
+            # Every service, recovery, and readiness event reaches both owners
+            # and the programmer.  Category/severity never suppresses an
+            # owner-level notification.
+            notifier.notify(event_key=event_key, text=text, category=category)
         except Exception as exc:  # noqa: BLE001 - service events must not affect ingestion
             log.warning("service event notification failed (%s)", exc.__class__.__name__)
 
@@ -225,14 +232,14 @@ class IngestService:
         await self._verify_mexc_readiness()
         await self._resolve_channel_entity()
         self._refresh_trading_readiness()
-        # Capture the newest already-stored id *before* live handlers are
-        # attached.  Messages that arrive afterwards are genuinely new and must
-        # stay above the boundary; recovered downtime traffic is separately
-        # marked non-tradeable by source.
-        startup_max = self.repo.max_message_id(self._selected_channel_id or 0)
-        # Persist the forward-only boundary before any live handler can run,
-        # so a delayed delivery of a pre-start message cannot trade in the
-        # window between snapshot and handler registration.
+        # Capture Telegram's newest visible id and the newest already-stored id
+        # *before* live handlers are attached.  Messages that arrive afterwards
+        # are genuinely new and must stay above the boundary; recovered
+        # downtime traffic is separately marked non-tradeable by source.
+        startup_max = await self._startup_boundary_snapshot()
+        # Persist the forward-only, per-channel boundary before any live
+        # handler can run.  If Telegram's latest id cannot be established, the
+        # boundary is left unarmed and trading readiness fails closed.
         self._arm_trading_boundary(startup_max)
         self._register_handlers()
         await self._run_recovery_sweep_if_needed()
@@ -284,7 +291,10 @@ class IngestService:
         def channel_ready() -> bool:
             return bool(self._selected_channel_id)
 
-        setter(telegram=telegram_ready, channel=channel_ready)
+        def boundary_ready() -> bool:
+            return bool(self._boundary_ready)
+
+        setter(telegram=telegram_ready, channel=channel_ready, activation_boundary=boundary_ready)
 
     async def _verify_mexc_readiness(self) -> None:
         verifier = getattr(self.trading, "verify_mexc_readiness", None)
@@ -298,25 +308,93 @@ class IngestService:
         if not verified:
             log.error("MEXC account readiness could not be verified; new entries will be blocked")
 
-    def _arm_trading_boundary(self, startup_max: int) -> int | None:
-        """Advance the activation boundary to the pre-handler stored maximum.
+    async def _startup_boundary_snapshot(self) -> int | None:
+        """Return the newest message identity visible before handlers start.
 
-        The boundary is the newest message that existed before this connection
-        cycle began listening.  It only moves forward.  Recovery/backfill rows
-        are rejected by source even when their ids are higher, so a downtime
-        gap cannot trade while a message delivered live during recovery still
-        can.
+        Requirement: a signal delivered during downtime must never trade after
+        restart.  Stored rows cover what the process saw before stopping;
+        Telegram's newest visible id covers messages the process never stored.
+        If Telegram cannot confirm its newest id, return None so the caller
+        fails closed instead of inventing a boundary.
+        """
+
+        assert self._selected_channel_id is not None
+        stored_max = int(self.repo.max_message_id(self._selected_channel_id) or 0)
+        getter = getattr(self._client, "get_messages", None)
+        if not callable(getter):
+            self._boundary_error = "Telegram client cannot enumerate the newest channel message"
+            log.error("%s; trading remains blocked", self._boundary_error)
+            return None
+        try:
+            messages = await getter(self._entity, limit=1)
+        except Exception as exc:  # noqa: BLE001 - unverifiable boundary fails closed
+            self._boundary_error = f"Telegram newest-message query failed ({exc.__class__.__name__})"
+            log.error("%s; trading remains blocked", self._boundary_error)
+            return None
+        latest = 0
+        if messages:
+            try:
+                first = messages[0]
+            except (TypeError, KeyError, IndexError):
+                first = messages
+            try:
+                latest = int(getattr(first, "id", 0) or 0)
+            except (TypeError, ValueError):
+                latest = 0
+        return max(stored_max, latest)
+
+    def _arm_trading_boundary(self, startup_max: int | None) -> int | None:
+        """Persist the forward-only per-channel boundary and set readiness.
+
+        A ``None`` snapshot means the latest Telegram identity could not be
+        established reliably.  The process keeps ingesting for observation but
+        the submission gate stays closed for new entries.
         """
 
         store = getattr(self.trading, "store", None)
         if store is None or self._selected_channel_id is None:
+            self._boundary_ready = False
+            self._boundary_error = "trading store or selected channel is unavailable"
             return None
-        boundary = store.ensure_activation_boundary(self._selected_channel_id, minimum=startup_max)
+        if startup_max is None:
+            self._boundary_ready = False
+            self._boundary_error = self._boundary_error or "newest Telegram message id unavailable"
+            store.audit(
+                "serve_boundary",
+                "lifecycle",
+                "activation_boundary_unavailable",
+                self._boundary_error,
+                event_type="recovery.activation_boundary_unavailable",
+                severity="CRITICAL",
+            )
+            self._notify_service_event(
+                event_key="service:activation_boundary_unavailable",
+                text=(
+                    "⚠️ مرز فعال‌سازی سیگنال برقرار نشد؛ اجرای سفارش جدید متوقف است. "
+                    f"دلیل: {self._boundary_error}"
+                ),
+                category="critical",
+            )
+            return None
+        try:
+            boundary = store.ensure_activation_boundary(self._selected_channel_id, minimum=startup_max)
+        except Exception as exc:  # noqa: BLE001 - unverifiable boundary fails closed
+            self._boundary_ready = False
+            self._boundary_error = f"activation boundary persistence failed ({exc.__class__.__name__})"
+            log.error("%s; trading remains blocked", self._boundary_error)
+            return None
+        self._boundary_ready = True
+        self._boundary_error = None
         log.info(
-            "trading activation boundary armed at message id %s (startup max %s)",
+            "trading activation boundary armed for channel %s at message id %s (startup max %s)",
+            self._selected_channel_id,
             boundary,
             startup_max,
         )
+        # Re-install the callback with the now-true state; the first readiness
+        # refresh ran before the boundary existed and must not leave a stale
+        # fail-closed callback behind.
+        self._refresh_trading_readiness()
         return int(boundary)
 
     def _register_handlers(self) -> None:
@@ -625,6 +703,11 @@ class IngestService:
             await monitor.start()
         except Exception as exc:  # noqa: BLE001 - trading still runs without ticks
             log.error("market monitor failed to start (%s)", exc.__class__.__name__)
+            self._notify_service_event(
+                event_key=f"service:market_monitor_start_failed:{exc.__class__.__name__}",
+                text=f"market monitor failed to start: {exc.__class__.__name__}",
+                category="critical",
+            )
             return
         log.info("market monitor started for conditional-entry/TP/SL lifecycle")
         self._start_tick_worker(trade_manager)
@@ -650,6 +733,11 @@ class IngestService:
                 await asyncio.to_thread(trade_manager.recover_on_startup)
             except Exception as exc:  # noqa: BLE001
                 log.error("trade recovery failed (%s); continuing", exc.__class__.__name__)
+                self._notify_service_event(
+                    event_key=f"service:trade_recovery_failed:{exc.__class__.__name__}",
+                    text=f"trade recovery failed: {exc.__class__.__name__}; read-only reconciliation continues",
+                    category="critical",
+                )
         while not self._stop.is_set():
             try:
                 await asyncio.to_thread(self.trading.reconcile_pending)
@@ -665,6 +753,11 @@ class IngestService:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconciliation must never kill ingestion
                 log.error("reconciliation sweep failed (%s); continuing", exc.__class__.__name__)
+                self._notify_service_event(
+                    event_key=f"service:reconciliation_failed:{exc.__class__.__name__}",
+                    text=f"reconciliation sweep failed: {exc.__class__.__name__}; no order was submitted",
+                    category="critical",
+                )
             await self._sleep_with_stop(interval)
 
     async def _backfill_worker(self) -> None:
@@ -702,6 +795,11 @@ class IngestService:
                 attempt += 1
                 delay = min(self.cfg.reconnect_backoff_max_s, 2 ** min(attempt, 9)) + random.uniform(0, 2)
                 log.error("backfill attempt %s failed (%s); retrying in %.0fs", attempt, exc.__class__.__name__, delay)
+                self._notify_service_event(
+                    event_key=f"service:backfill_failed:{exc.__class__.__name__}",
+                    text=f"history import attempt failed: {exc.__class__.__name__}; retrying with backoff",
+                    category="recovery",
+                )
                 await self._sleep_with_stop(delay)
                 continue
             except asyncio.CancelledError:
@@ -709,6 +807,11 @@ class IngestService:
             except Exception as exc:  # noqa: BLE001  (survivability never lets backfill kill the live loop)
                 attempt += 1
                 log.error("backfill crashed (%s) on attempt %s; retrying later", exc.__class__.__name__, attempt)
+                self._notify_service_event(
+                    event_key=f"service:backfill_crashed:{exc.__class__.__name__}",
+                    text=f"history import crashed: {exc.__class__.__name__}; retrying later",
+                    category="recovery",
+                )
                 await self._sleep_with_stop(min(300, 10 * attempt))
 
     # ------------------------------------------------------------ main loop

@@ -12,7 +12,7 @@ Telegram (MTProto, direct TLS)
   ingest service ──► SQLite archive ──► processing queue ──► trading pipeline
         │                 │                                      ▼
         │                 └── historical archive          MEXC Spot v3 REST
-        └── notification Bot API ──► owner/developer      (automatic MEXC Spot)
+        └── notification Bot API ──► Owner A + Owner B + programmer      (automatic MEXC Spot)
 ```
 
 One Telegram account and one selected channel. SQLite is the only durable
@@ -23,7 +23,7 @@ store. There is no HTTP server and no inbound network listener.
 | Entry point | What runs | Locks |
 | --- | --- | --- |
 | `tg-ingest serve` | Telegram ingestion, backfill, queue consumer, trading engine, notifications, reconciliation/monitor, and — when `cfg.control.enabled` — the ControlBot task | `<db>.serve.lock` and, when control is enabled, `<db>.control.lock` |
-| `tg-ingest control run` | Standalone owner/developer controller; no ingestion, backfill, queue, or trading worker | `<db>.control.lock` |
+| `tg-ingest control run` | Standalone two-owner/programmer controller; no ingestion, backfill, queue, or trading worker | `<db>.control.lock` |
 | Other CLI commands | Short-lived DB/network checks | none |
 
 Locks use kernel `flock`; they are released automatically on process exit or
@@ -41,11 +41,13 @@ Implemented in `tg_signal_ingest/service.py`.
    channel.
 4. Requeue queue items left in `processing` by a crashed run.
 5. Mark runtime Telegram/MEXC/channel readiness for the submission gate.
-6. Snapshot the selected channel's newest already-stored message id, before
-   live handlers are attached.
-7. Persist/advance the tradeable activation boundary to that snapshot (forward
-   only), still before handlers are attached. A message delivered after the
-   snapshot stays above the boundary.
+6. Snapshot Telegram's newest visible channel message id and the newest
+   already-stored message id, before live handlers are attached.
+7. Persist/advance the **per-channel** tradeable activation boundary to the
+   higher of those ids (forward only), still before handlers are attached. A
+   message delivered after the snapshot stays above the boundary. If Telegram's
+   newest id cannot be established, the boundary is left unarmed and the
+   submission gate fails closed.
 8. Attach live new-message, edit, and delete handlers.
 9. If a previous watermark exists, sweep the id gap for messages posted while
    offline; those rows are `source='recovery'` and non-tradeable; refresh the
@@ -168,7 +170,7 @@ visible until reconciliation resolves it. See `docs/data-model.md`.
 
 ## Control-bot lifecycle
 
-- `control/` contains the owner/developer controller, setup store, and Bot API
+- `control/` contains the two-owner/programmer controller, setup store, and Bot API
   client.
 - `cmd_serve` builds the ControlBot when `cfg.control.enabled` is true, acquires
   both locks, and passes it to `IngestService`. The service runs
