@@ -127,13 +127,14 @@ Environment overrides: `TRADING_ORDER_QUOTE_AMOUNT`,
 | Order type | LIMIT only | `order_type_policy`, `TRADING_ORDER_TYPE_POLICY`, and MARKET execution are rejected |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
 | `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
-| `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
+| `recon_interval_s` | `60.0` | reconciliation period, minimum 5 s. 60 s is sized from the weight budget: each open trade costs two `GET /api/v3/order` calls (weight 2 each) per sweep, so 10 open trades cost ~0.67 weight/s at 60 s — far below the 60/10 s cap |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
 | `entry_trigger_offset_ticks` | `3` | integer ≥1; conditional LIMIT entry waits for price to cross `Entry - offset × tick_size`. Missing resolves to 3; it cannot disable conditional entry or fall back to direct entry |
 | `entry_trigger_stale_threshold_s` | `60.0` | positive; a conditional-entry order is not triggered from an older price tick |
 | `tp1_allocation_pct_of_acquired` | `50.0` | 0–100 of actual acquired quantity |
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
-| `stop_loss_max_retries` | `3` | integer ≥1; caps definitive TP/SL rejection retries |
+| `signal_validity_s` | `43200` (12 h) | `1800 ≤ value ≤ 604800`; how long a signal stays actionable. Owner-editable from Telegram (`/validity <hours>`, stored in `control_settings.signal_validity_hours`). Distinct from an accepted order's lifetime |
+| `stop_loss_max_retries` | `3` | legacy key retained for compatibility; the OCO retry budget is the fixed owner-agreed schedule (1 attempt + 8 retries, see below) |
 | `stop_loss_trigger_offset_ticks` | `3` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
 | `monitor_poll_interval_s` | `2.0` | positive |
 | `monitor_max_retries` | `5` | integer ≥1 |
@@ -296,8 +297,16 @@ Unknown endpoints are charged a conservative default weight of `25`.
 Local protection:
 
 - Configured caps are `max_ip_weight_per_10s=60` and
-  `max_uid_weight_per_10s=100`; these are deliberately far below the official
-  limits, not additional trading limits.
+  `max_uid_weight_per_10s=100` by default; these are deliberately far below the
+  official limits, not additional trading limits. Both are configurable in
+  `config.toml` (`max_ip_weight_per_10s`, `max_uid_weight_per_10s`) within
+  validated bounds `[1, 300]` / `[1, 500]`.
+- The historical value 60 was an internal safety margin, never a measured MEXC
+  hard limit; raising it is an explicit operator decision.
+- Gate waits are measured: each acquisition returns its wait, waits ≥1 s are
+  logged as `MEXC rate gate deferred ...`, the wait is persisted in
+  `exchange_operations.rate_limit_wait_ms`, and `client.rate_stats()` exposes
+  requests / waiting requests / total and maximum wait.
 - `serve`, the `trading` CLI, and other local processes share file-backed
   sliding-window ledgers: `data/mexc-rate-limit-ip.json`,
   `data/mexc-rate-limit-uid.json`, and `data/mexc-rate-limit-order.json`.
@@ -612,10 +621,18 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
   target below the exchange lot/minimum is recorded in
   `unsold_residual_qty`/`unsold_residual_reason`, and the trade is marked
   `needs_reconciliation` rather than being presented as protected.
-- A missing OCO leg is retried on a later sweep up to
-  `stop_loss_max_retries`; a rejection is recorded. A canceled leg is not
-  recreated automatically, because doing so could oversell an already
-  partially exited position.
+- A partial entry fill is protected immediately: OCO quantity equals the
+  acquired quantity, and the unfilled entry remainder stays working. If the
+  acquired position is exited (TP1 or stop-loss), the remainder is cancelled so
+  it cannot open a new position later (F-05).
+- A rejected OCO leg is retried on the fixed owner-agreed schedule: initial
+  attempt plus 8 retries at 5, 10, 15, 30, 30, 30, 30, 30 seconds. The attempt
+  counter and `next_attempt_at` are persisted on `trade_orders`, so restarts do
+  not reset the budget. Deterministic rejections (price/quantity/precision/
+  symbol/permission) are terminal and never retried (F-02). An uncertain
+  submission is reconciled, never replaced. A canceled leg is not recreated
+  automatically, because doing so could oversell an already partially exited
+  position.
 - The OCO stop-limit leg may not fill at the exact stop price in a fast market.
   Any residual remains recorded and is not silently dropped.
 - On restart, `serve` runs `recover_on_startup()` and periodically
@@ -661,9 +678,12 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 
 - Conditional LIMIT entry is always the strategy when market is below Entry;
   the default trigger is exactly 3 exchange ticks below Entry.
-- All exit monitoring is active for every trade. New trade symbols are
-  subscribed to the monitor after startup, and the REST fallback fetches prices
-  through the MEXC client.
+- Price ticks are only needed for two states: `pending_entry` (conditional
+  trigger) and `unprotected_critical` (stop-loss alert for an unprotected
+  position). Symbols are subscribed/unsubscribed to match, so an OCO-managed
+  position costs no market-data polling (F-04).
+- Exchange order/leg/fill state is read exclusively by the periodic
+  reconciliation worker, never from the tick path.
 
 ### Pre-BUY exit-protection gate and the new-BUY block
 
@@ -694,10 +714,18 @@ block** is persisted in `app_state`.
 The block is never cleared by time. It clears only when every open position is
 fully sold or has exchange-confirmed working coverage. On every restart,
 `recover_on_startup()` rebuilds the block from durable trade state, so a stale
-flag cannot hide an unprotected position. The live execution path re-checks the
-block immediately before submission, so a retried queue item is also covered.
+flag cannot hide an unprotected position.
 
-`BUY_BLOCK_ACTIVE` / `BUY_BLOCK_CLEARED` notifications are sent on state
+`SubmissionGate.check(purpose="entry")` reads `trading.new_buys_blocked` inside
+the same `BEGIN IMMEDIATE` transaction that claims the submission, so the block
+really does refuse new BUY entries. Protection submissions
+(`purpose="protection"`) are unaffected: existing OCO/TP/SL management continues,
+and enabling the block never cancels or modifies an order.
+
+A blocked entry stays `planned` (like the pause gate) and expires with the
+signal validity window instead of being submitted later at a stale price.
+
+`BUY_BLOCK_ACTIVE_<reason-hash>` / `BUY_BLOCK_CLEARED` notifications are sent on state
 changes; audit events are written as `trading.buy_block`.
 
 ### Remaining limitations

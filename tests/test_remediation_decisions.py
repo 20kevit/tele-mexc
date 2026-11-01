@@ -340,3 +340,46 @@ def test_unreachable_exchange_marks_legs_unverified(cfg, repo) -> None:
         "SELECT COUNT(*) FROM oco_legs WHERE trade_order_id = 'missing-order' AND verified = 0"
     ).fetchone()
     assert row[0] == 0 or True  # no rows for an unknown order: nothing is invented
+
+
+# --------------------------------------------------------------------------
+# F-06 — a manual entry cancellation is accepted, never resubmitted
+# --------------------------------------------------------------------------
+
+
+def test_manual_entry_cancel_closes_without_resubmission(cfg, repo) -> None:
+    from tg_signal_ingest.trading.trade_manager import TradeManager
+    from tg_signal_ingest.trading.trade_store import TradeStore
+
+    store = TradeStore(repo.db, cfg.trading)
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO trades (trade_id, signal_id, idempotency_key, channel_id, message_id, "
+            "symbol, side, entry_mode, requested_quote, entry_price, trade_state, entry_intent_id, "
+            "created_at, updated_at) VALUES ('trade-m','sig-m','key-m',100,1,'BTCUSDT','buy','direct',"
+            "'3','100','entry_active','intent-m','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO order_intents (intent_id, signal_id, idempotency_key, client_order_id, symbol, "
+            "side, order_type, quote_amount, mode, state, create_msg_id, create_channel_id, planned_at, "
+            "updated_at) VALUES ('intent-m','sig-m','key-m','c-m','BTCUSDT','buy','limit','3','live',"
+            "'canceled',1,100,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"
+        )
+
+    class _Engine:
+        def __init__(self):
+            self.place_calls = 0
+
+        def reconcile_intent(self, intent_id, **_kwargs):
+            return {"state": "canceled", "executed_qty": Decimal("0")}
+
+    engine = _Engine()
+    notified: list[str] = []
+    tm = TradeManager(cfg.trading, store, engine=engine)
+    tm._notify_trade = lambda trade, key, text, **kw: notified.append(key)
+
+    tm._settle_entry_state(store.get_trade("trade-m"))
+
+    assert store.get_trade("trade-m")["trade_state"] == "closed"
+    assert engine.place_calls == 0, "a manual cancel must never be resubmitted"
+    assert any(key == "ENTRY_NOT_FILLED" for key in notified)

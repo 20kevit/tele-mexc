@@ -28,26 +28,26 @@ the owner's decision"; it is not a defect left behind by accident.
 
 | ID | Title | Evidence | Status | Commit |
 | --- | --- | --- | --- | --- |
-| N-01 | Signal validity window and delayed/ambiguous entry submission | runtime-confirmed | pending | — |
-| N-02 | Centralized MEXC API rate limiting | runtime-confirmed | pending | — |
+| N-01 | Signal validity window and delayed/ambiguous entry submission | runtime-confirmed | fixed | 15856a7 |
+| N-02 | Centralized MEXC API rate limiting | runtime-confirmed | fixed | 15856a7 |
 | N-03 | MEXC WebSocket market data | runtime-confirmed | deferred | — |
-| N-04 | Stale price handling in the tick queue | runtime-confirmed | pending | — |
-| N-05 | Missed Telegram messages during downtime | runtime-confirmed | verified-existing | — |
-| N-06 | Same-symbol duplicate BUY protection | runtime-confirmed | verified-existing | — |
-| N-07 | BUY Block enforcement | runtime-confirmed | pending | — |
-| N-08 | SQLite concurrency correctness | risk-only | pending | — |
+| N-04 | Stale price handling in the tick queue | runtime-confirmed | fixed | 15856a7 |
+| N-05 | Missed Telegram messages during downtime | runtime-confirmed | verified-existing | 15856a7 |
+| N-06 | Same-symbol duplicate BUY protection | runtime-confirmed | verified-existing | 15856a7 |
+| N-07 | BUY Block enforcement | runtime-confirmed | fixed | 15856a7 |
+| N-08 | SQLite concurrency correctness | risk-only | fixed | 15856a7 |
 | N-09 | Minimum order notional | risk-only | deferred | — |
-| N-10 | Existing protective controls | code-confirmed | pending | — |
-| F-01 | Standalone TP order path | code-confirmed | pending | — |
-| F-02 | OCO retry policy and per-attempt reporting | runtime-confirmed | pending | — |
-| F-04 | Excessive per-tick OCO leg polling | runtime-confirmed | pending | — |
-| F-05 | Partial entry fill protection | not-observed | pending | — |
-| F-06 | Manual entry cancellation | runtime-confirmed | pending | — |
-| F-07 | Manual sales and unknown exchange orders | runtime-confirmed | pending | — |
+| N-10 | Existing protective controls | code-confirmed | fixed | 15856a7 |
+| F-01 | Standalone TP order path | code-confirmed | fixed | 15856a7 |
+| F-02 | OCO retry policy and per-attempt reporting | runtime-confirmed | fixed | 15856a7 |
+| F-04 | Excessive per-tick OCO leg polling | runtime-confirmed | fixed | 15856a7 |
+| F-05 | Partial entry fill protection | not-observed | fixed | 15856a7 |
+| F-06 | Manual entry cancellation | runtime-confirmed | verified-existing | 15856a7 |
+| F-07 | Manual sales and unknown exchange orders | runtime-confirmed | fixed | 15856a7 |
 | F-09 | 100-trade monitoring limit | not-observed | deferred | — |
-| F-10 | Telegram notification reliability | runtime-confirmed | pending | — |
-| F-12 | OCO local database consistency | runtime-confirmed | pending | — |
-| F-13 | Incorrect MEXC error classification | runtime-confirmed | pending | — |
+| F-10 | Telegram notification reliability | runtime-confirmed | fixed | 15856a7 |
+| F-12 | OCO local database consistency | runtime-confirmed | fixed | 15856a7 |
+| F-13 | Incorrect MEXC error classification | runtime-confirmed | fixed | 15856a7 |
 
 ## Non-negotiable product policies (do not reopen)
 
@@ -69,3 +69,20 @@ recipients · exactly one designated owner with administrative control.
    instead.
 5. `tests/test_decision_registry.py` enforces schema, ID coverage, allowed
    statuses and that every `fixed`/`tested` item has a commit and tests.
+
+## Verification (remediation commit `15856a7`)
+
+| Check | Result |
+| --- | --- |
+| `pytest` (full suite) | 748 passed |
+| `ruff check .` | clean |
+| `mypy tg_signal_ingest` | clean (48 files) |
+| Migration 22 from v21 on a disposable copy | applied, data preserved, idempotent, `integrity_check=ok` |
+| Production database | untouched; no migration executed against `data/ingest.sqlite3` |
+| Production service | untouched; no restart, no deploy |
+| Exchange | no order created, cancelled or amended |
+| Telegram | no message sent from tests (fake Bot API only) |
+| Secrets | none printed, committed or logged |
+
+Deferred items are deliberate owner decisions, not unfinished work: WebSocket
+(N-03), minimum-notional caution (N-09) and the 100-trade listing limit (F-09).

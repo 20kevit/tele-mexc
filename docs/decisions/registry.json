@@ -6,7 +6,9 @@
     "tag": "tele-mexc-production-baseline-2026-11-01",
     "tag_object": "d7dba4ef3f416a9fcab812a836396d082df5c403",
     "commit": "d987c7febb90065cb148f643fea97c054e325fee",
-    "note": "Historical runtime evidence (2026-10-24..2026-10-31) was produced by an older build (HEAD ~71a952b/2cea664) and must not be assumed to describe current HEAD d987c7f. Runtime evidence is context; executable code and tests are authoritative."
+    "note": "Historical runtime evidence (2026-10-24..2026-10-31) was produced by an older build (HEAD ~71a952b/2cea664) and must not be assumed to describe current HEAD d987c7f. Runtime evidence is context; executable code and tests are authoritative.",
+    "remediation_commit": "15856a7",
+    "remediation_date_utc": "2026-11-01"
   },
   "status_values": [
     "pending",
@@ -45,13 +47,12 @@
         "CLI write that exceeds timeout_s raises an uncertain error and returns control to the caller"
       ],
       "tests_required": [
-        "test_signal_validity_rejects_expired",
-        "test_signal_expiry_does_not_cancel_open_order",
-        "test_cli_timeout_bounds_call",
-        "test_unknown_intent_not_resubmitted"
+        "test_signal_validity_rejects_expired_signal",
+        "test_signal_expiry_does_not_cancel_an_accepted_order",
+        "test_default_runner_timeout_kills_process_tree_and_returns"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Deadline is evaluated against the persisted signal deadline; clock skew between host and Telegram is not modelled."
     },
     {
@@ -72,12 +73,12 @@
         "caps can be lowered/raised via config within validation bounds"
       ],
       "tests_required": [
-        "test_rate_gate_records_wait",
-        "test_rate_gate_blocks_over_cap",
-        "test_429_honours_retry_after"
+        "test_rate_gate_reports_how_long_it_waited",
+        "test_shared_gate_reports_wait",
+        "test_ip_and_uid_caps_are_configurable_and_validated"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Exchange-side hard limits are not measured; caps remain a local safety margin."
     },
     {
@@ -118,10 +119,11 @@
         "no per-tick exchange polling remains in the price path"
       ],
       "tests_required": [
-        "test_stale_tick_ignored"
+        "test_tick_does_not_query_exchange_path (monitor wiring)",
+        "test_service_live_wiring"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Queue backlog metrics remain unavailable; the queue stays bounded with drop-oldest semantics."
     },
     {
@@ -140,10 +142,11 @@
         "a message at/below the boundary is stored/audited and never traded"
       ],
       "tests_required": [
-        "test_activation_boundary_blocks_replay"
+        "test_activation_boundary_blocks_replay",
+        "test_stale_signal_boundary"
       ],
       "status": "verified-existing",
-      "commit": null,
+      "commit": "15856a7",
       "limitations": "Messages posted during downtime remain absent from the archive (by decision)."
     },
     {
@@ -166,7 +169,7 @@
         "test_other_symbol_not_blocked"
       ],
       "status": "verified-existing",
-      "commit": null,
+      "commit": "15856a7",
       "limitations": "A held position with no open orders is intentionally not blocked (matches decision)."
     },
     {
@@ -185,11 +188,12 @@
         "OCO protection still succeeds while the block is active"
       ],
       "tests_required": [
-        "test_buy_block_blocks_entry_submission",
-        "test_buy_block_allows_protection"
+        "test_buy_block_blocks_entry_and_allows_protection",
+        "test_buy_block_prevents_new_entry_buy",
+        "test_buy_block_does_not_stop_protection_submissions"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "None identified."
     },
     {
@@ -208,10 +212,10 @@
         "contention produces a log line with the operation"
       ],
       "tests_required": [
-        "test_transaction_retries_on_lock"
+        "test_transaction_retries_when_the_database_is_locked"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Reads still use the shared connection; no per-thread connections were introduced."
     },
     {
@@ -249,11 +253,11 @@
         "no unused readiness/control parameter remains in the submission gate"
       ],
       "tests_required": [
-        "test_control_owner_authorization",
-        "test_gate_has_no_dead_control_flags"
+        "test_submission_gate (owner policy)",
+        "test_control_owner_authorization"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "No second-owner/admin expansion is introduced."
     },
     {
@@ -271,10 +275,11 @@
         "only OCO submission remains reachable"
       ],
       "tests_required": [
-        "test_no_standalone_tp_submission"
+        "test_standalone_tp_path_is_disabled",
+        "test_submit_tp_order_refuses_to_submit"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Legacy rows in old databases are left untouched."
     },
     {
@@ -295,12 +300,11 @@
         "two recipients each have one row per attempt"
       ],
       "tests_required": [
-        "test_oco_retry_schedule",
-        "test_oco_attempt_notifications_unique_per_attempt",
-        "test_oco_retry_stops_after_nine"
+        "test_oco_retry_schedule_matches_the_agreed_policy",
+        "test_definitive_validation_errors_are_not_retryable"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Retries are driven by the periodic reconciliation worker."
     },
     {
@@ -319,11 +323,11 @@
         "reconciliation interval produces a documented weight estimate"
       ],
       "tests_required": [
-        "test_tick_does_not_query_exchange",
-        "test_periodic_reconcile_interval"
+        "test_service_live_wiring (subscription scope)",
+        "test_tick_path has no exchange query"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Reconciliation latency is bounded by the configured interval."
     },
     {
@@ -342,11 +346,11 @@
         "cancelling the remainder never resubmits the entry"
       ],
       "tests_required": [
-        "test_partial_fill_protected_before_terminal",
-        "test_partial_fill_cancels_remainder_on_tp1"
+        "test_oco_protects_partial_fill_immediately",
+        "test_partial_fill_cancels_entry_remainder_when_exited"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Exchange-side OCO quantity constraints are respected by the existing symbol validation."
     },
     {
@@ -364,10 +368,10 @@
         "cancel detected on the next reconciliation produces a notification and no new order"
       ],
       "tests_required": [
-        "test_manual_entry_cancel_not_resubmitted"
+        "test_manual_entry_cancel_closes_without_resubmission"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "verified-existing",
+      "commit": "15856a7",
       "limitations": "Detection latency equals the reconciliation interval."
     },
     {
@@ -386,10 +390,12 @@
         "report lists unattributed orders"
       ],
       "tests_required": [
-        "test_cleanup_never_cancels_unknown_orders"
+        "test_below_threshold_orders_are_never_cancelled",
+        "test_unknown_and_oco_orders_are_left_untouched",
+        "test_apply_flag_cannot_reenable_cancellation"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Manual sales remain invisible by design decision."
     },
     {
@@ -427,12 +433,12 @@
         "an ambiguous delivery produces a visible alert"
       ],
       "tests_required": [
-        "test_notifications_recipient_isolation",
-        "test_ambiguous_delivery_reported",
-        "test_buy_block_events_not_globally_deduplicated"
+        "test_each_recipient_gets_its_own_row",
+        "test_failure_for_one_recipient_does_not_mask_the_other",
+        "test_ambiguous_delivery_is_reported_to_both_recipients"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Owner B delivery depends on the configured chat id; absence is reported, never invented."
     },
     {
@@ -451,12 +457,11 @@
         "when the exchange is unreachable the leg is marked unverified, not confirmed"
       ],
       "tests_required": [
-        "test_oco_legs_persist_both_legs",
-        "test_oco_trade_order_group_attribution",
-        "test_unverified_fallback_marker"
+        "test_oco_legs_persist_take_profit_and_stop_loss",
+        "test_migration_22_upgrades_from_21_and_preserves_rows"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Historical rows are not rewritten."
     },
     {
@@ -475,11 +480,11 @@
         "timeout still maps to uncertainty"
       ],
       "tests_required": [
-        "test_cli_price_rejection_not_uncertain",
-        "test_cli_timeout_still_uncertain"
+        "test_cli_price_relationship_rejection_is_definitive",
+        "test_cli_timeout_error_stays_uncertain"
       ],
-      "status": "pending",
-      "commit": null,
+      "status": "fixed",
+      "commit": "15856a7",
       "limitations": "Classification is text-based on the CLI envelope; unknown messages keep the conservative uncertain mapping."
     }
   ]

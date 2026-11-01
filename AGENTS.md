@@ -77,6 +77,16 @@ Do not silently change behavior to match an old doc.
 - Order idempotency is SHA-256 of
   `(channel_id, message_id, action, symbol)`; one Telegram message can produce
   at most one intent, and a conflicting edit is refused.
+- Exits are native OCO pairs only. A standalone take-profit order is never
+  submitted; legacy TP rows are parked as `needs_reconciliation`.
+- A signal is actionable only inside `trading.signal_validity_s` (default 12 h,
+  owner-editable via `/validity`). Expiry blocks *new* submissions and never
+  cancels an accepted order.
+- `trading.new_buys_blocked` is enforced by `SubmissionGate` for entry
+  submissions only; protection/OCO submissions continue while it is set.
+- Startup open-order cleanup is inspection-only: the bot never cancels an
+  order it cannot positively attribute, and never cancels merely for small
+  notional.
 - The activation boundary is persisted **per channel** under
   `app_state['trading.activation_boundary.channel.<channel_id>']` (with the
   legacy global key kept only as a migration fallback). Each `serve` start

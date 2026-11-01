@@ -185,10 +185,14 @@ visible until reconciliation resolves it. See `docs/data-model.md`.
 
 Implemented and covered by tests:
 
-- `TradeManager.on_tick()` evaluates TP1/TP2/stop-loss for every active trade,
+- `TradeManager.on_tick()` evaluates only price-driven work: a conditional
+  entry trigger and the stop-loss alert for an unprotected position. Exchange
+  order/leg/fill state is never queried from the tick path; the periodic
+  reconciliation sweep owns it (including OCO legs, see `docs/trading.md`).
   independent of whether conditional entry is enabled.
-- `serve` subscribes symbols for active trades at monitor startup and refreshes
-  subscriptions every 5 s, so trades created after startup are monitored and
+- `serve` subscribes symbols only for `pending_entry` / `unprotected_critical`
+  trades at monitor startup and refreshes subscriptions every 5 s, so a newly
+  created conditional entry is monitored and
   symbols with no active trade are unsubscribed.
 - The monitor's REST fallback (`IngestService._fetch_price`) uses the MEXC
   client, not the Telethon client.

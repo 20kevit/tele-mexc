@@ -21,6 +21,7 @@ the document.
 | `README.md` | Everyone | Product summary, quick start, safety model, limitations |
 | `docs/architecture.md` | Developers, operators | Processes, locks, `serve`/`control` lifecycle, ingestion, queue, trading wiring |
 | `docs/operations.md` | Operators | Install, credentials, service, backup, upgrade/rollback, recovery, troubleshooting |
+| `docs/DECISION_REGISTRY.md` | Authoritative audit-decision registry and per-item implementation status (machine-readable source: `docs/decisions/registry.json`) |
 | `docs/trading.md` | Operators, developers | Parsing, risk, fixed sizing, LIMIT execution, conditional entry, per-channel stale-signal boundary, two native OCO exits, restart recovery, reconciliation, readiness, notifications |
 | `docs/data-model.md` | Developers | Active and historical tables, migrations, enums, persistence invariants |
 | `docs/development.md` | Developers | Setup, test areas, lint/typecheck, migrations, change workflow |

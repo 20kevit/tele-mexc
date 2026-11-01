@@ -9,7 +9,7 @@ SQLite schema and persistence invariants. Source of truth:
 - WAL journal mode, `foreign_keys=ON`, 10-second busy timeout, `BEGIN IMMEDIATE`
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
-  `schema_migrations`. Current maximum version: **21**.
+  `schema_migrations`. Current maximum version: **22**.
 - Commands that open a normal repository run migrations, including `status`,
   `backfill status`, `trading status`, and `control status`. Read-only inspection
   of an existing database requires an external SQLite viewer or a disposable
@@ -46,6 +46,7 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 19 | `trade_orders` per-leg evidence columns; `trades` OCO/outcome columns; `reconciliation_results`/`messages`/`signals` `source_ref` |
 | 20 | `exchange_operations`, `oco_groups`, `oco_legs`, `notification_preferences`, `notification_callbacks`, `notification_delivery_attempts` |
 | 21 | notification outbox role check widened to `owner`, `owner_b`, `developer`; existing rows preserved |
+| 22 | remediation columns: `order_intents.deadline_at` (signal validity), `trade_orders.attempt`/`next_attempt_at`/`retryable` (bounded OCO retries, definitive rejections), `oco_legs.attempt`/`verified` (retry attempt and unverified-fallback marker); additive only |
 
 ## Table groups
 
