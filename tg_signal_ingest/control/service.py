@@ -10,19 +10,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from datetime import UTC, datetime
-from decimal import Decimal
 from typing import Any
 
 from ..config import AppConfig
 from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
-from ..mexc.errors import MexcError
 from ..repository import Repository
-from ..trading.balance import BalanceError, parse_account
 from ..trading.gate import GateTimeout, SubmissionGate
-from ..trading.parser import ParsedSignal
-from ..trading.sizing import SizingError, apply_sizing
 from ..version import format_version_text, get_version_info
 from .auth import AuthFlowError, TelegramLoginManager
 from .bot_api import BotApiClient, BotApiError
@@ -122,28 +118,6 @@ class ControlBot:
 
     def attach_engine(self, engine: Any) -> None:
         self._engine = engine
-
-    def apply_sizing(self, signal: ParsedSignal, decision: Any, meta: Any, client: Any) -> Any:
-        settings = self.store.settings()
-        free_base: Decimal | None = None
-        if signal.action == "sell":
-            if client is None or meta is None:
-                raise SizingError("برای فروش، اتصال MEXC و اطلاعات نماد لازم است")
-            try:
-                snapshot = parse_account(client.account(), fetched_at=time.monotonic())
-                asset = snapshot.balances.get(str(meta.base_asset).upper())
-                free_base = asset.spendable if asset is not None else Decimal(0)
-            except (BalanceError, MexcError) as exc:
-                raise SizingError(f"موجودی آزاد پایه در دسترس نیست ({exc.__class__.__name__})") from None
-        return apply_sizing(
-            side=str(signal.action),
-            decision=decision,
-            meta=meta,
-            buy_quote_usd=settings["buy_quote_usd"] if signal.action == "buy" else None,
-            sell_pct_free=settings["sell_pct_free"] if signal.action == "sell" else None,
-            free_base=free_base,
-            max_quote=None,
-        )
 
     # -------------------------------------------------------- bot transport
 
@@ -267,8 +241,6 @@ class ControlBot:
             await self._input_channel_search(chat_id, text)
         elif state == "buy_amount":
             await self._input_buy_amount(chat_id, text)
-        elif state == "sell_pct":
-            await self._input_sell_pct(chat_id, text)
         else:
             await self._send(chat_id, "از منوی زیر انتخاب کنید یا /start را بزنید.", self._menu_kb())
 
@@ -461,13 +433,6 @@ class ControlBot:
             await self._send(
                 chat_id,
                 "مبلغ ثابت خرید را به دلار بفرستید (مثلاً 10):",
-                _kb([[_btn("لغو", "m:status")]]),
-            )
-        elif action == "sell":
-            self.store.set_flow("sell_pct")
-            await self._send(
-                chat_id,
-                "درصد فروش از موجودی آزاد پایه را بفرستید (مثلاً 25):",
                 _kb([[_btn("لغو", "m:status")]]),
             )
         elif action == "sizing":
@@ -858,27 +823,19 @@ class ControlBot:
     # ------------------------------------------------------------ sizing
 
     async def _show_sizing(self, chat_id: int) -> None:
-        settings = self.store.settings()
         text = (
             "📏 اندازه سفارش\n"
-            f"• خرید: مبلغ ثابت {self.cfg.trading.order_quote_amount or settings['buy_quote_usd']} دلار "
+            f"• خرید: مبلغ ثابت {self.cfg.trading.order_quote_amount:g} دلار "
             "(بودجه اسمی، نه تضمین قیمت نهایی)\n"
-            f"• فروش: {settings['sell_pct_free']}٪ از موجودی آزاد/قابل استفاده پایه\n"
             f"• بافر کارمزد: {self.cfg.trading.balance_fee_buffer_pct}٪\n\n"
-            "موجودی فقط برای کفایت همان سفارش بررسی می‌شود؛ هیچ درصدی از حساب "
-            "به‌عنوان ذخیره کنار گذاشته نمی‌شود. "
-            "محاسبه نهایی در زمان تأیید/ارسال دوباره انجام می‌شود."
+            "این مبلغ در هر سیگنال Spot BUY استفاده می‌شود. "
+            "موجودی فقط برای کفایت همان سفارش بررسی می‌شود و هیچ درصدی از حساب "
+            "به‌عنوان ذخیره کنار گذاشته نمی‌شود."
         )
         await self._send(
             chat_id,
             text,
-            _kb(
-                [
-                    [_btn("تغییر مبلغ خرید (دلار)", "m:buy")],
-                    [_btn("تغییر درصد فروش", "m:sell")],
-                    [_btn("بازگشت", "m:status")],
-                ]
-            ),
+            _kb([[_btn("تغییر مبلغ خرید (دلار)", "m:buy")], [_btn("بازگشت", "m:status")]]),
         )
 
     async def _input_buy_amount(self, chat_id: int, text: str) -> None:
@@ -887,28 +844,23 @@ class ControlBot:
         except ValueError:
             await self._send(chat_id, "عدد معتبر بفرستید (مثلاً 10).")
             return
-        if value <= 0:
-            await self._send(chat_id, "مبلغ باید بزرگ‌تر از صفر باشد.")
+        if not math.isfinite(value) or value <= 0:
+            await self._send(chat_id, "مبلغ باید عددی متناهی و بزرگ‌تر از صفر باشد.")
             return
-        self.store.set_setting("buy_quote_usd", f"{value:g}")
+        if self.cfg.trading.order_quote_amount_source == "env":
+            await self._send(
+                chat_id,
+                "مبلغ خرید با متغیر محیطی TRADING_ORDER_QUOTE_AMOUNT قفل شده است؛ "
+                "برای تغییر از منو، آن متغیر را حذف کنید.",
+            )
+            return
+        self.store.set_setting("order_quote_amount", f"{value:g}")
+        self.cfg.trading.order_quote_amount = value
+        self.cfg.trading.order_quote_amount_source = "database (Telegram menu)"
+        self.cfg.trading.amount_configured = True
         self.store.clear_flow()
-        self.store.audit("sizing_changed", f"buy_quote_usd={value:g}")
-        await self._send(chat_id, "مبلغ خرید ذخیره شد.")
-        await self._show_sizing(chat_id)
-
-    async def _input_sell_pct(self, chat_id: int, text: str) -> None:
-        try:
-            value = float(text.strip().replace("%", "").replace("٪", ""))
-        except ValueError:
-            await self._send(chat_id, "عدد معتبر بفرستید (مثلاً 25).")
-            return
-        if not (0 < value <= 100):
-            await self._send(chat_id, "درصد باید بزرگ‌تر از صفر و حداکثر ۱۰۰ باشد.")
-            return
-        self.store.set_setting("sell_pct_free", f"{value:g}")
-        self.store.clear_flow()
-        self.store.audit("sizing_changed", f"sell_pct_free={value:g}")
-        await self._send(chat_id, "درصد فروش ذخیره شد.")
+        self.store.audit("sizing_changed", f"order_quote_amount={value:g}")
+        await self._send(chat_id, "مبلغ خرید ذخیره شد و در اجرای بعدی استفاده می‌شود.")
         await self._show_sizing(chat_id)
 
     # -------------------------------------------------- notification settings

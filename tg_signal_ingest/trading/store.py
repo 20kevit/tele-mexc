@@ -719,16 +719,6 @@ class TradingStore:
 
     # ------------------------------------------------------------ intents
 
-    def daily_totals(self, day_key: str) -> dict[str, Any]:
-        row = self.db.conn.execute(
-            "SELECT quote_spent, order_count FROM trading_daily_spend WHERE day_key = ?",
-            (day_key,),
-        ).fetchone()
-        return {
-            "quote_spent": Decimal(row["quote_spent"]) if row else Decimal(0),
-            "order_count": int(row["order_count"]) if row else 0,
-        }
-
     def count_open_intents(self) -> int:
         placeholders = ",".join("?" for _ in OPEN_INTENT_STATES)
         row = self.db.conn.execute(
@@ -929,7 +919,6 @@ class TradingStore:
         """
 
         now = self._ts()
-        day_key = self._now().date().isoformat()
         with self.db.transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM order_intents WHERE idempotency_key = ?", (idempotency_key,)
@@ -988,18 +977,6 @@ class TradingStore:
                 self._reserve_budget(conn, intent_id, quote_amount, now)
 
             conn.execute(
-                "INSERT OR IGNORE INTO trading_daily_spend (day_key, quote_spent, order_count, updated_at) "
-                "VALUES (?, '0', 0, ?)",
-                (day_key, now),
-            )
-            daily = conn.execute(
-                "SELECT quote_spent, order_count FROM trading_daily_spend WHERE day_key = ?",
-                (day_key,),
-            ).fetchone()
-            spent = Decimal(daily["quote_spent"])
-            count = int(daily["order_count"])
-
-            conn.execute(
                 """
                 INSERT INTO order_intents
                     (intent_id, signal_id, idempotency_key, client_order_id, symbol, side,
@@ -1024,10 +1001,6 @@ class TradingStore:
                     now,
                     now,
                 ),
-            )
-            conn.execute(
-                "UPDATE trading_daily_spend SET quote_spent = ?, order_count = ?, updated_at = ? WHERE day_key = ?",
-                (dec_str(spent + quote_amount), count + 1, now, day_key),
             )
             conn.execute(
                 "UPDATE signals SET status = 'planned', updated_at = ? WHERE signal_id = ?",

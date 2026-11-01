@@ -33,6 +33,13 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
         return False
     try:
         row = repo.db.conn.execute("SELECT value FROM control_settings WHERE key = 'order_quote_amount'").fetchone()
+        legacy = False
+        if row is None:
+            # Compatibility: older control menus wrote buy_quote_usd.  Read it
+            # only when the canonical setting is absent; it is never written
+            # again and the new menu stores order_quote_amount.
+            row = repo.db.conn.execute("SELECT value FROM control_settings WHERE key = 'buy_quote_usd'").fetchone()
+            legacy = row is not None
     except Exception:  # noqa: BLE001 - a missing/old schema must not block startup
         return False
     if row is None:
@@ -44,9 +51,9 @@ def apply_persisted_trading_settings(cfg: AppConfig, repo: Repository) -> bool:
     if not math.isfinite(value) or value <= 0:
         return False
     cfg.trading.order_quote_amount = value
-    cfg.trading.order_quote_amount_source = "database (Telegram menu)"
+    cfg.trading.order_quote_amount_source = "legacy database (buy_quote_usd)" if legacy else "database (Telegram menu)"
     cfg.trading.amount_configured = True
-    log.info("applied persisted order amount %.8g USDT from the Telegram menu", value)
+    log.info("applied persisted order amount %.8g USDT from the control database", value)
     return True
 
 

@@ -311,3 +311,22 @@ def test_receipt_is_suppressed_for_backlog_recovery(cfg, repo):
 
     engine.process_item(_item(100, 19038), _store_message(repo, 19038, ALERT))
     assert bot.sent == []
+
+
+def test_intent_creation_does_not_aggregate_daily_spend(cfg, repo):
+    store = TradingStore(repo.db, cfg.trading)
+    _create_intent(store, 1)
+
+    rows = repo.db.conn.execute("SELECT COUNT(*) AS c FROM trading_daily_spend").fetchone()
+    assert int(rows["c"]) == 0
+    assert not hasattr(store, "daily_totals")
+
+
+def test_budget_ledger_reservation_is_idempotent(cfg, repo):
+    store = TradingStore(repo.db, cfg.trading)
+    intent = _create_intent(store, 1)
+    before = _ledger(store)
+
+    store.ensure_budget_reservation(intent["intent_id"])
+    assert _ledger(store) == before
+    assert _reserved_total(store) == Decimal("10.02")

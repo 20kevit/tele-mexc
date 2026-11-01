@@ -34,8 +34,6 @@ SENSITIVE_PAYLOAD_KEYS = {
 }
 
 DEFAULT_SETTINGS: dict[str, str] = {
-    "buy_quote_usd": "10",
-    "sell_pct_free": "25",
     "sensitive_cleanup_s": "0",
     "channel_page_size": "10",
 }
@@ -178,14 +176,6 @@ class ControlStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 (key, value, self._ts()),
             )
-
-    def settings(self) -> dict[str, Any]:
-        return {
-            "buy_quote_usd": self.get_float_setting("buy_quote_usd", 10.0),
-            "sell_pct_free": self.get_float_setting("sell_pct_free", 25.0),
-            "sensitive_cleanup_s": max(0, self.get_int_setting("sensitive_cleanup_s", 0)),
-            "channel_page_size": min(10, max(1, self.get_int_setting("channel_page_size", 10))),
-        }
 
     # -------------------------------------------------- notification settings
 

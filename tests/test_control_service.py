@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from tg_signal_ingest.control.service import ControlBot
 from tg_signal_ingest.control.store import ControlStore
 
@@ -592,3 +594,66 @@ async def test_notification_severity_is_one_selected_level(cfg, repo):
     await control.handle_update(_callback(2, "n:set:WARNING"))
     assert store.notification_min_severity() == "WARNING"
     assert any("WARNING" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_writes_the_execution_setting(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:buy"))
+    await control.handle_update(_message(2, "7.25"))
+
+    assert store.get_setting("order_quote_amount") == "7.25"
+    assert control.cfg.trading.order_quote_amount == pytest.approx(7.25)
+    assert control.cfg.trading.order_quote_amount_source == "database (Telegram menu)"
+    assert store.get_setting("buy_quote_usd") is None
+    assert any("ذخیره شد" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_invalid_values_do_not_change_execution(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+    original = control.cfg.trading.order_quote_amount
+
+    await control.handle_update(_callback(1, "m:buy"))
+    for value in ("0", "-3", "nan", "inf", "not-a-number"):
+        await control.handle_update(_message(2, value))
+        assert store.get_setting("order_quote_amount") is None
+        assert control.cfg.trading.order_quote_amount == original
+        assert any("معتبر" in item["text"] or "بزرگ‌تر" in item["text"] for item in fake.sent)
+
+
+async def test_control_sizing_ui_has_no_sell_percentage_flow(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:sizing"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert "m:sell" not in callbacks
+    assert not any("فروش" in item["text"] for item in fake.sent[-1:])
+
+    await control.handle_update(_callback(2, "m:sell"))
+    assert any("گزینه نامعتبر" in item["text"] for item in fake.sent)
+
+
+async def test_control_buy_amount_respects_environment_precedence(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    cfg.trading.order_quote_amount = 4.25
+    cfg.trading.order_quote_amount_source = "env"
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "m:buy"))
+    await control.handle_update(_message(2, "9.5"))
+
+    assert store.get_setting("order_quote_amount") is None
+    assert control.cfg.trading.order_quote_amount == 4.25
+    assert any("TRADING_ORDER_QUOTE_AMOUNT" in item["text"] for item in fake.sent)

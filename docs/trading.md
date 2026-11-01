@@ -123,7 +123,7 @@ Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
 | Key | Default | Validation / meaning |
 | --- | --- | --- |
 | `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
-| `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
+| `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (`control_settings.order_quote_amount`) > `[trading]` > default. A legacy `buy_quote_usd` value is read only when the canonical key is absent. |
 | Order type | LIMIT only | `order_type_policy`, `TRADING_ORDER_TYPE_POLICY`, and MARKET execution are rejected |
 | `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
 | `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
@@ -158,7 +158,7 @@ change financial behaviour.
 
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
 threshold, or symbol allowlist. MEXC market metadata and order filters remain
-enforced. The `trading_daily_spend` table is maintained but no cap reads it.
+enforced. The historical `trading_daily_spend` table is retained for compatibility but is no longer written or read.
 
 ## Parsing and executable signals
 
@@ -577,7 +577,7 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - Every OCO transition writes an audit event (`oco.intended`, `oco.state`,
   `oco.sibling_canceled`) and a notification (`OCO_PROTECTION_ACTIVE`,
   `OCO_PROTECTION_PARTIAL`, `OCO_PROTECTION_UNCERTAIN`, `OCO_PROTECTION_FAILED`)
-  routed per the owner/developer preferences below.
+  routed by recipient role and the selected minimum severity below.
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
 
@@ -656,32 +656,21 @@ changes; audit events are written as `trading.buy_block`.
 Owner/developer notices are written to `trading_notifications` before delivery
 and retried independently of order execution. The outbox key is
 `(event_key, role)`; long text is split into chunks. A notification failure can
-never resubmit an order. Each event carries a `category` and `event_type`, and
-delivery goes only to recipients whose persisted preference enables that
-category.
+never resubmit an order. Each event carries a severity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, or
+`CRITICAL`). The control bot exposes one selectable minimum severity:
 
-### Notification categories and defaults
+| Selected level | Delivered |
+| --- | --- |
+| DEBUG | DEBUG and above |
+| INFO | INFO and above |
+| WARNING | WARNING and above |
+| ERROR | ERROR and above |
+| CRITICAL | CRITICAL only |
 
-| Category | Owner default | Developer default |
-| --- | --- | --- |
-| `signal_decision` | off | on |
-| `signal_accepted` | on | on |
-| `exchange_operation` | on | on |
-| `order_lifecycle` | on | on |
-| `oco_lifecycle` | on | on |
-| `take_profit` | on | on |
-| `stop_loss` | on | on |
-| `reconciliation` | on | on |
-| `critical` | on | on |
-| `diagnostic` | off | on |
-| `notification_delivery` | off | on |
-| `recovery` | off | on |
-
-The owner opts out of routine local signal rejections (`signal_decision` off);
-the developer receives every category. Preferences are stored in
-`notification_preferences` and can be toggled through the control bot's Persian
-"تنظیمات اعلان‌ها" menu (`n:settings`), with fallback to these code defaults
-when a row is missing.
+Recipient routing is separate from severity: genuine signals go to owner and
+developer, routine local rejections/diagnostics go to the developer, and
+recovery notices default to the developer. The obsolete per-role/per-category
+`notification_preferences` table is historical and is no longer read or written.
 
 ### Delivery outcomes and ambiguous recovery
 

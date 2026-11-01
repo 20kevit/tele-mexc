@@ -71,7 +71,7 @@ tradeable, and only above the activation boundary.
 | `order_fills` | unique `(exchange_order_id, exchange_trade_id)`; price, quantity, quote, fee, trade time |
 | `reconciliation_results` | append-only outcome (`consistent`, `resolved`, `discrepancy`, `ambiguous`, `not_found`) |
 | `audit_events` | v2 structured timeline: `event_id`, `event_type` (`category.event`), `severity`, `occurred_at_utc`, `recorded_at_utc`, correlation/causation ids, `trade_id`/`intent_id`/`order_id`/`exchange_order_id`, `symbol`, `reason_code`, `outcome`, `source_ref`, `evidence_source`, `evidence_limitations`, `payload_json`, `dedupe_key`; redacted and bounded `detail` |
-| `trading_daily_spend` | per-day quote/count bookkeeping; no cap currently reads it |
+| `trading_daily_spend` | historical per-day bookkeeping table; retained for compatibility, no runtime writes or cap |
 
 Relationships:
 

@@ -1436,7 +1436,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     control = sub.add_parser("control", help="Telegram owner control bot")
     control_sub = control.add_subparsers(dest="control_cmd", required=True)
-    control_status = control_sub.add_parser("status", help="offline control setup/approval overview")
+    control_status = control_sub.add_parser("status", help="offline control setup and readiness overview")
     control_status.set_defaults(func=cmd_control_status)
     control_run = control_sub.add_parser("run", help="run the owner controller only (serve can embed it automatically)")
     control_run.set_defaults(func=cmd_control_run)
