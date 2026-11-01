@@ -10,9 +10,8 @@ Telegram (MTProto, direct TLS)
         │  live events / backfill / recovery
         ▼
   ingest service ──► SQLite archive ──► processing queue ──► trading pipeline
-        │                 │                                      │
-        │                 └── offline analysis (manual)          ▼
-        │                                                MEXC Spot v3 REST
+        │                 │                                      ▼
+        │                 └── historical archive          MEXC Spot v3 REST
         └── notification Bot API ──► owner/developer      (automatic MEXC Spot)
 ```
 
@@ -24,14 +23,11 @@ store. There is no HTTP server and no inbound network listener.
 | Entry point | What runs | Locks |
 | --- | --- | --- |
 | `tg-ingest serve` | Telegram ingestion, backfill, queue consumer, trading engine, notifications, live reconciliation/monitor | `<db>.serve.lock` |
-| `tg-ingest manage run` | Two-operator management bot; data-only, bounded validation | `<db>.serve.lock` + `<db>.control.lock` |
-| `tg-ingest control run` | Legacy owner controller only; no ingestion worker | `<db>.control.lock` |
-| `tg-ingest analyze ...` | Offline analysis of stored messages | none |
+| `tg-ingest control run` | Owner/developer controller only; no ingestion worker | `<db>.control.lock` |
 | Other CLI commands | Short-lived DB/network checks | none |
 
 Locks use kernel `flock`; they are released automatically on process exit or
-crash. Control and management use the same Bot API token, so do not run them
-concurrently.
+crash. Do not run two controllers against the same database concurrently.
 
 ## `serve` startup sequence
 
@@ -86,8 +82,7 @@ and audited, never fed to the processing/trading path.
 **Backfill** (`tg_signal_ingest/backfill.py`) pages from newest to oldest using
 `backfill_next_max_id`, with `backfill_scope` = `full` or `since`. Each page
 commits messages and a checkpoint. A resumed run continues from the checkpoint;
-a completed run is a no-op. The management bot has a separate, bounded,
-data-only ingestion worker that never touches the processing queue.
+a completed run is a no-op.
 
 **Live gap recovery** walks message ids above `live_last_seen_message_id` in
 `recovery_sweep_size` pages and advances the watermark. `refresh_recent_window`
@@ -117,7 +112,7 @@ raw message text
   → signals row
   → replay/activation-boundary guard
   → RiskManager (BUY only, fixed quote amount, symbol constraints)
-  → order_intents row + atomic budget reservation
+  → order_intents row + atomic technical reservation
   → submission gate (pause + readiness)
   → MEXC Spot execution
   → exchange_orders, order_status_history, order_fills
@@ -173,10 +168,6 @@ visible until reconciliation resolves it. See `docs/data-model.md`.
   `IngestService`, and the production service uses only
   `control.bot_api.BotApiClient` for notifications. (The service constructor
   still accepts an optional `control_bot` for tests/embedding.)
-- `management/` is the current two-operator channel/preview/validation bot. It
-  does not instantiate the trading engine, MEXC client, or processing queue.
-- `analysis/` is a separate offline parser and review pipeline. It does not
-  contact Telegram/MEXC and is not wired into `serve`.
 
 ## Trade-lifecycle wiring
 

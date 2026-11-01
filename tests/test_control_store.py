@@ -1,4 +1,4 @@
-"""Durable control-bot state: setup, learning, approvals, secrets, dedupe."""
+"""Durable control-bot state: setup, secrets, dedupe."""
 
 from __future__ import annotations
 
@@ -25,18 +25,6 @@ def _store(repo) -> tuple[ControlStore, Clock]:
     return ControlStore(repo.db, now=clock), clock
 
 
-def _sample(store: ControlStore, message_id: int, *, actionable: bool = True):
-    return store.add_learning_sample(
-        channel_id=100,
-        message_id=message_id,
-        edit_version=0,
-        message_text=f"BUY BTCUSDT ENTRY 100 TP 110 SL 95 #{message_id}",
-        extracted={"symbol": "BTCUSDT"},
-        parser_kind="signal",
-        actionable=actionable,
-    )
-
-
 def test_setup_state_machine_requires_every_step(repo):
     store, _ = _store(repo)
     assert store.setup()["effective_state"] == "not_configured"
@@ -52,57 +40,12 @@ def test_setup_state_machine_requires_every_step(repo):
     assert store.effective_state() == "channel_selection_pending"
 
     store.update_setup(selected_channel_id=-100123, selected_channel_title="Signals")
-    assert store.effective_state() == "channel_selected"
-
-    store.update_setup(learning_state="in_progress")
-    assert store.effective_state() == "learning_in_progress"
-
-    store.update_setup(learning_state="completed")
     assert store.effective_state() == "automatic"
 
     store.update_setup(paused=1, pause_reason="owner pause")
     assert store.effective_state() == "paused"
     store.update_setup(paused=0)
     assert store.effective_state() == "automatic"
-
-
-def test_learning_requires_five_consecutive_actionable_approvals(repo):
-    store, _ = _store(repo)
-    samples = [_sample(store, i)[0] for i in range(1, 6)]
-
-    for sample in samples[:4]:
-        store.decide_learning_sample(sample["sample_id"], True)
-    assert store.setup()["learning_streak"] == 4
-    assert store.setup()["learning_state"] == "in_progress"
-
-    store.decide_learning_sample(samples[4]["sample_id"], True)
-    assert store.setup()["learning_streak"] == 5
-    assert store.setup()["learning_state"] == "completed"
-
-    rejected = _sample(store, 6)[0]
-    store.decide_learning_sample(rejected["sample_id"], False)
-    assert store.setup()["learning_streak"] == 0
-    assert store.setup()["learning_state"] == "in_progress"
-    assert store.setup()["learning_completed_at"] is None
-
-
-def test_invalid_or_duplicate_learning_examples_cannot_inflate_progress(repo):
-    store, _ = _store(repo)
-    invalid = _sample(store, 1, actionable=False)[0]
-    with pytest.raises(ValueError, match="cannot be approved"):
-        store.decide_learning_sample(invalid["sample_id"], True)
-
-    store.decide_learning_sample(invalid["sample_id"], False)
-    assert store.setup()["learning_streak"] == 0
-
-    sample, created = _sample(store, 2)
-    assert created is True
-    duplicate, created_again = _sample(store, 2)
-    assert created_again is False
-    assert duplicate["sample_id"] == sample["sample_id"]
-    with pytest.raises(ValueError, match="already decided"):
-        store.decide_learning_sample(sample["sample_id"], True)
-        store.decide_learning_sample(sample["sample_id"], True)
 
 
 def test_update_dedupe_and_flow_ttl_never_store_sensitive_payload(repo):
@@ -128,9 +71,7 @@ def test_secretbox_roundtrip_and_tamper_detection(repo):
     store.put_secret("mexc_api_secret", "super-secret-value", box)
     assert store.get_secret("mexc_api_secret", box) == "super-secret-value"
 
-    row = repo.db.conn.execute(
-        "SELECT * FROM control_secrets WHERE name = 'mexc_api_secret'"
-    ).fetchone()
+    row = repo.db.conn.execute("SELECT * FROM control_secrets WHERE name = 'mexc_api_secret'").fetchone()
     assert "super-secret-value" not in str(dict(row))
     repo.db.conn.execute(
         "UPDATE control_secrets SET ciphertext = ? WHERE name = 'mexc_api_secret'",

@@ -90,3 +90,47 @@ def test_notification_events_are_idempotent(cfg, repo):
     notifier.notify(event_key="fixed-event", text="hello", category="signal_accepted")
     assert len(bot.sent) == 2  # one per role, not four
     assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
+
+
+def test_minimum_severity_filters_events(cfg, repo):
+    engine = _engine(cfg, repo)
+    bot = FlakyBot()
+    notifier = _notifier(engine, bot)
+
+    notifier.notify(event_key="diag", text="debug detail", category="diagnostic")
+    assert bot.sent == []  # default minimum is INFO
+
+    notifier.store.set_notification_min_severity("WARNING")
+    notifier.notify(event_key="info", text="routine info", category="order_lifecycle")
+    assert bot.sent == []
+
+    notifier.notify(event_key="warn", text="reconcile warning", category="reconciliation")
+    assert len(bot.sent) == 2
+    assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
+
+
+def test_critical_threshold_receives_only_critical(cfg, repo):
+    engine = _engine(cfg, repo)
+    bot = FlakyBot()
+    notifier = _notifier(engine, bot)
+    notifier.store.set_notification_min_severity("CRITICAL")
+
+    notifier.notify(event_key="err", text="failed", category="order_lifecycle")
+    assert bot.sent == []
+
+    notifier.notify(event_key="crit", text="unprotected", category="critical")
+    assert len(bot.sent) == 2
+
+
+def test_distinct_trades_never_suppress_each_other(cfg, repo):
+    engine = _engine(cfg, repo)
+    bot = FlakyBot()
+    notifier = _notifier(engine, bot)
+
+    notifier.notify_trade({"trade_id": "t1", "signal_id": "s1"}, "ENTRY_SUBMITTED", "first")
+    notifier.notify_trade({"trade_id": "t2", "signal_id": "s2"}, "ENTRY_SUBMITTED", "second")
+
+    texts = [text for _, text in bot.sent]
+    assert len(texts) == 4  # two trades x two roles
+    assert texts.count("first") == 2
+    assert texts.count("second") == 2

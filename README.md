@@ -20,20 +20,15 @@ write backend. No withdrawals, no futures, no unofficial endpoints.
 - Storage: SQLite with reproducible migrations.
 - Config: `.env` (secrets) + private `config.toml` (runtime paths/options).
 - CLI: `tg-ingest` (setup, auth, channels, backfill, serve, status, diagnostics,
-  trading status/signals/intents/parse/reconcile/repair-signals,
-  offline `analyze` replay/summary/list/show/review/failures/corpus-check, owner
-  control bot, and a two-operator `manage run`/`manage status` bot with developer
-  self-authorized bounded validation).
+  trading status/signals/intents/parse/reconcile/repair-signals, owner control
+  bot).
 - Exchange: MEXC Spot v3 REST (HMAC-SHA256 signing, documented endpoint weights,
   process-shared rate gates, Decimal arithmetic, idempotent intents,
   partial-fill tracking/reconciliation). Market monitoring batches all symbols
   into one ticker request per interval and honors `429`/`418` `Retry-After`.
 
 See `docs/operations.md` for the full operator guide,
-`docs/SIGNAL_ANALYSIS.md` for the offline, non-trading candidate/review
-pipeline, `docs/CONTROL_BOT_FA.md` for the Persian owner guide,
-`docs/MANAGEMENT_BOT_FA.md` for the two-operator management and bounded-validation
-bot, and
+`docs/CONTROL_BOT_FA.md` for the Persian owner guide, and
 `docs/LIVE_VERIFICATION.md` for the manual Telegram verification procedure.
 
 ## Reviewer quick start (offline)
@@ -101,32 +96,13 @@ journalctl -u tg-ingest.service -f
   MEXC Spot credentials, and a healthy MEXC CLI write backend. There is no
   fallback to a simulated or test-only mode.
 - The optional Telegram control bot authenticates the personal session, verifies
-  MEXC permissions, selects the channel, and completes the learning examples.
-  Both the configured owner and the configured developer have owner-equivalent
-  access to every control-bot command and administrative action. Its
-  `/pause` and `/resume` controls are enforced at the order-submission boundary
-  with a kernel file lock and a transactional readiness check. See
+  MEXC permissions, and selects the channel. Both the configured owner and the
+  configured developer have owner-equivalent access to every control-bot command
+  and administrative action. Notifications use one selectable minimum severity
+  (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`); role routing remains separate.
+  Its `/pause` and `/resume` controls are enforced at the order-submission
+  boundary with a kernel file lock and a transactional readiness check. See
   `docs/CONTROL_BOT_FA.md`.
-- The `manage` bot authorizes exactly two numeric operators (owner and
-  developer), lists channels, and previews the latest ten messages read-only.
-  It can also store one bounded sample of 10/25/50 messages after a developer
-  request that the developer self-authorizes, followed by a separate developer
-  start; the sample is then analysed offline for human confirm/correct/reject.
-  The self-authorization is limited to bounded validation and does not grant
-  unrelated owner-only controls. It never starts full history ingestion or live
-  monitoring. The shared
-  personal session is authenticated only from a trusted SSH terminal
-  (`tg-ingest auth login`); the bot never asks for or accepts a login code in
-  chat, because Telegram invalidates codes shared in Telegram messages. It does
-  not instantiate the processing queue, exchange client, or trading engine,
-  does not download media, and never places an order. Logout requires explicit
-  confirmation and only removes the session after a successful server-side
-  `logOut`.
-- Offline candidate analysis (`tg-ingest analyze ...`) is independent of the
-  trading parser/engine and is not wired into `serve`. It reads already-stored
-  messages, never contacts Telegram or MEXC, and stores human corrections
-  append-only. It requires an explicit manual command and never starts
-  collection, backfill, or live monitoring. See `docs/SIGNAL_ANALYSIS.md`.
 
 ## Known limitations (platform-imposed)
 

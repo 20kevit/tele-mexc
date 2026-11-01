@@ -121,15 +121,13 @@ def test_amount_must_be_numeric(tmp_path):
         load_config(root=root, environ={}, require_credentials=False)
 
 
-def test_amount_is_not_coupled_to_aggregate_budget(tmp_path):
+def test_removed_aggregate_budget_key_is_rejected(tmp_path):
     root = _root_with(
         "[trading]\norder_quote_amount = 60\naggregate_budget_quote = 50",
         tmp_path=tmp_path,
     )
-    t = load_config(root=root, environ={}, require_credentials=False).trading
-    # Per-order size is owner-controlled; the aggregate value is reference-only.
-    assert t.order_quote_amount == 60.0
-    assert t.aggregate_budget_quote == 50.0
+    with pytest.raises(ConfigError, match="aggregate_budget_quote"):
+        load_config(root=root, environ={}, require_credentials=False)
 
 
 def test_amount_from_environment(tmp_path):

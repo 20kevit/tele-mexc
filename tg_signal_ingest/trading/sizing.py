@@ -61,11 +61,14 @@ def apply_sizing(
                 raise SizingError("a limit price is required to size a buy")
             base = meta.quantize_quantity(quote / price)
             if base <= 0:
-                raise SizingError("buy budget is smaller than the symbol quantity step")
+                raise SizingError("buy amount is smaller than the symbol quantity step")
             quote = base * price
         meta.validate_order(
-            side="BUY", order_type=decision.order_type.upper(),
-            quantity=base, quote_amount=quote, price=decision.limit_price,
+            side="BUY",
+            order_type=decision.order_type.upper(),
+            quantity=base,
+            quote_amount=quote,
+            price=decision.limit_price,
         )
         return RiskDecision(
             approved=True,
@@ -96,8 +99,11 @@ def apply_sizing(
             raise SizingError("no valid price is available to value the sell")
         quote = base * price
         meta.validate_order(
-            side="SELL", order_type=decision.order_type.upper(),
-            quantity=base, quote_amount=quote, price=decision.limit_price,
+            side="SELL",
+            order_type=decision.order_type.upper(),
+            quantity=base,
+            quote_amount=quote,
+            price=decision.limit_price,
         )
         return RiskDecision(
             approved=True,

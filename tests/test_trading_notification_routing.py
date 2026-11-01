@@ -44,7 +44,7 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
 
 def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, repo):
     """Owner policy: routine local signal rejections go to the developer only,
-    never to the owner, unless the owner re-enables the category."""
+    never to the owner; this is explicit role routing, not a severity preference."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -66,8 +66,7 @@ def test_genuine_sell_notifies_developer_only_and_is_explicitly_ignored(cfg, rep
 
 
 def test_locally_rejected_genuine_buy_notifies_developer_only_with_reason(cfg, repo):
-    """Owner policy: a genuine signal rejected locally is a routine local
-    rejection and is reported to the developer, not the owner."""
+    """A genuine signal rejected locally is reported to the developer only."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -88,8 +87,7 @@ def test_locally_rejected_genuine_buy_notifies_developer_only_with_reason(cfg, r
     assert text in joined
 
 
-def test_per_order_amount_above_aggregate_reference_is_not_rejected(cfg, repo):
-    cfg.trading.aggregate_budget_quote = 5.0
+def test_fixed_per_order_amount_is_submitted_without_a_budget_cap(cfg, repo):
     open_order = {
         "orderId": "ex-over-ref",
         "symbol": "BTCUSDT",
@@ -112,8 +110,7 @@ def test_per_order_amount_above_aggregate_reference_is_not_rejected(cfg, repo):
 
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
 
-    # The per-order amount (10 USDT in the test engine) is not capped by the
-    # aggregate reference (5 USDT); the real order is submitted.
+    # The fixed per-order amount is submitted; there is no aggregate cap.
     assert result is not None and result["state"] == "open"
     assert client.place_calls == 1
     assert len(bot.sent) == 2

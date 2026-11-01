@@ -188,8 +188,7 @@ def _ready(repo: Repository) -> None:
     with repo.db.transaction() as conn:
         conn.execute(
             "UPDATE control_setup SET telegram_state='authenticated', "
-            "mexc_state='verified', selected_channel_id=100, "
-            "learning_state='completed', paused=0 WHERE id=1"
+            "mexc_state='verified', selected_channel_id=100, paused=0 WHERE id=1"
         )
 
 
@@ -209,7 +208,6 @@ def _reason(cfg: AppConfig, repo: Repository) -> str | None:
         ("telegram_state", "unauthenticated", "Telegram"),
         ("mexc_state", "not_configured", "MEXC"),
         ("selected_channel_id", None, "channel"),
-        ("learning_state", "in_progress", "learning"),
     ],
 )
 def test_readiness_prerequisites_are_checked_individually(cfg, repo, column, value, expected):
@@ -388,10 +386,9 @@ def test_runtime_readiness_flip_blocks_the_next_submission_immediately(cfg, repo
     state["telegram"] = True
     with repo.db.transaction() as conn:
         assert gate.check(conn) is None
+    state["channel"] = False
     with repo.db.transaction() as conn:
-        conn.execute("UPDATE control_setup SET learning_state='in_progress' WHERE id = 1")
-    with repo.db.transaction() as conn:
-        assert "learning" in (gate.check(conn) or "").lower()
+        assert "channel" in (gate.check(conn) or "").lower()
 
 
 def test_engine_submission_flip_blocks_the_next_order(cfg, repo):

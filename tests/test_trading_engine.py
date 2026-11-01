@@ -995,7 +995,6 @@ def test_persistent_timestamp_error_rejects_with_zero_order_submissions(cfg, rep
 def test_balance_preflight_counts_competing_local_intents(cfg, repo):
     client = FakeMexc(account_response=_account(usdt="15"))
     engine = _engine(cfg, repo, client, mode="live")
-    cfg.trading.remaining_balance_reserve_pct = 0.0
 
     store = TradingStore(repo.db, cfg.trading)
     parsed = SignalParser().parse(ALERT)

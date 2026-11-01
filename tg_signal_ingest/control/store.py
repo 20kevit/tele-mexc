@@ -7,7 +7,6 @@ code, two-step password, bot token, or exchange secret is stored here.
 from __future__ import annotations
 
 import json
-import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -37,7 +36,6 @@ SENSITIVE_PAYLOAD_KEYS = {
 DEFAULT_SETTINGS: dict[str, str] = {
     "buy_quote_usd": "10",
     "sell_pct_free": "25",
-    "learning_target": "5",
     "sensitive_cleanup_s": "0",
     "channel_page_size": "10",
 }
@@ -67,9 +65,6 @@ SETUP_FIELDS = {
     "mexc_label",
     "selected_channel_id",
     "selected_channel_title",
-    "learning_state",
-    "learning_streak",
-    "learning_completed_at",
     "paused",
     "pause_reason",
 }
@@ -141,11 +136,7 @@ class ControlStore:
             return "telegram_authenticated"
         if not s.get("selected_channel_id"):
             return "channel_selection_pending"
-        if s.get("learning_state") == "in_progress":
-            return "learning_in_progress"
-        if s.get("learning_state") == "completed":
-            return "automatic"
-        return "channel_selected"
+        return "automatic"
 
     def refresh_setup_state(self) -> str:
         state = self.effective_state()
@@ -192,45 +183,24 @@ class ControlStore:
         return {
             "buy_quote_usd": self.get_float_setting("buy_quote_usd", 10.0),
             "sell_pct_free": self.get_float_setting("sell_pct_free", 25.0),
-            "learning_target": max(1, self.get_int_setting("learning_target", 5)),
             "sensitive_cleanup_s": max(0, self.get_int_setting("sensitive_cleanup_s", 0)),
             "channel_page_size": min(10, max(1, self.get_int_setting("channel_page_size", 10))),
         }
 
     # -------------------------------------------------- notification settings
 
-    def get_notification_setting(self, role: str, category: str) -> bool | None:
-        row = self.db.conn.execute(
-            "SELECT enabled FROM notification_preferences WHERE role = ? AND category = ?",
-            (role, category),
-        ).fetchone()
-        if row is None:
-            return None
-        return bool(int(row["enabled"]))
+    NOTIFICATION_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
-    def set_notification_setting(self, role: str, category: str, enabled: bool) -> None:
-        now = self._ts()
-        with self.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO notification_preferences (role, category, enabled, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(role, category) DO UPDATE SET "
-                "enabled = excluded.enabled, updated_at = excluded.updated_at",
-                (role, category, 1 if enabled else 0, now),
-            )
-        self.audit(
-            f"notification_{role}_{category}",
-            f"{'enabled' if enabled else 'disabled'}: notification {category} for {role}",
-        )
+    def notification_min_severity(self) -> str:
+        value = (self.get_setting("notification_min_severity", "INFO") or "INFO").upper()
+        return value if value in self.NOTIFICATION_LEVELS else "INFO"
 
-    def list_notification_settings(self, role: str | None = None) -> list[dict[str, Any]]:
-        if role is None:
-            rows = self.db.conn.execute("SELECT * FROM notification_preferences ORDER BY role, category").fetchall()
-        else:
-            rows = self.db.conn.execute(
-                "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
-                (role,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+    def set_notification_min_severity(self, level: str) -> None:
+        value = str(level).upper()
+        if value not in self.NOTIFICATION_LEVELS:
+            raise ValueError(f"unknown notification level {level!r}")
+        self.set_setting("notification_min_severity", value)
+        self.audit("notification_level_changed", f"minimum severity={value}")
 
     # ---------------------------------------------------------------- flow
 
@@ -289,163 +259,6 @@ class ControlStore:
             "INSERT INTO control_audit (event, detail, created_at) VALUES (?, ?, ?)",
             (event[:200], detail[:2000], self._ts()),
         )
-
-    # ------------------------------------------------------------ learning
-
-    def add_learning_sample(
-        self,
-        *,
-        channel_id: int,
-        message_id: int,
-        edit_version: int,
-        message_text: str,
-        extracted: dict[str, Any],
-        parser_kind: str,
-        actionable: bool,
-    ) -> tuple[dict[str, Any], bool]:
-        sample_id = f"ls-{secrets.token_hex(8)}"
-        now = self._ts()
-        with self.db.transaction() as conn:
-            seq_row = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS n FROM control_learning_samples"
-            ).fetchone()
-            sequence = int(seq_row["n"])
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO control_learning_samples
-                    (sample_id, channel_id, message_id, edit_version, message_text,
-                     extracted_json, parser_kind, actionable, decision, sequence, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                """,
-                (
-                    sample_id,
-                    channel_id,
-                    message_id,
-                    edit_version,
-                    message_text,
-                    json.dumps(extracted, ensure_ascii=False, separators=(",", ":")),
-                    parser_kind,
-                    1 if actionable else 0,
-                    sequence,
-                    now,
-                ),
-            )
-            if cur.rowcount == 0:
-                row = conn.execute(
-                    "SELECT * FROM control_learning_samples WHERE channel_id = ? AND message_id = ? "
-                    "AND edit_version = ?",
-                    (channel_id, message_id, edit_version),
-                ).fetchone()
-                assert row is not None
-                return dict(row), False
-        row = self.get_learning_sample(sample_id)
-        assert row is not None
-        return row, True
-
-    def get_learning_sample(self, sample_id: str) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT * FROM control_learning_samples WHERE sample_id = ?", (sample_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        out = dict(row)
-        try:
-            out["extracted"] = json.loads(out["extracted_json"])
-        except ValueError:
-            out["extracted"] = {}
-        return out
-
-    def pending_learning_sample(self) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT sample_id FROM control_learning_samples WHERE decision = 'pending' ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
-        return self.get_learning_sample(str(row["sample_id"])) if row else None
-
-    def latest_learning_sample(self) -> dict[str, Any] | None:
-        row = self.db.conn.execute(
-            "SELECT sample_id FROM control_learning_samples ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
-        return self.get_learning_sample(str(row["sample_id"])) if row else None
-
-    def learning_examples(self, limit: int = 5) -> list[dict[str, Any]]:
-        rows = self.db.conn.execute(
-            "SELECT sample_id FROM control_learning_samples WHERE decision = 'approved' ORDER BY sequence DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [s for r in rows if (s := self.get_learning_sample(str(r["sample_id"]))) is not None]
-
-    def decide_learning_sample(self, sample_id: str, approved: bool, reason: str = "") -> dict[str, Any]:
-        now = self._ts()
-        decision = "approved" if approved else "rejected"
-        with self.db.transaction() as conn:
-            row = conn.execute("SELECT * FROM control_learning_samples WHERE sample_id = ?", (sample_id,)).fetchone()
-            if row is None:
-                raise ValueError("learning sample not found")
-            if row["decision"] != "pending":
-                raise ValueError("this example was already decided")
-            if approved and not int(row["actionable"]):
-                raise ValueError("a non-signal or ambiguous extraction cannot be approved")
-            conn.execute(
-                "UPDATE control_learning_samples SET decision = ?, decision_reason = ?, decided_at = ? "
-                "WHERE sample_id = ?",
-                (decision, reason[:500], now, sample_id),
-            )
-        self.recompute_learning_state()
-        result = self.get_learning_sample(sample_id)
-        assert result is not None
-        return result
-
-    def recompute_learning_state(self) -> int:
-        """Recompute the consecutive-approval streak from persisted decisions.
-
-        Only actionable valid examples participate. A rejected actionable
-        example resets the streak; non-actionable rejections neither count nor
-        break it (they were never eligible training data).
-        """
-
-        rows = self.db.conn.execute(
-            "SELECT actionable, decision FROM control_learning_samples "
-            "WHERE decision IN ('approved', 'rejected') ORDER BY sequence"
-        ).fetchall()
-        streak = 0
-        for row in rows:
-            if not int(row["actionable"]):
-                continue
-            if row["decision"] == "approved":
-                streak += 1
-            else:
-                streak = 0
-        target = max(1, self.get_int_setting("learning_target", 5))
-        setup = self._get_setup_row()
-        completed_at = setup.get("learning_completed_at")
-        learning_state = setup.get("learning_state") or "not_started"
-        if streak >= target:
-            learning_state = "completed"
-            completed_at = completed_at or self._ts()
-        elif learning_state == "completed" and streak < target:
-            # A later rejection invalidates completion until the owner restarts.
-            learning_state = "in_progress"
-            completed_at = None
-        elif streak > 0 or rows:
-            learning_state = "in_progress"
-        self.update_setup(
-            learning_streak=streak,
-            learning_state=learning_state,
-            learning_completed_at=completed_at,
-        )
-        self.refresh_setup_state()
-        return streak
-
-    def reset_learning(self) -> None:
-        with self.db.transaction() as conn:
-            conn.execute("DELETE FROM control_learning_samples")
-        self.update_setup(
-            learning_state="in_progress",
-            learning_streak=0,
-            learning_completed_at=None,
-        )
-        self.audit("learning_reset", "owner explicitly restarted the learning phase")
-        self.refresh_setup_state()
 
     # -------------------------------------------------------------- notices
 

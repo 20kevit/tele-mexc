@@ -22,9 +22,7 @@ import asyncio
 import contextlib
 import json
 import os
-import sqlite3
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 from .backfill import BackfillError, run_backfill
@@ -92,7 +90,6 @@ backfill_since = "{backfill_since}"  # used only when scope = "since" (YYYY-MM-D
 # One-time owner acknowledgement; required before the pipeline is constructed.
 # execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 # order_quote_amount = 3
-# aggregate_budget_quote = 50
 # order_type_policy = "limit"
 # recon_interval_s = 30
 # emergency_stop = false
@@ -279,8 +276,8 @@ async def cmd_auth_login(_args) -> int:
             message = await interactive_login(cfg)
     except SessionBusyError:
         print(
-            "Login not completed: the Telegram session is in use by tg-manage or "
-            "another process. Wait for the current operation to finish and retry; "
+            "Login not completed: the Telegram session is in use by another "
+            "process. Wait for the current operation to finish and retry; "
             "do not stop or restart the service just for this lock.",
             file=sys.stderr,
         )
@@ -312,112 +309,6 @@ async def cmd_auth_check(_args) -> int:
         return 3
     print(f"Session status: valid (account: {name or 'unknown'})")
     return 0
-
-
-async def cmd_auth_check_channel(_args) -> int:
-    """Verify the current session can access the exact management-selected channel.
-
-    This is read-only: it opens the selected channel by its stored access hash,
-    prints no channel id/title, and never fetches message history. Use the
-    ``TG_SESSION_PATH`` environment variable to check a separate account
-    session without touching the default/employer session.
-    """
-
-    from .management.store import ManagementStore
-    from .telethon import resolve_session_file
-
-    cfg = _load_or_exit()
-    _, session_file = resolve_session_file(cfg)
-    print(f"  session file: {'present' if session_file.is_file() else 'MISSING'}")
-    if not Path(cfg.db_path).is_file():
-        print("management database unavailable: not initialized", file=sys.stderr)
-        return 1
-    db = None
-    try:
-        try:
-            db = Database(cfg.db_path, read_only=True)
-            store = ManagementStore(db)
-            owner = int(cfg.control.owner_user_id) if cfg.control.owner_user_id else None
-            developer = int(cfg.control.developer_user_id) if cfg.control.developer_user_id else None
-            selections: list[tuple[str, dict]] = []
-            for role, operator_id in (("owner", owner), ("developer", developer)):
-                if operator_id is None:
-                    continue
-                details = store.selected_channel_details(operator_id)
-                if details.get("selected_channel_id"):
-                    selections.append((role, details))
-        except sqlite3.Error:
-            print("management schema not initialized", file=sys.stderr)
-            return 1
-        if not selections:
-            print("no management-selected channel found", file=sys.stderr)
-            return 2
-        channel_ids = {int(details["selected_channel_id"]) for _role, details in selections}
-        if len(channel_ids) != 1:
-            print(
-                "owner and developer selections differ; refusing to choose a channel",
-                file=sys.stderr,
-            )
-            return 2
-        channel_id = channel_ids.pop()
-        access_hash = next(
-            (int(details["access_hash"]) for _role, details in selections if details.get("access_hash")),
-            0,
-        )
-        if not access_hash:
-            print("selected channel has no stored access hash", file=sys.stderr)
-            return 2
-        print(f"  management selections checked: {len(selections)}")
-
-        try:
-            async with SessionGuard(cfg).use():
-                client = await connect_and_verify(cfg)
-                try:
-                    me = await client.get_me()
-                    name = (
-                        (getattr(me, "first_name", None) or "") + " " + (getattr(me, "last_name", None) or "")
-                    ).strip()
-                    username = getattr(me, "username", None)
-                    account_id = int(getattr(me, "id", 0) or 0)
-                    print(
-                        f"  account: {name[:1] + '***' if name else '(none)'}"
-                        + (f" (@{username[:1]}***)" if username else "")
-                    )
-                    print(
-                        "  account matches: "
-                        f"owner={bool(owner and account_id == owner)} "
-                        f"developer={bool(developer and account_id == developer)}"
-                    )
-                    from telethon.tl.types import InputChannel
-
-                    entity = await client.get_entity(InputChannel(channel_id, access_hash))
-                    if getattr(entity, "megagroup", False):
-                        channel_type = "megagroup"
-                    elif getattr(entity, "broadcast", False):
-                        channel_type = "broadcast"
-                    else:
-                        channel_type = "other"
-                    print("  channel access: OK")
-                    print(f"  channel type: {channel_type}")
-                    print(f"  title present: {bool(getattr(entity, 'title', None))}")
-                    print(f"  username present: {bool(getattr(entity, 'username', None))}")
-                    print(f"  entity matches selection: {int(getattr(entity, 'id', 0)) == channel_id}")
-                    return 0
-                finally:
-                    with contextlib.suppress(Exception):
-                        await client.disconnect()
-        except SessionBusyError:
-            print("session status: busy (another process is using this session)", file=sys.stderr)
-            return 4
-        except AuthRequired as exc:
-            print(f"session status: {exc}", file=sys.stderr)
-            return 3
-        except Exception as exc:  # noqa: BLE001 - classify access failures
-            print(f"channel verification failed: {exc.__class__.__name__}", file=sys.stderr)
-            return 4
-    finally:
-        if db is not None:
-            db.close()
 
 
 def _ingestion_process_running(cfg) -> str | None:
@@ -469,8 +360,8 @@ async def cmd_auth_logout(_args) -> int:
             outcome = await logout_and_delete_session(cfg)
     except SessionBusyError:
         print(
-            "refusing logout: the Telegram session is currently in use by tg-manage "
-            "or another process. Wait for the current operation to finish and retry.",
+            "refusing logout: the Telegram session is currently in use by another "
+            "process. Wait for the current operation to finish and retry.",
             file=sys.stderr,
         )
         return 4
@@ -691,124 +582,6 @@ def _read_only_repo(cfg):
     return db, Repository(db, processing_max_attempts=cfg.processing_max_attempts)
 
 
-def cmd_manage_status(_args) -> int:
-    from .management.store import ManagementStore
-
-    cfg = _load_or_exit(require_credentials=False)
-    if not Path(cfg.db_path).is_file():
-        print("management database: not initialized (run 'tg-ingest manage run' once)")
-        return 1
-    try:
-        db, repo = _read_only_repo(cfg)
-    except (FileNotFoundError, sqlite3.Error) as exc:
-        print(f"management database unavailable: {exc.__class__.__name__}", file=sys.stderr)
-        return 1
-    try:
-        try:
-            store = ManagementStore(db)
-            state = store.state()
-        except sqlite3.Error:
-            print("management schema not initialized (run 'tg-ingest manage run' once)")
-            return 1
-        print("Telegram management bot")
-        print(f"  configured: {'yes' if cfg.control.management_configured else 'no'}")
-        print(
-            "  authorized operators: owner="
-            f"{'set' if cfg.control.owner_user_id else 'MISSING'} developer="
-            f"{'set' if cfg.control.developer_user_id else 'MISSING'}"
-        )
-        print(f"  bot token: {'set' if cfg.control.bot_token else 'MISSING'}")
-        print("  transport: direct TCP/TLS")
-        print(f"  telegram state: {state.get('telegram_state')}")
-        print(f"  account label: {state.get('telegram_label') or '-'}")
-        print(
-            f"  selected channel: {state.get('selected_channel_title') or 'not selected'}"
-            f" (id={state.get('selected_channel_id') or '-'})"
-        )
-        try:
-            print(f"  pending login stages: {store.pending_flow_count()}")
-        except sqlite3.Error:
-            print("  pending login stages: unavailable (older schema)")
-        job = store.latest_job()
-        if job is None:
-            print("  ingestion: not started")
-        else:
-            counts = repo.message_counts(int(job["channel_id"]))
-            print(f"  ingestion: {job['status']} channel={job['channel_id']}")
-            print(
-                f"    stored={counts.total} inserted={job['inserted']} updated={job['updated']} failed={job['failed']}"
-            )
-            print(f"    checkpoint={job.get('checkpoint_next_max_id')} error={job.get('error') or '-'}")
-            if job.get("max_messages") is not None:
-                print(f"    bounded sample: {job['max_messages']} messages")
-        if store.validation_available():
-            print("  validation workflow: ready")
-            request = store.latest_import_request()
-            if request is not None:
-                print(
-                    "    request: "
-                    f"{request['status']} limit={request['max_messages']} "
-                    f"reviewed={request['reviewed_count']}/{request['candidate_count']}"
-                )
-        else:
-            print("  validation workflow: schema not applied")
-        print("  trading/MEXC: deliberately disabled in the management bot")
-        return 0
-    finally:
-        db.close()
-
-
-async def _cmd_manage_run() -> int:
-    from .locking import AlreadyRunningError, SingleInstanceLock
-    from .management.bot import ManagementBot
-
-    cfg = _load_or_exit()
-    if not cfg.control.management_configured:
-        print(
-            "management bot requires CONTROL_BOT_TOKEN, CONTROL_OWNER_USER_ID and CONTROL_DEVELOPER_USER_ID",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        bot = BotApiClient(cfg.control.bot_token or "", api_base=cfg.control.api_base)
-    except (ConfigError, BotApiError) as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-    lock = SingleInstanceLock.for_database(cfg.db_path)
-    control_lock = SingleInstanceLock.for_control(cfg.db_path)
-    db = None
-    try:
-        try:
-            lock.acquire()
-            control_lock.acquire()
-        except AlreadyRunningError as exc:
-            print(f"management bot refused to start: {exc}", file=sys.stderr)
-            return 1
-        db, repo = _new_repo(cfg)
-        from .trading.runtime import apply_persisted_trading_settings
-
-        apply_persisted_trading_settings(cfg, repo)
-        manager = ManagementBot(cfg, repo, bot)
-        stop = asyncio.Event()
-        _install_stop_handlers(stop)
-        print(
-            "Telegram management bot running "
-            "(two operators; preview and developer self-authorized bounded validation; "
-            "trading disabled)."
-        )
-        await manager.run(stop)
-        return 0
-    finally:
-        if db is not None:
-            db.close()
-        control_lock.release()
-        lock.release()
-
-
-def cmd_manage_run(_args) -> int:
-    return asyncio.run(_cmd_manage_run())
-
-
 def cmd_control_status(_args) -> int:
     from .control.secretbox import SecretBox
     from .control.store import ControlStore
@@ -829,11 +602,8 @@ def cmd_control_status(_args) -> int:
         print(f"  telegram: {setup['telegram_state']} — {setup['telegram_account_label'] or '-'}")
         print(f"  MEXC: {setup['mexc_state']} — {setup['mexc_label'] or '-'}")
         print(f"  channel: {setup['selected_channel_title'] or 'not selected'}")
-        print(
-            f"  learning: {setup['learning_state']} "
-            f"({int(setup['learning_streak'] or 0)}/{store.get_int_setting('learning_target', 5)})"
-        )
         print(f"  execution paused: {bool(int(setup['paused'] or 0))}")
+        print(f"  notification minimum: {store.notification_min_severity()}")
         print("  valid signals execute automatically when setup is ready and execution is not paused.")
     finally:
         db.close()
@@ -1170,13 +940,6 @@ def cmd_diag_orders(args) -> int:
         lines.append(f"    {intent['intent_id']} state={intent['state']} sym={intent['symbol']} reason={reason[:80]}")
     lines.append("")
 
-    # Show budget summary
-    budget = store.budget_summary()
-    lines.append("  budget summary:")
-    lines.append(f"    limit: {budget['limit']} USDT")
-    lines.append(f"    reserved: {budget['reserved']} USDT")
-    lines.append(f"    spent: {budget['spent']} USDT")
-    lines.append(f"    remaining: {budget['remaining']} USDT")
     db.close()
     for line in lines:
         print(line)
@@ -1263,7 +1026,6 @@ def cmd_messages_show(args) -> int:
     if raw is None:
         print("message not found", file=sys.stderr)
         return 1
-    import json
 
     payload = dict(raw)
     payload.pop("raw_json", None)
@@ -1399,7 +1161,6 @@ def cmd_trading_intents(args) -> int:
 
 
 def cmd_trading_parse(args) -> int:
-    import json
 
     from .trading.parser import SignalParser
 
@@ -1626,313 +1387,6 @@ def cmd_queue_reprocess(args) -> int:
     return 0
 
 
-def _analysis_repo(db_path: str | None = None):
-    cfg = _load_or_exit(require_credentials=False)
-    if db_path:
-        # Offline analysis may target a disposable copy. Never require the
-        # operator to edit the production config just to run a dry-run.
-        resolved = Path(db_path).expanduser()
-        cfg = replace(cfg, db_path=resolved, data_dir=resolved.parent)
-    db, repo = _new_repo(cfg)
-    return cfg, db, repo
-
-
-def _iso_argument(value: str | None, name: str) -> str | None:
-    if value is None:
-        return None
-    from datetime import datetime
-
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise SystemExit(f"{name} must be an ISO date or timestamp") from exc
-    return value
-
-
-def cmd_analyze_replay(args) -> int:
-    from .analysis import ReplayScope, run_replay
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    selected = repo.selected_channel()
-    channel_id = args.channel_id if args.channel_id is not None else (selected.channel_id if selected else None)
-    if channel_id is None:
-        print("no channel selected; pass --channel-id to replay a specific channel", file=sys.stderr)
-        db.close()
-        return 1
-    scope = ReplayScope(
-        channel_id=channel_id,
-        since=_iso_argument(args.since, "--since"),
-        until=_iso_argument(args.until, "--until"),
-        limit=args.limit,
-        after_message_id=args.after_message_id,
-        include_deleted=not args.exclude_deleted,
-        dry_run=args.dry_run,
-    )
-    try:
-        stats = run_replay(repo, scope)
-    except Exception as exc:  # noqa: BLE001 - CLI boundary reports safely
-        print(f"analysis replay failed: {exc.__class__.__name__}", file=sys.stderr)
-        db.close()
-        return 1
-    mode = "dry-run" if stats.dry_run else f"run={stats.run_id}"
-    print(f"offline analysis replay ({mode})")
-    print(
-        f"  scanned={stats.scanned} inserted={stats.inserted} duplicates={stats.duplicates} "
-        f"superseded={stats.superseded} needs_review={stats.needs_review} "
-        f"failures={stats.failures} deleted_marked={stats.deleted_marked}"
-    )
-    print(f"  last_message_id={stats.last_message_id}")
-    if stats.by_classification:
-        print(
-            "  by classification: "
-            + ", ".join(f"{key}={value}" for key, value in sorted(stats.by_classification.items()))
-        )
-    db.close()
-    return 1 if stats.failures else 0
-
-
-def cmd_analyze_reindex(args) -> int:
-    from .analysis import AnalysisStore
-    from .analysis.parser import SignalAnalysisParser
-    from .analysis.reindex import rebuild_signal_index
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    selected = repo.selected_channel()
-    channel_id = args.channel_id if args.channel_id is not None else (selected.channel_id if selected else None)
-    if channel_id is None:
-        print("no channel selected; pass --channel-id to reindex a specific channel", file=sys.stderr)
-        db.close()
-        return 1
-    parser = SignalAnalysisParser()
-    store = AnalysisStore(repo.db)
-    try:
-        stats = rebuild_signal_index(
-            db,
-            channel_id=channel_id,
-            dry_run=args.dry_run,
-            parser=parser,
-            store=store,
-        )
-    except Exception as exc:  # noqa: BLE001 - CLI boundary reports safely
-        print(f"signal index rebuild failed: {exc.__class__.__name__}", file=sys.stderr)
-        db.close()
-        return 1
-    report: dict = stats.as_json()
-    report["context"] = {
-        "channel_id": channel_id,
-        "parser_version": parser.version,
-        "signals_in_index": db.conn.execute(
-            "SELECT COUNT(*) AS c FROM channel_signals WHERE channel_id = ?",
-            (channel_id,),
-        ).fetchone()["c"],
-        "links_in_index": db.conn.execute(
-            "SELECT COUNT(*) AS c FROM signal_message_links WHERE channel_id = ?",
-            (channel_id,),
-        ).fetchone()["c"],
-        "link_status_breakdown": {
-            row["status"]: row["c"]
-            for row in db.conn.execute(
-                "SELECT status, COUNT(*) AS c FROM signal_message_links WHERE channel_id = ? GROUP BY status",
-                (channel_id,),
-            ).fetchall()
-        },
-        "conflicts": db.conn.execute(
-            "SELECT COUNT(*) AS c FROM signal_message_links WHERE channel_id = ? AND status = 'conflict'",
-            (channel_id,),
-        ).fetchone()["c"],
-    }
-    mode = "dry-run (nothing written)" if stats.dry_run else "applied"
-    print(f"logical signal index rebuild ({mode}) for channel {channel_id}")
-    print(
-        f"  messages={stats.messages_scanned} parse_failures={stats.parse_failures} "
-        f"initial_signals={stats.initial_signals} follow_ups={stats.follow_ups} "
-        f"long={stats.long_signals} short={stats.short_signals} ambiguous={stats.ambiguous}"
-    )
-    print(
-        f"  signals_planned={stats.signals_planned} duplicate_signal_ids={stats.duplicate_signal_ids} "
-        f"linked={stats.links_linked} unresolved={stats.links_unresolved} "
-        f"conflicts={stats.links_conflict} no_reference={stats.links_no_reference}"
-    )
-    if not stats.dry_run:
-        print(
-            f"  applied: signals_created={stats.signals_created} "
-            f"signals_updated={stats.signals_updated} signals_unchanged={stats.signals_unchanged} "
-            f"links_created={stats.links_created} links_updated={stats.links_updated}"
-        )
-    if args.report_path:
-        report_path = Path(args.report_path).expanduser()
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        print(f"  machine-readable report: {report_path}")
-    db.close()
-    return 0
-
-
-def cmd_analyze_summary(args) -> int:
-    from .analysis import AnalysisStore
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    store = AnalysisStore(repo.db)
-    summary = store.summary()
-    print("offline signal analysis summary (no exchange activity)")
-    print(f"  candidates: total={summary['total']} status={summary['status'] or 'none'}")
-    print(f"  current classification: {summary['classification'] or 'none'}")
-    print(f"  current parse status:   {summary['parse_status'] or 'none'}")
-    print(f"  current review status:  {summary['review_status'] or 'none'}")
-    print(f"  unresolved failures:    {summary['unresolved_failures']}")
-    latest = summary["latest_run"]
-    if latest:
-        print(
-            f"  latest run: {latest['run_id']} status={latest['status']} "
-            f"started={latest['started_at']} finished={latest['finished_at'] or '-'}"
-        )
-    else:
-        print("  latest run: none")
-    db.close()
-    return 0
-
-
-def cmd_analyze_list(args) -> int:
-    from .analysis import AnalysisStore
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    rows = AnalysisStore(repo.db).list_candidates(
-        classification=args.classification,
-        parse_status=args.parse_status,
-        review_status=args.review_status,
-        include_superseded=args.include_superseded,
-        limit=args.limit,
-    )
-    for row in rows:
-        entry = (
-            f"{row['entry_low_price']}-{row['entry_high_price']}"
-            if row["entry_low_price"] and row["entry_high_price"]
-            else (row["entry_price"] or "-")
-        )
-        targets = ",".join(str(t.get("price")) for t in row["targets"]) or "-"
-        print(
-            f"{row['candidate_id']:<25} msg={row['message_id']:<8} v{row['edit_version']} "
-            f"{row['classification']:<15} {row['parse_status']:<12} {row['review_status']:<11} "
-            f"{(row['symbol'] or '-'):<12} {(row['side'] or '-'):<4} entry={entry:<20} "
-            f"tp={targets:<20} sl={row['stop_loss'] or '-'}"
-        )
-    db.close()
-    return 0
-
-
-def cmd_analyze_show(args) -> int:
-    import json
-
-    from .analysis import AnalysisStore
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    store = AnalysisStore(repo.db)
-    row = store.get_candidate(args.candidate_id)
-    if row is None:
-        print("candidate not found", file=sys.stderr)
-        db.close()
-        return 1
-    payload = dict(row)
-    payload["channel_id"] = "<redacted-channel>"
-    payload["reviews"] = store.list_reviews(args.candidate_id)
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    if args.show_text:
-        source = repo.get_message_raw(int(row["channel_id"]), int(row["message_id"]))
-        if source is None:
-            print("source message not found", file=sys.stderr)
-        else:
-            print("source text (explicit --show-text):")
-            print(source.get("text") or source.get("caption") or "<no text>")
-    db.close()
-    return 0
-
-
-def cmd_analyze_review(args) -> int:
-    from .analysis import AnalysisError, AnalysisStore, validate_correction
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    corrections: dict[str, object] = {}
-    for source, target in (
-        ("set_classification", "classification"),
-        ("set_market_type", "market_type"),
-        ("set_symbol", "symbol"),
-        ("set_quote_asset", "quote_asset"),
-        ("set_side", "side"),
-        ("set_entry", "entry_price"),
-        ("set_entry_low", "entry_low_price"),
-        ("set_entry_high", "entry_high_price"),
-        ("set_stop", "stop_loss"),
-        ("set_targets", "targets"),
-    ):
-        value = getattr(args, source)
-        if value is not None:
-            corrections[target] = value
-    try:
-        corrected = validate_correction(corrections) if corrections else None
-        review = AnalysisStore(repo.db).add_review(
-            args.candidate_id,
-            reviewer=args.reviewer or os.environ.get("USER") or "operator",
-            decision=args.decision,
-            corrected=corrected,
-            note=args.note,
-        )
-    except KeyError:
-        print("candidate not found", file=sys.stderr)
-        db.close()
-        return 1
-    except AnalysisError as exc:
-        print(f"review rejected: {exc}", file=sys.stderr)
-        db.close()
-        return 2
-    print(
-        f"review recorded: id={review.get('review_id')} decision={review.get('decision')} candidate={args.candidate_id}"
-    )
-    db.close()
-    return 0
-
-
-def cmd_analyze_failures(args) -> int:
-    from .analysis import AnalysisStore
-
-    _cfg, db, repo = _analysis_repo(getattr(args, "db_path", None))
-    rows = AnalysisStore(repo.db).list_failures(unresolved_only=not args.all, limit=args.limit)
-    for row in rows:
-        print(
-            f"failure={row['failure_id']} msg={row['message_id']} v{row['edit_version']} "
-            f"attempts={row['attempts']} type={row['error_type']} "
-            f"last={row['last_failed_at']} resolved={row['resolved_at'] or '-'}"
-        )
-    print(f"unresolved failures: {AnalysisStore(repo.db).unresolved_failure_count()}")
-    db.close()
-    return 0
-
-
-def cmd_analyze_corpus(args) -> int:
-    from .analysis import CorpusError, check_corpus, load_corpus
-
-    try:
-        examples = load_corpus(args.path)
-    except CorpusError as exc:
-        print(f"corpus error: {exc}", file=sys.stderr)
-        return 1
-    report = check_corpus(examples)
-    print(
-        f"corpus check: total={report.total} matched={report.matched} "
-        f"mismatched={report.mismatched} human_reviewed={report.human_reviewed}"
-    )
-    if report.human_reviewed == 0:
-        print("warning: no human-reviewed real examples; corpus is synthetic and not accuracy evidence")
-    for mismatch in report.mismatches or []:
-        print(f"  mismatch id={mismatch['id']} field={mismatch['field']} language={mismatch['language']}")
-    return 1 if report.mismatched else 0
-
-
-# ------------------------------------------------------------------ assembly
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tg-ingest",
@@ -1954,11 +1408,6 @@ def build_parser() -> argparse.ArgumentParser:
     auth_login.set_defaults(func=cmd_auth_login)
     auth_check = auth_sub.add_parser("check", help="verify stored session validity")
     auth_check.set_defaults(func=cmd_auth_check)
-    auth_check_channel = auth_sub.add_parser(
-        "check-channel",
-        help="verify stored session access to the management-selected channel",
-    )
-    auth_check_channel.set_defaults(func=cmd_auth_check_channel)
     auth_logout = auth_sub.add_parser("logout", help="revoke Telegram session, delete local files")
     auth_logout.set_defaults(func=cmd_auth_logout)
 
@@ -1984,13 +1433,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="offline health/sync overview")
     status.set_defaults(func=cmd_status)
-
-    manage = sub.add_parser("manage", help="owner channel-management bot (no trading)")
-    manage_sub = manage.add_subparsers(dest="manage_cmd", required=True)
-    manage_run = manage_sub.add_parser("run", help="run authentication/channel/backfill bot")
-    manage_run.set_defaults(func=cmd_manage_run)
-    manage_status = manage_sub.add_parser("status", help="read-only management status")
-    manage_status.set_defaults(func=cmd_manage_status)
 
     control = sub.add_parser("control", help="Telegram owner control bot")
     control_sub = control.add_subparsers(dest="control_cmd", required=True)
@@ -2085,77 +1527,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ts_preflight.set_defaults(func=cmd_trading_preflight)
 
-    analyze = sub.add_parser("analyze", help="offline signal analysis of persisted messages (no exchange calls)")
-    an_sub = analyze.add_subparsers(dest="analyze_cmd", required=True)
-    an_common = argparse.ArgumentParser(add_help=False)
-    an_common.add_argument(
-        "--db-path",
-        default=None,
-        help="explicit SQLite path (use a disposable copy for validation)",
-    )
-    an_replay = an_sub.add_parser("replay", parents=[an_common], help="deterministic, idempotent offline replay")
-    an_replay.add_argument("--channel-id", type=int, default=None, help="defaults to the selected channel")
-    an_replay.add_argument("--since", default=None, help="ISO date/timestamp lower bound")
-    an_replay.add_argument("--until", default=None, help="ISO date/timestamp upper bound")
-    an_replay.add_argument("--limit", type=int, default=None, help="bounded sample size")
-    an_replay.add_argument("--after-message-id", type=int, default=None, help="resume after this Telegram message id")
-    an_replay.add_argument(
-        "--exclude-deleted", action="store_true", help="skip tombstoned messages instead of marking candidates"
-    )
-    an_replay.add_argument("--dry-run", action="store_true", help="parse only; write nothing")
-    an_replay.set_defaults(func=cmd_analyze_replay)
-
-    an_summary = an_sub.add_parser("summary", parents=[an_common], help="counts by classification/review/failure")
-    an_summary.set_defaults(func=cmd_analyze_summary)
-
-    an_reindex = an_sub.add_parser(
-        "reindex",
-        parents=[an_common],
-        help="rebuild the per-channel logical signal index from stored messages",
-    )
-    an_reindex.add_argument("--channel-id", type=int, default=None, help="defaults to the selected channel")
-    an_reindex.add_argument("--dry-run", action="store_true", help="classify and plan in memory only; write nothing")
-    an_reindex.add_argument("--report-path", default=None, help="write a JSON machine-readable report to this path")
-    an_reindex.set_defaults(func=cmd_analyze_reindex)
-
-    an_list = an_sub.add_parser("list", parents=[an_common], help="list candidate signals (no message text)")
-    an_list.add_argument("--classification", default=None)
-    an_list.add_argument("--parse-status", default=None, choices=["parsed", "needs_review", "failed"])
-    an_list.add_argument("--review-status", default=None, choices=["unreviewed", "confirmed", "corrected", "rejected"])
-    an_list.add_argument("--include-superseded", action="store_true")
-    an_list.add_argument("--limit", type=int, default=50)
-    an_list.set_defaults(func=cmd_analyze_list)
-
-    an_show = an_sub.add_parser("show", parents=[an_common], help="show one candidate and its review history")
-    an_show.add_argument("candidate_id")
-    an_show.add_argument("--show-text", action="store_true", help="also print the private source text (explicit only)")
-    an_show.set_defaults(func=cmd_analyze_show)
-
-    an_review = an_sub.add_parser("review", parents=[an_common], help="append a human review/correction")
-    an_review.add_argument("candidate_id")
-    an_review.add_argument("--decision", choices=["confirm", "correct", "reject"], required=True)
-    an_review.add_argument("--reviewer", default=None)
-    an_review.add_argument("--note", default=None)
-    an_review.add_argument("--set-classification", default=None)
-    an_review.add_argument("--set-market-type", default=None, choices=["spot", "non_spot", "unknown"])
-    an_review.add_argument("--set-symbol", default=None)
-    an_review.add_argument("--set-quote-asset", default=None)
-    an_review.add_argument("--set-side", default=None, choices=["buy", "sell"])
-    an_review.add_argument("--set-entry", default=None)
-    an_review.add_argument("--set-entry-low", default=None)
-    an_review.add_argument("--set-entry-high", default=None)
-    an_review.add_argument("--set-stop", default=None)
-    an_review.add_argument("--set-targets", default=None, help="comma-separated target prices")
-    an_review.set_defaults(func=cmd_analyze_review)
-
-    an_fail = an_sub.add_parser("failures", parents=[an_common], help="inspect isolated parsing failures")
-    an_fail.add_argument("--all", action="store_true", help="include resolved failures")
-    an_fail.add_argument("--limit", type=int, default=50)
-    an_fail.set_defaults(func=cmd_analyze_failures)
-
-    an_corpus = an_sub.add_parser("corpus-check", help="validate the redacted parser corpus")
-    an_corpus.add_argument("--path", required=True)
-    an_corpus.set_defaults(func=cmd_analyze_corpus)
     return parser
 
 

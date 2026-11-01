@@ -129,7 +129,7 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
     The phone number, code, and 2FA password are read from the operator's
     terminal and never logged or persisted. Telegram invalidates login codes
     that are sent into a Telegram chat, so this flow deliberately never accepts
-    a code through the management bot or any other Telegram conversation.
+    a code through the control bot or any other Telegram conversation.
     """
 
     client = client or build_client(cfg)
@@ -156,13 +156,9 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
             "chat. Telegram invalidates codes shared in a Telegram chat."
         )
         try:
-            phone = input(
-                "Phone number with country code (e.g. +15550101337; not logged): "
-            ).strip()
+            phone = input("Phone number with country code (e.g. +15550101337; not logged): ").strip()
         except (EOFError, KeyboardInterrupt):
-            raise AuthRequired(
-                "Login cancelled before a code was requested; no session was changed."
-            ) from None
+            raise AuthRequired("Login cancelled before a code was requested; no session was changed.") from None
         if not phone.startswith("+"):
             raise AuthRequired("Phone number must start with your country code, e.g. +15550101337.")
 
@@ -221,13 +217,10 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
                     await client.sign_in(password=password)
                 except PasswordHashInvalidError:
                     raise AuthRequired(
-                        "Telegram rejected the 2FA password (PASSWORD_HASH_INVALID); "
-                        "login aborted. No code was stored."
+                        "Telegram rejected the 2FA password (PASSWORD_HASH_INVALID); login aborted. No code was stored."
                     ) from None
                 except FloodWaitError as exc:
-                    raise AuthRequired(
-                        f"Telegram rate-limited 2FA attempts; wait {exc.seconds} seconds."
-                    ) from None
+                    raise AuthRequired(f"Telegram rate-limited 2FA attempts; wait {exc.seconds} seconds.") from None
                 break
             except PhoneCodeExpiredError:
                 # Telegram also uses this category when it invalidates a code
@@ -262,13 +255,9 @@ async def interactive_login(cfg: AppConfig, client: TelegramClient | None = None
                     "Telegram rejected the phone number (PHONE_NUMBER_INVALID); no code was stored."
                 ) from None
             except FloodWaitError as exc:
-                raise AuthRequired(
-                    f"Telegram rate-limited code attempts; wait {exc.seconds} seconds."
-                ) from None
+                raise AuthRequired(f"Telegram rate-limited code attempts; wait {exc.seconds} seconds.") from None
         else:
-            raise AuthRequired(
-                "Login not completed after the allowed code attempts; no new code was requested."
-            )
+            raise AuthRequired("Login not completed after the allowed code attempts; no new code was requested.")
 
         secure_session_files(cfg)
         if not await client.is_user_authorized():

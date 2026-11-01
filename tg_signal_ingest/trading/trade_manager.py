@@ -818,7 +818,7 @@ class TradeManager:
         if self.engine is None:
             self._record_error(trade, "engine unavailable", "runtime")
             return
-        # Reuse the engine's full live gate: budget + balance preflight + order.
+        # Reuse the engine's full live gate: reservation + balance preflight + order.
         try:
             self.engine._execute_intent(intent["intent_id"])
         except Exception as exc:  # noqa: BLE001

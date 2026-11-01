@@ -1,6 +1,6 @@
 """Persisted owner amount: config precedence and restart behaviour.
 
-The Telegram management menu stores the per-order quote amount in
+The Telegram control menu stores the per-order quote amount in
 ``control_settings``.  Environment/TOML configuration must always win, while a
 built-in default may be replaced by the stored value.  These tests use a
 disposable SQLite database and never touch the network.

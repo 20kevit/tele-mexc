@@ -68,40 +68,15 @@ PROTECTION_STATES = (
     "unknown_requires_reconciliation",
 )
 
-# Notification routing defaults.  A missing preference row falls back here, so
-# the policy is explicit in code as well as in the migration seed.
-NOTIFICATION_CATEGORIES = (
-    "signal_decision",
-    "signal_accepted",
-    "exchange_operation",
-    "order_lifecycle",
-    "oco_lifecycle",
-    "take_profit",
-    "stop_loss",
-    "reconciliation",
-    "critical",
-    "diagnostic",
-    "notification_delivery",
-    "recovery",
-)
+SEVERITY_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+DEFAULT_MIN_SEVERITY = "INFO"
 
-NOTIFICATION_DEFAULTS: dict[str, dict[str, bool]] = {
-    "owner": {
-        "signal_decision": False,
-        "signal_accepted": True,
-        "exchange_operation": True,
-        "order_lifecycle": True,
-        "oco_lifecycle": True,
-        "take_profit": True,
-        "stop_loss": True,
-        "reconciliation": True,
-        "critical": True,
-        "diagnostic": False,
-        "notification_delivery": False,
-        "recovery": False,
-    },
-    "developer": {category: True for category in NOTIFICATION_CATEGORIES},
-}
+
+def severity_rank(value: str | None) -> int:
+    try:
+        return SEVERITY_LEVELS.index(str(value or DEFAULT_MIN_SEVERITY).upper())
+    except ValueError:
+        return SEVERITY_LEVELS.index(DEFAULT_MIN_SEVERITY)
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -788,45 +763,6 @@ class TradingStore:
 
     # ------------------------------------------------------- budget ledger
 
-    @staticmethod
-    def _budget_committed(conn: Any) -> tuple[Decimal, Decimal]:
-        """Return (active reservations, settled spend+fees) from the ledger."""
-
-        active = Decimal("0")
-        spent = Decimal("0")
-        for row in conn.execute(
-            "SELECT active, reserved_quote, spent_quote, fee_quote FROM trading_budget_ledger"
-        ).fetchall():
-            try:
-                if int(row["active"]) == 1:
-                    active += Decimal(row["reserved_quote"])
-                else:
-                    spent += Decimal(row["spent_quote"]) + Decimal(row["fee_quote"])
-            except (InvalidOperation, TypeError, ValueError):
-                # A malformed ledger row must never free budget silently.
-                active += Decimal(str(row["reserved_quote"] or "0"))
-        return active, spent
-
-    def budget_summary(self) -> dict[str, Decimal]:
-        """Cumulative spend tracking (never reset).
-
-        ``limit`` is only the configured *reference* value.  It is never
-        enforced: the owner controls the per-order amount with
-        ``order_quote_amount`` and this ledger only records what was spent.
-        """
-
-        limit = Decimal(str(self.cfg.aggregate_budget_quote))
-        active, spent = self._budget_committed(self.db.conn)
-        remaining = limit - active - spent
-        if remaining < 0:
-            remaining = Decimal("0")
-        return {
-            "limit": limit,
-            "reserved": active,
-            "spent": spent,
-            "remaining": remaining,
-        }
-
     def _reserved_with_fee_buffer(self, quote_amount: Decimal) -> Decimal:
         factor = Decimal(1) + Decimal(str(self.cfg.balance_fee_buffer_pct)) / Decimal(100)
         return quote_amount * factor
@@ -853,10 +789,10 @@ class TradingStore:
     def _reserve_budget(self, conn: Any, intent_id: str, quote_amount: Decimal, now: str) -> Decimal:
         """Insert the spend-tracking reservation for an intent.
 
-        The reservation is never compared with ``aggregate_budget_quote``.
-        That value is a reference/display figure, not an order cap: a per-order
-        amount must not be coupled to cumulative spend.  The caller must
-        already hold a write transaction so the insert stays atomic.
+        The reservation is a technical concurrency/idempotency guard for an
+        intent.  It is not a portfolio budget and is never compared with a
+        spending cap.  The caller must already hold a write transaction so the
+        insert stays atomic.
         """
 
         reserve = self._reserved_with_fee_buffer(quote_amount)
@@ -1651,8 +1587,8 @@ class TradingStore:
 
     # ------------------------------------------------------- trading settings
     # Persisted owner-controlled settings (e.g. order_quote_amount) that can be
-    # changed through the Telegram management menu and survive restarts.  They
-    # live in the shared ``control_settings`` table so the management bot, the
+    # changed through the Telegram control menu and survive restarts.  They
+    # live in the shared ``control_settings`` table so the control bot, the
     # control bot and the trading pipeline all read the same value.
     # Config.toml/env take precedence at load time; DB values override the
     # built-in default when no explicit config source is present.
@@ -1790,35 +1726,18 @@ class TradingStore:
 
     # -------------------------------------------------------- notifications
 
-    def notification_enabled(self, role: str, category: str) -> bool:
-        """Return the persisted preference, falling back to the code defaults."""
+    def notification_min_severity(self) -> str:
+        value = (self.get_setting("notification_min_severity") or DEFAULT_MIN_SEVERITY).upper()
+        return value if value in SEVERITY_LEVELS else DEFAULT_MIN_SEVERITY
 
-        row = self.db.conn.execute(
-            "SELECT enabled FROM notification_preferences WHERE role = ? AND category = ?",
-            (role, category),
-        ).fetchone()
-        if row is not None:
-            return bool(int(row["enabled"]))
-        return NOTIFICATION_DEFAULTS.get(role, {}).get(category, False)
+    def set_notification_min_severity(self, level: str) -> None:
+        value = str(level).upper()
+        if value not in SEVERITY_LEVELS:
+            raise ValueError(f"unknown severity {level!r}")
+        self.set_setting("notification_min_severity", value)
 
-    def set_notification_preference(self, role: str, category: str, enabled: bool) -> None:
-        with self.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO notification_preferences (role, category, enabled, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(role, category) DO UPDATE SET "
-                "enabled = excluded.enabled, updated_at = excluded.updated_at",
-                (role, category, 1 if enabled else 0, self._ts()),
-            )
-
-    def notification_preferences(self, role: str | None = None) -> list[dict[str, Any]]:
-        if role is None:
-            rows = self.db.conn.execute("SELECT * FROM notification_preferences ORDER BY role, category").fetchall()
-        else:
-            rows = self.db.conn.execute(
-                "SELECT * FROM notification_preferences WHERE role = ? ORDER BY category",
-                (role,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+    def notification_allowed(self, severity: str) -> bool:
+        return severity_rank(severity) >= severity_rank(self.notification_min_severity())
 
     def enqueue_notification(
         self,

@@ -29,7 +29,7 @@ from typing import Any
 from ..config import EXECUTION_ACKNOWLEDGEMENT, AppConfig
 
 # Purposes are intentionally explicit: protective exits must remain possible
-# when a *setup* prerequisite (channel/learning) has changed, but they still
+# when a *setup* prerequisite (channel/session) has changed, but they still
 # stop on pause, emergency stop, missing credentials or an unacknowledged
 # pipeline.
 ENTRY = "entry"
@@ -183,9 +183,6 @@ class SubmissionGate:
             channel_ok = self._dimension_ok("channel", bool(row["selected_channel_id"]))
             if not channel_ok:
                 return "no channel is selected"
-            if row["learning_state"] != "completed":
-                return "required learning/setup is not completed"
-
             unresolved = conn.execute(
                 "SELECT COUNT(*) AS n FROM order_intents WHERE state IN "
                 "('submitting', 'reconciling', 'unknown_requires_reconciliation')"

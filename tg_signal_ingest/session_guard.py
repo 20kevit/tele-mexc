@@ -1,6 +1,6 @@
 """Single-owner guard for the shared Telethon session file.
 
-The management bot, the ingestion worker, and the CLI all use the same
+The control bot, the ingestion worker, and the CLI all use the same
 ``tg_session.session`` file. Telethon/SQLite does not safely support concurrent
 writers, so this module combines an in-process ``asyncio.Lock`` with a
 cross-process ``flock``. A login flow holds the guard for its whole interactive
@@ -59,9 +59,7 @@ class SessionGuard:
             lease.acquire()
         except AlreadyRunningError:
             self._lock.release()
-            raise SessionBusyError(
-                "the Telegram session is locked by another process"
-            ) from None
+            raise SessionBusyError("the Telegram session is locked by another process") from None
         except Exception:
             self._lock.release()
             raise
@@ -73,11 +71,7 @@ class SessionGuard:
 
         if self._lease is None:
             return
-        if (
-            operator_id is not None
-            and self._holder is not None
-            and int(operator_id) != int(self._holder)
-        ):
+        if operator_id is not None and self._holder is not None and int(operator_id) != int(self._holder):
             return
         lease, self._lease = self._lease, None
         self._holder = None

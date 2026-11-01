@@ -8,6 +8,11 @@ Owner of the Telegram account performs the interactive steps; the operator
 records the outcomes. This project uses direct Telegram networking only; no
 proxy listener or proxy variables are required.
 
+> **Status note:** Steps referring to `tg-manage`, the two-operator management
+> bot, bounded validation import, or the learning/example workflow are
+> historical. Those features were removed. Current verification is limited to
+> `serve`, `control`, normal ingestion/backfill, and trading readiness.
+
 ## Completed on the new VPS without owner credentials (2026-10-22 audit)
 
 | Check | Result |

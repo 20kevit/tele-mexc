@@ -1,6 +1,6 @@
 """Single-owner Persian control bot for the ingestion/trading process.
 
-The bot manages authentication, channel setup, learning, sizing, notifications,
+The bot manages authentication, channel setup, sizing, notifications,
 and administrative pause/resume. Trading decisions remain in the existing
 intent, risk, balance-preflight, execution, and reconciliation pipeline.
 """
@@ -27,7 +27,6 @@ from ..version import format_version_text, get_version_info
 from .auth import AuthFlowError, TelegramLoginManager
 from .bot_api import BotApiClient, BotApiError
 from .channels import ChannelChoice, fetch_channels, find_channel
-from .learning import LearningService, extract_fields
 from .mexc_setup import verify_mexc_client
 from .secretbox import SecretBox, SecretBoxError
 from .store import ControlStore
@@ -87,7 +86,6 @@ class ControlBot:
         self.repo = repo
         self.bot = bot
         self.store = store or ControlStore(repo.db)
-        self.learning = LearningService(self.store, repo)
         self.auth = TelegramLoginManager(cfg, client_factory=telethon_factory)
         self.box = SecretBox(cfg.control.secret_key)
         self._telethon_factory = telethon_factory
@@ -279,8 +277,8 @@ class ControlBot:
 
         Both operators have owner-equivalent access to every control-bot command
         and administrative action (start/status, pause/resume, version, MEXC
-        setup, channel selection, learning, sizing, notifications,
-        disconnect, adopt). Usernames are never used for authorization. The owner
+        setup, channel selection, sizing, notifications, disconnect, adopt).
+        Usernames are never used for authorization. The owner
         account and its permissions are preserved; the developer is added as an
         additional explicitly configured numeric Telegram user id.
         """
@@ -316,14 +314,10 @@ class ControlBot:
             await self._menu_action(chat_id, parts[1] if len(parts) > 1 else "")
         elif head == "ch":
             await self._channel_action(chat_id, parts)
-        elif head == "lr":
-            await self._learning_action(chat_id, parts)
         elif head == "au":
             await self._auth_action(chat_id, parts)
         elif head == "mx":
             await self._mexc_action(chat_id, parts)
-        elif head == "l":
-            await self._learning_menu_action(chat_id, parts)
         elif head == "n":
             await self._notification_action(chat_id, parts)
         else:
@@ -344,15 +338,12 @@ class ControlBot:
                 rows.append([_btn("📡 انتخاب کانال سیگنال", "m:channel")])
             else:
                 rows.append([_btn("📡 کانال / تغییر کانال", "m:channel")])
-            if s["learning_state"] != "completed":
-                rows.append([_btn("📚 ادامه یادگیری سیگنال", "m:learn")])
+            rows.append([_btn("📏 اندازه سفارش", "m:sizing")])
+            rows.append([_btn("🔔 تنظیمات اعلان‌ها", "n:settings")])
+            if int(s.get("paused") or 0):
+                rows.append([_btn("▶️ ادامه اجرا", "m:resume")])
             else:
-                rows.append([_btn("📏 اندازه سفارش", "m:sizing")])
-                rows.append([_btn("🔔 تنظیمات اعلان‌ها", "n:settings")])
-                if int(s.get("paused") or 0):
-                    rows.append([_btn("▶️ ادامه اجرا", "m:resume")])
-                else:
-                    rows.append([_btn("⏸ توقف اجرای سفارش", "m:pause")])
+                rows.append([_btn("⏸ توقف اجرای سفارش", "m:pause")])
         rows.append([_btn("📊 وضعیت", "m:status"), _btn("❓ راهنما", "m:help")])
         return _kb(rows)
 
@@ -387,8 +378,6 @@ class ControlBot:
         label: str | None,
         discrepancy: str | None,
     ) -> str:
-        target = self.store.get_int_setting("learning_target", 5)
-        streak = int(s.get("learning_streak") or 0)
         channel = s.get("selected_channel_title") or "انتخاب نشده"
         auth_word = (
             "متصل" if probe_status == "valid" else ("نامشخص" if probe_status == "unreachable" else "نیاز به ورود")
@@ -398,8 +387,6 @@ class ControlBot:
             f"• تلگرام: {auth_word}" + (f" — {label}" if label else ""),
             f"• MEXC: {'تأییدشده' if s['mexc_state'] == 'verified' else 'تنظیم نشده'}",
             f"• کانال: {channel}",
-            f"• یادگیری: {streak} از {target} نمونه متوالی"
-            + (" — تکمیل شده" if s["learning_state"] == "completed" else ""),
             f"• وضعیت اجرا: {'متوقف' if int(s.get('paused') or 0) else 'فعال'}",
         ]
         if discrepancy == "session_valid_db_unauthenticated":
@@ -433,9 +420,7 @@ class ControlBot:
         if state == "channel_selection_pending":
             return "کلید MEXC تأیید شد. کانال سیگنال را انتخاب کنید."
         if state == "channel_selected":
-            return "کانال انتخاب شد. یادگیری قالب سیگنال را شروع کنید."
-        if state == "learning_in_progress":
-            return "یادگیری نیمه‌کاره است؛ از همان نمونه فعلی ادامه دهید."
+            return "کانال انتخاب شد؛ پردازش خودکار سیگنال‌های معتبر از این پیام‌های جدید فعال است."
         if state == "ready":
             return "همه‌چیز آماده است؛ سیگنال‌های معتبر به‌صورت خودکار پردازش می‌شوند."
         if state == "automatic":
@@ -454,8 +439,7 @@ class ControlBot:
             "• /cancel: لغو فقط همان مرحله ورود یا ورودی جاری.\n\n"
             "امنیت: ورود تلگرام فقط از ترمینال امن SSH انجام می‌شود؛ شماره، کد ورود "
             "و رمز دو مرحله‌ای را در هیچ چت تلگرامی نفرستید. کلید و رمز MEXC نیز "
-            "نباید در چت یا لاگ نوشته شوند.\n\n"
-            "یادگیری فقط درستی استخراج را تأیید می‌کند و جایگزین کنترل‌های ریسک معامله نیست."
+            "نباید در چت یا لاگ نوشته شوند."
         )
         await self._send(chat_id, text, _kb([[_btn("بازگشت", "m:status")]]))
 
@@ -472,10 +456,6 @@ class ControlBot:
             await self._show_mexc(chat_id)
         elif action == "channel":
             await self._show_channels(chat_id, 0)
-        elif action == "learn":
-            await self._show_learning(chat_id)
-        elif action == "learn_next":
-            await self._show_next_candidate(chat_id)
         elif action == "buy":
             self.store.set_flow("buy_amount")
             await self._send(
@@ -870,168 +850,10 @@ class ControlBot:
             chat_id,
             f"✅ کانال انتخاب شد: {choice.title}\n\n"
             "از این پس پیام‌های جدید از طریق مسیر موجود دریافت می‌شوند. "
-            "backfill به‌صورت خودکار شروع نمی‌شود و معامله فعال نمی‌شود.\n\n"
-            "در مرحله یادگیری، پیام‌های ذخیره‌شده را یکی‌یکی می‌بینید و درستی استخراج را تأیید می‌کنید.",
+            "backfill به‌صورت خودکار شروع نمی‌شود. سیگنال‌های معتبر جدید "
+            "به‌صورت خودکار پردازش می‌شوند.",
         )
         await self._show_start(chat_id)
-
-    # ----------------------------------------------------------- learning
-
-    async def _show_learning(self, chat_id: int) -> None:
-        s = self.store.setup()
-        target = self.store.get_int_setting("learning_target", 5)
-        streak = int(s.get("learning_streak") or 0)
-        if not s.get("selected_channel_id"):
-            await self._send(chat_id, "ابتدا کانال سیگنال را انتخاب کنید.", _kb([[_btn("انتخاب کانال", "m:channel")]]))
-            return
-        if s["learning_state"] == "completed":
-            examples = self.store.learning_examples(5)
-            text = (
-                f"✅ یادگیری تکمیل شده است ({streak} از {target} نمونه متوالی).\n"
-                "تکمیل یادگیری به‌تنهایی معامله را فعال نمی‌کند.\n"
-                f"نمونه‌های تأییدشده اخیر: {len(examples)} مورد"
-            )
-            await self._send(
-                chat_id,
-                text,
-                _kb(
-                    [
-                        [_btn("نمونه‌های تأییدشده", "m:learn_next")],
-                        [_btn("شروع دوباره یادگیری", "l:restart")],
-                        [_btn("بازگشت", "m:status")],
-                    ]
-                ),
-            )
-            return
-        await self._send(
-            chat_id,
-            f"📚 یادگیری قالب سیگنال\n"
-            f"پیشرفت: {streak} از {target} نمونه معتبر متوالی.\n"
-            "برای هر پیام، متن اصلی و فیلدهای استخراج‌شده را می‌بینید و تأیید یا رد می‌کنید. "
-            "رد یک نمونه معتبر، شمارنده را بازنشانی می‌کند. نمونه نامعتبر قابل تأیید نیست.",
-            _kb(
-                [
-                    [_btn("نمونه بعدی", "m:learn_next")],
-                    [_btn("شروع دوباره", "l:restart")],
-                    [_btn("بازگشت", "m:status")],
-                ]
-            ),
-        )
-
-    async def _learning_menu_action(self, chat_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else ""
-        if action == "restart":
-            await self._send(
-                chat_id,
-                "⚠️ با شروع دوباره، همه نمونه‌های تأییدشده و شمارنده متوالی پاک می‌شوند. "
-                "کانال، تنظیمات و تاریخچه سفارش‌ها حفظ می‌شوند.",
-                _kb([[_btn("تأیید شروع دوباره", "l:restart2")], [_btn("انصراف", "m:status")]]),
-            )
-        elif action == "restart2":
-            self.store.reset_learning()
-            await self._send(
-                chat_id,
-                "یادگیری از نو شروع شد. نمونه بعدی را ببینید.",
-                _kb([[_btn("نمونه بعدی", "m:learn_next")]]),
-            )
-        else:
-            await self._show_learning(chat_id)
-
-    async def _show_next_candidate(self, chat_id: int) -> None:
-        candidate = self.learning.pending_candidate()
-        if candidate is None and self.store.setup().get("learning_state") == "completed":
-            examples = self.store.learning_examples(5)
-            if not examples:
-                await self._send(chat_id, "یادگیری تکمیل شده و نمونه جدیدی برای مرور نیست.")
-                return
-            lines = ["✅ یادگیری تکمیل شده است. آخرین نمونه‌های تأییدشده:"]
-            for sample in examples:
-                text = (sample.get("message_text") or "").replace("\n", " ")[:80]
-                lines.append(f"• {text}")
-            await self._send(chat_id, "\n".join(lines), _kb([[_btn("بازگشت", "m:status")]]))
-            return
-        if candidate is None:
-            candidate = self.learning.next_candidate()
-        if candidate is None:
-            await self._send(
-                chat_id,
-                "پیام جدیدی برای بررسی وجود ندارد. پس از دریافت پیام در کانال، دوباره تلاش کنید.",
-                _kb([[_btn("تلاش دوباره", "m:learn_next")], [_btn("بازگشت", "m:status")]]),
-            )
-            return
-        await self._send(chat_id, "📨 متن اصلی پیام کانال:\n\n" + candidate.message_text)
-        parsed = candidate.parsed
-        fields = extract_fields(parsed)
-        sample_id = candidate.sample["sample_id"]
-        lines = ["🧾 فیلدهای استخراج‌شده:"]
-        explanations = [
-            ("نماد", fields["symbol"], "جفت‌ارز قابل معامله در اسپات"),
-            ("جهت", fields["action"], "خرید یا فروش"),
-            ("نوع سفارش", fields["order_type"], "محدود یا بازار؛ خالی یعنی پیش‌فرض تنظیمات"),
-            ("قیمت ورود", fields["entry_price"], "قیمت یا میانگین محدوده ورود"),
-            (
-                "محدوده ورود",
-                f"{_fmt(fields['entry_low_price'])} تا {_fmt(fields['entry_high_price'])}",
-                "کران پایین و بالای ورود",
-            ),
-            ("حد سود", ", ".join(fields["targets"]) or None, "اهداف سود استخراج‌شده"),
-            ("حد ضرر", fields["stop_loss"], "سطح خروج اضطراری"),
-            ("حجم/مبلغ", fields["amount_text"], "دستور اندازه در متن پیام، نه اندازه نهایی سفارش"),
-        ]
-        for label, value, meaning in explanations:
-            lines.append(f"• {label}: {_fmt(value)} — {meaning}")
-        if not parsed.actionable:
-            lines.append("")
-            lines.append("⚠️ این پیام به‌عنوان سیگنال معتبر و قابل استخراج شناسایی نشد.")
-            if parsed.reasons:
-                lines.append("دلیل: " + "; ".join(parsed.reasons))
-            lines.append("چنین نمونه‌ای قابل تأیید نیست و در شمارنده پنج‌نمونه‌ای حساب نمی‌شود.")
-        rows = []
-        if parsed.actionable:
-            rows.append([_btn("✅ تأیید استخراج", f"lr:y:{sample_id}")])
-        rows.append([_btn("❌ رد استخراج", f"lr:n:{sample_id}")])
-        rows.append([_btn("بازگشت", "m:status")])
-        await self._send(chat_id, "\n".join(lines), _kb(rows))
-
-    async def _learning_action(self, chat_id: int, parts: list[str]) -> None:
-        if len(parts) < 3:
-            await self._show_learning(chat_id)
-            return
-        decision = parts[1]
-        sample_id = parts[2]
-        approved = decision == "y"
-        current = self.store.get_learning_sample(sample_id)
-        if current is None:
-            await self._send(chat_id, "این نمونه پیدا نشد.")
-            return
-        if current["decision"] != "pending":
-            await self._send(chat_id, "این نمونه قبلاً بررسی شده و دکمه آن مصرف شده است.")
-            return
-        ok, note, _updated = self.learning.decide(sample_id, approved)
-        if not ok:
-            await self._send(chat_id, f"⚠️ {note}")
-            return
-        self.store.refresh_setup_state()
-        s = self.store.setup()
-        target = self.store.get_int_setting("learning_target", 5)
-        await self._send(
-            chat_id,
-            f"{note}\nپیشرفت فعلی: {int(s.get('learning_streak') or 0)} از {target}.",
-        )
-        if s["learning_state"] == "completed":
-            await self._send(
-                chat_id,
-                "🎓 یادگیری تکمیل شد. یادگیری فقط درستی استخراج را تأیید می‌کند و "
-                "جایگزین اعتبارسنجی بازار و کنترل‌های ریسک نیست. پردازش خودکار "
-                "سیگنال‌های معتبر فعال است.",
-                _kb([[_btn("اندازه سفارش", "m:sizing")], [_btn("بازگشت", "m:status")]]),
-            )
-        else:
-            await self._send(
-                chat_id,
-                "نمونه بعدی را بررسی کنید.",
-                _kb([[_btn("نمونه بعدی", "m:learn_next")], [_btn("بازگشت", "m:status")]]),
-            )
 
     # ------------------------------------------------------------ sizing
 
@@ -1042,9 +864,9 @@ class ControlBot:
             f"• خرید: مبلغ ثابت {self.cfg.trading.order_quote_amount or settings['buy_quote_usd']} دلار "
             "(بودجه اسمی، نه تضمین قیمت نهایی)\n"
             f"• فروش: {settings['sell_pct_free']}٪ از موجودی آزاد/قابل استفاده پایه\n"
-            f"• ذخیره موجودی: {self.cfg.trading.remaining_balance_reserve_pct}٪\n"
             f"• بافر کارمزد: {self.cfg.trading.balance_fee_buffer_pct}٪\n\n"
-            "در فروش، موجودی قفل‌شده و سفارش‌های باز دیگر به‌عنوان آزاد حساب نمی‌شوند. "
+            "موجودی فقط برای کفایت همان سفارش بررسی می‌شود؛ هیچ درصدی از حساب "
+            "به‌عنوان ذخیره کنار گذاشته نمی‌شود. "
             "محاسبه نهایی در زمان تأیید/ارسال دوباره انجام می‌شود."
         )
         await self._send(
@@ -1092,47 +914,20 @@ class ControlBot:
     # -------------------------------------------------- notification settings
 
     async def _show_notification_settings(self, chat_id: int) -> None:
-        """Persian notification-preferences menu for owner and developer."""
+        """One minimum severity threshold; recipient routing stays separate."""
 
-        rows: list[list[dict[str, str]]] = []
-        for role in ("owner", "developer"):
-            enabled_categories: list[str] = []
-            disabled_categories: list[str] = []
-            for setting in self.store.list_notification_settings(role):
-                cat = setting["category"]
-                if setting["enabled"]:
-                    enabled_categories.append(cat)
-                else:
-                    disabled_categories.append(cat)
-            label = "مالک" if role == "owner" else "توسعه‌دهنده"
-            rows.append(
-                [
-                    _btn(f"{label}: فعال ({len(enabled_categories)})", f"n:{role}:on"),
-                    _btn(f"{label}: غیرفعال ({len(disabled_categories)})", f"n:{role}:off"),
-                ]
-            )
-            # Show a few representative toggle buttons for the role.
-            for cat in (
-                "signal_decision",
-                "signal_accepted",
-                "exchange_operation",
-                "oco_lifecycle",
-                "reconciliation",
-                "critical",
-                "diagnostic",
-            ):
-                current = self.store.get_notification_setting(role, cat)
-                if current is None:
-                    continue
-                state = "✅" if current else "❌"
-                rows.append([_btn(f"{state} {role}/{cat}", f"n:toggle:{role}:{cat}")])
+        current = self.store.notification_min_severity()
+        rows = [
+            [_btn(f"{'✅ ' if current == level else ''}{level}", f"n:set:{level}")]
+            for level in self.store.NOTIFICATION_LEVELS
+        ]
         rows.append([_btn("بازگشت", "m:status")])
         await self._send(
             chat_id,
-            "🔔 تنظیمات اعلان‌ها\n"
-            "برای فعال/غیرفعال کردن دسته‌بندی اعلان‌ها برای مالک یا توسعه‌دهنده، "
-            "دکمه مربوطه را بزنید. حالت پیش‌فرض مالک فقط اعلان‌های معامله‌ای است؛ "
-            "توسعه‌دهنده همه دسته‌بندی‌ها دریافت می‌کند.",
+            "🔔 حداقل سطح اعلان\n"
+            f"سطح فعلی: {current}\n"
+            "همه اعلان‌های این سطح و بالاتر ارسال می‌شوند. "
+            "مسیر گیرنده (مالک/توسعه‌دهنده) جدا از سطح اهمیت است.",
             _kb(rows),
         )
 
@@ -1141,20 +936,15 @@ class ControlBot:
         if head == "settings":
             await self._show_notification_settings(chat_id)
             return
-        if head == "toggle" and len(parts) >= 4:
-            role = parts[2]
-            category = parts[3]
-            if role not in ("owner", "developer"):
-                await self._send(chat_id, "نقش نامعتبر است.")
+        if head == "set" and len(parts) >= 3:
+            level = parts[2].upper()
+            if level not in self.store.NOTIFICATION_LEVELS:
+                await self._send(chat_id, "سطح اعلان نامعتبر است.")
                 return
-            current = self.store.get_notification_setting(role, category)
-            if current is None:
-                await self._send(chat_id, "دسته‌بندی یافت نشد.")
-                return
-            self.store.set_notification_setting(role, category, not current)
+            self.store.set_notification_min_severity(level)
             await self._send(
                 chat_id,
-                f"اعلان {category} برای {role} {'فعال' if not current else 'غیرفعال'} شد.",
+                f"حداقل سطح اعلان روی {level} تنظیم شد.",
                 _kb([[_btn("بازگشت به اعلان‌ها", "n:settings")]]),
             )
             return

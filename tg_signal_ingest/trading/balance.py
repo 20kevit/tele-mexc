@@ -10,7 +10,7 @@ The preflight is deliberately conservative:
 * ``min(free, available)`` is treated as spendable when both are present;
 * outstanding local non-terminal live intents on the same symbol are
   subtracted so two pending orders cannot spend the same balance;
-* a configurable fee buffer and the configured reserve percentage are applied.
+* a configurable fee buffer covers pre-trade exchange fees; no portfolio reserve is applied.
 
 Exchange balances can still change externally between this read and order
 acceptance. That race cannot be eliminated client-side; the exchange's own
@@ -78,11 +78,7 @@ def parse_account(raw: Any, *, fetched_at: float) -> AccountSnapshot:
     if raw.get("canTrade") is not True:
         raise BalanceError("account response does not grant canTrade")
     permissions = raw.get("permissions")
-    if (
-        isinstance(permissions, list)
-        and permissions
-        and "SPOT" not in {str(p).upper() for p in permissions}
-    ):
+    if isinstance(permissions, list) and permissions and "SPOT" not in {str(p).upper() for p in permissions}:
         raise BalanceError("account has no SPOT permission")
     rows = raw.get("balances")
     if not isinstance(rows, list):
@@ -104,9 +100,7 @@ def parse_account(raw: Any, *, fetched_at: float) -> AccountSnapshot:
         if row.get("locked") not in (None, ""):
             locked = _decimal(row.get("locked"), f"{asset}.locked")
         balances[asset] = AssetBalance(asset=asset, free=free, available=available, locked=locked)
-    return AccountSnapshot(
-        balances=balances, can_trade=True, fetched_at=fetched_at, raw=dict(raw)
-    )
+    return AccountSnapshot(balances=balances, can_trade=True, fetched_at=fetched_at, raw=dict(raw))
 
 
 def validate_balance(
@@ -122,14 +116,11 @@ def validate_balance(
     outstanding_quote: Decimal = Decimal("0"),
     now: float,
 ) -> None:
-    """Raise :class:`BalanceError` unless the order fits the configured budget."""
+    """Raise :class:`BalanceError` unless free balance covers this exact order."""
 
     age = snapshot.age_s(now)
     if age > cfg.balance_max_age_s:
-        raise BalanceError(
-            f"account balance snapshot is stale ({age:.1f}s > {cfg.balance_max_age_s:.1f}s)"
-        )
-    reserve_pct = Decimal(str(cfg.remaining_balance_reserve_pct))
+        raise BalanceError(f"account balance snapshot is stale ({age:.1f}s > {cfg.balance_max_age_s:.1f}s)")
     fee_factor = Decimal(1) + Decimal(str(cfg.balance_fee_buffer_pct)) / Decimal(100)
 
     if side.lower() == "buy":
@@ -153,14 +144,12 @@ def validate_balance(
     spendable = balance.spendable
     if spendable <= outstanding:
         raise BalanceError(
-            f"no free {asset} left after outstanding local orders "
-            f"(free={spendable}, outstanding={outstanding})"
+            f"no free {asset} left after outstanding local orders (free={spendable}, outstanding={outstanding})"
         )
     usable = spendable - outstanding
-    reserve = spendable * reserve_pct / Decimal(100)
-    if usable - required < reserve:
+    if usable < required:
         raise BalanceError(
             f"insufficient free {asset} for this order: "
-            f"free={spendable}, outstanding={outstanding}, reserve={reserve}, "
+            f"free={spendable}, outstanding={outstanding}, "
             f"required={required} (fees included at {cfg.balance_fee_buffer_pct}%)"
         )

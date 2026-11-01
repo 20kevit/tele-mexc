@@ -113,8 +113,9 @@ class IngestService:
         notifier = getattr(self.trading, "notifier", None)
         if notifier is None:
             return
+        roles = ("developer",) if category == "recovery" else None
         try:
-            notifier.notify(event_key=event_key, text=text, category=category)
+            notifier.notify(event_key=event_key, text=text, category=category, roles=roles)
         except Exception as exc:  # noqa: BLE001 - service events must not affect ingestion
             log.warning("service event notification failed (%s)", exc.__class__.__name__)
 

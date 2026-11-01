@@ -13,6 +13,10 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
   per-signal approval gate.
 - `/pause` is enforced at the exchange-submission boundary; `/resume` rechecks
   readiness and cannot bypass emergency stop or reconciliation blockers.
+- Notifications use one minimum severity: DEBUG, INFO, WARNING, ERROR, or
+  CRITICAL. Recipient routing for owner/developer remains separate.
+- Balance checks verify sufficiency for the exact order; no percentage of the
+  account is reserved.
 - The service opens no inbound ports and exposes no HTTP API.
 - Telegram and MEXC use direct outbound TLS. Legacy Telegram proxy settings
   are rejected; service units unset ambient proxy variables.
@@ -144,25 +148,13 @@ The unit runs as root in `/opt/projects/akha1`, uses `.venv/bin/tg-ingest
 serve`, restarts on failure, and strips ambient proxy variables. It exposes no
 ports.
 
-Management bot:
-
-```bash
-cp deploy/tg-manage.service /etc/systemd/system/tg-manage.service
-systemctl daemon-reload
-systemctl enable --now tg-manage
-journalctl -fu tg-manage
-```
-
-`tg-manage-personal.service` is the same bot with
-`TG_SESSION_PATH=config/tg_session_personal` and the same token/database. Run
-only one of `tg-ingest`, `tg-manage`, `tg-manage-personal`, or `control run`
-against a given database at a time as an operating rule.
+The primary control bot can run embedded in `serve` or separately with
+`control run`. It takes the control lock. Do not run a second controller against
+the same database.
 
 | Unit | Command | Locks |
 | --- | --- | --- |
-| `tg-ingest.service` | `tg-ingest serve` | serve |
-| `tg-manage.service` | `tg-ingest manage run` | serve + control |
-| `tg-manage-personal.service` | `TG_SESSION_PATH=... manage run` | serve + control |
+| `tg-ingest.service` | `tg-ingest serve` | serve + optional control |
 
 Restart only after an intentional code/config change:
 
@@ -187,21 +179,7 @@ state lives under `data/mexc-rate-limit-*.json`; do not delete it while a
 process is running. A `429` or `418` is honored via `Retry-After`; do not retry
 in a tight loop.
 
-## Bots and offline pipelines
-
-### Management bot (current)
-
-```bash
-.venv/bin/tg-ingest manage status
-.venv/bin/tg-ingest manage run
-```
-
-Requires `CONTROL_BOT_TOKEN`, `CONTROL_OWNER_USER_ID`, and
-`CONTROL_DEVELOPER_USER_ID` (positive and different). It lists channels,
-previews the latest ten messages, supports a developer-self-authorized bounded
-validation sample, and performs safe logout. It never starts the parser, queue,
-MEXC client, risk engine, or orders. UI details:
-`docs/MANAGEMENT_BOT_FA.md`.
+## Bots
 
 ### Legacy control bot
 
@@ -218,65 +196,7 @@ owner (`CONTROL_OWNER_USER_ID`) and the configured developer
 (`CONTROL_DEVELOPER_USER_ID`) with owner-equivalent access to every control-bot
 command and administrative action. Owner guide: `docs/CONTROL_BOT_FA.md`.
 
-### Offline analysis
 
-```bash
-.venv/bin/tg-ingest analyze summary
-.venv/bin/tg-ingest analyze replay --channel-id <id> --limit 100 --dry-run
-.venv/bin/tg-ingest analyze list --parse-status needs_review
-.venv/bin/tg-ingest analyze show <candidate_id>
-.venv/bin/tg-ingest analyze review <candidate_id> --decision confirm --note "checked"
-.venv/bin/tg-ingest analyze failures
-```
-
-Analysis reads already-stored messages, never contacts Telegram/MEXC, and never
-creates orders. Use `--db-path` for a disposable copy. Details:
-`docs/SIGNAL_ANALYSIS.md`.
-
-## MEXC credentials and verification
-
-Store `MEXC_API_KEY`/`MEXC_API_SECRET` only in the private `.env` (mode `0600`),
-never in `config.toml`, the systemd unit, chat, or command arguments. Use a key
-with Spot read + Spot trade only, preferably IP-whitelisted; withdrawal
-permission must be disabled.
-
-```bash
-.venv/bin/tg-ingest trading status      # presence + effective config/state
-.venv/bin/tg-ingest trading verify      # read-only apiKeyInfo; no order
-```
-
-Verification changes nothing and places no order. Changed `.env`/config values
-require a process restart.
-
-### Official CLI profile and preflight
-
-Live order *writes* use the official `@mexc-ai/cli` binary. Its credentials are
-stored in the CLI's own encrypted profile and are never copied into `.env` or
-this application. The CLI accepts the same standard MEXC Open API Access/Secret
-key pair used by the REST client (Spot read + Spot trade; no withdrawal):
-
-```bash
-mexc profile set tg-ingest     # interactive; enter the key/secret in your terminal
-mexc profile use tg-ingest
-mexc profile list              # no credentials needed
-.venv/bin/tg-ingest trading preflight            # local binary/version/schema/profile checks
-.venv/bin/tg-ingest trading preflight --network  # + doctor, current-orders, account identity
-```
-
-`preflight` never places, cancels or modifies an order and prints no secrets.
-`--network` fails without running the signed read when the CLI `doctor` reports a
-problem, when the configured CLI profile is missing, or when the CLI profile and
-the REST key read different Spot account balances. Live mode additionally
-rejects `[mexc_cli] enabled = false` when the trading pipeline is built. The
-minimum version is `0.0.22`. Non-interactive CLI writes (`--yes`) are armed by
-default; an explicit `false` remains a fail-closed override and makes every
-write reject locally.
-
-## Recovery
-
-### After reboot or network outage
-
-No manual replay is needed. `serve` reconnects with backoff, sweeps the message
 id gap above the stored watermark, refreshes the recent window for edits, and
 requeues queue items left in `processing`. Backfill resumes from its checkpoint.
 
@@ -287,7 +207,7 @@ requeues queue items left in `processing`. Backfill resumes from its checkpoint.
 .venv/bin/tg-ingest auth login
 ```
 
-The management bot may stay running; the session lock serializes access. Never
+The control process may stay running; the session lock serializes access. Never
 send the code to a chat.
 
 ### Exchange uncertainty
@@ -361,7 +281,6 @@ and last error. Writes fail closed when `trusted` is false.
 | MEXC `429`/`418` | Honor `Retry-After`; check the shared limiter files/logs; never hammer the API |
 | Terminal intent `rejected`, signal still active | Dry-run `trading repair-signals`, review the exact rows, then `--apply` |
 | No tradeable message after restart | Expected: the activation boundary advanced or the row is recovery/backfill-sourced |
-| Bounded validation unavailable | Run `analyze reindex` first and check management state |
 
 ## Backup and restore
 
@@ -376,7 +295,7 @@ chmod 600 /var/backups/tg-signal/ingest-backup.sqlite3
 
 Restore:
 
-1. Stop `tg-ingest`, `tg-manage`, and `control` processes.
+1. Stop `tg-ingest` and `control` processes.
 2. Preserve the current database and `-wal`/`-shm` files for rollback.
 3. Replace `data/ingest.sqlite3` with the backup.
 4. Remove stale `data/ingest.sqlite3-wal` and `-shm`.

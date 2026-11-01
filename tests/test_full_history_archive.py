@@ -1,15 +1,9 @@
-"""Complete-archive mission tests: full-history pagination and bot pagination.
+"""Full-history pagination tests for the production backfill path.
 
-Two independent areas, kept apart:
-
-1. Full historical backfill (``run_backfill``) against a deterministic fake
-   Telegram pagination client: both boundary crossing with message-ID gaps,
-   empty history, interrupted/resumed runs, duplicate delivery, flood-wait
-   respect, and raw/reply metadata preservation.
-
-2. Management-bot archive pagination over a 20-signal seeded index built
-   through the normal replay + reindex path: first/last page boundaries,
-   forward/back page movement, and signal-to-signal prev/next endpoints.
+``run_backfill`` is exercised against a deterministic fake Telegram pagination
+client: boundary crossing with message-ID gaps, empty history,
+interrupted/resumed runs, duplicate delivery, flood-wait respect, and
+raw/reply metadata preservation.
 
 Everything is mock-only: no Telegram API, no exchange access, and the trading
 tables must stay untouched throughout.
@@ -21,17 +15,11 @@ import asyncio
 import json
 from datetime import timedelta
 
-import pytest
 from telethon.errors import FloodWaitError
 
 from tests.conftest import FAKE_MESSAGE_EPOCH, FakeMsg, ReplyTo
-from tests.test_management_bot import OWNER, _bot, _callback, _message
 from tg_signal_ingest import backfill
-from tg_signal_ingest.analysis import ReplayScope, run_replay
-from tg_signal_ingest.analysis.reindex import rebuild_signal_index
 from tg_signal_ingest.backfill import run_backfill
-from tg_signal_ingest.management import signal_review as sr
-from tg_signal_ingest.normalize import message_to_record
 
 CHANNEL = 100
 
@@ -220,122 +208,3 @@ class TestFullHistoryPagination:
         raw = json.loads(follow["raw_json"])
         assert raw["id"] == 7
         assert raw["message"].startswith("🆔 #7")
-
-
-# ---------------------------------------------------------------------------
-# Management-bot full-archive pagination
-# ---------------------------------------------------------------------------
-
-
-def _initial(n: int, short: bool = False) -> str:
-    entry = 3 + n * 0.01
-    sign = -1 if short else 1
-    bow = "🔴" if short else "🟢"
-    side = "SHORT" if short else "LONG"
-    return (
-        f"🆔 #{n}\n⏰ 1405/08/01\n TIME =08:{n % 60:02d}\n *{side}*{bow}\n"
-        f" ⚡️TOOBIT:SYMXUSDT.P(15)\n\n"
-        f" ✅Entry: {entry:.2f}\n 🔰Stop Loss : {entry - sign * 0.05:.2f}\n\n"
-        f" 📌TP1 : {entry + sign * 0.02:.2f}\n 📌TP2 : {entry + sign * 0.04:.2f}\n\n"
-        f" 🤑FULL Target : {entry + sign * 0.07:.2f}\n"
-        f" 💰Deposit 1.00%\n 💠MAX LEV Suggested  =  8 (-17.39%)"
-    )
-
-
-@pytest.fixture()
-def archive_repo(repo):
-    """20 initial signals (#1..#20 chronological), one SHORT every 5th."""
-
-    for n in range(1, 21):
-        msg_id = 500 + n - 1
-        msg = FakeMsg(msg_id, _initial(n, short=n % 5 == 0))
-        repo.upsert_message(message_to_record(CHANNEL, msg, "live"), enqueue_processing=False)
-    run_replay(repo, ReplayScope(channel_id=CHANNEL))
-    rebuild_signal_index(repo.db, channel_id=CHANNEL, dry_run=False)
-    return repo
-
-
-def _flat_kb(reply_markup):
-    return [b for row in reply_markup["inline_keyboard"] for b in row]
-
-
-def _next_button(buttons):
-    return next(b for b in buttons if "بعدی" in b["text"])
-
-
-class TestBotArchivePagination:
-    def _selected(self, control):
-        control.store.set_operator_channel(OWNER, selected_channel_id=CHANNEL, selected_channel_title="Signals")
-
-    @pytest.mark.asyncio
-    async def test_archive_paginates_across_pages_and_boundaries(self, cfg, archive_repo):
-        control, fake, _ = _bot(cfg, archive_repo)
-        self._selected(control)
-
-        await control.handle_update(_message(1, "/signals"))
-        page1 = fake.sent_to(OWNER)[-1]
-        assert "(8 از 20)" in page1["text"]
-        buttons1 = _flat_kb(page1["reply_markup"])
-        assert sum(1 for b in buttons1 if b["text"].startswith(("🟢", "🔴"))) == 8
-        assert any("بعدی" in b["text"] for b in buttons1)
-        assert not any("قبلی" in b["text"] for b in buttons1)  # first page: no back
-
-        await control.handle_update(_callback(2, _next_button(buttons1)["callback_data"]))
-        page2 = fake.sent_to(OWNER)[-1]
-        buttons2 = _flat_kb(page2["reply_markup"])
-        assert any("قبلی" in b["text"] for b in buttons2)
-
-        await control.handle_update(_callback(3, _next_button(buttons2)["callback_data"]))
-        page3 = fake.sent_to(OWNER)[-1]
-        assert "(4 از 20)" in page3["text"]  # last partial page
-        buttons3 = _flat_kb(page3["reply_markup"])
-        assert not any("بعدی" in b["text"] for b in buttons3)  # last page: no forward
-        assert any("قبلی" in b["text"] for b in buttons3)
-
-        prev = next(b for b in buttons3 if "قبلی" in b["text"])
-        await control.handle_update(_callback(4, prev["callback_data"]))
-        page2b = fake.sent_to(OWNER)[-1]
-        assert "(8 از 20)" in page2b["text"]
-        # same rows as before (one-shot tokens are re-minted per render)
-        assert [b["text"] for b in _flat_kb(page2b["reply_markup"])] == [b["text"] for b in buttons2]
-
-        # pagination is read-only: no trading tables were touched
-        for table in ("signals", "order_intents", "exchange_orders"):
-            assert archive_repo.db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
-
-    @pytest.mark.asyncio
-    async def test_signal_prev_next_moves_by_chronology(self, cfg, archive_repo):
-        control, fake, _ = _bot(cfg, archive_repo)
-        self._selected(control)
-
-        ids = sr.logical_ids(archive_repo.db, CHANNEL)  # chronological, oldest first
-        assert ids == list(range(1, 21))
-
-        # middle signal: both prev and next buttons
-        await control._signal_view(OWNER, ids[9])
-        detail = fake.sent_to(OWNER)[-1]
-        assert f"سیگنال #{ids[9]}" in detail["text"]
-        labels = [b["text"] for b in _flat_kb(detail["reply_markup"])]
-        assert any("سیگنال قبلی" in label for label in labels)
-        assert any("سیگنال بعدی" in label for label in labels)
-
-        # oldest signal: no previous
-        await control._signal_view(OWNER, ids[0])
-        labels = [b["text"] for b in _flat_kb(fake.sent_to(OWNER)[-1]["reply_markup"])]
-        assert not any("سیگنال قبلی" in label for label in labels)
-        assert any("سیگنال بعدی" in label for label in labels)
-
-        # newest signal: no next
-        await control._signal_view(OWNER, ids[-1])
-        labels = [b["text"] for b in _flat_kb(fake.sent_to(OWNER)[-1]["reply_markup"])]
-        assert not any("سیگنال بعدی" in label for label in labels)
-        assert any("سیگنال قبلی" in label for label in labels)
-
-    @pytest.mark.asyncio
-    async def test_unknown_signal_beyond_archive_reports_missing(self, cfg, archive_repo):
-        control, fake, _ = _bot(cfg, archive_repo)
-        self._selected(control)
-
-        await control._signal_view(OWNER, 999)
-
-        assert any("ثبت نشده است" in item["text"] for item in fake.sent_to(OWNER))

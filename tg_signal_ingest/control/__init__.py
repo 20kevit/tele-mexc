@@ -1,4 +1,4 @@
-"""Single-owner Telegram control bot for setup, learning, and administration."""
+"""Telegram control bot for owner setup, pause/resume, and administration."""
 
 from .bot_api import BotApiClient, BotApiError
 from .secretbox import SecretBox, SecretBoxError

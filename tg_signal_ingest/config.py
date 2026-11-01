@@ -79,18 +79,14 @@ class TradingConfig:
     # closed); it never falls back to a simulated or test-only execution path.
     execution_acknowledgement: str | None = None
     order_type_policy: str = "limit"  # "limit" | "market"; market requires explicit config
-    remaining_balance_reserve_pct: float = 20.0  # reserve when spending an asset
     balance_fee_buffer_pct: float = 0.2  # conservative fee buffer on top of order size
     balance_max_age_s: float = 5.0  # reject account snapshots older than this
     recon_interval_s: float = 30.0
     emergency_stop: bool = False  # app_state runtime flag; config initial value
-    fake_price_for_tests: bool = False
     # Fixed per-order quote amount (owner-approved, never inferred from signal text).
     order_quote_amount: float = 3.0
     order_quote_amount_source: str = "default (3 USDT)"
     amount_configured: bool = True
-    # Cumulative test/live budget reference (USDT). Configurable; no hard ceiling.
-    aggregate_budget_quote: float = 50.0
     # Conditional entry: when set to an int >= 1, trades wait for an upward price
     # trigger before submission. None or 0 disables conditional entry.
     entry_trigger_offset_ticks: int | None = None
@@ -124,7 +120,6 @@ class TradingConfig:
         return {
             "execution_acknowledged": self.execution_acknowledgement == EXECUTION_ACKNOWLEDGEMENT,
             "order_type_policy": self.order_type_policy,
-            "remaining_balance_reserve_pct": self.remaining_balance_reserve_pct,
             "balance_fee_buffer_pct": self.balance_fee_buffer_pct,
             "balance_max_age_s": self.balance_max_age_s,
             "recon_interval_s": self.recon_interval_s,
@@ -132,7 +127,6 @@ class TradingConfig:
             "order_quote_amount": self.order_quote_amount,
             "order_quote_amount_source": self.order_quote_amount_source,
             "amount_configured": self.amount_configured,
-            "aggregate_budget_quote": self.aggregate_budget_quote,
             "entry_trigger_offset_ticks": self.entry_trigger_offset_ticks,
             "entry_trigger_stale_threshold_s": self.entry_trigger_stale_threshold_s,
             "tp1_allocation_pct_of_acquired": self.tp1_allocation_pct_of_acquired,
@@ -166,12 +160,6 @@ class ControlConfig:
     @property
     def configured(self) -> bool:
         return bool(self.bot_token and self.owner_user_id)
-
-    @property
-    def management_configured(self) -> bool:
-        """The two-operator management bot needs both explicit numeric IDs."""
-
-        return bool(self.bot_token and self.owner_user_id and self.developer_user_id)
 
 
 @dataclass
@@ -449,6 +437,9 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         "max_open_orders",
         "max_signal_age_s",
         "max_price_deviation_pct",
+        "aggregate_budget_quote",
+        "remaining_balance_reserve_pct",
+        "fake_price_for_tests",
         "allowed_symbols",
         "allowlist_mode",
     ):
@@ -481,17 +472,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         if policy not in ("limit", "market"):
             raise ConfigError("trading.order_type_policy must be 'limit' or 'market'.")
         t.order_type_policy = policy
-
-    reserve = tr_raw.get("remaining_balance_reserve_pct")
-    if reserve not in (None, ""):
-        if (
-            not isinstance(reserve, (int, float))
-            or isinstance(reserve, bool)
-            or not math.isfinite(float(reserve))
-            or not 0 <= float(reserve) < 100
-        ):
-            raise ConfigError("trading.remaining_balance_reserve_pct must be between 0 and 100.")
-        t.remaining_balance_reserve_pct = float(reserve)
 
     fee_buffer = tr_raw.get("balance_fee_buffer_pct")
     if fee_buffer not in (None, ""):
@@ -567,18 +547,6 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         t.order_quote_amount = 3.0
         t.order_quote_amount_source = "default (3 USDT)"
         t.amount_configured = True
-
-    # ---- aggregate_budget_quote (cumulative budget reference) ----
-    budget_val = tr_raw.get("aggregate_budget_quote")
-    if budget_val not in (None, ""):
-        if (
-            not isinstance(budget_val, (int, float))
-            or isinstance(budget_val, bool)
-            or not math.isfinite(float(budget_val))
-            or float(budget_val) <= 0
-        ):
-            raise ConfigError("trading.aggregate_budget_quote must be a positive finite number.")
-        t.aggregate_budget_quote = float(budget_val)
 
     # ---- conditional entry trigger offset ----
     offset_val = tr_raw.get("entry_trigger_offset_ticks")

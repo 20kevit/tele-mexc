@@ -1,4 +1,4 @@
-"""Audit journal dedupe, notification preferences, and OCO group/leg lifecycle.
+"""Audit journal dedupe, notification severity, and OCO group/leg lifecycle.
 
 Uses a real migrated SQLite database.  No network, no exchange.
 """
@@ -23,27 +23,39 @@ def store(cfg, tmp_path):
 
 def test_audit_dedupe_idempotent(store):
     store.audit(
-        "corr-1", "lifecycle", "intent_planned",
-        "intent created", event_id="evt-1", dedupe_key="dedupe:1",
-        intent_id="intent-1", symbol="BTCUSDT",
+        "corr-1",
+        "lifecycle",
+        "intent_planned",
+        "intent created",
+        event_id="evt-1",
+        dedupe_key="dedupe:1",
+        intent_id="intent-1",
+        symbol="BTCUSDT",
     )
     # Repeat with the same dedupe key: no duplicate row.
     store.audit(
-        "corr-1", "lifecycle", "intent_planned",
-        "intent created", event_id="evt-1", dedupe_key="dedupe:1",
-        intent_id="intent-1", symbol="BTCUSDT",
+        "corr-1",
+        "lifecycle",
+        "intent_planned",
+        "intent created",
+        event_id="evt-1",
+        dedupe_key="dedupe:1",
+        intent_id="intent-1",
+        symbol="BTCUSDT",
     )
-    rows = list(
-        store.db.conn.execute("SELECT COUNT(*) AS c FROM audit_events WHERE dedupe_key = ?", ("dedupe:1",))
-    )
+    rows = list(store.db.conn.execute("SELECT COUNT(*) AS c FROM audit_events WHERE dedupe_key = ?", ("dedupe:1",)))
     assert rows[0]["c"] == 1
 
 
 def test_audit_event_type_and_redaction(store):
     store.audit(
-        "corr-2", "mexc_request", "place_order",
-        "order 123456789:ABC token", event_id="evt-2",
-        intent_id="intent-1", symbol="BTCUSDT",
+        "corr-2",
+        "mexc_request",
+        "place_order",
+        "order 123456789:ABC token",
+        event_id="evt-2",
+        intent_id="intent-1",
+        symbol="BTCUSDT",
         payload={"api_key": "secret", "qty": "0.1"},
     )
     row = store.db.conn.execute(
@@ -55,17 +67,23 @@ def test_audit_event_type_and_redaction(store):
     assert row["secrets_redacted"] == 1
 
 
-def test_notification_preferences_defaults_and_toggle(store):
-    # Missing rows fall back to code defaults.
-    assert store.notification_enabled("owner", "signal_decision") is False
-    assert store.notification_enabled("owner", "signal_accepted") is True
-    assert store.notification_enabled("developer", "diagnostic") is True
-    # Toggle persists.
-    store.set_notification_preference("owner", "signal_decision", True)
-    assert store.notification_enabled("owner", "signal_decision") is True
-    rows = store.notification_preferences("owner")
-    cats = {r["category"]: bool(r["enabled"]) for r in rows}
-    assert cats["signal_decision"] is True
+def test_notification_minimum_severity_is_the_only_filter(store):
+    assert store.notification_min_severity() == "INFO"
+    assert store.notification_allowed("DEBUG") is False
+    assert store.notification_allowed("INFO") is True
+    assert store.notification_allowed("CRITICAL") is True
+
+    store.set_notification_min_severity("WARNING")
+    assert store.notification_min_severity() == "WARNING"
+    assert store.notification_allowed("INFO") is False
+    assert store.notification_allowed("WARNING") is True
+
+    store.set_notification_min_severity("CRITICAL")
+    assert store.notification_allowed("ERROR") is False
+    assert store.notification_allowed("CRITICAL") is True
+
+    with pytest.raises(ValueError):
+        store.set_notification_min_severity("LOUD")
 
 
 def test_oco_group_and_leg_lifecycle(store):
@@ -78,8 +96,23 @@ def test_oco_group_and_leg_lifecycle(store):
             "acquired_base_qty, entry_intent_id, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'position_open', ?, ?, ?, ?, ?, '0.1', 'intent-1', ?, ?)",
             (
-                "trade-1", "sig-1", "idem-1", 100, 1, "BTCUSDT", "buy", "limit",
-                "10", "100", "110", "120", "50", "100", "95", now, now,
+                "trade-1",
+                "sig-1",
+                "idem-1",
+                100,
+                1,
+                "BTCUSDT",
+                "buy",
+                "limit",
+                "10",
+                "100",
+                "110",
+                "120",
+                "50",
+                "100",
+                "95",
+                now,
+                now,
             ),
         )
         conn.execute(
@@ -110,12 +143,22 @@ def test_oco_group_and_leg_lifecycle(store):
     tp2 = store.list_trade_orders("trade-1", kind="stop_loss")[0]
 
     store.upsert_oco_leg(
-        group_id=group, trade=store.get_trade("trade-1"), order=tp1, state="filled",
-        leg_role="take_profit", exchange_status="FILLED", filled_qty=Decimal("0.05"),
+        group_id=group,
+        trade=store.get_trade("trade-1"),
+        order=tp1,
+        state="filled",
+        leg_role="take_profit",
+        exchange_status="FILLED",
+        filled_qty=Decimal("0.05"),
     )
     store.upsert_oco_leg(
-        group_id=group, trade=store.get_trade("trade-1"), order=tp2, state="canceled",
-        leg_role="take_profit", exchange_status="CANCELED", cancel_reason="oco_sibling_filled",
+        group_id=group,
+        trade=store.get_trade("trade-1"),
+        order=tp2,
+        state="canceled",
+        leg_role="take_profit",
+        exchange_status="CANCELED",
+        cancel_reason="oco_sibling_filled",
         canceled_by_leg="take_profit",
     )
     legs = store.list_oco_legs(group)

@@ -446,7 +446,7 @@ class TradingEngine:
         except RiskLimitExceeded as exc:
             reason = str(exc)
             self.store.update_signal(signal_id, "rejected", reason)
-            self.store.audit(signal_id, "risk", "aggregate_budget_rejected", reason)
+            self.store.audit(signal_id, "risk", "reservation_rejected", reason)
             self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
@@ -888,6 +888,7 @@ class TradingEngine:
             record=record,
             signal_id=signal_id,
             diagnostics=parsed.reason_text or None,
+            roles=NOTIFY_DEVELOPER,
             category="signal_decision",
             event_type="signal.rejected_locally",
         )
@@ -1015,23 +1016,9 @@ class TradingEngine:
                 lines.append(f"average fill price: {format(avg, 'f')}")
         if intent.get("reject_reason"):
             lines.append(f"reason: {intent['reject_reason']}")
-        summary = self._budget_summary()
-        if summary is not None:
-            committed = summary["spent"] + summary["reserved"]
-            lines.append(
-                "cumulative tracked spend: "
-                f"{format(committed, 'f')} USDT "
-                f"(reference {summary['limit']} USDT; not an order cap)"
-            )
         lines.append("original message:")
         lines.append(self._original_text(intent=intent))
         return "\n".join(lines)
-
-    def _budget_summary(self) -> dict[str, Decimal] | None:
-        try:
-            return self.store.budget_summary()
-        except Exception:  # noqa: BLE001 - reporting must never break trading
-            return None
 
     def execute_intent(self, intent_id: str) -> dict[str, Any]:
         """Revalidate a planned intent immediately before exchange submission.

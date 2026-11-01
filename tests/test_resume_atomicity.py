@@ -75,8 +75,6 @@ def _ready(repo: Repository, *, paused: bool = True) -> ControlStore:
         mexc_label="Spot",
         selected_channel_id=100,
         selected_channel_title="Signals",
-        learning_state="completed",
-        learning_streak=5,
         paused=1 if paused else 0,
         pause_reason="owner paused execution" if paused else None,
     )
@@ -123,7 +121,6 @@ async def test_unauthorized_resume_cannot_unpause(cfg, repo):
         ("telegram_state", "unauthenticated", "Telegram"),
         ("mexc_state", "not_configured", "MEXC"),
         ("selected_channel_id", None, "channel"),
-        ("learning_state", "in_progress", "learning"),
     ],
 )
 async def test_resume_refuses_missing_setup_prerequisites(cfg, repo, field, value, expected):

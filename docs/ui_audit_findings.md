@@ -1,3 +1,7 @@
+> **Status note:** This audit describes the removed two-operator `manage` bot.
+> The bot and its bounded-import/review UI were removed; the findings remain as
+> historical evidence only.
+
 # UI/UX Audit — Management Bot Interface (findings & fixes)
 
 Branch: `ui-audit` (worktree `/opt/projects/akha1-ui-audit`), commit `df64f72` on top of `1b6e8ac`.

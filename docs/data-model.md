@@ -9,9 +9,8 @@ SQLite schema and persistence invariants. Source of truth:
 - WAL journal mode, `foreign_keys=ON`, 10-second busy timeout, `BEGIN IMMEDIATE`
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
-  `schema_migrations`. Current maximum version: **16**.
-- Commands that open a normal repository run migrations; `manage status` opens
-  read-only and never migrates. Help and commands that do not open a repository
+  `schema_migrations`. Current maximum version: **20**.
+- Commands that open a normal repository run migrations; read-only status commands open the database without writing. Help and commands that do not open a repository
   do not necessarily run migrations.
 - There is no automatic retention, pruning, or archival job. The database grows
   with messages, edits, signals, queue rows, audit events, notifications, and
@@ -29,16 +28,16 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 3 | signal/intent lookup indexes |
 | 4 | `order_intents.fill_sync_required`, `fill_synced_at` |
 | 5 | legacy `control_*` tables |
-| 6 | management tables and message `sender_id`/`sender_name`/`post_author`/`entities_json` |
-| 7 | per-operator management flows/channels and callback ownership |
-| 8 | offline `signal_candidates`, reviews, analysis runs/failures |
-| 9 | bounded validation requests, drafts, ingestion constraints |
+| 6 | historical management tables and message `sender_id`/`sender_name`/`post_author`/`entities_json` |
+| 7 | historical per-operator management flows/channels |
+| 8 | historical offline candidate/review tables |
+| 9 | historical bounded-validation requests/drafts |
 | 10 | structured channel-format candidate fields and logical index |
 | 11 | `trading_budget_ledger` |
 | 12 | `trades`, `trade_orders` |
 | 13 | `order_protection` (exchange-side TP/SL intent and verification state) |
 | 14 | `trading_notifications` |
-| 15 | management flow `order_amount_input` stage |
+| 15 | historical management flow stage |
 | 16 | unique `(event_key, role)` notification outbox |
 | 17 | `trade_orders.stop_trigger_price` (recorded; body extended later) |
 | 18 | normalized `audit_events` v2 schema (event_type, dedupe_key, indexes) |
@@ -84,14 +83,14 @@ signals 1 ── * order_intents 1 ── * order_fills
                     └── trading_budget_ledger (1:1)
 ```
 
-### Budget and notifications
+### Reservations and notifications
 
 | Table | Purpose |
 | --- | --- |
 | `trading_budget_ledger` | one row per executable intent: reserved/spent/fee quote, active flag, state (`reserved`, `uncertain`, `settled`, `released`) |
 | `trading_notifications` | durable outbox; unique `(event_key, role)`, status `pending`/`sending`/`sent`/`failed`/`ambiguous`/`suppressed`/`canceled`, `category`/`event_type`, attempts/error/next attempt |
 
-The ledger is the authoritative cumulative budget tracker. It is never reset by restart.
+The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. Notification severity is one global minimum (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`); recipient role routing remains separate.
 The notification outbox is independent of order state.
 
 ### Exchange evidence and OCO lifecycle
@@ -101,7 +100,7 @@ The notification outbox is independent of order state.
 | `exchange_operations` | one row per exchange call, inserted **before** the request; `operation_class` (`read`/`write`), endpoint, payloads (redacted), response classification/code, error, `uncertainty` |
 | `oco_groups` | one row per trade (`oco_group_id` PK, `trade_id` unique); `state` mirrors trade state, `intended_config`, `protection_status`, `closed_at` |
 | `oco_legs` | one row per OCO target (`leg_id` PK, unique per group+target); `kind`, `target`, prices/qtys, state, exchange status, fills/fees, `cancel_reason`, `canceled_by_target` |
-| `notification_preferences` | `(role, category)` PK with `enabled`; owner defaults material trading only, developer all |
+| `notification_preferences` | historical per-category preferences; no longer read or written. Current filtering uses one `notification_min_severity` in `control_settings` |
 | `notification_callbacks` | single-use time-limited tokens for `expand`/`signal_source`/`ack` actions |
 | `notification_delivery_attempts` | per-notification attempt history: outcome, error, message id, retry-after, `ambiguous` flag |
 
@@ -139,28 +138,20 @@ The current live hybrid backend advertises no attached-protection support and
 uses native OCO exits instead; `order_protection` is retained for backends that
 do support attached triggers.
 
-### Offline analysis
+### Historical / compatibility tables
 
-| Table | Purpose |
-| --- | --- |
-| `signal_candidates` | immutable per `(channel, message, edit_version, parser_version)`; classification, structured fields, ambiguity, parse status |
-| `signal_candidate_reviews` | append-only human confirm/correct/reject rows |
-| `analysis_runs` | replay/reindex run summaries |
-| `analysis_failures` | isolated per-row parse failures with resolution state |
-| `channel_signals`, `signal_message_links` | logical signal index and link status (`linked`, `unresolved`, `conflict`, `no_reference`) |
-
-These tables are not read by the trading path. Schema detail and semantics:
-`docs/SIGNAL_ANALYSIS.md`.
-
-### Management/control (adjacent)
+These tables are retained so existing databases migrate forward without data
+loss. The application features that wrote some of them have been removed.
 
 | Group | Purpose |
 | --- | --- |
-| `control_*` | legacy owner setup, settings, flows, learning samples, approvals, updates, encrypted secrets, audit, notices |
-| `mgmt_*` | two-operator state, auth flows, updates, callbacks, channel snapshots, ingestion jobs, audit, per-operator selections, bounded validation requests/drafts |
+| `channel_signals`, `signal_message_links` | historical logical signal index and link status; preserved for future browsing |
+| `signal_candidates`, `signal_candidate_reviews`, `analysis_runs`, `analysis_failures` | historical offline-analysis records |
+| `control_*` | owner setup/settings/flows/encrypted secrets/audit/notices plus historical learning and approval records |
+| `mgmt_*` | historical two-operator management state, ingestion jobs, and bounded-validation requests |
 
-`manage status` reads these read-only. Secrets in `control_secrets` are encrypted
-with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable.
+No rows are deleted by the application on upgrade. Secrets in `control_secrets`
+are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable.
 
 ## Enum reference
 
@@ -214,8 +205,8 @@ Restore with the service stopped; remove stale `-wal`/`-shm` files; keep mode
 `0600`. Verify with `tg-ingest status` and `tg-ingest trading status` before
 starting `serve`.
 
-Offline inspections (except `manage status`, repository-opening status and
-analysis commands may initialize or migrate the selected database):
+Repository-opening status commands may initialize or migrate the selected
+database:
 
 ```bash
 .venv/bin/tg-ingest status
@@ -223,5 +214,4 @@ analysis commands may initialize or migrate the selected database):
 .venv/bin/tg-ingest queue list --status failed
 .venv/bin/tg-ingest trading status
 .venv/bin/tg-ingest trading intents
-.venv/bin/tg-ingest analyze summary --db-path <disposable-database-path>
 ```

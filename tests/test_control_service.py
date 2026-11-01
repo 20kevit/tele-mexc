@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 from tg_signal_ingest.control.service import ControlBot
 from tg_signal_ingest.control.store import ControlStore
-from tg_signal_ingest.normalize import message_to_record
 
 OWNER = 4242
 DEVELOPER = 7777
@@ -132,7 +131,7 @@ def _callback(update_id: int, data: str, *, user: int = OWNER):
     }
 
 
-def _full_setup(store: ControlStore, *, completed: bool = True) -> None:
+def _full_setup(store: ControlStore) -> None:
     store.update_setup(
         telegram_state="authenticated",
         telegram_account_label="Owner",
@@ -140,8 +139,6 @@ def _full_setup(store: ControlStore, *, completed: bool = True) -> None:
         mexc_label="Spot trade + read",
         selected_channel_id=CHANNEL,
         selected_channel_title="Signals",
-        learning_state="completed" if completed else "in_progress",
-        learning_streak=5 if completed else 0,
     )
     store.refresh_setup_state()
 
@@ -203,7 +200,6 @@ async def test_start_requires_owner_and_resumes_persisted_setup(cfg, repo):
     text = fake.sent[-1]["text"]
     assert "وضعیت سیستم" in text
     assert "کانال: Signals" in text
-    assert "یادگیری: 5 از 5" in text
     assert store.setup()["effective_state"] == before["effective_state"]
     assert store.flow()["state"] == "idle"
 
@@ -300,31 +296,6 @@ async def test_chat_login_is_disabled_and_stale_challenge_is_discarded(cfg, repo
     persisted = " ".join(str(row["detail"] or "") for row in audit)
     assert "chat_login_rejected" in events
     assert "12345" not in persisted
-
-
-async def test_learning_requires_five_valid_examples_before_ready_state(cfg, repo):
-    _add_channel(repo)
-    for index in range(1, 6):
-        repo.upsert_message(
-            message_to_record(
-                CHANNEL,
-                Msg(index, f"BUY BTCUSDT ENTRY 100 TP 110 SL 95 #{index}"),
-                "live",
-            )
-        )
-    store = ControlStore(repo.db)
-    _full_setup(store, completed=False)
-    control, fake, _engine = _bot(cfg, repo)
-
-    for index in range(5):
-        await control.handle_update(_callback(100 + index * 2, "m:learn_next"))
-        approve = next(btn for btn in fake.last_buttons() if btn["callback_data"].startswith("lr:y:"))
-        await control.handle_update(_callback(101 + index * 2, approve["callback_data"]))
-
-    setup = store.setup()
-    assert setup["learning_streak"] == 5
-    assert setup["learning_state"] == "completed"
-    assert setup["effective_state"] == "automatic"
 
 
 async def test_legacy_order_approval_callback_is_inert_and_tick_is_safe(cfg, repo):
@@ -588,3 +559,36 @@ async def test_developer_is_blocked_when_not_configured(cfg, repo):
 
     await control.handle_update(_message(1, "/start", user=DEVELOPER))
     assert "دسترسی مجاز نیست" in fake.sent[-1]["text"]
+
+
+async def test_learning_workflow_is_removed_from_control_bot(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_message(1, "/start"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert not any(callback in ("m:learn", "m:learn_next") or callback.startswith("lr:") for callback in callbacks)
+    assert "یادگیری" not in fake.sent[-1]["text"]
+
+    await control.handle_update(_callback(2, "lr:y:legacy-sample"))
+    assert any("دکمه نامعتبر" in item["text"] for item in fake.sent)
+
+
+async def test_notification_severity_is_one_selected_level(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, _engine = _bot(cfg, repo)
+
+    await control.handle_update(_callback(1, "n:settings"))
+    keyboard = fake.sent[-1].get("reply_markup") or {}
+    callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
+    assert {f"n:set:{level}" for level in store.NOTIFICATION_LEVELS} <= set(callbacks)
+    assert not any(callback.startswith("n:toggle:") for callback in callbacks)
+
+    await control.handle_update(_callback(2, "n:set:WARNING"))
+    assert store.notification_min_severity() == "WARNING"
+    assert any("WARNING" in item["text"] for item in fake.sent)

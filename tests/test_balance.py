@@ -83,11 +83,10 @@ def test_stale_snapshot_is_rejected(cfg):
         )
 
 
-def test_buy_respects_fee_buffer_and_reserve(cfg):
-    cfg.trading.remaining_balance_reserve_pct = 20.0
+def test_buy_respects_fee_buffer(cfg):
     cfg.trading.balance_fee_buffer_pct = 0.5
     snap = _snapshot()
-    # 100 free, 20% reserve => 80 usable; 10 + 0.5% fee = 10.05 fits easily.
+    # 100 free; 10 + 0.5% fee = 10.05 fits.
     validate_balance(
         snap,
         cfg=cfg.trading,
@@ -100,8 +99,7 @@ def test_buy_respects_fee_buffer_and_reserve(cfg):
     )
 
 
-def test_buy_rejected_by_reserve_and_fee(cfg):
-    cfg.trading.remaining_balance_reserve_pct = 90.0
+def test_buy_rejected_by_fee_inclusive_requirement(cfg):
     cfg.trading.balance_fee_buffer_pct = 1.0
     raw = {
         "canTrade": True,
@@ -117,13 +115,12 @@ def test_buy_rejected_by_reserve_and_fee(cfg):
             base_asset="BTC",
             quote_asset="USDT",
             base_quantity=None,
-            quote_amount=Decimal("5"),
+            quote_amount=Decimal("10"),
             now=0,
         )
 
 
 def test_sell_uses_base_asset(cfg):
-    cfg.trading.remaining_balance_reserve_pct = 0.0
     cfg.trading.balance_fee_buffer_pct = 0.0
     snap = _snapshot()
     validate_balance(
@@ -150,7 +147,6 @@ def test_sell_uses_base_asset(cfg):
 
 
 def test_outstanding_local_orders_are_subtracted(cfg):
-    cfg.trading.remaining_balance_reserve_pct = 0.0
     cfg.trading.balance_fee_buffer_pct = 0.0
     snap = _snapshot()
     with pytest.raises(BalanceError, match="insufficient"):

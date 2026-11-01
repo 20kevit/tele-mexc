@@ -34,7 +34,7 @@ approval.
 | Owner acknowledgement | `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"` is required to construct the pipeline |
 | MEXC CLI backend | `[mexc_cli] enabled = true` and a healthy CLI profile are required for Spot writes |
 | Sizing | One fixed `order_quote_amount` chosen by the owner; signal text never changes it |
-| Submission boundary | Pause, emergency stop, Telegram/MEXC/channel/learning readiness and reconciliation blockers are checked atomically with the `planned -> submitting` claim |
+| Submission boundary | Pause, emergency stop, Telegram/MEXC/channel readiness and reconciliation blockers are checked atomically with the `planned -> submitting` claim |
 
 `control_setup.paused` is authoritative. `/pause` takes an exclusive kernel
 `flock`, waits for any in-flight submission to finish, writes the pause state,
@@ -124,15 +124,13 @@ Environment overrides: `TRADING_EXECUTION_ACKNOWLEDGEMENT`,
 | --- | --- | --- |
 | `execution_acknowledgement` | unset | exact `I_UNDERSTAND_REAL_MONEY_AND_RISKS`; unset/wrong refuses pipeline construction |
 | `order_quote_amount` | `3.0` | positive finite per-order quote; 3 USDT default; precedence is env > owner Telegram menu (DB) > `[trading]` > default |
-| `aggregate_budget_quote` | `50.0` | cumulative spend reference for reporting; must be >0; never caps per-order size and is not enforced as a ceiling |
 | `order_type_policy` | `limit` | `limit` or `market`; explicit signal semantics still apply |
-| `remaining_balance_reserve_pct` | `20.0` | `0 ≤ value < 100` |
-| `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5` |
-| `balance_max_age_s` | `5.0` | `(0, 300]`; stale account snapshots fail closed |
+| `balance_fee_buffer_pct` | `0.2` | `0 ≤ value ≤ 5`; pre-trade fee cover because the exact fee is only known after fills |
+| `balance_max_age_s` | `5.0` | `(0, 300]`; rejects a stale account snapshot before submission |
 | `recon_interval_s` | `30.0` | reconciliation period, minimum 5 s |
 | `emergency_stop` | `false` | blocks new intents and pre-submit revalidation |
 | `entry_trigger_offset_ticks` | unset | unset = direct entry; otherwise integer ≥1 enables conditional entry |
-| `entry_trigger_stale_threshold_s` | `60.0` | positive; older price ticks are ignored |
+| `entry_trigger_stale_threshold_s` | `60.0` | positive; a conditional-entry order is not triggered from an older price tick |
 | `tp1_allocation_pct_of_acquired` | `50.0` | 0–100 of actual acquired quantity |
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
 | `stop_loss_max_retries` | `3` | integer ≥1; caps definitive TP/SL rejection retries |
@@ -146,13 +144,25 @@ caps, signal-age/price-deviation caps, `allowed_symbols`, and `allowlist_mode`
 are rejected at load time. They are not silently ignored because that would
 change financial behaviour.
 
+### Retained safety parameters
+
+| Setting | Why it is retained |
+| --- | --- |
+| `execution_acknowledgement` | One-time global construction gate proving the owner intends automatic real Spot execution. It is not per-order approval. |
+| `balance_fee_buffer_pct` | The exact exchange fee is only visible after fills; the pre-trade requirement adds a small documented buffer so the quote/base balance is sufficient. |
+| `balance_max_age_s` | Prevents a decision based on a stale account snapshot. It is a freshness check, not portfolio polling. |
+| `entry_trigger_stale_threshold_s` | Prevents a conditional entry from triggering on an old market tick. |
+| `entry_trigger_offset_ticks` | Controls the conditional-entry downward trigger distance; owner-adjustable and defaults to the documented strategy when set. |
+| `stop_loss_trigger_offset_ticks` | Controls the OCO stop activation trigger relative to the configured stop exit price. |
+
+
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
 threshold, or symbol allowlist. MEXC market metadata and order filters remain
 enforced. The `trading_daily_spend` table is maintained but no cap reads it.
 
 ## Parsing and executable signals
 
-`trading/parser.py` is deterministic and independent of the offline analyzer.
+`trading/parser.py` is the only production parser.
 
 | Kind | Meaning |
 | --- | --- |
@@ -319,33 +329,35 @@ Market polling:
   prices. Order submission remains governed by the no-retry
   `unknown_requires_reconciliation` path.
 
-## Budget ledger
+## Technical reservation ledger
 
-Intent creation and budget reservation are one atomic transaction. The reserved amount is:
+Intent creation and its reservation are one atomic transaction. The reserved
+amount is:
 
 ```
 quote_amount * (1 + balance_fee_buffer_pct / 100)
 ```
 
-`trading_budget_ledger` states:
+`trading_budget_ledger` is **not a portfolio budget** and has no configurable
+spending cap. It prevents duplicate reservations and keeps concurrent intent
+creation coherent. States:
 
 | State | Effect |
 | --- | --- |
-| `reserved` | Counts against the cap |
-| `uncertain` | Frozen; still counts; never auto-released |
-| `settled` | Reservation removed; actual spend and fees retained |
-| `released` | No charge; used for rejected/failed/never-sent intents |
+| `reserved` | Active technical reservation |
+| `uncertain` | Frozen until reconciliation; never auto-released |
+| `settled` | Reservation replaced by actual spend and fees |
+| `released` | Rejected/failed/never-sent intent; no active reservation |
 
 - Filled: settle actual `cumulativeQuoteQty` (or fill totals), plus real fees;
   when fees are not yet visible, the configured buffer is retained.
 - Canceled: retain actual partial spend and fees.
 - Rejected/failed/canceled-locally: release.
-- The summary is `limit - active_reserved - settled_spend`; restart never
-  resets the ledger.
+- Restart never resets the ledger.
 
 ## Execution
 
-Flow: budget ensure → fresh balance preflight → `submitting` → exchange →
+Flow: reservation ensure → fresh balance preflight → `submitting` → exchange →
 `submitted`/uncertain/rejected → reconciliation. Pause/readiness are checked in
 the same transaction as `planned → submitting`.
 
@@ -356,8 +368,9 @@ Live balance preflight:
   asset is missing.
 - Required = order notional × fee factor (BUY) or base quantity × fee factor
   (SELL).
-- Subtract outstanding local open intents for the same symbol; also keep
-  `remaining_balance_reserve_pct` free.
+- Subtract outstanding local open intents for the same symbol; the remaining
+  free amount must cover the fee-inclusive requirement. No percentage of the
+  account is reserved.
 - A timestamp rejection (`700003`/`10073`) on the read-only account query is
   retried once with a fresh signature. A second failure rejects before any
   order call; other balance errors are never retried.
@@ -490,7 +503,7 @@ conditional entry defers the entry intent until a price trigger.
 - **Entry:** limit BUY at the signal entry price; never converts to market.
 - **Conditional entry:** if market < entry and offset ≥1, wait for
   `entry_price - offset_ticks × tick_size`, then submit the limit BUY through the
-  engine's budget/balance gate. Missing/stale price fails closed.
+  engine's reservation/balance gate. Missing/stale price fails closed.
 - **TP1:** first target; limit SELL of
   `tp1_allocation_pct_of_acquired` of actual filled quantity.
 - **TP2:** second target; limit SELL of `tp2_allocation_pct_of_remaining` of what
@@ -743,15 +756,14 @@ modifies an order.
 2. Use a MEXC key with Spot read + Spot trade only; enable IP allowlist; no
    withdrawal permission.
 3. Set `order_quote_amount` to an owner-approved positive value.
-4. Set `aggregate_budget_quote` to an owner-approved positive value (default 50 USDT; no hard ceiling).
-5. Set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`.
-6. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
+4. Set `execution_acknowledgement = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"`.
+   This is a one-time global construction gate, not per-order approval.
+5. Leave `mexc_cli.confirm_noninteractive_writes` unset (defaults to `true`) or
    set it to `true`; never leave an explicit `false` when writes are intended.
-7. Complete owner setup: Telegram authenticated, MEXC verified, channel
-   selected, learning completed, and not paused.
-8. Restart once; confirm the activation boundary advanced.
-9. Submit one minimal test signal only after a separate explicit approval.
-10. Monitor `trading status`, `trading intents`, and the notification outbox.
+6. Complete owner setup: Telegram authenticated, MEXC verified, and channel
+   selected.
+7. Restart once; confirm the activation boundary advanced.
+8. Monitor `trading status`, `trading intents`, and the notification outbox.
 
 ### OCO certainty follow-up review
 
