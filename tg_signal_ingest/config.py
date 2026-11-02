@@ -97,12 +97,10 @@ class TradingConfig:
     tp1_allocation_pct_of_acquired: float = 50.0
     tp2_allocation_pct_of_remaining: float = 100.0
     stop_loss_max_retries: int = 3
-    # Stop-loss trigger offset: for new bot-initiated LONG spot positions the
-    # stop-loss *activation trigger* is placed this many valid price ticks
-    # above the configured stop-loss exit price so it can activate earlier as
-    # the market falls. Zero disables the offset (trigger == exit price).
-    # The configured stop-loss exit price itself is never changed.
-    stop_loss_trigger_offset_ticks: int = 3
+    # Deprecated compatibility setting. The Stop-Loss activation trigger is
+    # always exactly the configured Stop-Loss exit price; the only accepted
+    # value is zero. A nonzero value is rejected during configuration loading.
+    stop_loss_trigger_offset_ticks: int = 0
     # Price feed polling (monitor) configuration.
     monitor_poll_interval_s: float = 2.0
     monitor_max_retries: int = 5
@@ -125,11 +123,6 @@ class TradingConfig:
     def conditional_entry_enabled(self) -> bool:
         """Conditional entry is always the strategy; invalid offsets fail later."""
         return self.effective_entry_trigger_offset_ticks >= 1
-
-    @property
-    def stop_loss_trigger_enabled(self) -> bool:
-        """Stop-loss trigger offset is active when at least one tick is configured."""
-        return self.stop_loss_trigger_offset_ticks is not None and self.stop_loss_trigger_offset_ticks >= 1
 
     def as_dict_public(self) -> dict[str, object]:
         return {
@@ -651,10 +644,13 @@ def _load_mexc_and_trading(cfg: AppConfig, toml: dict[str, object], env: dict[st
         if (
             not isinstance(sl_trigger_offset_val, int)
             or isinstance(sl_trigger_offset_val, bool)
-            or sl_trigger_offset_val < 0
+            or sl_trigger_offset_val != 0
         ):
-            raise ConfigError("trading.stop_loss_trigger_offset_ticks must be a whole number >= 0.")
-        t.stop_loss_trigger_offset_ticks = int(sl_trigger_offset_val)
+            raise ConfigError(
+                "trading.stop_loss_trigger_offset_ticks must be 0; "
+                "the Stop-Loss trigger is always the configured Stop-Loss price."
+            )
+        t.stop_loss_trigger_offset_ticks = 0
 
     poll_val = tr_raw.get("monitor_poll_interval_s")
     if poll_val not in (None, ""):

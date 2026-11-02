@@ -37,4 +37,4 @@ def test_balance_fee_and_freshness_settings_are_retained():
     assert trading.balance_fee_buffer_pct >= 0
     assert trading.balance_max_age_s > 0
     assert trading.entry_trigger_stale_threshold_s > 0
-    assert trading.stop_loss_trigger_offset_ticks >= 0
+    assert trading.stop_loss_trigger_offset_ticks == 0

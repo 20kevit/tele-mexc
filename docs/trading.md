@@ -135,7 +135,7 @@ Environment overrides: `TRADING_ORDER_QUOTE_AMOUNT`,
 | `tp2_allocation_pct_of_remaining` | `100.0` | 0–100 of quantity left after TP1 |
 | `signal_validity_s` | `43200` (12 h) | `1800 ≤ value ≤ 604800`; how long a signal stays actionable. Owner-editable from Telegram (`/validity <hours>`, stored in `control_settings.signal_validity_hours`). Distinct from an accepted order's lifetime |
 | `stop_loss_max_retries` | `3` | legacy key retained for compatibility; the OCO retry budget is the fixed owner-agreed schedule (1 attempt + 8 retries, see below) |
-| `stop_loss_trigger_offset_ticks` | `3` | stop-loss activation trigger = exit price + this many symbol ticks (0 disables); exit price itself unchanged |
+| `stop_loss_trigger_offset_ticks` | `0` | deprecated compatibility key; only `0` is accepted. The Stop-Loss activation trigger is exactly the configured exit price |
 | `monitor_poll_interval_s` | `2.0` | positive |
 | `monitor_max_retries` | `5` | integer ≥1 |
 | `monitor_backoff_base_s` | `1.0` | positive |
@@ -153,7 +153,7 @@ change financial behaviour.
 | `balance_max_age_s` | Prevents a decision based on a stale account snapshot. It is a freshness check, not portfolio polling. |
 | `entry_trigger_stale_threshold_s` | Prevents a conditional entry from triggering on an old market tick. |
 | `entry_trigger_offset_ticks` | Conditional-entry trigger distance; default exactly 3 ticks, still owner-adjustable. |
-| `stop_loss_trigger_offset_ticks` | Controls the OCO stop activation trigger relative to the configured stop exit price. |
+| `stop_loss_trigger_offset_ticks` | Retained only as a zero-valued compatibility key; no Stop-Loss tick offset is applied. |
 
 
 There is no daily-order cap, open-order cap, signal-age limit, price-deviation
@@ -468,19 +468,16 @@ take-profit/stop-loss triggers. Instead, once the entry intent is terminal and
 native MEXC OCO SELL orders against the **actual acquired base quantity**:
 
 - OCO 1: `tp1_allocation_pct` (default 50%) at TP1, with a stop-limit leg whose
-  *execution price* is the configured stop-loss and whose *activation trigger*
-  is `stop_loss + (stop_loss_trigger_offset_ticks × symbol_tick_size)` (default
-  three ticks above the exit price), so the stop can activate earlier as the
-  market falls.
-- OCO 2: the remaining allocation at TP2, with the same split between the
-  stop-limit execution price (configured stop-loss, unchanged) and the
-  activation trigger (the configured `stop_loss_trigger_offset_ticks`, default 3 ticks above it).
+  *execution price* and *activation trigger* are both exactly the configured
+  stop-loss. No tick offset is applied.
+- OCO 2: the remaining allocation at TP2, with the same exact Stop-Loss trigger
+  and execution price.
 - Each OCO is one exchange order with two linked legs; when one leg activates,
   the exchange cancels the other leg inside that OCO. The two OCO orders do not
   cancel each other.
 - The activation trigger and the stop-limit execution price are distinct
-  exchange fields (`triggerPrice` / `triggerLimitPrice` on `spot.trade.place-oco`).
-  The configured stop-loss exit price itself is never changed by the offset.
+  exchange fields (`triggerPrice` / `triggerLimitPrice` on `spot.trade.place-oco`),
+  but both are set to the configured stop-loss price.
 
 Protection is reported as active only after every required leg has an exchange
 identifier. The states are:

@@ -37,7 +37,7 @@ from ..mexc.errors import (
     MexcUnexpectedResponse,
     MexcWafError,
 )
-from ..mexc.symbols import SymbolValidationError, compute_stop_loss_trigger_price
+from ..mexc.symbols import SymbolValidationError
 from ..repository import QueueItem, Repository
 from .audit import normalize_event_type
 from .balance import BalanceError, parse_account, validate_balance
@@ -1842,25 +1842,12 @@ class TradingEngine:
         }
 
     def _compute_stop_loss_trigger(self, trade: dict[str, Any], stop_price: Decimal) -> Decimal | None:
-        """Return the stop-loss activation trigger for ``trade``'s symbol.
+        """Return the Stop-Loss activation trigger.
 
-        ``trigger = stop_loss_exit_price + offset × symbol_tick_size``.  The
-        configured stop-loss exit price itself is never changed; only the
-        activation trigger moves upward so it can activate earlier as the
-        market falls.  Returns None (fail closed) when symbol metadata is
-        unavailable, so no exit is placed without a verified trigger price.
+        The trigger is always exactly the configured Stop-Loss price. No tick
+        offset is applied and no configuration value can reintroduce one.
         """
-        offset = int(getattr(self.cfg.trading, "stop_loss_trigger_offset_ticks", 3) or 3)
-        if offset < 1:
-            # Owner disabled the offset: trigger equals the exit price.
-            return stop_price
-        meta = self._symbol_meta(trade.get("symbol"))
-        if meta is None:
-            return None
-        try:
-            return compute_stop_loss_trigger_price(stop_price, meta.price_step, offset)
-        except Exception:  # noqa: BLE001 - fail closed on any metadata/math issue
-            return None
+        return stop_price
 
     def submit_oco_sell(
         self,
@@ -1891,11 +1878,8 @@ class TradingEngine:
         """Submit a native OCO SELL pair (limit leg + stop-limit leg) via the CLI.
 
         The limit leg is the take-profit (price); the stop-limit leg is the
-        stop-loss.  The stop-loss activation *trigger* is three symbol ticks
-        above the configured stop-loss exit price so it activates earlier as
-        the market falls, while the stop-limit execution price stays at the
-        configured exit price.  ``trigger_price`` (activation) and
-        ``trigger_limit_price`` (execution) are therefore distinct fields.
+        stop-loss.  The stop-loss activation trigger is exactly the configured
+        Stop-Loss price, and the stop-limit execution price is the same price.
         """
 
         client = self._live_client()
