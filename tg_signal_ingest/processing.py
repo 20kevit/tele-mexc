@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from .repository import QueueItem, Repository
@@ -67,7 +69,31 @@ class ProcessingEngine:
         handler = self._handlers.get(item.item_type)
         if handler is None:
             return True, None  # default: no-op consumer (parser not installed yet)
-        await handler(item, record)
+        started = time.monotonic()
+        try:
+            await handler(item, record)
+        except Exception:
+            duration_ms = int(round(max(0.0, time.monotonic() - started) * 1000))
+            log.warning(
+                "queue_handler queue_id=%s channel_id=%s message_id=%s item_type=%s duration_ms=%s outcome=error",
+                item.queue_id, item.channel_id, item.message_id, item.item_type, duration_ms,
+            )
+            raise
+        duration_ms = int(round(max(0.0, time.monotonic() - started) * 1000))
+        try:
+            created = datetime.fromisoformat(item.created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            queue_age_ms = max(0, int((datetime.now(UTC) - created).total_seconds() * 1000))
+        except (TypeError, ValueError):
+            queue_age_ms = -1
+        level = logging.INFO if duration_ms >= 1000 or queue_age_ms >= 1000 else logging.DEBUG
+        log.log(
+            level,
+            "queue_handler queue_id=%s channel_id=%s message_id=%s item_type=%s "
+            "queue_age_ms=%s duration_ms=%s outcome=ok",
+            item.queue_id, item.channel_id, item.message_id, item.item_type, queue_age_ms, duration_ms,
+        )
         return True, None
 
     async def run_once(self, max_items: int | None = None) -> ProcessingStats:

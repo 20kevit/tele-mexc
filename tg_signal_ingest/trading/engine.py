@@ -261,11 +261,49 @@ class TradingEngine:
 
     # ------------------------------------------------------------ ingestion
 
+    @contextlib.contextmanager
+    def _measure_signal_stage(self, item: QueueItem, stage: str) -> Any:
+        started = self._monotonic()
+        outcome = "ok"
+        try:
+            yield
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            duration_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
+            level = logging.DEBUG if stage == "parse" else logging.INFO
+            log.log(
+                level,
+                "signal_stage channel_id=%s message_id=%s queue_id=%s item_type=%s stage=%s duration_ms=%s outcome=%s",
+                item.channel_id, item.message_id, item.queue_id, item.item_type, stage, duration_ms, outcome,
+            )
+
     def process_item(self, item: QueueItem, record: dict[str, Any]) -> dict[str, Any] | None:
         """Handle one queue item. Returns an intent dict when one is created."""
 
-        with self._process_lock:
-            return self._process_item(item, record)
+        wait_started = self._monotonic()
+        self._process_lock.acquire()
+        acquired = self._monotonic()
+        outcome = "ok"
+        try:
+            try:
+                return self._process_item(item, record)
+            except Exception:
+                outcome = "error"
+                raise
+        finally:
+            released = self._monotonic()
+            self._process_lock.release()
+            wait_ms = int(round(max(0.0, acquired - wait_started) * 1000))
+            hold_ms = int(round(max(0.0, released - acquired) * 1000))
+            level = logging.INFO if wait_ms >= 50 or hold_ms >= 1000 else logging.DEBUG
+            log.log(
+                level,
+                "signal_lock scope=process_item channel_id=%s message_id=%s queue_id=%s "
+                "wait_ms=%s hold_ms=%s outcome=%s",
+                item.channel_id, item.message_id, item.queue_id, wait_ms, hold_ms, outcome,
+            )
 
     def _process_item(self, item: QueueItem, record: dict[str, Any]) -> dict[str, Any] | None:
         if item.item_type == "delete" or int(record.get("deleted") or 0):
@@ -274,7 +312,8 @@ class TradingEngine:
 
         text = record.get("text") or record.get("caption")
         version = int(record.get("processing_version") or 0)
-        parsed = self.parser.parse(text, is_edit=item.item_type == "edit" or version > 0)
+        with self._measure_signal_stage(item, "parse"):
+            parsed = self.parser.parse(text, is_edit=item.item_type == "edit" or version > 0)
         signal_id, inserted = self.store.record_signal(
             parsed,
             channel_id=item.channel_id,
@@ -415,22 +454,25 @@ class TradingEngine:
             self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
-        reference = self._reference_price(parsed)
-        meta = self._symbol_meta(parsed.symbol)
+        with self._measure_signal_stage(item, "reference_price"):
+            reference = self._reference_price(parsed)
+        with self._measure_signal_stage(item, "symbol_metadata"):
+            meta = self._symbol_meta(parsed.symbol)
         if meta is None:
             reason = "symbol metadata unavailable; refusing to trade without exchange constraints"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "validate", "rejected", reason)
             self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
-        decision = self.risk.evaluate(
-            parsed,
-            message_datetime=record.get("datetime"),
-            reference_price=reference,
-            base_asset=getattr(meta, "base_asset", None),
-            now=self._now(),
-            symbol_meta=meta,
-        )
+        with self._measure_signal_stage(item, "risk_evaluation"):
+            decision = self.risk.evaluate(
+                parsed,
+                message_datetime=record.get("datetime"),
+                reference_price=reference,
+                base_asset=getattr(meta, "base_asset", None),
+                now=self._now(),
+                symbol_meta=meta,
+            )
         if not decision.approved:
             self.store.update_signal(signal_id, "rejected", decision.reason)
             self.store.audit(signal_id, "risk", "rejected", decision.reason)
@@ -457,21 +499,22 @@ class TradingEngine:
             # 'validated'.  create_intent reconciles the durable state.
             self.store.update_signal(signal_id, "validated")
         try:
-            intent, inserted = self.store.create_intent(
-                signal=parsed,
-                signal_id=signal_id,
-                channel_id=item.channel_id,
-                message_id=item.message_id,
-                edit_version=version,
-                idempotency_key=idempotency_key,
-                client_order_id=client_order_id,
-                mode="live",
-                order_type=decision.order_type,
-                quote_amount=decision.quote_amount or Decimal(0),
-                base_quantity=decision.base_quantity,
-                limit_price=decision.limit_price,
-                deadline_at=deadline.isoformat() if deadline is not None else None,
-            )
+            with self._measure_signal_stage(item, "intent_persistence"):
+                intent, inserted = self.store.create_intent(
+                    signal=parsed,
+                    signal_id=signal_id,
+                    channel_id=item.channel_id,
+                    message_id=item.message_id,
+                    edit_version=version,
+                    idempotency_key=idempotency_key,
+                    client_order_id=client_order_id,
+                    mode="live",
+                    order_type=decision.order_type,
+                    quote_amount=decision.quote_amount or Decimal(0),
+                    base_quantity=decision.base_quantity,
+                    limit_price=decision.limit_price,
+                    deadline_at=deadline.isoformat() if deadline is not None else None,
+                )
         except TradingError as exc:
             # DB/TradingError during intent admission — fail closed, do not submit
             reason = f"intent admission failed safely: {exc}"
@@ -506,7 +549,8 @@ class TradingEngine:
         # Trade lifecycle coordinator: conditional entry, TP1/TP2, SL.
         defer = False
         if self.trade_manager is not None:
-            trade_decision = self.trade_manager.on_intent_planned(intent, parsed, reference)
+            with self._measure_signal_stage(item, "trade_lifecycle_planning"):
+                trade_decision = self.trade_manager.on_intent_planned(intent, parsed, reference)
             if trade_decision.rejected:
                 # Fail-closed: do NOT submit an entry order.
                 return intent
@@ -532,9 +576,10 @@ class TradingEngine:
                 )
         if defer:
             return intent
-        result = self._execute_intent(intent["intent_id"])
-        if self.trade_manager is not None and result is not None:
-            self.trade_manager.on_intent_executed(result)
+        with self._measure_signal_stage(item, "order_execution"):
+            result = self._execute_intent(intent["intent_id"])
+            if self.trade_manager is not None and result is not None:
+                self.trade_manager.on_intent_executed(result)
         return result
 
     # -------------------------------------------------------------- helpers
@@ -813,9 +858,11 @@ class TradingEngine:
     ) -> None:
         """Best-effort durable notification; never affects order handling."""
 
-        if self.notifier is None:
-            return
+        started = self._monotonic()
+        outcome = "skipped" if self.notifier is None else "ok"
         try:
+            if self.notifier is None:
+                return
             self.notifier.notify(
                 event_key=event_key,
                 text=text,
@@ -826,7 +873,14 @@ class TradingEngine:
                 event_type=event_type or normalize_event_type("order_lifecycle", event_key),
             )
         except Exception as exc:  # noqa: BLE001 - reporting must not break execution
+            outcome = "error"
             log.warning("notification enqueue failed (%s)", exc.__class__.__name__)
+        finally:
+            duration_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
+            log.info(
+                "signal_stage signal_id=%s intent_id=%s stage=notification_enqueue duration_ms=%s outcome=%s",
+                signal_id or "none", intent_id or "none", duration_ms, outcome,
+            )
 
     @staticmethod
     def _is_genuine_signal(parsed: ParsedSignal) -> bool:

@@ -30,6 +30,7 @@ oversell the position.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import threading
@@ -244,6 +245,28 @@ class TradeManager:
         self._trade_locks = KeyedRLockPool()
         self._buy_block_lock = threading.Lock()
 
+    @contextlib.contextmanager
+    def _hold_trade_lock(self, key: str, operation: str) -> Any:
+        requested = self._clock()
+        with self._trade_locks.hold(key):
+            acquired = self._clock()
+            outcome = "ok"
+            try:
+                yield
+            except Exception:
+                outcome = "error"
+                raise
+            finally:
+                released = self._clock()
+                wait_ms = int(round(max(0.0, acquired - requested) * 1000))
+                hold_ms = int(round(max(0.0, released - acquired) * 1000))
+                level = logging.INFO if wait_ms >= 50 or hold_ms >= 1000 else logging.DEBUG
+                log.log(
+                    level,
+                    "trade_lock operation=%s signal_or_trade=%s wait_ms=%s hold_ms=%s outcome=%s",
+                    operation, key, wait_ms, hold_ms, outcome,
+                )
+
     @property
     def notifier(self) -> Any:
         """Notifier attached to the engine after construction (lazy)."""
@@ -268,7 +291,7 @@ class TradeManager:
         closed and the engine must not execute the intent at all.  ``trade`` is
         the created trade row or ``None``.
         """
-        with self._trade_locks.hold(str(intent["signal_id"])):
+        with self._hold_trade_lock(str(intent["signal_id"]), "on_intent_planned"):
             existing = self.store.get_trade_by_signal(intent["signal_id"])
             if existing is not None:
                 if existing.get("entry_mode") == "conditional" and existing.get("trade_state") == "pending_entry":
@@ -312,7 +335,7 @@ class TradeManager:
         trade = self.store.get_trade_by_intent(intent_id)
         if trade is None:
             return
-        with self._trade_locks.hold(str(trade.get("signal_id") or trade["trade_id"])):
+        with self._hold_trade_lock(str(trade.get("signal_id") or trade["trade_id"]), "on_intent_executed"):
             trade = self.store.get_trade_by_intent(intent_id)
             if trade is None:
                 return
@@ -352,7 +375,7 @@ class TradeManager:
             if trade["symbol"].upper() != symbol.upper():
                 continue
             key = str(trade.get("signal_id") or trade["trade_id"])
-            with self._trade_locks.hold(key):
+            with self._hold_trade_lock(key, "on_tick"):
                 current = self.store.get_trade(trade["trade_id"])
                 if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                     continue
@@ -374,7 +397,7 @@ class TradeManager:
                 if trade["trade_state"] in TERMINAL_TRADE_STATES:
                     continue
                 key = str(trade.get("signal_id") or trade["trade_id"])
-                with self._trade_locks.hold(key):
+                with self._hold_trade_lock(key, "recover_on_startup"):
                     current = self.store.get_trade(trade["trade_id"])
                     if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                         continue
@@ -2464,7 +2487,7 @@ class TradeManager:
                 if trade["trade_state"] in TERMINAL_TRADE_STATES:
                     continue
                 key = str(trade.get("signal_id") or trade["trade_id"])
-                with self._trade_locks.hold(key):
+                with self._hold_trade_lock(key, "reconcile_all_open"):
                     current = self.store.get_trade(trade["trade_id"])
                     if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                         continue

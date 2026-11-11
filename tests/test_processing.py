@@ -25,6 +25,25 @@ class TestEngine:
         assert stats.processed == 0
         assert len(tester.handled) == 1
 
+    def test_handler_logs_queue_age_and_duration(self, repo, caplog):
+        from tests.conftest import FakeMsg
+        from tg_signal_ingest.normalize import message_to_record
+
+        repo.upsert_message(message_to_record(100, FakeMsg(6, "timed"), "live"))
+
+        async def handler(item, record):
+            return None
+
+        caplog.set_level(10, logger="ingest.processing")
+        engine = ProcessingEngine(repo)
+        engine.register_handler("message", handler)
+        stats = asyncio.run(engine.run_once())
+        assert stats.processed == 1
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert "queue_handler" in rendered
+        assert "queue_age_ms=" in rendered
+        assert "duration_ms=" in rendered
+
     def test_edit_notifies_and_skips_superseded(self, repo):
         from tests.conftest import FakeMsg
         from tg_signal_ingest.normalize import message_to_record

@@ -165,6 +165,11 @@ stdlib `urllib` in a worker thread. It provides:
 - Structured REST request logs include request id, endpoint, HTTP/exchange status,
   Retry-After, cooldown/rate-gate wait, network duration, and outcome. Signed
   parameters, credentials, and payloads are never logged.
+- Queue and signal-stage telemetry records queue age, handler duration, parser,
+  reference-price, symbol-metadata, risk, intent persistence, trade planning,
+  order execution, and notification-enqueue durations. Signal-process and
+  per-trade lock wait/hold durations are recorded separately; routine timings
+  remain debug-level while slow stages/locks are promoted to info.
 - Dynamic symbol metadata and precision validation from `exchangeInfo`.
 - Decimal-only order-book parsing and depth validation.
 

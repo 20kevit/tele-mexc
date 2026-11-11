@@ -516,10 +516,11 @@ def test_filled_without_full_allocation_is_not_confirmed(env):
     assert store.get_trade(trade["trade_id"])["trade_state"] != "oco_active"
 
 
-def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(env):
+def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(env, caplog):
     import threading
 
     cfg, store, engine, client, notifier, tm = env
+    caplog.set_level(10, logger="ingest.trading")
     entered = threading.Event()
     release = threading.Event()
     trade = {"trade_id": "trade-slow", "signal_id": "signal-slow", "trade_state": "entry_active"}
@@ -555,3 +556,6 @@ def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(en
         reconciliation.join(2)
         independent.join(2)
     assert not reconciliation.is_alive() and not independent.is_alive()
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trade_lock operation=reconcile_all_open" in rendered
+    assert "trade_lock operation=on_intent_planned" in rendered

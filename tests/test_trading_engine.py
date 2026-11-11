@@ -941,7 +941,8 @@ def test_balance_preflight_rejects_insufficient_quote_before_submission(cfg, rep
     assert "insufficient" in intent["reject_reason"]
 
 
-def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, monkeypatch):
+def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, monkeypatch, caplog):
+    caplog.set_level(10, logger="ingest.trading")
     client = FakeMexc(account_response=_account(btc="0.01"))
     engine = _engine(cfg, repo, client, mode="live")
     def unexpected_ticker(**_kwargs):
@@ -959,6 +960,10 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
     assert client.place_calls == 0 and client.account_calls == 0
     signal = engine.store.get_signal("100:71:0")
     assert signal is not None and "SHORT/SELL" in signal["rejection_reason"]
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "signal_stage" in rendered and "stage=parse" in rendered
+    assert "stage=notification_enqueue" in rendered
+    assert "signal_lock scope=process_item" in rendered
 
 
 def test_balance_api_failure_rejects_without_submitting(cfg, repo):
