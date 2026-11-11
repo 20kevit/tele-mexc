@@ -751,7 +751,12 @@ class IngestService:
                 )
         while not self._stop.is_set():
             try:
-                await asyncio.to_thread(self.trading.reconcile_pending)
+                reconcile_stats = await asyncio.to_thread(self.trading.reconcile_pending)
+                if getattr(reconcile_stats, "parked", 0):
+                    log.info(
+                        "reconciliation backoff parked %s intent(s) after repeated MEXC order-not-found responses",
+                        reconcile_stats.parked,
+                    )
                 resume = getattr(self.trading, "resume_planned_intents", None)
                 if callable(resume):
                     await asyncio.to_thread(resume)

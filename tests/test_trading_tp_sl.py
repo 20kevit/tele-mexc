@@ -496,3 +496,33 @@ def test_ignores_other_symbol(env):
     # The entry BUY was placed during setup; OCO exits for this symbol only.
     oco_calls = [c for c in client.place_calls if c.get("order_type") == "OCO_STOP_LIMIT_ORDER"]
     assert len(oco_calls) == 2, oco_calls
+
+
+def test_repeated_mexc_not_found_parks_trade_order_queries(env):
+    from datetime import UTC, datetime, timedelta
+
+    cfg, store, engine, client, notifier, tm = env
+    now = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
+    tm._now = lambda: now
+    order = {
+        "trade_order_id": "trade-order-missing",
+        "state": "unknown_requires_reconciliation",
+        "not_observed_reason": "MEXC_ORDER_NOT_FOUND:count=2:code=-2013",
+        "last_observed_at": now.isoformat(),
+    }
+    trade = {"trade_id": "trade-missing"}
+    store.list_trade_orders = lambda _trade_id: [order]
+    tm._list_trade_orders = lambda _trade_id: [order]
+    tm._refresh = lambda value: value
+    tm._refresh_sold_fields = lambda _trade: None
+    tm._verify_oco_invariant = lambda _trade: None
+    tm._advance_trade_after_reconcile = lambda _trade: None
+    calls = []
+    tm._reconcile_single_order = lambda _trade, _order: calls.append("queried")
+
+    tm._reconcile_trade_orders(trade)
+    assert calls == []  # count=2 => 120s; no query during the parked window
+
+    tm._now = lambda: now + timedelta(seconds=121)
+    tm._reconcile_trade_orders(trade)
+    assert calls == ["queried"]

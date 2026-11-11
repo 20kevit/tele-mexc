@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import deque
 from collections.abc import Callable
 from decimal import Decimal
@@ -43,6 +44,7 @@ from .errors import (
     _TIMESTAMP_CODES,
     MexcClockError,
     MexcConfigError,
+    MexcError,
     MexcNetworkError,
     MexcRateLimitError,
     MexcServerError,
@@ -386,12 +388,14 @@ class MexcSpotClient:
         with self._block_lock:
             self._blocked_until = max(self._blocked_until, self._monotonic() + seconds)
 
-    def _await_backoff(self) -> None:
+    def _await_backoff(self) -> float:
+        """Wait out the shared Retry-After cooldown and return actual elapsed seconds."""
+        started = self._monotonic()
         while True:
             with self._block_lock:
                 wait = self._blocked_until - self._monotonic()
             if wait <= 0:
-                return
+                return max(0.0, self._monotonic() - started)
             self._sleep(wait)
 
     def _classify_and_raise(self, status: int, text: str, headers: dict[str, str]) -> None:
@@ -418,7 +422,12 @@ class MexcSpotClient:
                     http_status=status,
                     retry_after_s=retry_after,
                 )
-            raise MexcWafError(f"WAF access denied (403): {msg}", code=code, http_status=status)
+            raise MexcWafError(
+                f"WAF access denied (403): {msg}",
+                code=code,
+                http_status=status,
+                retry_after_s=retry_after,
+            )
 
         try:
             parsed = json.loads(text)
@@ -441,7 +450,7 @@ class MexcSpotClient:
             raise precision(f"amount/precision rejected ({code}): {msg}", code)
         if code in _BALANCE_CODES:
             raise insufficient_balance(f"insufficient balance ({code}): {msg}", code)
-        if code == -2011:
+        if code in (-2011, -2013):
             raise not_found(f"order not found / terminal ({code}): {msg}", code)
         if code in (700002, 602):
             raise signature(f"signature rejected ({code}): {msg}", code)
@@ -486,16 +495,17 @@ class MexcSpotClient:
         # Only signed, read-only calls get the single clock-refresh retry.
         attempts = 2 if (signed and not is_write and self._server_clock is not None) else 1
         last_timestamp_error: Exception | None = None
+        request_id = uuid.uuid4().hex[:12]
         for attempt in range(attempts):
-            # Wait for any Retry-After backoff and the shared rate bucket
-            # *before* stamping the request.  The gate can legitimately sleep
-            # for a full 10-second window; a timestamp taken earlier would then
-            # be outside recvWindow (700003) even with a correct host clock.
-            self._await_backoff()
-            waited = self._acquire_bucket(method, path, signed=signed, bucket=bucket)
-            self._record_wait(waited, method=method, path=path)
+            # Wait for cooldown and weighted limits before stamping the request.
+            # Keep the two waits separate in telemetry; both remain on the same
+            # centralized client gates and no request is retried because of a wait.
+            cooldown_wait = self._await_backoff()
+            rate_gate_wait = self._acquire_bucket(method, path, signed=signed, bucket=bucket)
+            self._record_wait(cooldown_wait + rate_gate_wait, method=method, path=path)
+            started = self._monotonic()
             try:
-                return self._send_once(
+                result = self._send_once(
                     method,
                     path,
                     params=params,
@@ -505,6 +515,10 @@ class MexcSpotClient:
                 )
             except MexcTimestampError as exc:
                 last_timestamp_error = exc
+                self._log_request_result(
+                    request_id, method, path, started, cooldown_wait, rate_gate_wait,
+                    attempt + 1, outcome="timestamp_rejected", error=exc,
+                )
                 if attempt + 1 >= attempts or self._server_clock is None:
                     raise
                 log.warning(
@@ -513,11 +527,76 @@ class MexcSpotClient:
                 try:
                     self._server_clock.refresh(force=True)
                 except MexcClockError:
-                    # Keep the exchange's original diagnosis; the refresh
-                    # failure is recorded in the clock snapshot.
                     raise exc from None
+            except MexcError as exc:
+                if is_write and isinstance(exc, (MexcNetworkError, MexcServerError, MexcUnexpectedResponse)):
+                    outcome = "unknown_write_outcome"
+                elif isinstance(exc, MexcNetworkError):
+                    outcome = "network_error"
+                else:
+                    outcome = "exchange_error"
+                self._log_request_result(
+                    request_id, method, path, started, cooldown_wait, rate_gate_wait,
+                    attempt + 1, outcome=outcome, error=exc,
+                )
+                raise
+            except Exception as exc:
+                self._log_request_result(
+                    request_id, method, path, started, cooldown_wait, rate_gate_wait,
+                    attempt + 1, outcome="transport_error", error=exc,
+                )
+                raise
+            else:
+                self._log_request_result(
+                    request_id, method, path, started, cooldown_wait, rate_gate_wait,
+                    attempt + 1, outcome="success", status=200,
+                )
+                return result
         assert last_timestamp_error is not None
         raise last_timestamp_error
+
+    def _log_request_result(
+        self,
+        request_id: str,
+        method: str,
+        path: str,
+        started: float,
+        cooldown_wait: float,
+        rate_gate_wait: float,
+        attempt: int,
+        *,
+        outcome: str,
+        status: int | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Emit safe per-request telemetry without URL parameters or payloads."""
+        elapsed_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
+        cooldown_ms = int(round(max(0.0, cooldown_wait) * 1000))
+        gate_ms = int(round(max(0.0, rate_gate_wait) * 1000))
+        error_status = getattr(error, "http_status", None)
+        status = status if status is not None else error_status
+        exchange_code = getattr(error, "code", None)
+        retry_after = getattr(error, "retry_after_s", None)
+        cooldown_set = getattr(error, "cooldown_set_s", None)
+        error_class = error.__class__.__name__ if error is not None else "-"
+        network_classification = "none"
+        if isinstance(error, MexcNetworkError):
+            message = str(error).lower()
+            network_classification = (
+                "timeout" if "timeout" in message or "timed out" in message else "transport_failure"
+            )
+        level = logging.WARNING if outcome != "success" or elapsed_ms >= 1000 or cooldown_ms >= 1000 else logging.DEBUG
+        log.log(
+            level,
+            "mexc_rest request_id=%s method=%s endpoint=%s status=%s exchange_code=%s "
+            "retry_after_s=%s cooldown_set_s=%s cooldown_wait_ms=%s rate_gate_wait_ms=%s duration_ms=%s "
+            "attempt=%s outcome=%s error_class=%s network_classification=%s",
+            request_id, method, path, status if status is not None else "none",
+            exchange_code if exchange_code is not None else "none",
+            retry_after if retry_after is not None else "none",
+            cooldown_set if cooldown_set is not None else "none",
+            cooldown_ms, gate_ms, elapsed_ms, attempt, outcome, error_class, network_classification,
+        )
 
     def _acquire_bucket(self, method: str, path: str, *, signed: bool, bucket: str) -> float:
         """Reserve endpoint weight and return the seconds spent waiting."""
@@ -596,16 +675,25 @@ class MexcSpotClient:
         del query  # never log signed parameter strings
 
         if status != 200:
+            cooldown_set: float | None = None
             if status in (403, 418, 429):
                 retry_after = self._retry_after(response_headers)
-                self._block_requests(retry_after if retry_after is not None else DEFAULT_WAF_BACKOFF_S)
-            self._classify_and_raise(status, text, response_headers)
+                cooldown_set = retry_after if retry_after is not None else DEFAULT_WAF_BACKOFF_S
+                self._block_requests(cooldown_set)
+            try:
+                self._classify_and_raise(status, text, response_headers)
+            except MexcError as exc:
+                if exc.http_status is None:
+                    exc.http_status = status
+                if cooldown_set is not None:
+                    exc.cooldown_set_s = cooldown_set
+                raise
         if text and "json" not in content_type.lower() and not text.lstrip().startswith(("{", "[")):
-            raise MexcUnexpectedResponse(f"unexpected content-type {content_type!r}")
+            raise MexcUnexpectedResponse(f"unexpected content-type {content_type!r}", http_status=status)
         try:
             return json.loads(text) if text else {}
         except ValueError as exc:
-            raise MexcUnexpectedResponse("malformed JSON from MEXC") from exc
+            raise MexcUnexpectedResponse("malformed JSON from MEXC", http_status=status) from exc
 
     def _sign(self, total_params: str) -> str:
         digest = hmac.new(self.api_secret.encode("utf-8"), total_params.encode("utf-8"), hashlib.sha256).hexdigest()

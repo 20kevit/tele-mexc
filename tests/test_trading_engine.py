@@ -318,6 +318,7 @@ def test_network_uncertainty_never_retries_and_reconciles_to_filled(cfg, repo):
     assert still is not None and still["state"] == "unknown_requires_reconciliation"
 
     client.query_error = None
+    engine._now = lambda: NOW + timedelta(seconds=61)
     client.query_results.append(
         {
             "orderId": "ex-1",
@@ -940,9 +941,17 @@ def test_balance_preflight_rejects_insufficient_quote_before_submission(cfg, rep
     assert "insufficient" in intent["reject_reason"]
 
 
-def test_sell_signal_is_refused_before_any_balance_or_exchange_call(cfg, repo):
+def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, monkeypatch):
     client = FakeMexc(account_response=_account(btc="0.01"))
     engine = _engine(cfg, repo, client, mode="live")
+    def unexpected_ticker(**_kwargs):
+        raise AssertionError("ticker called for a Spot SELL signal")
+
+    def unexpected_metadata(_symbol):
+        raise AssertionError("exchange metadata called for a Spot SELL signal")
+
+    monkeypatch.setattr(client, "ticker_price", unexpected_ticker)
+    monkeypatch.setattr(client.symbols, "get", unexpected_metadata)
     sell = "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"
     intent = engine.process_item(_item(100, 71), _store_message(repo, 71, sell))
 
@@ -1413,3 +1422,27 @@ def test_market_payload_is_rejected_at_the_payload_boundary(cfg, repo):
                 "limit_price": None,
             }
         )
+
+
+def test_repeated_order_not_found_uses_persistent_exponential_backoff(cfg, repo):
+    engine = _engine(cfg, repo)
+    intent_id = "intent-backoff"
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO reconciliation_results (intent_id, outcome, created_at) VALUES (?, 'not_found', ?)",
+            (intent_id, NOW.isoformat()),
+        )
+    assert engine._not_found_backoff_remaining(intent_id) == pytest.approx(60.0)
+
+    second_at = NOW + timedelta(seconds=60)
+    with repo.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO reconciliation_results (intent_id, outcome, created_at) VALUES (?, 'not_found', ?)",
+            (intent_id, second_at.isoformat()),
+        )
+    engine._now = lambda: second_at
+    assert engine._not_found_backoff_remaining(intent_id) == pytest.approx(120.0)
+
+    later = second_at + timedelta(seconds=121)
+    engine._now = lambda: later
+    assert engine._not_found_backoff_remaining(intent_id) == 0.0

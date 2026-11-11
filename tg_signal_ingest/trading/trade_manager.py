@@ -39,6 +39,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ..locking import KeyedRLockPool
 from ..mexc.errors import (
     MexcAuthError,
     MexcConfigError,
@@ -240,7 +241,8 @@ class TradeManager:
         self._price_provider = price_provider
         self._now = now or (lambda: datetime.now(UTC))
         self._clock = clock or time.monotonic
-        self._lock = threading.RLock()
+        self._trade_locks = KeyedRLockPool()
+        self._buy_block_lock = threading.Lock()
 
     @property
     def notifier(self) -> Any:
@@ -266,7 +268,7 @@ class TradeManager:
         closed and the engine must not execute the intent at all.  ``trade`` is
         the created trade row or ``None``.
         """
-        with self._lock:
+        with self._trade_locks.hold(str(intent["signal_id"])):
             existing = self.store.get_trade_by_signal(intent["signal_id"])
             if existing is not None:
                 if existing.get("entry_mode") == "conditional" and existing.get("trade_state") == "pending_entry":
@@ -307,7 +309,10 @@ class TradeManager:
         intent_id = intent.get("intent_id")
         if intent_id is None:
             return
-        with self._lock:
+        trade = self.store.get_trade_by_intent(intent_id)
+        if trade is None:
+            return
+        with self._trade_locks.hold(str(trade.get("signal_id") or trade["trade_id"])):
             trade = self.store.get_trade_by_intent(intent_id)
             if trade is None:
                 return
@@ -341,14 +346,17 @@ class TradeManager:
         """
         if price is None or not price.is_finite() or price <= 0:
             return
-        with self._lock:
-            trades = self.store.list_trades()
-            for trade in trades:
-                if trade["trade_state"] in TERMINAL_TRADE_STATES:
+        for trade in self.store.list_trades():
+            if trade["trade_state"] in TERMINAL_TRADE_STATES:
+                continue
+            if trade["symbol"].upper() != symbol.upper():
+                continue
+            key = str(trade.get("signal_id") or trade["trade_id"])
+            with self._trade_locks.hold(key):
+                current = self.store.get_trade(trade["trade_id"])
+                if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                     continue
-                if trade["symbol"].upper() != symbol.upper():
-                    continue
-                self._evaluate_trade_tick(trade, price, received_at)
+                self._evaluate_trade_tick(current, price, received_at)
 
     def recover_on_startup(self) -> None:
         """Rehydrate active trades from durable state after a restart.
@@ -358,21 +366,25 @@ class TradeManager:
         interrupted stop-loss/exit states are resumed.  Uncertain submissions
         are only queried — never resubmitted with a new client order id.
         """
-        with self._lock:
-            # Establish the fail-closed block from durable state before any
-            # reconciliation call can fail, then refresh it again afterwards.
-            self._refresh_buy_block()
-            try:
-                for trade in self.store.list_trades():
-                    if trade["trade_state"] in TERMINAL_TRADE_STATES:
+        # Establish the fail-closed block before reconciliation. Each trade is
+        # reconciled under its own lock; unrelated signals remain admissible.
+        self._refresh_buy_block()
+        try:
+            for trade in self.store.list_trades():
+                if trade["trade_state"] in TERMINAL_TRADE_STATES:
+                    continue
+                key = str(trade.get("signal_id") or trade["trade_id"])
+                with self._trade_locks.hold(key):
+                    current = self.store.get_trade(trade["trade_id"])
+                    if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                         continue
                     try:
-                        self._reconcile_trade(trade["trade_id"])
+                        self._reconcile_trade(current["trade_id"])
                     except Exception as exc:  # noqa: BLE001 - never block recovery
-                        log.error("recovery reconcile failed for %s: %s", trade["trade_id"], exc)
-                        self._record_error(trade, f"recovery failed: {exc}", "reconciliation")
-            finally:
-                self._refresh_buy_block()
+                        log.error("recovery reconcile failed for %s: %s", current["trade_id"], exc)
+                        self._record_error(current, f"recovery failed: {exc}", "reconciliation")
+        finally:
+            self._refresh_buy_block()
 
     # ===================================================================
     # Trade creation + entry decision
@@ -581,6 +593,10 @@ class TradeManager:
         return self._verified_exit_coverage(trade) < remaining
 
     def _refresh_buy_block(self) -> None:
+        with self._buy_block_lock:
+            self._refresh_buy_block_locked()
+
+    def _refresh_buy_block_locked(self) -> None:
         """Persist the global new-BUY block from verified exit coverage.
 
         The block is never cleared by time.  It clears only when every open
@@ -2442,18 +2458,22 @@ class TradeManager:
     # ===================================================================
 
     def reconcile_all_open(self) -> None:
-        """Reconcile every non-terminal trade (called after reconnect/restart)."""
-        with self._lock:
-            try:
-                for trade in self.store.list_trades():
-                    if trade["trade_state"] in TERMINAL_TRADE_STATES:
+        """Reconcile non-terminal trades independently, without a global API lock."""
+        try:
+            for trade in self.store.list_trades():
+                if trade["trade_state"] in TERMINAL_TRADE_STATES:
+                    continue
+                key = str(trade.get("signal_id") or trade["trade_id"])
+                with self._trade_locks.hold(key):
+                    current = self.store.get_trade(trade["trade_id"])
+                    if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
                         continue
                     try:
-                        self._reconcile_trade(trade["trade_id"])
+                        self._reconcile_trade(current["trade_id"])
                     except Exception as exc:  # noqa: BLE001
-                        log.error("reconcile failed for %s: %s", trade["trade_id"], exc)
-            finally:
-                self._refresh_buy_block()
+                        log.error("reconcile failed for %s: %s", current["trade_id"], exc)
+        finally:
+            self._refresh_buy_block()
 
     def _reconcile_trade(self, trade_id: str) -> None:
         """Reconcile one trade and refresh the durable new-BUY block."""
@@ -2720,6 +2740,30 @@ class TradeManager:
                 self._settle_entry_state(refreshed)
         return synced
 
+    @staticmethod
+    def _trade_order_not_found_streak(reason: str) -> int:
+        prefix = "MEXC_ORDER_NOT_FOUND:"
+        if not reason.startswith(prefix):
+            return 0
+        for part in reason[len(prefix):].split(":"):
+            if part.startswith("count="):
+                try:
+                    return max(0, int(part.split("=", 1)[1]))
+                except ValueError:
+                    return 0
+        return 0
+
+    def _trade_order_not_found_backoff_remaining(self, order: dict[str, Any]) -> float:
+        streak = self._trade_order_not_found_streak(str(order.get("not_observed_reason") or ""))
+        if streak <= 0:
+            return 0.0
+        last = _dec_ts(order.get("last_observed_at"))
+        if last is None:
+            return 0.0
+        delay = min(60.0 * (2 ** (streak - 1)), 900.0)
+        elapsed = max(0.0, (self._now() - last).total_seconds())
+        return max(0.0, delay - elapsed)
+
     def _reconcile_trade_orders(self, trade: dict[str, Any], *, advance: bool = True) -> None:
         """Query TP/SL order status and recompute sold totals across ALL orders."""
         if not self.engine:
@@ -2729,6 +2773,13 @@ class TradeManager:
                 continue
             if order["state"] == "pending":
                 continue  # never sent; the submit path will send it
+            remaining = self._trade_order_not_found_backoff_remaining(order)
+            if remaining > 0:
+                log.debug(
+                    "trade-order reconciliation parked for %s after MEXC order-not-found; retry in %.1fs",
+                    order["trade_order_id"], remaining,
+                )
+                continue
             updated = self._reconcile_single_order(trade, order)
             if (
                 updated is not None
@@ -2802,6 +2853,14 @@ class TradeManager:
         if mapped == "not_found":
             if order["state"] == "pending":
                 return order
+            error_code = fresh.get("error_code")
+            if error_code in (-2011, -2013):
+                previous = str(order.get("not_observed_reason") or "")
+                streak = self._trade_order_not_found_streak(previous) + 1
+                fresh = dict(fresh)
+                fresh["not_observed_reason"] = (
+                    f"MEXC_ORDER_NOT_FOUND:count={streak}:code={error_code}"
+                )
             mapped = "unknown_requires_reconciliation"
             raw_state = "NOT_FOUND"
         # FILLED with no executed quantity is not trustworthy enough to size a
@@ -2850,7 +2909,7 @@ class TradeManager:
             exchange_status=str(raw_state) if raw_state is not None else None,
             sold_qty=sold,
             last_observed_at=self._ts(),
-            not_observed_reason=None,
+            not_observed_reason=fresh.get("not_observed_reason"),
         )
 
     def _refresh_sold_fields(self, trade: dict[str, Any]) -> None:

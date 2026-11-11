@@ -73,6 +73,7 @@ class ReconcileStats:
     ambiguous: int = 0
     discrepancies: int = 0
     not_found: int = 0
+    parked: int = 0
     errors: int = 0
 
 
@@ -404,6 +405,15 @@ class TradingEngine:
                 signal_id=signal_id,
             )
             return existing_intent
+
+        # Spot BUY-only policy is decidable locally. Reject SHORT/SELL before
+        # ticker or exchangeInfo calls so exchange cooldowns cannot delay it.
+        if parsed.action == "sell":
+            reason = "SHORT/SELL signals are not executed; this bot is Spot BUY only"
+            self.store.update_signal(signal_id, "rejected", reason)
+            self.store.audit(signal_id, "risk", "rejected", reason)
+            self._notify_rejected(signal_id, parsed, reason, record=record)
+            return None
 
         reference = self._reference_price(parsed)
         meta = self._symbol_meta(parsed.symbol)
@@ -1988,9 +1998,13 @@ class TradingEngine:
                     order_id=exchange_id,
                     orig_client_order_id=client_order_id if not exchange_id else None,
                 )
-            except MexcOrderNotFound:
-                op.succeed({"status": "NOT_FOUND"})
-                return {"state": "NOT_FOUND", "executed_qty": Decimal("0")}
+            except MexcOrderNotFound as exc:
+                op.succeed({"status": "NOT_FOUND", "code": exc.code})
+                return {
+                    "state": "NOT_FOUND",
+                    "executed_qty": Decimal("0"),
+                    "error_code": exc.code,
+                }
             op.succeed(raw)
         order_id = raw.get("orderId") or exchange_id
         return {
@@ -2158,7 +2172,7 @@ class TradingEngine:
                 )
             return result
         except MexcTimestampError as exc:
-            outcome = "not_found"
+            outcome = "ambiguous"
             self.store.transition_intent(
                 intent_id,
                 "unknown_requires_reconciliation",
@@ -2402,9 +2416,47 @@ class TradingEngine:
             return mapped, "consistent", f"exchange status {exchange_status} matches local state"
         return mapped, "resolved", f"local {local_state} -> exchange {exchange_status}"
 
+    def _not_found_backoff_remaining(self, intent_id: str) -> float:
+        """Persistently back off repeated missing-order query responses.
+
+        A missing query result never resolves an uncertain submission. It stays
+        in the reconciliation set, but repeated -2011/-2013 responses use an
+        exponential 60s, 120s, 240s... cadence capped at 15 minutes. The most
+        recent durable reconciliation rows survive process restarts.
+        """
+        rows = self.repo.db.conn.execute(
+            "SELECT outcome, created_at FROM reconciliation_results "
+            "WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 8",
+            (intent_id,),
+        ).fetchall()
+        streak = 0
+        latest_at: str | None = None
+        for row in rows:
+            if str(row["outcome"]) != "not_found":
+                break
+            streak += 1
+            if latest_at is None:
+                latest_at = str(row["created_at"])
+        if streak == 0 or latest_at is None:
+            return 0.0
+        last = _parse_signal_time(latest_at)
+        if last is None:
+            return 0.0
+        delay = min(60.0 * (2 ** (streak - 1)), 900.0)
+        elapsed = max(0.0, (self._now() - last).total_seconds())
+        return max(0.0, delay - elapsed)
+
     def reconcile_pending(self, limit: int = 50) -> ReconcileStats:
         stats = ReconcileStats()
         for intent in self.store.pending_reconciliation(limit=limit):
+            remaining = self._not_found_backoff_remaining(str(intent["intent_id"]))
+            if remaining > 0:
+                stats.parked += 1
+                log.debug(
+                    "reconciliation parked for %s after repeated order-not-found responses; retry in %.1fs",
+                    intent["intent_id"], remaining,
+                )
+                continue
             stats.checked += 1
             try:
                 result = self.reconcile_intent(intent["intent_id"])

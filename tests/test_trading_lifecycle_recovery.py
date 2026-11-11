@@ -514,3 +514,44 @@ def test_filled_without_full_allocation_is_not_confirmed(env):
     store.transition_trade_order(order["trade_order_id"], "filled", sold_qty=Decimal("0.01"))
     tm._place_oco_exits(trade)
     assert store.get_trade(trade["trade_id"])["trade_state"] != "oco_active"
+
+
+def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(env):
+    import threading
+
+    cfg, store, engine, client, notifier, tm = env
+    entered = threading.Event()
+    release = threading.Event()
+    trade = {"trade_id": "trade-slow", "signal_id": "signal-slow", "trade_state": "entry_active"}
+    tm.store.list_trades = lambda: [trade]
+    tm.store.get_trade = lambda _trade_id: dict(trade)
+    tm._refresh_buy_block = lambda: None
+
+    def reconcile(_trade_id):
+        entered.set()
+        assert release.wait(2)
+
+    tm._reconcile_trade = reconcile
+    reconciliation = threading.Thread(target=tm.reconcile_all_open)
+    reconciliation.start()
+    assert entered.wait(1)
+
+    tm.store.get_trade_by_signal = lambda _signal_id: None
+    tm._create_trade = lambda intent, _parsed, _reference: {
+        "trade_id": f"trade-{intent['signal_id']}", "entry_mode": "direct"
+    }
+    independent_done = threading.Event()
+    independent = threading.Thread(
+        target=lambda: (
+            tm.on_intent_planned({"signal_id": "signal-independent"}, _parsed(), ENTRY),
+            independent_done.set(),
+        )
+    )
+    independent.start()
+    try:
+        assert independent_done.wait(0.5), "unrelated signal waited behind another trade's reconciliation"
+    finally:
+        release.set()
+        reconciliation.join(2)
+        independent.join(2)
+    assert not reconciliation.is_alive() and not independent.is_alive()

@@ -132,8 +132,17 @@ Key ordering guarantees:
 - The signal and intent are persisted before any exchange call.
 - Budget reservation and intent insertion share one transaction.
 - One message maps to at most one idempotency key/intent.
-- A process lock serializes the whole decision path, including concurrent
-  queue retries.
+- A process lock serializes the signal decision path, including concurrent
+  duplicate deliveries/retries. The TradeManager uses per-trade locks, so a slow
+  reconciliation for one existing trade does not hold a global lifecycle lock
+  against an unrelated signal.
+- The queue remains a single consumer because the current runtime shares one
+  SQLite connection across repositories/stores. Do not increase worker count
+  until connection isolation and FIFO ordering per symbol are independently
+  established; a worker-count increase alone is not a safe latency fix. A slow
+  REST call inside a BUY decision/submission can therefore still occupy the
+  single signal consumer; eliminating that remaining boundary needs a separate
+  per-worker DB-connection/execution-queue design, not an unsafe lock bypass.
 - Notifications are an independent durable outbox; delivery retries cannot
   resubmit an order.
 
@@ -149,7 +158,13 @@ stdlib `urllib` in a worker thread. It provides:
 - Documented per-endpoint weights, file-backed shared IP/UID/order gates, one
   batch ticker request per monitor interval; 429/418/403 trigger a per-process
   backoff honoring `Retry-After`, with a conservative default.
-- Typed errors; 5xx/network/unknown submit outcomes are ambiguous.
+- Typed errors; 5xx/network/unknown submit outcomes are ambiguous. HTTP `-2011`
+  and `-2013` order-not-found responses remain unresolved for uncertain intents;
+  repeated entry and TP/SL not-found queries use durable exponential backoff
+  (60 s to 15 min), without changing uncertain-order state or retrying writes.
+- Structured REST request logs include request id, endpoint, HTTP/exchange status,
+  Retry-After, cooldown/rate-gate wait, network duration, and outcome. Signed
+  parameters, credentials, and payloads are never logged.
 - Dynamic symbol metadata and precision validation from `exchangeInfo`.
 - Decimal-only order-book parsing and depth validation.
 

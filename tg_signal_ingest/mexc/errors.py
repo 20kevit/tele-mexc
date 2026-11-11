@@ -16,6 +16,7 @@ class MexcError(Exception):
         super().__init__(message)
         self.http_status = http_status
         self.code = code
+        self.cooldown_set_s: float | None = None
 
 
 class MexcConfigError(MexcError):
@@ -93,7 +94,7 @@ class MexcOrderRejected(MexcError):
 
 
 class MexcOrderNotFound(MexcError):
-    """-2011 Unknown order sent — cancel/query target missing/terminal."""
+    """-2011/-2013 order query or cancel target is not currently visible."""
 
 
 class AccidentalOrderRiskError(MexcError):

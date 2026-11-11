@@ -163,9 +163,10 @@ def test_418_waf_retry_after_and_403_are_waf_errors():
         _client(transport).ping()
     assert excinfo.value.retry_after_s == 120.0
 
-    transport = Transport(status=403, payload={"msg": "waf"})
-    with pytest.raises(MexcWafError):
+    transport = Transport(status=403, payload={"msg": "waf"}, headers={"Retry-After": "30"})
+    with pytest.raises(MexcWafError) as waf:
         _client(transport).ping()
+    assert waf.value.retry_after_s == 30.0
 
 
 def test_unknown_order_maps_to_typed_not_found():
@@ -380,3 +381,32 @@ def test_shared_gate_prunes_expired_events(tmp_path):
     now[0] += 10.1
     gate.acquire(1)
     assert gate.state_path.exists()
+
+
+def test_2013_order_does_not_exist_is_typed_as_not_found():
+    transport = Transport(status=400, payload={"code": -2013, "msg": "Order does not exist."})
+    with pytest.raises(MexcOrderNotFound) as excinfo:
+        _client(transport).query_order(symbol="BTCUSDT", order_id="missing")
+    assert excinfo.value.code == -2013
+    assert excinfo.value.http_status == 400
+
+
+def test_rest_request_telemetry_includes_safe_status_and_retry_after(caplog):
+    transport = Transport(
+        status=429,
+        payload={"code": 700001, "msg": "too many requests"},
+        headers={"Retry-After": "7"},
+    )
+    client = _client(transport)
+    with pytest.raises(MexcRateLimitError):
+        client.ping()
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "mexc_rest request_id=" in rendered
+    assert "endpoint=/api/v3/ping" in rendered
+    assert "status=429" in rendered
+    assert "retry_after_s=7.0" in rendered
+    assert "cooldown_set_s=7.0" in rendered
+    assert "cooldown_wait_ms=0" in rendered
+    assert "duration_ms=" in rendered
+    assert "outcome=exchange_error" in rendered
+    assert "signature=" not in rendered and "secret-from-test" not in rendered

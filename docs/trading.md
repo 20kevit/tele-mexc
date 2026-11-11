@@ -173,7 +173,8 @@ enforced. The historical `trading_daily_spend` table is retained for compatibili
 | `info` | Ordinary channel text |
 | `ambiguous` | Direction detected but required fields/format are not safe |
 
-- LONG is treated as BUY; SHORT/SELL is retained but rejected by risk.
+- LONG is treated as BUY; SHORT/SELL is retained but rejected locally before
+  ticker-price or `exchangeInfo` REST requests.
 - Futures/perpetual/margin/leverage wording is ingested but never enables
   Futures execution. A LONG signal with a Spot-compatible symbol and complete
   Entry/SL/TP1/TP2 fields is executed as a Spot BUY; leverage/deposit text is

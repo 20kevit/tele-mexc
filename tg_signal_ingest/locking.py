@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from collections.abc import Hashable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -97,3 +100,39 @@ class SingleInstanceLock:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
+
+
+class KeyedRLockPool:
+    """Provide independent re-entrant locks for unrelated durable entities.
+
+    A short registry guard protects reference counts only; callers never hold it
+    while doing database or network work. Entries disappear after the final
+    holder/waiter exits, so the pool does not grow with the message archive.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._entries: dict[Hashable, tuple[Any, int]] = {}
+
+    @contextmanager
+    def hold(self, key: Hashable) -> Iterator[None]:
+        with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                lock = threading.RLock()
+                self._entries[key] = (lock, 1)
+            else:
+                lock, users = entry
+                self._entries[key] = (lock, users + 1)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._guard:
+                current = self._entries.get(key)
+                if current is not None and current[0] is lock:
+                    if current[1] <= 1:
+                        del self._entries[key]
+                    else:
+                        self._entries[key] = (lock, current[1] - 1)
