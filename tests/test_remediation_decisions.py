@@ -217,7 +217,7 @@ def test_signal_validity_is_bounded(tmp_path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_transaction_retries_when_the_database_is_locked(tmp_path) -> None:
+def test_transaction_retries_when_the_database_is_locked(tmp_path, monkeypatch) -> None:
     db = Database(tmp_path / "retry.sqlite3")
     db.migrate()
     state = {"failed": False}
@@ -235,7 +235,8 @@ def test_transaction_retries_when_the_database_is_locked(tmp_path) -> None:
                 raise sqlite3.OperationalError("database is locked")
             return self._inner.execute(sql, *args, **kwargs)
 
-    db.conn = _FlakyConn(db.conn)  # type: ignore[assignment]
+    # File-backed databases expose the current thread's connection via thread-local state.
+    monkeypatch.setattr(db._local, "conn", _FlakyConn(db.conn))
     with db.transaction() as conn:
         conn.execute("SELECT 1")
     assert state["failed"] is True
@@ -265,7 +266,7 @@ def test_migration_22_upgrades_from_21_and_preserves_rows(tmp_path, monkeypatch)
     db = Database(path)
     applied = db.migrate()
     assert 22 in applied
-    assert db.schema_version() == 22
+    assert db.schema_version() == 23
     assert db.conn.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0] == 1
     cols = {r[1] for r in db.conn.execute("PRAGMA table_info(trade_orders)")}
     assert {"attempt", "next_attempt_at", "retryable"} <= cols

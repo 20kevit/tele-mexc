@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
 
@@ -12,6 +13,7 @@ import pytest
 
 from tg_signal_ingest.mexc import (
     MexcOrderNotFound,
+    MexcOrderStateUncertain,
     MexcRateLimitError,
     MexcSpotClient,
     MexcTimestampError,
@@ -410,3 +412,58 @@ def test_rest_request_telemetry_includes_safe_status_and_retry_after(caplog):
     assert "duration_ms=" in rendered
     assert "outcome=exchange_error" in rendered
     assert "signature=" not in rendered and "secret-from-test" not in rendered
+
+
+def test_2011_and_2013_on_create_order_are_ambiguous_not_rejections():
+    """A create-order answer of "not visible" can never prove a rejection."""
+
+    for code in (-2011, -2013):
+        transport = Transport(status=400, payload={"code": code, "msg": "Order does not exist."})
+        client = _client(transport)
+        with pytest.raises(MexcOrderStateUncertain) as excinfo:
+            client.place_order(
+                symbol="BTCUSDT",
+                side="BUY",
+                order_type="LIMIT",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+            )
+        assert excinfo.value.code == code
+        assert not isinstance(excinfo.value, MexcOrderNotFound)
+        assert transport.calls[0]["method"] == "POST"
+
+
+def test_2011_and_2013_on_query_and_cancel_stay_order_not_found():
+    for code in (-2011, -2013):
+        transport = Transport(status=400, payload={"code": code, "msg": "Order does not exist."})
+        client = _client(transport)
+        with pytest.raises(MexcOrderNotFound):
+            client.query_order(symbol="BTCUSDT", order_id="missing")
+        with pytest.raises(MexcOrderNotFound):
+            client.cancel_order(symbol="BTCUSDT", order_id="missing")
+
+
+def test_create_order_not_found_is_logged_as_unknown_write_outcome(caplog):
+    caplog.set_level(logging.DEBUG, logger="ingest.mexc")
+    transport = Transport(status=400, payload={"code": -2013, "msg": "Order does not exist."})
+    with pytest.raises(MexcOrderStateUncertain):
+        _client(transport).place_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=Decimal("1"),
+            price=Decimal("100"),
+        )
+    post_lines = [r.getMessage() for r in caplog.records if "method=POST" in r.getMessage()]
+    assert post_lines, "no POST telemetry recorded"
+    assert all("outcome=unknown_write_outcome" in line for line in post_lines)
+    assert "error_class=MexcOrderStateUncertain" in post_lines[-1]
+    assert "exchange_code=-2013" in post_lines[-1]
+    assert "endpoint=/api/v3/order" in post_lines[-1]
+
+    query_transport = Transport(status=400, payload={"code": -2013, "msg": "Order does not exist."})
+    with pytest.raises(MexcOrderNotFound):
+        _client(query_transport).query_order(symbol="BTCUSDT", order_id="missing")
+    get_lines = [r.getMessage() for r in caplog.records if "method=GET" in r.getMessage()]
+    assert get_lines, "no GET telemetry recorded"
+    assert all("outcome=exchange_error" in line for line in get_lines)

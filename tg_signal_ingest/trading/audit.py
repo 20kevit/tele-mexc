@@ -34,6 +34,10 @@ _SENSITIVE_KEYS = frozenset(
 
 _SEVERITIES = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
+# Create operations where a "not found" answer can never prove the order was
+# rejected: the submission may have landed and only the response is ambiguous.
+CREATE_OPERATION_TYPES = frozenset({"place_order", "place_oco", "place_test_order"})
+
 
 def redact_text(value: Any, *, limit: int = MAX_TEXT) -> str | None:
     """Return a bounded, redacted string (or ``None`` for no value)."""
@@ -107,11 +111,17 @@ def correlation_digest(*parts: Any) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()[:32]
 
 
-def classify_exchange_error(exc: BaseException) -> tuple[str, str, str]:
+def classify_exchange_error(
+    exc: BaseException, *, operation_type: str | None = None
+) -> tuple[str, str, str]:
     """Return ``(response_classification, reason_code, uncertainty)``.
 
     Classification is based on the exception type name only, so this module
     stays independent from the MEXC client to avoid import cycles.
+    ``operation_type`` supplies the request context that the exception type
+    alone cannot: ``-2011``/``-2013`` (``MexcOrderNotFound``) are a definitive
+    "not currently visible" answer to a query or cancel, but on a create they
+    are an ambiguous submission and must be recorded uncertain.
     """
 
     name = exc.__class__.__name__
@@ -120,10 +130,15 @@ def classify_exchange_error(exc: BaseException) -> tuple[str, str, str]:
     uncertain = {
         "MexcNetworkError", "MexcServerError", "MexcUnexpectedResponse",
         "MexcWafError", "MexcTimestampError", "MexcDuplicateOrder",
+        "MexcOrderStateUncertain",
         "TimeoutError", "URLError", "ConnectionError",
     }
     if name in uncertain:
         return "uncertain", name, "uncertain"
-    if name in {"MexcOrderRejected", "MexcOrderNotFound", "MexcInsufficientBalance"}:
+    if name == "MexcOrderNotFound":
+        if operation_type in CREATE_OPERATION_TYPES:
+            return "uncertain", name, "uncertain"
+        return "not_found", name, "none"
+    if name in {"MexcOrderRejected", "MexcInsufficientBalance"}:
         return "rejected", name, "none"
     return "error", name, "none"

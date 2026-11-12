@@ -224,6 +224,19 @@ def _make_needs_rec_trade(cfg, repo, trade_id="tr-needs-rec", symbol="BTCUSDT", 
 # ── §2 needs_reconciliation lifecycle ─────────────────────────────────────
 
 
+
+
+def test_ignored_legacy_trade_is_skipped_by_startup_recovery(cfg, repo):
+    engine, tm, store, tid = _make_needs_rec_trade(cfg, repo, trade_id="tr-ignored-legacy")
+    spy = engine.client
+    store.update_trade_state(tid, "ignored_legacy", note="owner chose to ignore pre-deployment order")
+    tm.recover_on_startup()
+    assert spy.query_calls == []
+    assert spy.place_oco_calls == []
+    assert spy.place_order_calls == []
+    assert store.list_non_terminal_trades() == []
+
+
 def test_needs_reconciliation_is_not_terminal(cfg, repo):
     assert RECONCILIATION_REQUIRED_STATE == "needs_reconciliation"
     assert "needs_reconciliation" not in TERMINAL_TRADE_STATES

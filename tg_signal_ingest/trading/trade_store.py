@@ -191,7 +191,8 @@ class TradeStore(TradingStore):
         """
 
         rows = self.db.conn.execute(
-            "SELECT * FROM trades WHERE trade_state NOT IN ('closed', 'tp2_completed') ORDER BY updated_at"
+            "SELECT * FROM trades WHERE trade_state NOT IN "
+            "('closed', 'tp2_completed', 'ignored_legacy') ORDER BY updated_at"
         ).fetchall()
         return [dict(r) for r in rows]
 

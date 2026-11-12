@@ -23,6 +23,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .repository import QueueItem, Repository
+from .telemetry import (
+    SLOW_QUEUE_AGE_MS,
+    SLOW_QUEUE_ITEM_MS,
+    level_for,
+)
 
 log = logging.getLogger("ingest.processing")
 
@@ -87,7 +92,7 @@ class ProcessingEngine:
             queue_age_ms = max(0, int((datetime.now(UTC) - created).total_seconds() * 1000))
         except (TypeError, ValueError):
             queue_age_ms = -1
-        level = logging.INFO if duration_ms >= 1000 or queue_age_ms >= 1000 else logging.DEBUG
+        level = level_for((duration_ms, SLOW_QUEUE_ITEM_MS), (queue_age_ms, SLOW_QUEUE_AGE_MS))
         log.log(
             level,
             "queue_handler queue_id=%s channel_id=%s message_id=%s item_type=%s "

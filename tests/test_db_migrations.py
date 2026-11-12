@@ -109,11 +109,23 @@ def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypat
             "('legacy:1', 'owner', 1, 'legacy text', 'pending', "
             "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
         )
+        conn.execute(
+            "INSERT INTO app_state (key, value, updated_at) VALUES "
+            "('trading.new_buys_blocked', '1', '2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO app_state (key, value, updated_at) VALUES "
+            "('trading.new_buys_block_reason', 'legacy exposure', '2026-01-01T00:00:00Z')"
+        )
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS)
     applied = db.migrate()
-    assert applied == [17, 18, 19, 20, 21, 22]
-    assert db.schema_version() == 22
+    assert applied == [17, 18, 19, 20, 21, 22, 23]
+    assert db.schema_version() == 23
+    assert db.conn.execute("SELECT trade_state FROM trades WHERE trade_id='t-1'").fetchone()[0] == "ignored_legacy"
+    assert db.conn.execute("SELECT state FROM trade_orders WHERE trade_order_id='to-1'").fetchone()[0] == "open"
+    assert db.conn.execute("SELECT value FROM app_state WHERE key='trading.new_buys_blocked'").fetchone()[0] == "0"
+    assert db.conn.execute("SELECT value FROM app_state WHERE key='trading.new_buys_block_reason'").fetchone()[0] == ""
     assert db.migrate() == []  # idempotent
 
     audit = db.conn.execute("SELECT event_type, source_ref FROM audit_events").fetchone()

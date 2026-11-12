@@ -121,3 +121,91 @@ def test_emergency_stop_and_pause_are_reported(configured):
     assert _status(report, "emergency stop") == "FAIL"
     assert _status(report, "pause state") == "WARN"
     assert not report.ready
+
+
+def _detail(report, name: str) -> str:
+    return next(check.detail for check in report.checks if check.name == name)
+
+
+def test_worktree_classifier_allows_only_documented_local_artifacts():
+    status = "\n".join(
+        [
+            "?? migrations/0001.sql",
+            "?? reports/PHASE5_INDEPENDENT_AUDIT.md",
+            "?? tests/test_accounting_backfill.py",
+            "?? tests/fixtures/accounting/snapshot.json",
+            "?? tg_signal_ingest/accounting/store.py",
+            "?? reports/subdir/PHASE5.md",
+            "?? reports/notes.txt",
+            "?? tests/test_other.py",
+            "?? tg_signal_ingest/mexc/unreleased.py",
+            "?? notes.txt",
+            " M docs/trading.md",
+        ]
+    )
+    unexpected, local_artifacts = readiness_module.classify_worktree_status(status)
+    assert local_artifacts == [
+        "migrations/0001.sql",
+        "reports/PHASE5_INDEPENDENT_AUDIT.md",
+        "tests/test_accounting_backfill.py",
+        "tests/fixtures/accounting/snapshot.json",
+        "tg_signal_ingest/accounting/store.py",
+    ]
+    assert unexpected == [
+        "reports/subdir/PHASE5.md",
+        "reports/notes.txt",
+        "tests/test_other.py",
+        "tg_signal_ingest/mexc/unreleased.py",
+        "notes.txt",
+        " M docs/trading.md",
+    ]
+
+
+def test_known_local_accounting_artifacts_do_not_block_readiness(configured, monkeypatch):
+    cfg, repo = configured
+    status = "\n".join(
+        [
+            "?? migrations/",
+            "?? reports/PHASE5_INDEPENDENT_AUDIT.md",
+            "?? tests/fixtures/accounting/",
+            "?? tests/test_accounting_backfill.py",
+            "?? tg_signal_ingest/accounting/",
+        ]
+    )
+    monkeypatch.setattr(
+        readiness_module,
+        "_run_git",
+        lambda args: status if args[0] == "status" else "abc123",
+    )
+    report = build_readiness_report(cfg, repo, network=False, cli_checker=lambda: {"ok": True, "detail": "0.0.22"})
+    assert _status(report, "working tree") == "PASS"
+    assert "known local accounting artifact" in _detail(report, "working tree")
+    assert report.ready, report.render()
+
+
+def test_tracked_source_modification_still_blocks_readiness(configured, monkeypatch):
+    cfg, repo = configured
+    status = "?? tg_signal_ingest/accounting/\n M tg_signal_ingest/trading/readiness.py"
+    monkeypatch.setattr(
+        readiness_module,
+        "_run_git",
+        lambda args: status if args[0] == "status" else "abc123",
+    )
+    report = build_readiness_report(cfg, repo, network=False, cli_checker=lambda: {"ok": True, "detail": "0.0.22"})
+    assert _status(report, "working tree") == "FAIL"
+    assert "tg_signal_ingest/trading/readiness.py" in _detail(report, "working tree")
+    assert not report.ready
+
+
+def test_unexpected_untracked_file_still_blocks_readiness(configured, monkeypatch):
+    cfg, repo = configured
+    status = "?? reports/PHASE5_INDEPENDENT_AUDIT.md\n?? tools/unreleased_script.sh"
+    monkeypatch.setattr(
+        readiness_module,
+        "_run_git",
+        lambda args: status if args[0] == "status" else "abc123",
+    )
+    report = build_readiness_report(cfg, repo, network=False, cli_checker=lambda: {"ok": True, "detail": "0.0.22"})
+    assert _status(report, "working tree") == "FAIL"
+    assert "tools/unreleased_script.sh" in _detail(report, "working tree")
+    assert not report.ready

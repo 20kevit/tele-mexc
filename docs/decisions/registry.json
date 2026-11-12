@@ -212,11 +212,14 @@
         "contention produces a log line with the operation"
       ],
       "tests_required": [
-        "test_transaction_retries_when_the_database_is_locked"
+        "test_transaction_retries_when_the_database_is_locked",
+        "test_reader_on_another_thread_cannot_see_uncommitted_transaction",
+        "test_in_memory_database_uses_thread_local_connections_with_shared_data",
+        "test_close_waits_for_an_in_flight_writer_transaction"
       ],
       "status": "fixed",
       "commit": "15856a7",
-      "limitations": "Reads still use the shared connection; no per-thread connections were introduced."
+      "limitations": "The former shared-connection limitation was removed by the signal-latency follow-up: every handle uses one connection per calling thread (file-backed WAL, read-only mode=ro, and a private temporary database behind :memory:) while writers stay serialised by one process-wide transaction lock. Database.close() is idempotent, waits for an in-flight writer, and leaves an active reader with a normal SQLite error rather than a half-closed handle."
     },
     {
       "id": "N-09",

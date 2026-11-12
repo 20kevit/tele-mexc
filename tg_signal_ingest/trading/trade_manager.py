@@ -46,6 +46,8 @@ from ..mexc.errors import (
     MexcConfigError,
     MexcDuplicateOrder,
     MexcNetworkError,
+    MexcOrderNotFound,
+    MexcOrderStateUncertain,
     MexcPermissionError,
     MexcPrecisionError,
     MexcRateLimitError,
@@ -53,6 +55,7 @@ from ..mexc.errors import (
     MexcSymbolError,
     MexcUnexpectedResponse,
 )
+from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
 from .parser import ParsedSignal
 from .store import TERMINAL_INTENT_STATES, TradingError
 from .trade_store import TradeStore
@@ -81,6 +84,7 @@ class TradeDecision:
 TERMINAL_TRADE_STATES = (
     "closed",
     "tp2_completed",
+    "ignored_legacy",
 )
 
 # A position with no verified exit coverage.  Unlike ``needs_reconciliation``
@@ -140,6 +144,9 @@ _UNCERTAIN_ERRORS = (
     MexcUnexpectedResponse,
     MexcServerError,
     MexcRateLimitError,
+    # -2011/-2013 answering a create request: the order may have landed.
+    MexcOrderStateUncertain,
+    MexcOrderNotFound,
 )
 
 
@@ -169,7 +176,18 @@ def _dec_ts(value: Any) -> datetime | None:
 def _is_retryable_oco_error(exc: BaseException) -> bool:
     """False for deterministic rejections that must never be retried."""
 
-    if isinstance(exc, (MexcPrecisionError, MexcSymbolError, MexcPermissionError, MexcConfigError, MexcAuthError)):
+    if isinstance(
+        exc,
+        (
+            MexcPrecisionError,
+            MexcSymbolError,
+            MexcPermissionError,
+            MexcConfigError,
+            MexcAuthError,
+            MexcOrderNotFound,
+            MexcOrderStateUncertain,
+        ),
+    ):
         return False
     text = str(exc).lower()
     return not any(token in text for token in _NON_RETRYABLE_TOKENS)
@@ -260,7 +278,7 @@ class TradeManager:
                 released = self._clock()
                 wait_ms = int(round(max(0.0, acquired - requested) * 1000))
                 hold_ms = int(round(max(0.0, released - acquired) * 1000))
-                level = logging.INFO if wait_ms >= 50 or hold_ms >= 1000 else logging.DEBUG
+                level = level_for((wait_ms, SLOW_LOCK_WAIT_MS), (hold_ms, SLOW_LOCK_HOLD_MS))
                 log.log(
                     level,
                     "trade_lock operation=%s signal_or_trade=%s wait_ms=%s hold_ms=%s outcome=%s",

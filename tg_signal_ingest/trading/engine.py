@@ -31,6 +31,7 @@ from ..mexc.errors import (
     MexcError,
     MexcNetworkError,
     MexcOrderNotFound,
+    MexcOrderStateUncertain,
     MexcRateLimitError,
     MexcServerError,
     MexcTimestampError,
@@ -39,6 +40,12 @@ from ..mexc.errors import (
 )
 from ..mexc.symbols import SymbolValidationError
 from ..repository import QueueItem, Repository
+from ..telemetry import (
+    SLOW_LOCK_HOLD_MS,
+    SLOW_LOCK_WAIT_MS,
+    SLOW_SIGNAL_STAGE_MS,
+    level_for,
+)
 from .audit import normalize_event_type
 from .balance import BalanceError, parse_account, validate_balance
 from .evidence import ExchangeEvidence
@@ -272,7 +279,7 @@ class TradingEngine:
             raise
         finally:
             duration_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
-            level = logging.DEBUG if stage == "parse" else logging.INFO
+            level = level_for((duration_ms, SLOW_SIGNAL_STAGE_MS))
             log.log(
                 level,
                 "signal_stage channel_id=%s message_id=%s queue_id=%s item_type=%s stage=%s duration_ms=%s outcome=%s",
@@ -297,7 +304,7 @@ class TradingEngine:
             self._process_lock.release()
             wait_ms = int(round(max(0.0, acquired - wait_started) * 1000))
             hold_ms = int(round(max(0.0, released - acquired) * 1000))
-            level = logging.INFO if wait_ms >= 50 or hold_ms >= 1000 else logging.DEBUG
+            level = level_for((wait_ms, SLOW_LOCK_WAIT_MS), (hold_ms, SLOW_LOCK_HOLD_MS))
             log.log(
                 level,
                 "signal_lock scope=process_item channel_id=%s message_id=%s queue_id=%s "
@@ -877,7 +884,8 @@ class TradingEngine:
             log.warning("notification enqueue failed (%s)", exc.__class__.__name__)
         finally:
             duration_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
-            log.info(
+            log.log(
+                level_for((duration_ms, SLOW_SIGNAL_STAGE_MS)),
                 "signal_stage signal_id=%s intent_id=%s stage=notification_enqueue duration_ms=%s outcome=%s",
                 signal_id or "none", intent_id or "none", duration_ms, outcome,
             )
@@ -1606,6 +1614,8 @@ class TradingEngine:
             MexcRateLimitError,
             MexcWafError,
             MexcTimestampError,  # timestamp drift -> uncertain; never auto-retry
+            MexcOrderStateUncertain,  # -2011/-2013 on a create: never a rejection
+            MexcOrderNotFound,  # e.g. a CLI backend losing sight right after submit
         ) as exc:
             self.store.transition_intent(
                 intent_id,
@@ -2185,15 +2195,16 @@ class TradingEngine:
                     op.succeed({"status": "NOT_FOUND"})
                     raise
                 op.succeed(raw)
-        except MexcOrderNotFound:
+        except MexcOrderNotFound as exc:
             outcome = "not_found"
-            # -2011 can be a live order that is not query-visible yet, or one
-            # canceled/filled outside our view. Never turn non-terminal state
-            # into a terminal local failure: that would lose tracking of a real
-            # order. Keep it in the reconciliation set indefinitely.
+            error_code = getattr(exc, "code", None) or -2011
+            # -2011/-2013 can be a live order that is not query-visible yet, or
+            # one canceled/filled outside our view. Never turn non-terminal
+            # state into a terminal local failure: that would lose tracking of a
+            # real order. Keep it in the reconciliation set indefinitely.
             if intent["state"] not in TERMINAL_INTENT_STATES:
                 note = (
-                    "exchange returned -2011 (not found); order may still exist. "
+                    f"exchange returned {error_code} (not found); order may still exist. "
                     "State remains uncertain and is NEVER retried automatically"
                 )
                 self.store.transition_intent(
@@ -2208,7 +2219,7 @@ class TradingEngine:
                 local_state=intent["state"],
                 exchange_state=None,
                 outcome=outcome,
-                detail="exchange returned -2011",
+                detail=f"exchange returned {error_code}",
             )
             result = self.store.get_intent(intent_id)
             assert result is not None

@@ -46,6 +46,7 @@ from .errors import (
     MexcConfigError,
     MexcError,
     MexcNetworkError,
+    MexcOrderStateUncertain,
     MexcRateLimitError,
     MexcServerError,
     MexcTimestampError,
@@ -55,6 +56,7 @@ from .errors import (
     insufficient_balance,
     not_found,
     order_rejected,
+    order_state_uncertain,
     permission,
     precision,
     signature,
@@ -398,7 +400,9 @@ class MexcSpotClient:
                 return max(0.0, self._monotonic() - started)
             self._sleep(wait)
 
-    def _classify_and_raise(self, status: int, text: str, headers: dict[str, str]) -> None:
+    def _classify_and_raise(
+        self, status: int, text: str, headers: dict[str, str], *, method: str = "GET"
+    ) -> None:
         """Map HTTP status + body to typed errors. Never includes the URL
         (which could contain signed parameters) in the message."""
 
@@ -451,6 +455,13 @@ class MexcSpotClient:
         if code in _BALANCE_CODES:
             raise insufficient_balance(f"insufficient balance ({code}): {msg}", code)
         if code in (-2011, -2013):
+            # Context matters: a query/cancel answer means "not currently
+            # visible" and is a safe not-found. A create-order answer can never
+            # prove the order was rejected, so it stays ambiguous/UNKNOWN.
+            if method.upper() == "POST":
+                raise order_state_uncertain(
+                    f"order state uncertain after submission ({code}): {msg}", code
+                )
             raise not_found(f"order not found / terminal ({code}): {msg}", code)
         if code in (700002, 602):
             raise signature(f"signature rejected ({code}): {msg}", code)
@@ -502,7 +513,11 @@ class MexcSpotClient:
             # centralized client gates and no request is retried because of a wait.
             cooldown_wait = self._await_backoff()
             rate_gate_wait = self._acquire_bucket(method, path, signed=signed, bucket=bucket)
-            self._record_wait(cooldown_wait + rate_gate_wait, method=method, path=path)
+            # ``_record_wait`` keeps its original meaning: time lost to the
+            # weighted rate limiter only. WAF/Retry-After cooldown is reported
+            # separately in the structured request log so limiter accounting
+            # and its "budget saturated" warning are not polluted by a ban.
+            self._record_wait(rate_gate_wait, method=method, path=path)
             started = self._monotonic()
             try:
                 result = self._send_once(
@@ -529,7 +544,16 @@ class MexcSpotClient:
                 except MexcClockError:
                     raise exc from None
             except MexcError as exc:
-                if is_write and isinstance(exc, (MexcNetworkError, MexcServerError, MexcUnexpectedResponse)):
+                if is_write and isinstance(
+                    exc,
+                    (
+                        MexcNetworkError,
+                        MexcServerError,
+                        MexcUnexpectedResponse,
+                        # -2011/-2013 answering a create: the order may have landed.
+                        MexcOrderStateUncertain,
+                    ),
+                ):
                     outcome = "unknown_write_outcome"
                 elif isinstance(exc, MexcNetworkError):
                     outcome = "network_error"
@@ -681,7 +705,7 @@ class MexcSpotClient:
                 cooldown_set = retry_after if retry_after is not None else DEFAULT_WAF_BACKOFF_S
                 self._block_requests(cooldown_set)
             try:
-                self._classify_and_raise(status, text, response_headers)
+                self._classify_and_raise(status, text, response_headers, method=method)
             except MexcError as exc:
                 if exc.http_status is None:
                     exc.http_status = status

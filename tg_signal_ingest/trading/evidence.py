@@ -79,7 +79,9 @@ class ExchangeOperation:
         self.outcome = classification or "error"
         kind = self.evidence.operation_class(self.operation_id)
         if classification is None:
-            classification, reason_code, uncertainty = classify_exchange_error(exc)
+            classification, reason_code, uncertainty = classify_exchange_error(
+                exc, operation_type=self.evidence.operation_type(self.operation_id)
+            )
         if uncertainty is None:
             uncertainty = "uncertain" if kind == "write" else "read_only_uncertain"
         self.evidence.store.finish_exchange_operation(
@@ -121,6 +123,7 @@ class ExchangeEvidence:
         self._clock_health = clock_health
         self._wait_provider = wait_provider
         self._classes: dict[str, str] = {}
+        self._types: dict[str, str] = {}
 
     def take_wait_ms(self) -> int | None:
         """Return (and reset) the rate-gate wait for the current thread.
@@ -138,6 +141,11 @@ class ExchangeEvidence:
 
     def operation_class(self, operation_id: str) -> str:
         return self._classes.get(operation_id, "write")
+
+    def operation_type(self, operation_id: str) -> str | None:
+        """Return the request context (e.g. ``place_order``) for classification."""
+
+        return self._types.get(operation_id)
 
     def _clock(self) -> str | None:
         if self._clock_health is None:
@@ -192,6 +200,7 @@ class ExchangeEvidence:
             evidence_limitations=evidence_limitations,
         )
         self._classes[operation_id] = kind
+        self._types[operation_id] = operation_type
         handle = ExchangeOperation(self, operation_id)
         try:
             yield handle
@@ -207,6 +216,7 @@ class ExchangeEvidence:
                 else:
                     handle.succeed(None)
             self._classes.pop(operation_id, None)
+            self._types.pop(operation_id, None)
 
     def record_read(
         self,

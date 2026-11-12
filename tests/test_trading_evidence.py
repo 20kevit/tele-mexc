@@ -9,7 +9,8 @@ from __future__ import annotations
 import pytest
 
 from tg_signal_ingest.db import Database
-from tg_signal_ingest.trading.audit import redact_payload, redact_text
+from tg_signal_ingest.mexc.errors import MexcOrderNotFound, MexcOrderStateUncertain
+from tg_signal_ingest.trading.audit import classify_exchange_error, redact_payload, redact_text
 from tg_signal_ingest.trading.evidence import ExchangeEvidence
 from tg_signal_ingest.trading.store import TradingStore
 
@@ -99,3 +100,59 @@ def test_audit_event_type_normalization():
     assert normalize_event_type("mexc_request", "place_order") == "mexc_request.place_order"
     assert normalize_event_type("MEXC_Request", "Place_Order!") == "mexc_request.place_order"
     assert normalize_event_type("cat", "evt", explicit="custom.Type") == "custom.Type"
+
+
+def test_not_found_classification_depends_on_request_context():
+    not_found = MexcOrderNotFound("not visible", code=-2011)
+    assert classify_exchange_error(not_found, operation_type="place_order") == (
+        "uncertain",
+        "MexcOrderNotFound",
+        "uncertain",
+    )
+    assert classify_exchange_error(not_found, operation_type="place_oco") == (
+        "uncertain",
+        "MexcOrderNotFound",
+        "uncertain",
+    )
+    assert classify_exchange_error(not_found, operation_type="query_order") == (
+        "not_found",
+        "MexcOrderNotFound",
+        "none",
+    )
+    assert classify_exchange_error(not_found, operation_type="query_trade_order") == (
+        "not_found",
+        "MexcOrderNotFound",
+        "none",
+    )
+    assert classify_exchange_error(not_found, operation_type="cancel_order") == (
+        "not_found",
+        "MexcOrderNotFound",
+        "none",
+    )
+    uncertain = MexcOrderStateUncertain("ambiguous after submit", code=-2013)
+    assert classify_exchange_error(uncertain, operation_type="place_order")[0] == "uncertain"
+    assert classify_exchange_error(uncertain, operation_type="query_order")[0] == "uncertain"
+
+
+def test_evidence_records_create_not_found_as_uncertain(store):
+    evidence = ExchangeEvidence(store)
+    with pytest.raises(MexcOrderNotFound), evidence.operation(
+        operation_type="place_order", purpose="entry_submission", symbol="BTCUSDT",
+    ):
+        raise MexcOrderNotFound("not visible", code=-2011)
+    ops = store.list_exchange_operations()
+    assert ops[0]["operation_type"] == "place_order"
+    assert ops[0]["response_classification"] == "uncertain"
+    assert ops[0]["uncertainty"] == "uncertain"
+
+
+def test_evidence_records_query_not_found_as_not_found(store):
+    evidence = ExchangeEvidence(store)
+    with pytest.raises(MexcOrderNotFound), evidence.operation(
+        operation_type="query_order", purpose="entry_reconciliation", symbol="BTCUSDT",
+    ):
+        raise MexcOrderNotFound("not visible", code=-2011)
+    ops = store.list_exchange_operations()
+    assert ops[0]["operation_type"] == "query_order"
+    assert ops[0]["response_classification"] == "not_found"
+    assert ops[0]["uncertainty"] == "none"

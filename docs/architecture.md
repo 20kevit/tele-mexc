@@ -136,13 +136,18 @@ Key ordering guarantees:
   duplicate deliveries/retries. The TradeManager uses per-trade locks, so a slow
   reconciliation for one existing trade does not hold a global lifecycle lock
   against an unrelated signal.
-- The queue remains a single consumer because the current runtime shares one
-  SQLite connection across repositories/stores. Do not increase worker count
-  until connection isolation and FIFO ordering per symbol are independently
-  established; a worker-count increase alone is not a safe latency fix. A slow
-  REST call inside a BUY decision/submission can therefore still occupy the
-  single signal consumer; eliminating that remaining boundary needs a separate
-  per-worker DB-connection/execution-queue design, not an unsafe lock bypass.
+- The queue remains a single consumer. The `Database` wrapper gives every
+  handle one connection per calling thread (file-backed WAL, read-only
+  `mode=ro`, and a private temporary database behind `:memory:`), so a
+  concurrent lifecycle worker only ever reads committed state; writers are
+  still serialised by one process-wide transaction lock. `Database.close()` is
+  idempotent, waits for an in-flight writer, and leaves an active reader with a
+  normal SQLite error rather than a half-closed handle. Do not increase worker
+  count without also establishing per-symbol FIFO for the queue itself; a
+  worker-count increase alone is not a safe latency fix. A slow REST call
+  inside a BUY decision/submission can therefore still occupy the single signal
+  consumer; eliminating that remaining boundary needs a separate
+  execution-queue design, not an unsafe lock bypass.
 - Notifications are an independent durable outbox; delivery retries cannot
   resubmit an order.
 
@@ -158,9 +163,11 @@ stdlib `urllib` in a worker thread. It provides:
 - Documented per-endpoint weights, file-backed shared IP/UID/order gates, one
   batch ticker request per monitor interval; 429/418/403 trigger a per-process
   backoff honoring `Retry-After`, with a conservative default.
-- Typed errors; 5xx/network/unknown submit outcomes are ambiguous. HTTP `-2011`
-  and `-2013` order-not-found responses remain unresolved for uncertain intents;
-  repeated entry and TP/SL not-found queries use durable exponential backoff
+- Typed errors; 5xx/network/unknown submit outcomes are ambiguous. `-2011` and
+  `-2013` are context-aware: on a query/cancel they mean "not currently visible"
+  and keep an uncertain intent unresolved; on a create-order response they are
+  treated as an ambiguous submission (never a rejection, never a resend).
+  Repeated entry and TP/SL not-found queries use durable exponential backoff
   (60 s to 15 min), without changing uncertain-order state or retrying writes.
 - Structured REST request logs include request id, endpoint, HTTP/exchange status,
   Retry-After, cooldown/rate-gate wait, network duration, and outcome. Signed
@@ -168,8 +175,9 @@ stdlib `urllib` in a worker thread. It provides:
 - Queue and signal-stage telemetry records queue age, handler duration, parser,
   reference-price, symbol-metadata, risk, intent persistence, trade planning,
   order execution, and notification-enqueue durations. Signal-process and
-  per-trade lock wait/hold durations are recorded separately; routine timings
-  remain debug-level while slow stages/locks are promoted to info.
+  per-trade lock wait/hold durations are recorded separately. Thresholds live in
+  `tg_signal_ingest/telemetry.py`: routine timings log at DEBUG and only slow
+  stages/locks are promoted to INFO.
 - Dynamic symbol metadata and precision validation from `exchangeInfo`.
 - Decimal-only order-book parsing and depth validation.
 

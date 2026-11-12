@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -12,12 +14,14 @@ from tg_signal_ingest.mexc.errors import (
     MexcCliConfirmationRequired,
     MexcNetworkError,
     MexcOrderNotFound,
+    MexcOrderStateUncertain,
     MexcRateLimitError,
     MexcTimestampError,
 )
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import SignalParser, TradingEngine, TradingStore
+from tg_signal_ingest.trading.trade_manager import _is_retryable_oco_error
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 MSG_DATE = NOW - timedelta(seconds=20)
@@ -1451,3 +1455,128 @@ def test_repeated_order_not_found_uses_persistent_exponential_backoff(cfg, repo)
     later = second_at + timedelta(seconds=121)
     engine._now = lambda: later
     assert engine._not_found_backoff_remaining(intent_id) == 0.0
+
+
+def test_create_order_not_found_response_stays_uncertain_and_is_never_resent(cfg, repo):
+    """A -2011/-2013 answer to a *create* must never become a rejection.
+
+    It must also never cause a resubmission: the intent stays in the durable
+    reconciliation set exactly like any other ambiguous write.
+    """
+
+    client = FakeMexc(
+        place_error=MexcOrderStateUncertain(
+            "order state uncertain after submission (-2013): Order does not exist.", code=-2013
+        )
+    )
+    engine = _engine(cfg, repo, client, mode="live")
+
+    intent = engine.process_item(_item(100, 21), _store_message(repo, 21, ALERT))
+    assert intent is not None
+    stored = engine.store.get_intent(intent["intent_id"])
+    assert stored is not None
+    assert stored["state"] == "unknown_requires_reconciliation"
+    assert stored["state"] != "rejected"
+    assert client.place_calls == 1
+
+    # Reconciliation only reads; it must not resubmit the order.
+    engine.reconcile_pending()
+    assert client.place_calls == 1
+    after = engine.store.get_intent(intent["intent_id"])
+    assert after is not None and after["state"] != "rejected"
+
+
+def test_ambiguous_oco_order_errors_are_never_retryable():
+    assert not _is_retryable_oco_error(MexcOrderNotFound("order not found", code=-2013))
+    assert not _is_retryable_oco_error(
+        MexcOrderStateUncertain("submission outcome unknown", code=-2013)
+    )
+
+
+def test_signal_stage_logging_is_threshold_based(cfg, repo, caplog):
+    engine = _engine(cfg, repo)
+    item = _item(100, 31)
+    caplog.set_level(logging.DEBUG, logger="ingest.trading")
+
+    fast = iter([0.0, 0.002])
+    engine._monotonic = lambda: next(fast)
+    with engine._measure_signal_stage(item, "reference_price"):
+        pass
+    assert caplog.records[-1].levelno == logging.DEBUG
+
+    slow = iter([10.0, 12.5])
+    engine._monotonic = lambda: next(slow)
+    with engine._measure_signal_stage(item, "reference_price"):
+        pass
+    assert caplog.records[-1].levelno == logging.INFO
+
+
+def test_symbol_lock_serialises_same_symbol_and_separates_other_symbols(cfg, repo):
+    engine = _engine(cfg, repo)
+    lock = engine._symbol_lock("BTCUSDT")
+    assert lock is engine._symbol_lock("btcusdt")
+    assert lock is not engine._symbol_lock("ETHUSDT")
+
+    inside = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def hold() -> None:
+        nonlocal active, max_active
+        with engine._symbol_lock("BTCUSDT"):
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            inside.set()
+            release.wait(5)
+            with state_lock:
+                active -= 1
+
+    first = threading.Thread(target=hold)
+    first.start()
+    assert inside.wait(5)
+    # The lock is genuinely held: a non-blocking acquire must fail.
+    assert lock.acquire(blocking=False) is False
+
+    second = threading.Thread(target=hold)
+    second.start()
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert max_active == 1
+    # Released and reusable.
+    assert lock.acquire(blocking=False) is True
+    lock.release()
+
+
+def test_query_not_found_2013_keeps_intent_uncertain_and_records_the_code(cfg, repo):
+    client = FakeMexc(place_error=MexcNetworkError("timeout after send"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 22), _store_message(repo, 22, ALERT))
+    assert intent is not None and intent["state"] == "unknown_requires_reconciliation"
+
+    client.query_error = MexcOrderNotFound("order does not exist", code=-2013)
+    stats = engine.reconcile_pending()
+    assert stats.not_found == 1
+    still = engine.store.get_intent(intent["intent_id"])
+    assert still is not None and still["state"] == "unknown_requires_reconciliation"
+    detail = engine.repo.db.conn.execute(
+        "SELECT detail FROM reconciliation_results WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 1",
+        (intent["intent_id"],),
+    ).fetchone()[0]
+    assert "-2013" in detail
+
+
+def test_submit_not_found_from_a_cli_backend_is_never_terminalised(cfg, repo):
+    client = FakeMexc(place_error=MexcOrderNotFound("CLI could not see the order it just placed"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 23), _store_message(repo, 23, ALERT))
+    assert intent is not None
+    stored = engine.store.get_intent(intent["intent_id"])
+    assert stored is not None
+    assert stored["state"] == "unknown_requires_reconciliation"
+    assert stored["state"] != "rejected"
+    assert client.place_calls == 1

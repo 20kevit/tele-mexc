@@ -43,6 +43,8 @@ class TestEngine:
         assert "queue_handler" in rendered
         assert "queue_age_ms=" in rendered
         assert "duration_ms=" in rendered
+        handler_records = [r for r in caplog.records if r.getMessage().startswith("queue_handler")]
+        assert handler_records and handler_records[-1].levelno == 10  # routine => DEBUG
 
     def test_edit_notifies_and_skips_superseded(self, repo):
         from tests.conftest import FakeMsg

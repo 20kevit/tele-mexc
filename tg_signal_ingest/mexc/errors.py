@@ -97,6 +97,18 @@ class MexcOrderNotFound(MexcError):
     """-2011/-2013 order query or cancel target is not currently visible."""
 
 
+class MexcOrderStateUncertain(MexcError):
+    """A *create-order* response said the order was not visible.
+
+    ``-2011``/``-2013`` are definitive "not currently visible" answers to a
+    query or a cancel, but they are not a safe rejection for a create request:
+    the submission may have landed and only the response is ambiguous.  Callers
+    must keep the submission ``unknown_requires_reconciliation`` and reconcile
+    read-only; they must never treat this as a terminal local rejection or
+    resend the order.
+    """
+
+
 class AccidentalOrderRiskError(MexcError):
     """Internal guard: a code path attempted a live order without authorization."""
 
@@ -185,6 +197,10 @@ def insufficient_balance(msg: str, code: int | None = None) -> MexcInsufficientB
 
 def not_found(msg: str, code: int | None = -2011) -> MexcOrderNotFound:
     return MexcOrderNotFound(msg, code=code)
+
+
+def order_state_uncertain(msg: str, code: int | None = None) -> MexcOrderStateUncertain:
+    return MexcOrderStateUncertain(msg, code=code)
 
 
 def order_rejected(msg: str, code: int | None = None) -> MexcOrderRejected:

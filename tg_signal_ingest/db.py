@@ -7,8 +7,10 @@ database do not produce spurious failures.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -1599,31 +1601,111 @@ MIGRATIONS: list[tuple[int, MigrationStep]] = [
     (20, _migration_20_audit_evidence_notifications),
     (21, _migration_21_second_owner_notifications),
     (22, _migration_22_remediation_columns),
+    (
+        23,
+        """
+        -- Owner decision: leave all pre-deployment trade lifecycles untouched.
+        -- Park local records so recovery/reconciliation cannot act on them.
+        -- This does not cancel, replace, query, or modify exchange orders.
+        UPDATE trades
+           SET trade_state = 'ignored_legacy',
+               updated_at = datetime('now')
+         WHERE trade_state NOT IN ('closed', 'tp2_completed');
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES ('trading.new_buys_blocked', '0', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = '0', updated_at = excluded.updated_at;
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES ('trading.new_buys_block_reason', '', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = '', updated_at = excluded.updated_at;
+        """,
+    ),
 ]
 
 
+class DatabaseClosedError(RuntimeError):
+    """Raised when a closed :class:`Database` handle is used again."""
+
+
 class Database:
-    """Thin wrapper over sqlite3 with embedded migrations."""
+    """Thin wrapper over sqlite3 with embedded migrations.
+
+    Every handle opens one connection per calling thread.
+
+    * File-backed write databases use WAL, so each reader sees the last
+      *committed* snapshot while writers stay serialised by ``self.lock``
+      inside :meth:`transaction`.
+    * Read-only handles open only ``mode=ro`` connections; nothing is written,
+      so per-thread connections cannot diverge.
+    * ``":memory:"`` is backed by a private temporary database file using the
+      same WAL path.  A second plain ``:memory:`` connection would be a
+      different, empty database, and a shared-cache memory URI
+      (``cache=shared``) returns ``SQLITE_LOCKED`` to readers while a writer
+      transaction is open (the busy handler is not used for table locks), so
+      neither of those can carry the per-thread model safely.
+
+    A handle can be closed from any thread: :meth:`close` waits for an
+    in-flight writer transaction, marks the handle closed, and closes every
+    tracked connection.  A concurrent reader receives a normal ``sqlite3``
+    error on its next statement instead of corrupting state, and later use of
+    the handle raises :class:`DatabaseClosedError`.
+    """
 
     def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = Path(path)
         self.lock = threading.RLock()
         self.read_only = read_only
+        self._connections_lock = threading.Lock()
+        self._connections: list[sqlite3.Connection] = []
+        self._local = threading.local()
+        self._closed = False
+        self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         if read_only:
             if not self.path.is_file():
                 raise FileNotFoundError(self.path)
-            self.conn = sqlite3.connect(
-                f"file:{self.path}?mode=ro", uri=True, check_same_thread=False, timeout=10
+            db_path = self.path
+        elif str(self.path) == ":memory:":
+            # Private, throwaway database with the proven WAL/per-thread path.
+            self._tempdir = tempfile.TemporaryDirectory(prefix="tg-ingest-mem-")
+            db_path = Path(self._tempdir.name) / "ingest.sqlite3"
+        else:
+            db_path = self.path
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._db_path = db_path
+        self._primary = self._connect()
+        if not read_only:
+            self._primary.execute("PRAGMA journal_mode=WAL")
+        # Reuse the WAL-initialized connection in the creating thread.
+        self._local.conn = self._primary
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Connection owned by the current thread."""
+
+        if self._closed:
+            raise DatabaseClosedError("database handle is closed")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro", uri=True, check_same_thread=False, timeout=10
             )
         else:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        if not read_only:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=10000")
-        self.conn.isolation_level = None  # autocommit; explicit BEGIN via lock
+            conn = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.isolation_level = None  # autocommit; explicit BEGIN via lock
+        with self._connections_lock:
+            if self._closed:
+                conn.close()
+                raise DatabaseClosedError("database handle is closed")
+            self._connections.append(conn)
+        return conn
 
     def migrate(self) -> list[int]:
         if self.read_only:
@@ -1670,6 +1752,9 @@ class Database:
 
             def __enter__(self):
                 outer.lock.acquire()
+                if outer._closed:
+                    outer.lock.release()
+                    raise DatabaseClosedError("database handle is closed")
                 # A bounded retry makes short-lived contention (another process
                 # holding the write lock) invisible to callers instead of
                 # surfacing as a failed trade transition.  It is logged because
@@ -1708,5 +1793,26 @@ class Database:
         return _Tx(self.conn)
 
     def close(self) -> None:
+        """Close every tracked connection.
+
+        Idempotent and safe from any thread.  ``self.lock`` is acquired first,
+        so an in-flight writer transaction finishes before the handle is marked
+        closed; a concurrent reader receives a normal ``sqlite3`` error on its
+        next statement rather than a half-closed handle.
+        """
+
         with self.lock:
-            self.conn.close()
+            with self._connections_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                conns = list(self._connections)
+                self._connections.clear()
+            for conn in conns:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+        tempdir = self._tempdir
+        self._tempdir = None
+        if tempdir is not None:
+            with contextlib.suppress(OSError):
+                tempdir.cleanup()

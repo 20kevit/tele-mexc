@@ -99,7 +99,10 @@ open/filled/canceled_local/rejected/failed/unknown_requires_reconciliation`
   (`NEW/PARTIALLY_FILLED/FILLED/CANCELED/PARTIALLY_CANCELED`).
 - Every reconciliation writes a durable `reconciliations` row (outcome
   `consistent | ambiguous | not_found | resolved | drifted`).
-- `-2011` never demotes a non-terminal intent to a terminal failure.
+- `-2011`/`-2013` never demote a non-terminal intent to a terminal failure.
+  On a query/cancel they mean "not currently visible"; on a create-order
+  response they mark the submission ambiguous (`unknown_requires_reconciliation`)
+  and it is only reconciled read-only — never rejected, never resent.
 - Terminal-but-unfilled-synced orders keep the `fill_sync_required` flag and
   fill history is re-read from `/api/v3/myTrades`.
 - `reconcile_pending(limit)` handles the backlog; CLI entry

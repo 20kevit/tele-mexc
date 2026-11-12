@@ -515,7 +515,8 @@ applies only to that path.
 | `CANCELED` / `PARTIALLY_CANCELED` | `canceled`; partial spend retained |
 | Unknown status | State unchanged, outcome `ambiguous` |
 | Network/5xx/malformed query | Outcome `ambiguous`; state unchanged |
-| `-2011` not found | Non-terminal intent becomes/stays `unknown_requires_reconciliation`; never terminalized, never retried |
+| `-2011` / `-2013` on a query or cancel | Non-terminal intent becomes/stays `unknown_requires_reconciliation`; never terminalized, never retried |
+| `-2011` / `-2013` on a create order | Submission outcome is ambiguous: stays `unknown_requires_reconciliation` and is only reconciled read-only. It is never converted into a definitive rejection and never resent |
 
 Fills are read from `myTrades` and inserted idempotently by
 `(exchange_order_id, exchange_trade_id)`. If persisted quantity is below the
@@ -829,7 +830,12 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 authorization. `readiness` is non-trading: it reads local state and, with
 `--network`, performs read-only Telegram/MEXC identity checks. It never places,
 cancels, replaces, or modifies an order and prints `READY FOR FIRST CONTROLLED
-STARTUP` or `NOT READY` with every blocker. `preflight` performs local
+STARTUP` or `NOT READY` with every blocker. Its working-tree check tolerates only
+the documented local accounting artifacts that intentionally stay untracked in
+the production checkout (`migrations/`, `tg_signal_ingest/accounting/`,
+`tests/test_accounting_*.py`, `tests/fixtures/accounting/`, and top-level
+`reports/*.md`); every tracked modification and every other untracked path
+remains a blocker. `preflight` performs local
 binary/version/schema and CLI-profile checks; with `--network` it also runs the
 CLI doctor, one signed read-only `current-orders` query, a signed `spot asset
 account` read, REST key validation, and compares the CLI and REST account
@@ -881,3 +887,18 @@ protection. An `oco_active` summary requires working quantity to cover the
 remaining recorded position (completed allocations do not add coverage). Two
 completed allocations finalize only through the existing residual-position
 check. These checks change status certainty, not submission authorization.
+
+
+## Legacy trade isolation (migration 23)
+
+At the owner's explicit direction, every pre-deployment non-terminal trade
+record is moved to the terminal local state ignored_legacy. Startup recovery,
+periodic trade reconciliation, tick handling, and the protection-derived
+new-BUY block must ignore these records. Migration 23 clears the old global
+new-BUY block once, while preserving closed/completed history.
+
+This is a local bookkeeping boundary only: it does not query, cancel, replace,
+or amend any existing MEXC order, and it does not claim that old positions are
+closed or protected. Exchange open-order checks still apply to a symbol before
+a new entry, so an actually open exchange order can still prevent a conflicting
+new entry on that same symbol.

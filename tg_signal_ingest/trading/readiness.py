@@ -24,9 +24,56 @@ FAIL = "FAIL"
 WARN = "WARN"
 NOT_VERIFIED = "NOT_VERIFIED"
 
-LATEST_MIGRATION = 21
+LATEST_MIGRATION = 23
 RECONCILIATION_BLOCKING_STATES = ("submitting", "reconciling", "unknown_requires_reconciliation")
 UNPROTECTED_TRADE_STATES = ("needs_reconciliation", "unprotected_critical")
+
+# Local-only artifacts that intentionally exist in the production checkout and
+# are not part of a release: the accounting audit package, its tests/fixtures and
+# one-off migration SQL, plus the audit reports it wrote.  They must never block
+# readiness - but any other untracked path, and every tracked modification, does.
+LOCAL_ARTIFACT_PREFIXES = (
+    "migrations/",
+    "tests/fixtures/accounting/",
+    "tests/test_accounting_",
+    "tg_signal_ingest/accounting/",
+)
+LOCAL_ARTIFACT_REPORT_DIR = "reports/"
+
+
+def _is_known_local_artifact(path: str) -> bool:
+    """True only for the documented, untracked accounting artifacts."""
+
+    if path.startswith(LOCAL_ARTIFACT_PREFIXES):
+        return True
+    if path.startswith(LOCAL_ARTIFACT_REPORT_DIR) and path.endswith(".md"):
+        # Top-level audit reports only - not sub-directories or other file types.
+        return "/" not in path[len(LOCAL_ARTIFACT_REPORT_DIR):]
+    return False
+
+
+def classify_worktree_status(status: str) -> tuple[list[str], list[str]]:
+    """Split ``git status --porcelain`` into ``(unexpected, local_artifacts)``.
+
+    Every tracked modification (index, worktree, rename, delete) is unexpected.
+    An untracked path is tolerated only when it matches the documented local
+    accounting artifacts.
+    """
+
+    unexpected: list[str] = []
+    local_artifacts: list[str] = []
+    for raw in status.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if not line.startswith("?? "):
+            unexpected.append(line)
+            continue
+        path = line[3:].strip()
+        if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        (local_artifacts if _is_known_local_artifact(path) else unexpected).append(path)
+    return unexpected, local_artifacts
 
 
 @dataclass
@@ -130,10 +177,25 @@ def build_readiness_report(
         report.add("git branch", PASS, branch)
     if dirty is None:
         report.add("working tree", WARN, "git status unavailable")
-    elif dirty:
-        report.add("working tree", FAIL, "uncommitted changes present; commit before the controlled startup")
     else:
-        report.add("working tree", PASS, "clean")
+        unexpected, local_artifacts = classify_worktree_status(dirty)
+        if unexpected:
+            preview = "; ".join(unexpected[:5])
+            if len(unexpected) > 5:
+                preview += f"; (+{len(unexpected) - 5} more)"
+            report.add(
+                "working tree",
+                FAIL,
+                f"uncommitted source changes present; commit before the controlled startup: {preview}",
+            )
+        elif local_artifacts:
+            report.add(
+                "working tree",
+                PASS,
+                f"clean; {len(local_artifacts)} known local accounting artifact(s) intentionally untracked",
+            )
+        else:
+            report.add("working tree", PASS, "clean")
 
     # -------------------------------------------------------------- database
     version = repo.db.schema_version()
@@ -257,7 +319,7 @@ def build_readiness_report(
     # -------------------------------------------------------------- trades
     open_trades = conn.execute(
         "SELECT trade_id, symbol, trade_state FROM trades WHERE trade_state NOT IN "
-        "('closed','tp2_completed','canceled','rejected','failed') ORDER BY updated_at"
+        "('closed','tp2_completed','canceled','rejected','failed','ignored_legacy') ORDER BY updated_at"
     ).fetchall()
     if open_trades:
         states = ", ".join(f"{row['symbol']}:{row['trade_state']}" for row in open_trades[:10])
