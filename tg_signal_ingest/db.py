@@ -1619,6 +1619,27 @@ MIGRATIONS: list[tuple[int, MigrationStep]] = [
         ON CONFLICT(key) DO UPDATE SET value = '', updated_at = excluded.updated_at;
         """,
     ),
+    (
+        24,
+        """
+        -- Preserve ambiguous historical submissions but remove them from all
+        -- automatic recovery/reconciliation loops. MEXC open-order checks remain
+        -- authoritative before any new order on the same symbol.
+        CREATE TABLE IF NOT EXISTS legacy_ignored_intents (
+            intent_id TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            ignored_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO legacy_ignored_intents (intent_id, reason, ignored_at)
+        SELECT intent_id,
+               'owner chose to ignore all pre-deployment order lifecycles',
+               datetime('now')
+          FROM order_intents
+         WHERE state IN ('planned', 'submitting', 'submitted', 'reconciling', 'open',
+                         'unknown_requires_reconciliation')
+            OR fill_sync_required = 1;
+        """,
+    ),
 ]
 
 

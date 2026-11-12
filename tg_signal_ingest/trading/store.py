@@ -1032,7 +1032,10 @@ class TradingStore:
         """Planned intents that were never claimed for exchange submission."""
 
         rows = self.db.conn.execute(
-            "SELECT * FROM order_intents WHERE state = 'planned' ORDER BY planned_at, intent_id LIMIT ?",
+            "SELECT * FROM order_intents WHERE state = 'planned' "
+            "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id) "
+            "ORDER BY planned_at, intent_id LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -1042,6 +1045,8 @@ class TradingStore:
         rows = self.db.conn.execute(
             f"SELECT * FROM order_intents WHERE mode = 'live' AND "
             f"(state IN ({placeholders}) OR fill_sync_required = 1) "
+            "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id) "
             "ORDER BY updated_at LIMIT ?",
             (*RECONCILABLE_INTENT_STATES, limit),
         ).fetchall()

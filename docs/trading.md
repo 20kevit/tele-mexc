@@ -889,13 +889,15 @@ completed allocations finalize only through the existing residual-position
 check. These checks change status certainty, not submission authorization.
 
 
-## Legacy trade isolation (migration 23)
+## Legacy trade and intent isolation (migrations 23-24)
 
 At the owner's explicit direction, every pre-deployment non-terminal trade
 record is moved to the terminal local state ignored_legacy. Startup recovery,
 periodic trade reconciliation, tick handling, and the protection-derived
 new-BUY block must ignore these records. Migration 23 clears the old global
-new-BUY block once, while preserving closed/completed history.
+new-BUY block once, while preserving closed/completed history. Migration 24 records
+pre-deployment non-terminal order intents in a local ignore registry so they no
+longer enter periodic reconciliation or planned-intent recovery.
 
 This is a local bookkeeping boundary only: it does not query, cancel, replace,
 or amend any existing MEXC order, and it does not claim that old positions are

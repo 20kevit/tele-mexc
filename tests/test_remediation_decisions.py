@@ -266,7 +266,7 @@ def test_migration_22_upgrades_from_21_and_preserves_rows(tmp_path, monkeypatch)
     db = Database(path)
     applied = db.migrate()
     assert 22 in applied
-    assert db.schema_version() == 23
+    assert db.schema_version() == 24
     assert db.conn.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0] == 1
     cols = {r[1] for r in db.conn.execute("PRAGMA table_info(trade_orders)")}
     assert {"attempt", "next_attempt_at", "retryable"} <= cols

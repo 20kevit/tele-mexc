@@ -24,7 +24,7 @@ FAIL = "FAIL"
 WARN = "WARN"
 NOT_VERIFIED = "NOT_VERIFIED"
 
-LATEST_MIGRATION = 23
+LATEST_MIGRATION = 24
 RECONCILIATION_BLOCKING_STATES = ("submitting", "reconciling", "unknown_requires_reconciliation")
 UNPROTECTED_TRADE_STATES = ("needs_reconciliation", "unprotected_critical")
 
@@ -288,7 +288,12 @@ def build_readiness_report(
             )
 
     # ------------------------------------------------------------- signals
-    planned = _count(conn, "SELECT COUNT(*) FROM order_intents WHERE state='planned'")
+    planned = _count(
+        conn,
+        "SELECT COUNT(*) FROM order_intents WHERE state='planned' "
+        "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+        "WHERE legacy.intent_id = order_intents.intent_id)",
+    )
     if planned:
         report.add(
             "pre-restart planned intents",
@@ -299,7 +304,9 @@ def build_readiness_report(
         report.add("pre-restart planned intents", PASS, "none")
     unresolved = _count(
         conn,
-        "SELECT COUNT(*) FROM order_intents WHERE state IN (?,?,?)",
+        "SELECT COUNT(*) FROM order_intents WHERE state IN (?,?,?) "
+        "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+        "WHERE legacy.intent_id = order_intents.intent_id)",
         RECONCILIATION_BLOCKING_STATES,
     )
     if unresolved:
@@ -310,7 +317,12 @@ def build_readiness_report(
         )
     else:
         report.add("unresolved submissions", PASS, "none")
-    fill_sync = _count(conn, "SELECT COUNT(*) FROM order_intents WHERE fill_sync_required=1")
+    fill_sync = _count(
+        conn,
+        "SELECT COUNT(*) FROM order_intents WHERE fill_sync_required=1 "
+        "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+        "WHERE legacy.intent_id = order_intents.intent_id)",
+    )
     if fill_sync:
         report.add("fill synchronization", WARN, f"{fill_sync} intent(s) still require fill synchronization")
     else:
@@ -393,7 +405,7 @@ def build_readiness_report(
     report.add(
         "startup recovery",
         PASS,
-        "existing entries/fills/OCOs are reconciled read-only; stale planned intents are canceled locally",
+        "new lifecycles only; pre-deployment trade and unresolved intent records are parked locally",
     )
 
     # --------------------------------------------------------------- network

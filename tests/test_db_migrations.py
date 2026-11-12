@@ -7,7 +7,9 @@ import sqlite3
 import pytest
 
 import tg_signal_ingest.db as db_module
+from tg_signal_ingest.config import TradingConfig
 from tg_signal_ingest.db import MIGRATIONS, Database
+from tg_signal_ingest.trading.store import TradingStore
 
 
 def test_migrations_apply_and_are_idempotent(tmp_path):
@@ -91,6 +93,14 @@ def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypat
             "VALUES ('c1', 'lifecycle', 'legacy_event', 'legacy detail', '2026-01-01T00:00:00Z')"
         )
         conn.execute(
+            "INSERT INTO order_intents (intent_id, signal_id, idempotency_key, client_order_id, "
+            "symbol, side, order_type, quote_amount, mode, state, create_msg_id, create_channel_id, "
+            "planned_at, updated_at) VALUES "
+            "('i-legacy', 's-legacy', 'k-legacy', 'c-legacy', 'BTCUSDT', 'buy', 'limit', "
+            "'10', 'live', 'unknown_requires_reconciliation', 1, 1, "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
             "INSERT INTO trades (trade_id, signal_id, idempotency_key, channel_id, message_id, "
             "symbol, side, entry_mode, requested_quote, entry_price, trade_state, created_at, updated_at) "
             "VALUES ('t-1', 's-1', 'idem-1', 1, 1, 'BTCUSDT', 'buy', 'direct', "
@@ -120,12 +130,20 @@ def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypat
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS)
     applied = db.migrate()
-    assert applied == [17, 18, 19, 20, 21, 22, 23]
-    assert db.schema_version() == 23
+    assert applied == [17, 18, 19, 20, 21, 22, 23, 24]
+    assert db.schema_version() == 24
     assert db.conn.execute("SELECT trade_state FROM trades WHERE trade_id='t-1'").fetchone()[0] == "ignored_legacy"
     assert db.conn.execute("SELECT state FROM trade_orders WHERE trade_order_id='to-1'").fetchone()[0] == "open"
     assert db.conn.execute("SELECT value FROM app_state WHERE key='trading.new_buys_blocked'").fetchone()[0] == "0"
     assert db.conn.execute("SELECT value FROM app_state WHERE key='trading.new_buys_block_reason'").fetchone()[0] == ""
+    assert db.conn.execute("SELECT COUNT(*) FROM legacy_ignored_intents").fetchone()[0] == 1
+    assert (
+        db.conn.execute("SELECT state FROM order_intents WHERE intent_id='i-legacy'").fetchone()[0]
+        == "unknown_requires_reconciliation"
+    )
+    store = TradingStore(db, TradingConfig())
+    assert store.pending_reconciliation() == []
+    assert store.list_planned_intents() == []
     assert db.migrate() == []  # idempotent
 
     audit = db.conn.execute("SELECT event_type, source_ref FROM audit_events").fetchone()
