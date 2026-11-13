@@ -88,7 +88,7 @@ sibling message parts exhausted the shared event/recipient budget.
   Callback-token storage is single-use and role-bound but remains an optional,
   unwired capability; no interactive-button claim is made.
 - No synthetic Telegram test message or MEXC request was sent. Actual Telegram
-  delivery was verified by five real system events, each with a recorded
+  delivery was verified by six real system-notification deliveries, each with a recorded
   `telegram_message_id`; no historical event replay occurred.
 - First worker start briefly raced migration 25 and logged `no such column:
   aggregate_type`. It recovered after the main migration completed. The worker
