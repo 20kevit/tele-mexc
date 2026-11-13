@@ -2,13 +2,12 @@
 
 ## Verdict
 
-**Rollout in progress; main service updated, worker temporarily stopped for a
-startup-order fix.** The release worktree and the follow-up startup-gate patch passed the complete
-test and static-quality gates. Migration 25 is applied in Production. The first
-worker start exposed a migration race; it recovered after migration and
-delivered five real system-notification messages, then was stopped deliberately
-while the startup schema gate was added and tested. No MEXC orders or balances
-were changed.
+**OPERATIONAL IN PRODUCTION.** The release worktree and follow-up startup-gate
+patch passed the complete test and static-quality gates. Migration 25 is applied.
+The first worker start exposed a migration race, then recovered and delivered
+six real system-notification messages. The startup schema gate was subsequently
+deployed; the restarted worker is active with a fresh heartbeat and no new
+schema errors. No MEXC orders or balances were changed.
 
 ## Isolation and source
 
@@ -98,6 +97,22 @@ sibling message parts exhausted the shared event/recipient budget.
   long-lived connection. A regression test verifies old-schema rejection and
   readiness after migration.
 
+## Post-deployment operational verification — 2026-11-13 15:11 UTC
+
+| Check | Observed result |
+| --- | --- |
+| `tg-ingest.service` | active, PID 244919, NRestarts 0 |
+| `tg-notification-worker.service` | active, PID 245563, NRestarts 0 |
+| Worker heartbeat | 0.9 seconds, `health=ok` |
+| Delivery ledger | 6 sent, 0 pending, 0 failed, 0 dead-letter, 0 ambiguous |
+| Telegram message IDs | 6 stored; every delivery has one successful attempt |
+| Historical replay | none; existing source/legacy cursors preserved |
+| Worker errors after startup-gate deployment | none observed |
+
+The worker remains a soft dependency (`Wants`) of the trading service. Its
+failure does not stop the trading service; it follows the main service lifecycle
+through `BindsTo`/`PartOf` and waits for the required DB schema before connecting.
+
 ## Rollout checklist
 
 1. Create and verify a consistent SQLite backup of `data/ingest.sqlite3` using
@@ -116,8 +131,7 @@ sibling message parts exhausted the shared event/recipient budget.
    original unit, daemon-reload, and restart the main service; do not touch
    exchange orders during rollback.
 
-The initial release commit is deployed to the production source tree. The
-startup-gate follow-up passed 870 tests and all static gates; it is committed
-and pushed next, then only `main.py` and the updated release documentation/tests
-need copying before starting the worker. The main trading service remains
-active; the worker is intentionally stopped until that copy is complete.
+Release branch `codex/notification-release-20261113` is pushed to GitHub.
+Initial release commit: `f36f3e0`; startup-gate follow-up: `e3fea1c`.
+Production source files and units match the reviewed release; both services are
+active and the notification path is operational.

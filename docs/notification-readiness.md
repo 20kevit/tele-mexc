@@ -1,8 +1,9 @@
 # Notification architecture and Phase 2 readiness
 
-Status: **release candidate ready for controlled rollout; not yet deployed**.
-This document records the implementation, validation evidence, and remaining
-post-deployment checks. It does not claim that the live worker is already running.
+Status: **operational in Production (2026-11-13)**. The main trading service
+and independent notification worker are active; heartbeat and actual Telegram
+deliveries have been verified. This document records the implementation,
+validation evidence, and post-deployment checks.
 
 Source of truth remains code and tests:
 
@@ -156,16 +157,18 @@ legacy compatibility outbox.
 | `git diff --check` | pass |
 | `systemd-analyze verify deploy/tg-ingest.service deploy/tg-notification-worker.service` | pass (static only) |
 
-No MEXC order/balance API or test-message send was performed. The controlled
-rollout did restart the production `tg-ingest.service` once at 15:05:50 UTC;
-migration 25 completed and the main service returned active with PID 244919
-and `NRestarts=0`. The worker initially raced the migration and logged a
-transient `aggregate_type` schema error; after migration it recovered and
-successfully delivered five real system-notification messages (all recorded
-with Telegram message IDs). No historical events or legacy notifications were
-replayed. The worker was then stopped deliberately while a startup schema gate
-was added. The main trading service remains active; no MEXC orders or balances
-were changed. The existing ControlBot configuration was not changed.
+No MEXC order/balance API or synthetic test-message send was performed. The
+controlled rollout restarted `tg-ingest.service` once at 15:05:50 UTC;
+migration 25 completed. The main service is active with PID `244919` and
+`NRestarts=0`; the notification worker is active with PID `245563` and
+`NRestarts=0`. The first worker start exposed a transient migration race, then
+recovered and delivered six real system-notification messages with Telegram
+message IDs. A schema-readiness gate was added, deployed, and verified on the
+subsequent worker start; no schema errors occurred after that start. The
+current heartbeat age was 0.9 seconds (`health=ok`), with `sent=6`, queue depth
+0, dead-letter 0, and ambiguous 0. No historical events or legacy notifications
+were replayed. No MEXC orders or balances were changed. Existing ControlBot
+configuration was not changed.
 
 ## Residual gaps / release prerequisites
 
@@ -174,11 +177,10 @@ were changed. The existing ControlBot configuration was not changed.
   columns and source tables before opening its long-lived read-only connection.
   This prevents the systemd `After=` ordering from racing the main service's
   migration. The dispatcher itself never migrates the trading DB.
-- The online SQLite backup and reviewed source/unit copy are complete. Migration
-  25 is applied in Production. The main service is active; the worker is
-  intentionally stopped pending deployment of the startup schema gate. Copy the
-  follow-up `main.py`, start the worker, and verify fresh heartbeat/no new schema
-  errors before declaring the notification path fully operational.
+- The online SQLite backup, reviewed source copy, and systemd unit installation
+  are complete. Migration 25 is applied in Production. The startup schema gate
+  is deployed; both units are active, heartbeat is fresh, and six actual system
+  notifications are recorded as sent with no pending/failed/ambiguous deliveries.
 - Deploy the worker unit with the real deployment path/user; the candidate unit
   uses the same `/opt/projects/akha1` paths as `tg-ingest.service`.
 - Notification callback buttons (`expand`/`source`/`ack`) are not emitted by the
