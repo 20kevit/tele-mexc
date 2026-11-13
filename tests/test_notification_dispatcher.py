@@ -12,6 +12,7 @@ from tg_signal_ingest.control.bot_api import (
     BotApiRateLimitError,
     BotApiTransportError,
 )
+from tg_signal_ingest.main import notification_source_schema_ready
 from tg_signal_ingest.notification_dispatcher import (
     NotificationDispatcher,
     heartbeat_status,
@@ -460,6 +461,34 @@ def test_existing_category_preferences_are_applied_per_recipient(tmp_path):
     finally:
         worker.close()
         source.close()
+
+
+def test_notification_source_schema_readiness_waits_for_migration_columns(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "trading.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE audit_events (
+            audit_id INTEGER PRIMARY KEY, event_id TEXT, event_type TEXT,
+            schema_version INTEGER, occurred_at_utc TEXT, aggregate_id TEXT,
+            correlation_id TEXT, symbol TEXT, severity TEXT, payload_json TEXT,
+            audience_json TEXT, event_class TEXT
+        );
+        CREATE TABLE control_settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE notification_preferences (
+            role TEXT, category TEXT, enabled INTEGER, updated_at TEXT
+        );
+        CREATE TABLE trading_notifications (notification_id INTEGER PRIMARY KEY, recipient_role TEXT);
+        """
+    )
+    conn.commit()
+    assert not notification_source_schema_ready(db_path)
+    conn.execute("ALTER TABLE audit_events ADD COLUMN aggregate_type TEXT")
+    conn.commit()
+    conn.close()
+    assert notification_source_schema_ready(db_path)
 
 
 def test_owner_b_category_override_takes_precedence_over_owner_fallback(tmp_path):

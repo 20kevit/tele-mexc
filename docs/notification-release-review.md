@@ -2,10 +2,13 @@
 
 ## Verdict
 
-**GO for controlled production rollout. Not deployed yet.** The isolated release
-worktree passed the complete test and static-quality gates. The production
-service, production database, exchange orders, and live Telegram delivery have
-not been changed or tested by this release review.
+**Rollout in progress; main service updated, worker temporarily stopped for a
+startup-order fix.** The release worktree and the follow-up startup-gate patch passed the complete
+test and static-quality gates. Migration 25 is applied in Production. The first
+worker start exposed a migration race; it recovered after migration and
+delivered five real system-notification messages, then was stopped deliberately
+while the startup schema gate was added and tested. No MEXC orders or balances
+were changed.
 
 ## Isolation and source
 
@@ -15,8 +18,11 @@ not been changed or tested by this release review.
 - Release worktree: `/tmp/tele-mexc-notification-release-20261113`.
 - Release worktree was created from the production base; no reset, clean, stash,
   or checkout was run in Production or the source Candidate.
-- Production `tg-ingest.service` remained active with MainPID `196659` and
-  `NRestarts=0`; no production files, database, or orders were changed.
+- Before rollout, Production `tg-ingest.service` was active with MainPID
+  `196659` and `NRestarts=0`. The controlled restart applied migration 25;
+  current main PID is `244919`, still active with `NRestarts=0`.
+- Production source files and unit files were backed up before copying. The
+  pre-deploy SQLite backup passed `PRAGMA integrity_check` at schema version 24.
 - The installed main unit differs from the reviewed unit only by the intended
   soft `Wants=tg-notification-worker.service` pull-in; no drop-ins exist.
 
@@ -58,8 +64,8 @@ not been changed or tested by this release review.
 
 | Gate | Result |
 | --- | --- |
-| Full pytest suite | **869 passed in 141.83s** |
-| Focused notification/policy/control/trading suite | **127 passed in 22.92s** |
+| Full pytest suite after startup-gate fix | **870 passed in 138.17s** |
+| Focused notification/policy/control/service suite | **101 passed in 14.44s** |
 | Ruff | PASS |
 | Mypy | PASS — 51 source files |
 | Compileall / AST | PASS |
@@ -82,9 +88,15 @@ sibling message parts exhausted the shared event/recipient budget.
 - Notification inline callback buttons (expand/source/ack) are not emitted.
   Callback-token storage is single-use and role-bound but remains an optional,
   unwired capability; no interactive-button claim is made.
-- No live Telegram test message or MEXC request was sent. Actual delivery by the
-  new worker remains unverified until the post-deployment worker heartbeat and
-  first real delivery are observed.
+- No synthetic Telegram test message or MEXC request was sent. Actual Telegram
+  delivery was verified by five real system events, each with a recorded
+  `telegram_message_id`; no historical event replay occurred.
+- First worker start briefly raced migration 25 and logged `no such column:
+  aggregate_type`. It recovered after the main migration completed. The worker
+  was then stopped deliberately; `wait_for_notification_source_schema` now
+  waits up to 180 seconds and checks required columns/tables before opening the
+  long-lived connection. A regression test verifies old-schema rejection and
+  readiness after migration.
 
 ## Rollout checklist
 
@@ -104,6 +116,8 @@ sibling message parts exhausted the shared event/recipient budget.
    original unit, daemon-reload, and restart the main service; do not touch
    exchange orders during rollback.
 
-**At the time this review was drafted, the release was not yet committed or
-deployed. The release branch and rollout status are recorded in the final
-release update.**
+The initial release commit is deployed to the production source tree. The
+startup-gate follow-up passed 870 tests and all static gates; it is committed
+and pushed next, then only `main.py` and the updated release documentation/tests
+need copying before starting the worker. The main trading service remains
+active; the worker is intentionally stopped until that copy is complete.

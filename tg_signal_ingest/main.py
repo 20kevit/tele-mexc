@@ -22,7 +22,9 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from .backfill import BackfillError, run_backfill
@@ -1529,6 +1531,58 @@ def cmd_notifications_requeue(args) -> int:
     return 0 if result == "requeued" else 1
 
 
+_NOTIFICATION_SOURCE_REQUIRED_COLUMNS = frozenset(
+    {
+        "audit_id", "event_id", "event_type", "schema_version", "occurred_at_utc",
+        "aggregate_type", "aggregate_id", "correlation_id", "symbol", "severity",
+        "payload_json", "audience_json", "event_class",
+    }
+)
+_NOTIFICATION_SOURCE_REQUIRED_TABLES = frozenset(
+    {"audit_events", "control_settings", "notification_preferences", "trading_notifications"}
+)
+
+
+def notification_source_schema_ready(db_path: Path) -> bool:
+    """Return whether the trading DB has the schema required by the relay.
+
+    The worker can be pulled in immediately after the main systemd process
+    starts, while the main service is still applying migrations. Probe using a
+    short-lived read-only connection so the long-lived dispatcher connection is
+    never opened against a pre-migration schema.
+    """
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if not _NOTIFICATION_SOURCE_REQUIRED_TABLES.issubset(tables):
+                return False
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(audit_events)")}
+            return _NOTIFICATION_SOURCE_REQUIRED_COLUMNS.issubset(columns)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def wait_for_notification_source_schema(
+    db_path: Path, *, timeout_s: float = 180.0, poll_interval_s: float = 1.0
+) -> bool:
+    """Wait for the main service's migration to finish before opening relay DB."""
+
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if notification_source_schema_ready(db_path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0.05, poll_interval_s))
+
+
 def cmd_notifications_worker(args) -> int:
     """Run the independent notification relay/delivery process."""
     cfg = _load_or_exit(require_credentials=False)
@@ -1543,6 +1597,12 @@ def cmd_notifications_worker(args) -> int:
     recipients = {role: int(chat_id) for role, chat_id in recipients.items() if chat_id}
     if not recipients:
         print("at least one notification recipient must be configured", file=sys.stderr)
+        return 2
+    if not wait_for_notification_source_schema(cfg.db_path):
+        print(
+            f"trading DB notification schema did not become ready within 180s: {cfg.db_path}",
+            file=sys.stderr,
+        )
         return 2
     from .notification_dispatcher import NotificationDispatcher
 

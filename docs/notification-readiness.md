@@ -148,29 +148,37 @@ legacy compatibility outbox.
 
 | Command | Result |
 | --- | --- |
-| `.venv/bin/pytest -q` | 869 passed (141.83s) |
-| focused notification/policy/control/trading suite | 127 passed (22.92s) |
+| `.venv/bin/pytest -q` | 870 passed (138.17s) |
+| focused notification/policy/control/trading suite | 101 passed (14.44s) |
 | `.venv/bin/ruff check .` | pass |
 | `.venv/bin/mypy tg_signal_ingest` | pass (51 files) |
 | `.venv/bin/python -m compileall -q tg_signal_ingest tests` | pass |
 | `git diff --check` | pass |
 | `systemd-analyze verify deploy/tg-ingest.service deploy/tg-notification-worker.service` | pass (static only) |
 
-No test or command performed a live Telegram/MEXC request, created a user
-session, ran a production migration, or started/stopped a production service.
-Owner A targeted verification was not performed and no test message was sent,
-so actual delivery by the new worker remains UNKNOWN until post-deploy
-verification. The existing ControlBot configuration was not changed.
+No MEXC order/balance API or test-message send was performed. The controlled
+rollout did restart the production `tg-ingest.service` once at 15:05:50 UTC;
+migration 25 completed and the main service returned active with PID 244919
+and `NRestarts=0`. The worker initially raced the migration and logged a
+transient `aggregate_type` schema error; after migration it recovered and
+successfully delivered five real system-notification messages (all recorded
+with Telegram message IDs). No historical events or legacy notifications were
+replayed. The worker was then stopped deliberately while a startup schema gate
+was added. The main trading service remains active; no MEXC orders or balances
+were changed. The existing ControlBot configuration was not changed.
 
 ## Residual gaps / release prerequisites
 
 - **Runtime systemd dependency behavior was verified in an isolated harness on 2026-11-13.** Temporary test units proved: (1) worker crash triggers worker restart while the main service remains active; (2) worker start-limit exhaustion leaves the main service active; (3) stopping the main service stops the worker. All temporary units were removed and `tg-ingest.service` remained active with unchanged PID `196659` and `NRestarts=0`. This validates systemd dependency behavior, not real Telegram delivery or the production rollout itself.
-- The worker must be started after migration 25 is applied and the trading DB
-  exists. The dispatcher itself never migrates the trading DB.
-- Production rollout still requires an online SQLite backup, copying only the
-  reviewed release files, installing the worker unit, daemon-reload, and one
-  controlled restart of `tg-ingest.service`. Verify both units and the worker
-  heartbeat immediately afterward.
+- The worker waits up to 180 seconds for the required `audit_events` domain
+  columns and source tables before opening its long-lived read-only connection.
+  This prevents the systemd `After=` ordering from racing the main service's
+  migration. The dispatcher itself never migrates the trading DB.
+- The online SQLite backup and reviewed source/unit copy are complete. Migration
+  25 is applied in Production. The main service is active; the worker is
+  intentionally stopped pending deployment of the startup schema gate. Copy the
+  follow-up `main.py`, start the worker, and verify fresh heartbeat/no new schema
+  errors before declaring the notification path fully operational.
 - Deploy the worker unit with the real deployment path/user; the candidate unit
   uses the same `/opt/projects/akha1` paths as `tg-ingest.service`.
 - Notification callback buttons (`expand`/`source`/`ack`) are not emitted by the
