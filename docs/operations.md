@@ -18,9 +18,11 @@ Commands assume `/opt/projects/akha1` and the project virtualenv.
   a missing offset resolves to 3, never direct entry.
 - `/pause` is enforced at the exchange-submission boundary; `/resume` rechecks
   readiness and cannot bypass emergency stop or reconciliation blockers.
-- Both owners receive every operational event. The legacy minimum-severity
-  setting is retained for compatibility but never suppresses the owners' stream.
-  The programmer receives the same event stream plus technical diagnostics.
+- Trading producers append local events; the independent notification worker
+  delivers them. CRITICAL and owner-safety alerts always reach both owners;
+  INFO+ follows per-recipient category/minimum preferences; DEBUG diagnostics
+  are programmer-only. Suppressed events remain in delivery history. See
+  `docs/notification-readiness.md`.
 - Balance checks verify sufficiency for the exact order; no percentage of the
   account is reserved.
 - The service opens no inbound ports and exposes no HTTP API.
@@ -228,17 +230,20 @@ in a tight loop.
 
 When `CONTROL_BOT_ENABLED` is true and the bot is fully configured,
 `tg-ingest serve` starts the ControlBot inside the service process and holds
-both `<db>.serve.lock` and `<db>.control.lock`. If control is disabled,
-`serve` still uses the Bot API client only for durable trading notifications.
+both `<db>.serve.lock` and `<db>.control.lock`. `serve` never sends trading
+notifications and never flushes an outbox. Telegram delivery runs in the
+independent `tg-ingest notifications worker` process (unit
+`tg-notification-worker.service`), which follows `tg-ingest.service` through
+`BindsTo`/`PartOf`; a worker failure never stops or stalls trading.
 
 `control run` starts the same controller without ingestion, backfill, queue,
 trading, or market-monitor workers and takes only `<db>.control.lock`. Never run
 it against a database already served by `serve`. Authorization covers Owner A
 (`CONTROL_OWNER_USER_ID`) and Owner B (`CONTROL_OWNER_B_USER_ID`) with full
 owner-level access. The programmer (`CONTROL_DEVELOPER_USER_ID`) is not an
-owner: it receives every operational event and technical diagnostics but can
-only use read-only diagnostic commands (`/status`, `/version`, `/help`). Owner
-guide: `docs/CONTROL_BOT_FA.md`.
+owner: it receives the durable event stream plus DEBUG technical diagnostics
+under its own preferences but can only use read-only diagnostic commands
+(`/status`, `/version`, `/help`). Owner guide: `docs/CONTROL_BOT_FA.md`.
 
 ### Telegram session revoked
 
@@ -267,13 +272,25 @@ Repeat after network recovery. Do not cancel or resubmit based only on a local
 guess; inspect the exchange order id/status.
 
 ```bash
-.venv/bin/tg-ingest trading notifications       # pending/failed outbox rows
-.venv/bin/tg-ingest trading notifications --status ambiguous --limit 50
+.venv/bin/tg-ingest trading notifications       # legacy compatibility outbox rows
+.venv/bin/tg-ingest notifications status        # queue depth, heartbeat, dead-letter, oldest age
+.venv/bin/tg-ingest notifications list --status ambiguous --limit 50
+.venv/bin/tg-ingest notifications requeue <delivery_id>
 ```
 
-The notification outbox is independent of order state; reviewing it never
-re-submits an order. Ambiguous deliveries (process ended mid-delivery) are
-recovered once on startup and never retried automatically.
+The delivery ledger (`data/notification-delivery.sqlite3`) is independent of
+order state; inspecting it never re-submits an order. Ambiguous deliveries are
+never retried automatically; `requeue` is an explicit operator action for one
+`ambiguous`/`dead_letter` row and grants exactly one additional attempt. A
+missing heartbeat means the worker never ran; a heartbeat older than 60 seconds
+means it is dead or hung.
+
+Run the worker manually only for isolated testing:
+
+```bash
+.venv/bin/tg-ingest notifications worker --once
+.venv/bin/tg-ingest notifications worker
+```
 
 ### Terminal-intent / signal consistency repair
 

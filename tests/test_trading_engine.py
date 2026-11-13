@@ -966,8 +966,16 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
     assert signal is not None and "SHORT/SELL" in signal["rejection_reason"]
     rendered = "\n".join(record.getMessage() for record in caplog.records)
     assert "signal_stage" in rendered and "stage=parse" in rendered
-    assert "stage=notification_enqueue" in rendered
     assert "signal_lock scope=process_item" in rendered
+    # The rejection is recorded as a durable domain event (no legacy outbox
+    # duplicate), so the canonical signal.rejected fact is present.
+    events = [
+        row["event_type"]
+        for row in engine.store.db.conn.execute(
+            "SELECT event_type FROM audit_events WHERE event_class='domain' ORDER BY audit_id"
+        ).fetchall()
+    ]
+    assert events == ["signal.received", "signal.rejected"]
 
 
 def test_balance_api_failure_rejects_without_submitting(cfg, repo):

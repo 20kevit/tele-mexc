@@ -321,18 +321,26 @@ class TradingEngine:
         version = int(record.get("processing_version") or 0)
         with self._measure_signal_stage(item, "parse"):
             parsed = self.parser.parse(text, is_edit=item.item_type == "edit" or version > 0)
+        # Determine the startup/backfill boundary before creating the domain
+        # event: historical messages must remain silent even when the new
+        # notification dispatcher is running.
+        historical = self._is_historical(item, record)
         signal_id, inserted = self.store.record_signal(
             parsed,
             channel_id=item.channel_id,
             message_id=item.message_id,
             edit_version=version,
+            # Only candidate trade signals produce the INFO "signal received"
+            # event.  Ambiguous input becomes a WARNING rejection (never a
+            # misleading INFO receipt), and chatter/cancel/result messages stay
+            # on the legacy diagnostic path.
+            emit_event=(not historical and parsed.kind in ("alert", "update")),
         )
 
         # Historical backfill and any message at/below the startup boundary
         # are stored and audited but are completely silent and non-tradeable.
         # This check runs before every notification/order path so a downtime
         # backlog can never flood recipients or become fresh orders.
-        historical = self._is_historical(item, record)
         if historical:
             if parsed.kind in ("alert", "update", "ambiguous", "cancel"):
                 boundary = self.store.activation_boundary(item.channel_id)
@@ -350,7 +358,7 @@ class TradingEngine:
                         f"message is at or below the activation boundary {boundary}; "
                         "cannot be distinguished from historical replay"
                     )
-                self.store.update_signal(signal_id, "rejected", reason)
+                self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
                 self.store.audit(signal_id, "lifecycle", "rejected_replay", reason)
             else:
                 self.store.audit(signal_id, "parse", parsed.kind, parsed.reason_text)
@@ -369,13 +377,13 @@ class TradingEngine:
                 self.store.update_signal(signal_id, "parsed", "cancel signal")
                 if record.get("source") == "backfill":
                     reason = "historical cancel imported by backfill; not applied to live orders"
-                    self.store.update_signal(signal_id, "rejected", reason)
+                    self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
                     self.store.audit(signal_id, "lifecycle", "cancel_ignored_backfill", reason)
                     return None
                 self._handle_cancel(parsed, signal_id, item.channel_id, item.message_id)
                 return None
             reason = "; ".join(parsed.reasons) or "not an actionable trading signal"
-            self.store.update_signal(signal_id, "rejected", reason)
+            self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
             self.store.audit(signal_id, "parse", "not_a_signal", reason)
             return None
 
@@ -386,7 +394,6 @@ class TradingEngine:
             reason = "; ".join(parsed.reasons) or "ambiguous signal"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "parse", "rejected_ambiguous", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
         # Historical/backfill traffic and anything at or below the one-time
@@ -411,15 +418,12 @@ class TradingEngine:
         if replay_reason is not None:
             self.store.update_signal(signal_id, "rejected", replay_reason)
             self.store.audit(signal_id, "lifecycle", "rejected_replay", replay_reason)
-            if not self._is_historical(item, record):
-                self._notify_rejected(signal_id, parsed, replay_reason, record=record)
             return None
 
         if self.store.has_later_cancel(item.channel_id, parsed.symbol, item.message_id):
             reason = "a later cancel signal for this symbol was already processed"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "lifecycle", "rejected_after_cancel", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
         deadline = self._signal_deadline(record)
@@ -430,7 +434,6 @@ class TradingEngine:
             )
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "lifecycle", "rejected_expired", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
         idempotency_key = self.idempotency_key(item.channel_id, item.message_id, parsed)
@@ -458,7 +461,6 @@ class TradingEngine:
             reason = "SHORT/SELL signals are not executed; this bot is Spot BUY only"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "risk", "rejected", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
         with self._measure_signal_stage(item, "reference_price"):
@@ -469,7 +471,6 @@ class TradingEngine:
             reason = "symbol metadata unavailable; refusing to trade without exchange constraints"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "validate", "rejected", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
         with self._measure_signal_stage(item, "risk_evaluation"):
             decision = self.risk.evaluate(
@@ -483,7 +484,6 @@ class TradingEngine:
         if not decision.approved:
             self.store.update_signal(signal_id, "rejected", decision.reason)
             self.store.audit(signal_id, "risk", "rejected", decision.reason)
-            self._notify_rejected(signal_id, parsed, decision.reason, record=record)
             return None
 
         # There is no permanent per-symbol trade-history admission lock.  A new
@@ -496,7 +496,6 @@ class TradingEngine:
             reason = "quantized order violates symbol constraints"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "validate", "rejected", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
         decision = quantized
 
@@ -527,7 +526,6 @@ class TradingEngine:
             reason = f"intent admission failed safely: {exc}"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             try:
                 if self.notifier:
                     self.notifier.notify_trade(None, "SYMBOL_CHECK_FAILED", reason)
@@ -538,7 +536,6 @@ class TradingEngine:
             reason = str(exc)
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "risk", "reservation_rejected", reason)
-            self._notify_rejected(signal_id, parsed, reason, record=record)
             return None
 
         if not inserted:
@@ -1058,41 +1055,6 @@ class TradingEngine:
             event_type="signal.not_a_signal",
         )
 
-    def _notify_rejected(
-        self,
-        signal_id: str,
-        parsed: ParsedSignal,
-        reason: str,
-        *,
-        record: dict[str, Any] | None = None,
-    ) -> None:
-        """Report a genuine signal rejected locally, to owner and developer."""
-
-        if parsed.action == "sell":
-            status = "IGNORED_SELL_SPOT_BUY_ONLY"
-            headline = "سیگنال فروش نادیده گرفته می‌شود❌ — این ربات فقط Spot BUY است"
-            detail = (
-                "intentionally ignored: this bot executes Spot BUY only; no exchange order was submitted. " + reason
-            )
-        else:
-            status = "REJECTED_LOCALLY"
-            headline = "🚫 سیگنال رد شد — سفارشی ارسال نشد"
-            detail = f"no exchange order was submitted. {reason}"
-        self._notify_decision(
-            event_key=f"{signal_id}:decision:{status}",
-            status=status,
-            symbol=parsed.symbol,
-            direction=parsed.action,
-            reason=f"{headline} | {detail}",
-            classification=parsed.kind,
-            record=record,
-            signal_id=signal_id,
-            diagnostics=parsed.reason_text or None,
-            roles=NOTIFY_ALL,
-            category="signal_decision",
-            event_type="signal.rejected_locally",
-        )
-
     def _notify_intent_decision(
         self,
         intent: dict[str, Any],
@@ -1269,11 +1231,6 @@ class TradingEngine:
         self.store.audit(intent["intent_id"], "risk", "pre_submit_revalidation_rejected", reason)
         result = self.store.get_intent(intent["intent_id"])
         assert result is not None
-        self._notify_intent_decision(
-            result,
-            status="REJECTED_LOCALLY",
-            reason=f"pre-submit revalidation failed: {reason}",
-        )
         return result
 
     def _execute_intent(self, intent_id: str) -> dict[str, Any]:
@@ -1318,7 +1275,6 @@ class TradingEngine:
             self.store.audit(intent_id, "risk", "rejected_expired", reason)
             result = self.store.get_intent(intent_id)
             assert result is not None
-            self._notify_intent_decision(result, status="REJECTED_LOCALLY", reason=reason)
             return result
         # Pause/readiness are checked inside the same transaction that flips
         # planned -> submitting, while the shared gate prevents pause from
@@ -1555,11 +1511,6 @@ class TradingEngine:
             self.store.audit(intent_id, "risk", "balance_preflight_rejected", balance_reason)
             result = self.store.get_intent(intent_id)
             assert result is not None
-            self._notify_intent_decision(
-                result,
-                status="REJECTED_LOCALLY",
-                reason=f"balance preflight rejected the order: {balance_reason}",
-            )
             return result
 
         # Cross-trade entry restriction: the exchange must confirm there is no
@@ -1697,17 +1648,9 @@ class TradingEngine:
 
         result = self.store.get_intent(intent_id)
         assert result is not None
-        status = self._order_status_label(result)
-        self._notify(
-            event_key=f"{intent_id}:result:{status}",
-            signal_id=intent.get("signal_id"),
-            intent_id=intent_id,
-            text=self._intent_text(
-                result,
-                self._headline_for_status(status),
-                submission_attempted=True,
-            ),
-        )
+        # The intent.state_changed event was written atomically with the
+        # exchange-state transition and is rendered by the independent worker.
+        # Avoid enqueueing a second formatted summary for the same transition.
         return result
 
     def _account_for_preflight(self, client: Any, intent: dict[str, Any] | None = None) -> Any:
@@ -2223,18 +2166,6 @@ class TradingEngine:
             )
             result = self.store.get_intent(intent_id)
             assert result is not None
-            if notify and result["state"] != intent["state"]:
-                status = self._order_status_label(result)
-                self._notify(
-                    event_key=f"{intent_id}:reconcile:{result['state']}:NOT_FOUND",
-                    signal_id=intent.get("signal_id"),
-                    intent_id=intent_id,
-                    text=self._intent_text(
-                        result,
-                        self._headline_for_status(status),
-                        submission_attempted=True,
-                    ),
-                )
             return result
         except MexcTimestampError as exc:
             outcome = "ambiguous"
@@ -2254,18 +2185,6 @@ class TradingEngine:
             )
             result = self.store.get_intent(intent_id)
             assert result is not None
-            if notify and result["state"] != intent["state"]:
-                status = self._order_status_label(result)
-                self._notify(
-                    event_key=f"{intent_id}:reconcile:{result['state']}:TIMESTAMP_DRIFT",
-                    signal_id=intent.get("signal_id"),
-                    intent_id=intent_id,
-                    text=self._intent_text(
-                        result,
-                        self._headline_for_status(status) + " — clock drift detected; reconcile after NTP sync",
-                        submission_attempted=True,
-                    ),
-                )
             return result
         except (MexcNetworkError, MexcUnexpectedResponse, MexcServerError) as exc:
             self.store.record_reconciliation(
@@ -2278,19 +2197,6 @@ class TradingEngine:
             )
             result = self.store.get_intent(intent_id)
             assert result is not None
-            if notify:
-                status = self._order_status_label(result)
-                self._notify(
-                    event_key=f"{intent_id}:reconcile:{result['state']}:QUERY_AMBIGUOUS",
-                    signal_id=intent.get("signal_id"),
-                    intent_id=intent_id,
-                    text=self._intent_text(
-                        result,
-                        self._headline_for_status(status) + " — reconciliation query failed; status may change",
-                        submission_attempted=True,
-                        status_label=("ACCEPTED_OPEN_RECONCILIATION_PENDING" if status == "ACCEPTED_OPEN" else status),
-                    ),
-                )
             return result
 
         exchange_status = str(raw.get("status") or "UNKNOWN").upper()
@@ -2348,20 +2254,6 @@ class TradingEngine:
         )
         result = self.store.get_intent(intent_id)
         assert result is not None
-        if notify and result["state"] != local_state:
-            fills = self.store.fills_for_order(str(order_id)) if order_id else []
-            status = self._order_status_label(result)
-            self._notify(
-                event_key=(f"{intent_id}:reconcile:{result['state']}:{exchange_status}:{len(fills)}"),
-                signal_id=intent.get("signal_id"),
-                intent_id=intent_id,
-                text=self._intent_text(
-                    result,
-                    self._headline_for_status(status) + f" — reconciled (local {local_state} -> {result['state']}, "
-                    f"exchange {exchange_status}, outcome={outcome})",
-                    submission_attempted=True,
-                ),
-            )
         return result
 
     def _resync_terminal_fills(self, intent: dict[str, Any], intent_id: str, *, notify: bool = True) -> dict[str, Any]:
@@ -2395,19 +2287,9 @@ class TradingEngine:
         )
         result = self.store.get_intent(intent_id)
         assert result is not None
-        if notify and fills_ok:
-            status = self._order_status_label(result)
-            fills = self.store.fills_for_order(str(order_id))
-            self._notify(
-                event_key=f"{intent_id}:fills:{result['state']}:{len(fills)}",
-                signal_id=intent.get("signal_id"),
-                intent_id=intent_id,
-                text=self._intent_text(
-                    result,
-                    self._headline_for_status(status) + " — fill history recovered",
-                    submission_attempted=True,
-                ),
-            )
+        # Fill rows and the meaningful reconciliation outcome are already
+        # durable domain events. Repeating a successful terminal fill scan
+        # must not enqueue a second formatted notification.
         return result
 
     @staticmethod

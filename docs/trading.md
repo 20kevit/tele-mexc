@@ -539,8 +539,11 @@ the same transaction as the state change it describes. Rows carry
 bounded, redacted `detail`. `secrets_redacted` is always set; the redaction
 layer masks bot tokens, bearer credentials, API keys, secrets, and long blobs.
 
-- `INSERT OR IGNORE` plus a `dedupe_key` makes each audit event idempotent
-  across retries and restarts; repeating the same event never duplicates a row.
+- Legacy audit rows use `INSERT OR IGNORE` plus `dedupe_key` for compatibility.
+  Domain rows (`event_class='domain'`) use the exact `event_id` as their sole
+  idempotency key, carry `aggregate_type`/`aggregate_id`/`audience_json`, and
+  are protected by UPDATE/DELETE triggers. Reusing an event id with a different
+  immutable envelope is rejected; distinct events are never content-collapsed.
 - `event` keeps the legacy human-readable name; `event_type` is the stable
   machine key (`mexc_request.place_order`, `trade.closed`, `reconcile.outcome`,
   `oco.sibling_canceled`, …).
@@ -661,7 +664,9 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - Every OCO transition writes an audit event (`oco.intended`, `oco.state`,
   `oco.sibling_canceled`) and a notification (`OCO_PROTECTION_ACTIVE`,
   `OCO_PROTECTION_PARTIAL`, `OCO_PROTECTION_UNCERTAIN`, `OCO_PROTECTION_FAILED`)
-  routed to both owners and the programmer; severity never suppresses them.
+  rendered from domain events. Protection-active INFO follows recipient
+  preferences; UNKNOWN/unprotected states are WARNING/CRITICAL safety alerts
+  that always reach both owners.
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
 - Each OCO order is tracked as its own target (`tp1`, `tp2`) with its own
@@ -695,7 +700,8 @@ protected:
 - The execution engine must offer a working OCO submission path.
 
 Any failure rejects the intent locally (`rejected`, category `risk`) with zero
-exchange calls and a notification to both owners + the programmer.
+exchange calls and a WARNING notification rendered from the domain event; both
+owners see genuine rejections.
 
 After an entry fills, `TradeManager._place_oco_exits()` places two native OCO
 SELL orders (TP1 + stop-loss, TP2 + stop-loss) against the actual acquired base
@@ -724,8 +730,9 @@ and enabling the block never cancels or modifies an order.
 A blocked entry stays `planned` (like the pause gate) and expires with the
 signal validity window instead of being submitted later at a stale price.
 
-`BUY_BLOCK_ACTIVE_<reason-hash>` / `BUY_BLOCK_CLEARED` notifications are sent on state
-changes; audit events are written as `trading.buy_block`.
+`BUY_BLOCK_ACTIVE_<reason-hash>` / `BUY_BLOCK_CLEARED` state changes produce
+durable events; the dispatcher renders and routes them under the normal
+recipient policy (`trading.buy_block` remains the audit marker).
 
 ### Remaining limitations
 
@@ -759,25 +766,33 @@ changes; audit events are written as `trading.buy_block`.
 
 ## Notifications
 
-Owner-level notices are written to `trading_notifications` before delivery
-and retried independently of order execution. The current schema (migration 21)
-stores one durable row per `(event_key, role)` with roles `owner`, `owner_b`, and
-`developer`; long text is split into chunks. A notification failure can never
-resubmit an order.
+Trading producers never send Telegram messages. They append a bounded local
+domain event (or, on legacy paths, a `trading_notifications` row) and continue.
+The independent `tg-ingest notifications worker` reads the trading database
+read-only, relays events into `data/notification-delivery.sqlite3`, and performs
+all Bot API I/O there. A notification delay or failure can therefore never block,
+retry, or resubmit an order.
 
-Recipient routing is deliberately simple:
+The authoritative severity/routing/delivery policy and the F-01…F-20 audit
+matrix are in [notification-readiness.md](notification-readiness.md). Summary:
 
 | Recipient | Receives |
 | --- | --- |
-| Owner A (`CONTROL_OWNER_USER_ID`) | Every operational event, including parser results, ignored/rejected signals, diagnostics, service lifecycle, and all trading/OCO/cancellation/reconciliation events |
-| Owner B (`CONTROL_OWNER_B_USER_ID`) | The same complete owner event stream |
-| Programmer (`CONTROL_DEVELOPER_USER_ID`) | The same event stream plus technical diagnostics; read-only control-bot access only |
+| Owner A (`CONTROL_OWNER_USER_ID`) | INFO and above, plus all owner-safety WARNING/ERROR/CRITICAL events; never DEBUG |
+| Owner B (`CONTROL_OWNER_B_USER_ID`) | Same owner policy with independent preferences and minimum severity |
+| Programmer (`CONTROL_DEVELOPER_USER_ID`) | The same event stream plus DEBUG diagnostics; read-only control access |
 
-The legacy `notification_min_severity` setting is retained for compatibility but
-**never suppresses owner-level events**. A signal being routine, a rejection
-being local, or an event being DEBUG does not remove it from either owner's
-stream. Distinct event identities are never collapsed; retries use the stable
-event key and role so the same event is not duplicated.
+- CRITICAL always reaches every configured recipient regardless of category or
+  minimum severity.
+- Genuine rejected/ambiguous signals are WARNING and owner-visible.
+- DEBUG (chatter, not-a-signal, parser diagnostics) is programmer-only.
+- Suppressed events remain in history with their rendered text and reason.
+- Only the exact `event_id` is idempotent; distinct lifecycle events are never
+  collapsed.
+- Per-recipient attempt budget is 10 including the initial attempt. Ambiguous
+  outcomes are never retried automatically; permanent 4xx is dead-letter.
+- The first lifecycle message per recipient/thread is the root; later lifecycle
+  messages reply to that recipient's own root. CRITICAL is standalone.
 
 The programmer is not a third owner: it cannot pause/resume, change the quote
 amount, change MEXC credentials, select a channel, or alter notification
@@ -785,29 +800,23 @@ settings. It can read status/version/help and inspect diagnostics.
 
 ### Delivery outcomes and ambiguous recovery
 
-- `sent` — Telegram accepted the message.
-- `retry` — transient failure or Telegram `retry_after`; scheduled again after
-  the wait (capped at 24h).
-- `failed` — definitive rejection; not retried automatically.
-- `ambiguous` — the process ended mid-delivery or acceptance could not be
-  confirmed; recovered once on startup to `ambiguous` and **never** retried
-  automatically.
-- `suppressed` — the chat is blocked/deactivated; not retried.
-
-Delivery attempts are recorded in `notification_delivery_attempts` with
-outcome, error, telegram message id, retry-after, and an `ambiguous` flag.
+- `sent` — Telegram definitively accepted the message (message id persisted).
+- `retry` — definitely-not-sent failure or Telegram 429; scheduled with full
+  jitter (five-minute maximum), never slept inline.
+- `dead_letter` — permanent rejection or exhausted budget; explicit operator
+  requeue only.
+- `ambiguous` — acceptance could not be confirmed (timeout/5xx/crash after
+  possible transmission); never retried automatically.
+- `suppressed` — category/severity policy or blocked/deactivated chat.
 
 ### Control-bot integration
 
-The control bot polls `getUpdates`, routes Persian callback data, and on each
-`tick` recovers ambiguous notifications older than 120s and flushes the trading
-outbox. Notification callbacks (`expand`, `signal_source`, `ack`) are issued as
-single-use, time-limited tokens in `notification_callbacks` and are consumed
-once per role.
-
-If `CONTROL_BOT_TOKEN` is set, `serve` sends notices to the configured
-owner/programmer ids; otherwise they stay pending in the outbox. The notifier
-tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
+The control bot polls `getUpdates`, routes Persian callback data, and only
+acknowledges/handles inbound commands. Its tick performs no notification
+recovery or flush. Callback handlers are read-only diagnostic/control actions,
+bound to the operator's private chat and authorized owner ids; the programmer is
+restricted to read-only callbacks. Notification callback tokens, where used, are
+opaque, role-bound, expiring, and atomically single-use.
 
 ## Inspect and operate
 
@@ -822,9 +831,16 @@ tolerates bots that accept only `(chat_id, text)` (no `reply_markup`).
 .venv/bin/tg-ingest trading parse <message_id>
 .venv/bin/tg-ingest trading reconcile
 .venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
+.venv/bin/tg-ingest notifications status
+.venv/bin/tg-ingest notifications list --status dead_letter --limit 50
+.venv/bin/tg-ingest notifications requeue <delivery_id>
 .venv/bin/tg-ingest trading readiness --network
 .venv/bin/tg-ingest trading verify
 ```
+
+`notifications status/list/requeue` inspect or requeue the independent delivery
+ledger; they never touch trading state or the exchange. `requeue` is an explicit
+operator action and grants exactly one additional attempt.
 
 `verify` and `reconcile` touch MEXC. Never run them without explicit
 authorization. `readiness` is non-trading: it reads local state and, with
@@ -876,7 +892,7 @@ balances. It never places, cancels or modifies an order.
    open-order cleanup is recorded.
 8. Start `serve`; confirm the per-channel activation boundary advanced and the
    service log reports it for the selected channel.
-9. Monitor `trading status`, `trading intents`, and the notification outbox.
+9. Monitor `trading status`, `trading intents`, and `notifications status`.
 
 ### OCO certainty follow-up review
 

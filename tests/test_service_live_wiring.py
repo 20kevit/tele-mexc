@@ -7,7 +7,7 @@ no Telegram or MEXC calls and assert the ordering that matters operationally:
 * symbols are subscribed from non-terminal trades;
 * ticks reach ``TradeManager.on_tick`` on the worker thread;
 * startup recovery runs before the first reconciliation sweep;
-* reconciliation and notification flushing happen on every interval.
+* reconciliation remains in the service; notification delivery is independent.
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ async def test_reconciliation_worker_recovers_before_sweeping(cfg, repo):
     assert tm.recovered == 1
     assert trading.reconciled_pending == 1
     assert tm.reconciled == 1
-    assert trading.notifier.flushed == 1
+    assert trading.notifier.flushed == 0
 
 
 async def test_live_mode_schedules_monitor_and_reconciliation(cfg, repo):

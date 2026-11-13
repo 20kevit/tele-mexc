@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 from telethon.errors import FloodWaitError
 
 from tests.conftest import FakeMsg
 from tg_signal_ingest.backfill import BackfillReport
+from tg_signal_ingest.control.service import ControlBot
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.service import IngestService
 
@@ -287,35 +289,74 @@ async def test_recovery_sweep_honors_full_flood_wait(cfg, selected_repo):
     assert waits and waits[0] >= 321
 
 
-def test_service_notifications_are_delivered_once_per_recipient(cfg, selected_repo):
-    """Service lifecycle events are delivered via the existing notifier and
-    deduplicated by (event_key, role) so restarts/retries never duplicate them.
+def test_service_notifications_are_distinct_domain_events(cfg, selected_repo):
+    """Every recorded service occurrence gets a fresh event identity.
+
+    Only an identical ``event_id`` is idempotent; content-based collapsing of
+    two distinct occurrences is deliberately not performed.
     """
-
-    from tg_signal_ingest.trading.notify import TradingNotifier
-
     svc = IngestService(cfg, selected_repo, client=FakeClient(), trading_engine=FakeTrading(selected_repo, cfg))
-
-    class FakeBot:
-        def __init__(self) -> None:
-            self.sent: list[tuple[int, str]] = []
-
-        def send_message(self, chat_id: int, text: str, reply_markup=None) -> dict:
-            self.sent.append((int(chat_id), str(text)))
-            return {"message_id": len(self.sent)}
-
-    bot = FakeBot()
-    svc.trading.notifier = TradingNotifier(svc.trading.store, bot, owner_id=1, developer_id=2)
-
-    # Every service event goes to both owners/programmer and is deduplicated
-    # by event key, not hidden by category or severity.
     svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
     svc._notify_service_event(event_key="svc:start", text="serve started", category="critical")
 
-    assert len(bot.sent) == 2  # one per recipient, not four
-    assert {chat for chat, _ in bot.sent} == {1, 2}
-    assert all("serve started" in text for _, text in bot.sent)
+    rows = svc.trading.store.db.conn.execute(
+        "SELECT event_id, event_type, severity, payload_json FROM audit_events WHERE event_class='domain'"
+    ).fetchall()
+    events = [row for row in rows if row["event_type"] == "system.service_event"]
+    assert len(events) == 2
+    assert len({row["event_id"] for row in events}) == 2
+    assert all(row["severity"] == "INFO" for row in events)
+    assert all('"event_key":"svc:start"' in row["payload_json"] for row in events)
 
-    svc._notify_service_event(event_key="svc:recovery", text="recovery done", category="recovery")
-    assert len(bot.sent) == 4
-    assert {chat for chat, _ in bot.sent} == {1, 2}
+
+def test_notification_role_distinguishes_owner_a_owner_b_and_developer():
+    service = object.__new__(ControlBot)
+    service.cfg = SimpleNamespace(
+        control=SimpleNamespace(
+            owner_user_id=101,
+            owner_b_user_id=202,
+            developer_user_id=303,
+        )
+    )
+    assert service._notification_role(101) == "owner"
+    assert service._notification_role(202) == "owner_b"
+    assert service._notification_role(303) == "developer"
+    assert service._notification_role(404) is None
+
+
+def test_notification_settings_are_per_recipient_and_owner_a_can_manage_others():
+    service = object.__new__(ControlBot)
+    service.cfg = SimpleNamespace(
+        control=SimpleNamespace(
+            owner_user_id=101,
+            owner_b_user_id=202,
+            developer_user_id=303,
+        )
+    )
+
+    class Store:
+        NOTIFICATION_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+        def __init__(self):
+            self.calls = []
+
+        def set_notification_min_severity(self, level, role=None):
+            self.calls.append((level, role))
+
+    store = Store()
+    sent = []
+
+    async def fake_send(*args, **kwargs):
+        sent.append(args)
+
+    service.store = store
+    service._send = fake_send
+    asyncio.run(service._notification_action(101, ["n", "set", "owner_b", "WARNING"]))
+    assert store.calls == [("WARNING", "owner_b")]
+
+    asyncio.run(service._notification_action(202, ["n", "set", "owner", "CRITICAL"]))
+    assert store.calls == [("WARNING", "owner_b")]
+    assert any("فقط مالک A" in str(args[1]) for args in sent)
+
+    asyncio.run(service._notification_action(202, ["n", "set", "owner_b", "ERROR"]))
+    assert store.calls[-1] == ("ERROR", "owner_b")

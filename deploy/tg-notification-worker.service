@@ -1,0 +1,33 @@
+[Unit]
+Description=Tele-MEXC independent Telegram notification dispatcher
+# The dependency is strictly one-directional: this worker follows tg-ingest,
+# but tg-ingest never depends on this worker. A Telegram/worker failure can
+# therefore never stop, stall, or restart trading. BindsTo stops the worker
+# when tg-ingest stops or fails; PartOf propagates stop/restart; After only
+# orders startup (the worker waits for tg-ingest, not the reverse).
+BindsTo=tg-ingest.service
+PartOf=tg-ingest.service
+After=network-online.target tg-ingest.service
+Wants=network-online.target
+# Failure detection: after too many crashes in a window the unit is marked
+# failed instead of restarting forever. The operator can detect this through
+# the stale heartbeat in ``tg-ingest notifications status``.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/projects/akha1
+ExecStart=/opt/projects/akha1/.venv/bin/tg-ingest notifications worker
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectHome=no
+Environment=PYTHONUNBUFFERED=1
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy TELEGRAM_PROXY_TYPE TELEGRAM_PROXY_HOST TELEGRAM_PROXY_PORT TELEGRAM_PROXY_USERNAME TELEGRAM_PROXY_PASSWORD
+
+[Install]
+WantedBy=multi-user.target

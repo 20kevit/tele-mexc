@@ -38,9 +38,31 @@ from .processing import ProcessingEngine
 from .repository import Repository
 from .telethon import AuthRequired, build_client, connect_and_verify
 from .trading import TradingEngine, build_trading_engine
+from .trading.domain_events import DomainEventConflict, build_domain_event
 from .utils import marked_channel_id
 
 log = logging.getLogger("ingest.service")
+
+
+def _service_event_severity(event_key: str) -> str:
+    """Map service lifecycle keys onto the approved five-level policy.
+
+    Ordinary start/stop/recovery notices are INFO.  A fail-closed condition
+    that stops or blocks new entries is CRITICAL; other failures are ERROR.
+    """
+
+    key = str(event_key).lower()
+    critical_tokens = (
+        "activation_boundary",
+        "market_monitor_start_failed",
+        "emergency",
+        "unprotected",
+    )
+    if any(token in key for token in critical_tokens):
+        return "CRITICAL"
+    if any(token in key for token in ("error", "unavailable", "failed")):
+        return "ERROR"
+    return "INFO"
 
 
 class ChannelNotAccessible(Exception):
@@ -108,23 +130,32 @@ class IngestService:
         text: str,
         category: str = "critical",
     ) -> None:
-        """Best-effort service-lifecycle notification via the trading notifier.
+        """Persist one service-lifecycle domain event and return.
 
-        Reuses the existing durable outbox: events are persisted before delivery,
-        keyed by ``(event_key, role)`` so restarts and retries cannot duplicate
-        them.  No secrets, session data, or signal text are included.
+        No Telegram I/O, flush, or retry happens here: the independent worker
+        renders and delivers the event.  Each occurrence gets a fresh event id,
+        so distinct restarts/errors are never content-collapsed.  No secrets,
+        session data, or signal text are included.
         """
 
-        notifier = getattr(self.trading, "notifier", None)
-        if notifier is None:
+        store = getattr(self.trading, "store", None)
+        if store is None:
             return
         try:
-            # Every service, recovery, and readiness event reaches both owners
-            # and the programmer.  Category/severity never suppresses an
-            # owner-level notification.
-            notifier.notify(event_key=event_key, text=text, category=category)
+            try:
+                store.record_domain_event(
+                    build_domain_event(
+                        "system.service_event",
+                        aggregate_id="tg-ingest",
+                        correlation_id="tg-ingest",
+                        severity=_service_event_severity(event_key),
+                        payload={"event_key": event_key, "message": str(text)[:2000]},
+                    )
+                )
+            except DomainEventConflict:
+                log.warning("service event id collision; event not recorded")
         except Exception as exc:  # noqa: BLE001 - service events must not affect ingestion
-            log.warning("service event notification failed (%s)", exc.__class__.__name__)
+            log.warning("service event persistence failed (%s)", exc.__class__.__name__)
 
     # ------------------------------------------------------------ loop run
 
@@ -762,9 +793,8 @@ class IngestService:
                     await asyncio.to_thread(resume)
                 if trade_manager is not None:
                     await asyncio.to_thread(trade_manager.reconcile_all_open)
-                notifier = getattr(self.trading, "notifier", None)
-                if notifier is not None:
-                    await asyncio.to_thread(notifier.flush)
+                # Notification delivery belongs to the independent dispatcher.
+                # The trading/reconciliation worker never performs Telegram I/O.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconciliation must never kill ingestion

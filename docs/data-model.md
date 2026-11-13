@@ -9,7 +9,7 @@ SQLite schema and persistence invariants. Source of truth:
 - WAL journal mode, `foreign_keys=ON`, 10-second busy timeout, `BEGIN IMMEDIATE`
   transactions serialized by a process-wide lock.
 - Embedded, append-only migrations applied in order and recorded in
-  `schema_migrations`. Current maximum version: **22**.
+  `schema_migrations`. Current maximum version: **25**.
 - Commands that open a normal repository run migrations, including `status`,
   `backfill status`, `trading status`, and `control status`. Read-only inspection
   of an existing database requires an external SQLite viewer or a disposable
@@ -47,6 +47,9 @@ channel metadata, order data, and audit detail. Treat every copy as sensitive.
 | 20 | `exchange_operations`, `oco_groups`, `oco_legs`, `notification_preferences`, `notification_callbacks`, `notification_delivery_attempts` |
 | 21 | notification outbox role check widened to `owner`, `owner_b`, `developer`; existing rows preserved |
 | 22 | remediation columns: `order_intents.deadline_at` (signal validity), `trade_orders.attempt`/`next_attempt_at`/`retryable` (bounded OCO retries, definitive rejections), `oco_legs.attempt`/`verified` (retry attempt and unverified-fallback marker); additive only |
+| 23 | owner decision: park pre-deployment trades as `ignored_legacy`; clear the diagnostic new-BUY block state; no exchange action |
+| 24 | `legacy_ignored_intents`: keep ambiguous historical intents out of automatic recovery/reconciliation |
+| 25 | Phase 2 domain-event envelope on `audit_events`: additive `event_class` (default `legacy`), `aggregate_type`, `aggregate_id`, `audience_json`; domain-only UPDATE/DELETE triggers enforce immutability |
 
 ## Table groups
 
@@ -74,7 +77,7 @@ tradeable, and only above the activation boundary.
 | `order_status_history` | append-only intent state transitions |
 | `order_fills` | unique `(exchange_order_id, exchange_trade_id)`; price, quantity, quote, fee, trade time |
 | `reconciliation_results` | append-only outcome (`consistent`, `resolved`, `discrepancy`, `ambiguous`, `not_found`) |
-| `audit_events` | v2 structured timeline: `event_id`, `event_type` (`category.event`), `severity`, `occurred_at_utc`, `recorded_at_utc`, correlation/causation ids, `trade_id`/`intent_id`/`order_id`/`exchange_order_id`, `symbol`, `reason_code`, `outcome`, `source_ref`, `evidence_source`, `evidence_limitations`, `payload_json`, `dedupe_key`; redacted and bounded `detail` |
+| `audit_events` | v2 structured timeline: `event_id`, `event_type` (`category.event`), `severity`, `occurred_at_utc`, `recorded_at_utc`, correlation/causation ids, `trade_id`/`intent_id`/`order_id`/`exchange_order_id`, `symbol`, `reason_code`, `outcome`, `source_ref`, `evidence_source`, `evidence_limitations`, `payload_json`, `dedupe_key`; redacted and bounded `detail`. Migration 25 adds `event_class` (`legacy`/`domain`), `aggregate_type`, `aggregate_id`, `audience_json`; rows with `event_class='domain'` are append-only and use `event_id` as the sole idempotency key (no `dedupe_key`) |
 | `trading_daily_spend` | historical per-day bookkeeping table; retained for compatibility, no runtime writes or cap |
 
 Relationships:
@@ -92,10 +95,11 @@ signals 1 ── * order_intents 1 ── * order_fills
 | Table | Purpose |
 | --- | --- |
 | `trading_budget_ledger` | one row per executable intent: reserved/spent/fee quote, active flag, state (`reserved`, `uncertain`, `settled`, `released`) |
-| `trading_notifications` | durable outbox; unique `(event_key, role)`, status `pending`/`sending`/`sent`/`failed`/`ambiguous`/`suppressed`/`canceled`, `category`/`event_type`, attempts/error/next attempt |
+| `trading_notifications` | compatibility producer outbox; unique `(event_key, role)`, formatted text, recipient, category/event type. New rows are relayed by the independent dispatcher; its old delivery status columns are not authoritative after the dispatcher cutover |
 
-The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. The legacy global notification severity value is retained only for compatibility and never suppresses the two owners' event stream; roles are `owner`, `owner_b`, and `developer`.
-The notification outbox is independent of order state.
+The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. Notification roles are `owner`, `owner_b`, and `developer`. `notification_min_severity` in `control_settings` is the shared default; `notification_min_severity.<role>` overrides it per recipient. Per-category `notification_preferences` are applied per recipient; `owner_b` inherits `owner` preferences until its own rows exist. CRITICAL and owner-safety alerts bypass both filters for owners.
+
+`TradingNotifier.notify()` is enqueue-only: trading producers never perform Telegram I/O or call `flush()`. The independent `tg-ingest notifications worker` relays domain events and new formatted rows from `trading_notifications` into a separate `notification-delivery.sqlite3` ledger. That delivery DB owns `deliveries` (one row per event/recipient/fragment with `part_no`, `thread_key`, `reply_to_message_id`, attempts, claim token, message id), `delivery_attempts`, `delivery_threads` (per-recipient root message for trade/intent replies), `relayed_events`, `relayed_legacy_notifications`, and `dispatcher_state` (cursors + heartbeat). It establishes independent no-replay boundaries for both the domain journal and legacy outbox at first startup. The trading DB is read-only to the dispatcher; legacy outbox status fields therefore remain compatibility metadata, not the source of truth for delivery outcomes.
 
 ### Exchange evidence and OCO lifecycle
 
@@ -104,9 +108,10 @@ The notification outbox is independent of order state.
 | `exchange_operations` | one row per exchange call, inserted **before** the request; `operation_class` (`read`/`write`), endpoint, payloads (redacted), response classification/code, error, `uncertainty` |
 | `oco_groups` | one row per trade (`oco_group_id` PK, `trade_id` unique); `state` mirrors trade state, `intended_config`, `protection_status`, `closed_at` |
 | `oco_legs` | one row per OCO target (`leg_id` PK, unique per group+target); `kind`, `target`, prices/qtys, state, exchange status, fills/fees, `cancel_reason`, `canceled_by_target` |
-| `notification_preferences` | historical per-category preferences; no longer read or written. Current filtering uses one `notification_min_severity` in `control_settings` |
-| `notification_callbacks` | single-use time-limited tokens for `expand`/`signal_source`/`ack` actions |
-| `notification_delivery_attempts` | per-notification attempt history: outcome, error, message id, retry-after, `ambiguous` flag |
+| `notification_preferences` | per-role/per-category enablement, read by the independent dispatcher; `owner_b` falls back to `owner` defaults/preferences |
+| `notification-delivery.sqlite3` (separate file) | independent relay cursors, per-recipient delivery state, message fragments/threads, attempts, message IDs, suppression decisions, and worker heartbeat; no schema migration in the trading DB |
+| `notification_callbacks` | opaque, role-bound, expiring, atomically single-use tokens for `expand`/`signal_source`/`ack`; not currently emitted by the dispatcher |
+| `notification_delivery_attempts` | legacy per-notification attempt history: outcome, error, message id, retry-after, `ambiguous` flag |
 
 `exchange_operations.uncertainty`: `none`, `uncertain`, `reconciled`,
 `read_only_uncertain`. An uncertain write is never auto-resubmitted.
@@ -122,7 +127,7 @@ never invented.
 | Table | Purpose |
 | --- | --- |
 | `trades` | one row per live executed signal (`signal_id` unique); entry mode/price, trigger, TP1/TP2/SL prices and allocations, acquired/sold quantities, state, entry intent/order, retry/error fields |
-| `trade_orders` | TP1/TP2/SL orders; unique client order id, exchange id, allocated/sold qty, state, plus `stop_trigger_price`, `oco_group_id`, `leg_role`, `last_observed_at`, `evidence_id`, `not_observed_reason`, `cancel_reason`, `canceled_by_leg`, `filled_quote`, `fee_amount`, `fee_asset` |
+| `trade_orders` | TP1/TP2/SL orders; unique client order id, exchange id, allocated/sold qty, state, plus `stop_trigger_price`, `oco_group_id`, `leg_role`, `last_observed_at`, `evidence_id`, `not_observed_reason`, `cancel_reason`, `canceled_by_leg`, `filled_quote`, `fee_amount`, `fee_asset`, bounded `attempt`/`next_attempt_at`/`retryable` |
 | `order_protection` | intended/verified exchange-side TP/SL for an entry intent: prices, mode, status, entry order id, verified timestamp, error |
 
 `trades.trade_state`: `pending_entry`, `entry_active`, `position_open`,
@@ -172,6 +177,7 @@ are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable
 | `exchange_orders.status` | `NEW`, `FILLED`, `PARTIALLY_FILLED`, `CANCELED`, `PARTIALLY_CANCELED`, `UNKNOWN` |
 | `order_fills.source` | `reconciliation`, `rest_query` |
 | `audit_events.category` | `telegram`, `parse`, `validate`, `risk`, `mexc_request`, `lifecycle`, `reconcile`, `config`, `emergency` |
+| `audit_events.event_class` | `legacy` (pre-Phase-2 audit rows), `domain` (immutable typed domain events) |
 | `trading_budget_ledger.state` | `reserved`, `uncertain`, `settled`, `released` |
 | `order_protection.status` | `not_requested`, `unverified`, `active`, `triggered`, `completed`, `rejected`, `unknown_requires_reconciliation` |
 | `trading_notifications.status` | `pending`, `sending`, `sent`, `failed`, `ambiguous`, `suppressed`, `canceled` |
@@ -186,7 +192,9 @@ are encrypted with `CONTROL_SECRET_KEY`; losing the key makes them unrecoverable
 4. Idempotency key and client order id are unique. Intent planning precedes
    submission.
 5. Every intent state change appends history; reconciliation outcomes and audit
-   events are append-only.
+   events are append-only. Domain events (`event_class='domain'`) are protected
+   by UPDATE/DELETE triggers and are idempotent only by exact `event_id` reuse;
+   the same event_id with a different immutable envelope is rejected.
 6. Budget reservation is inserted in the same transaction as the intent.
 7. Fills are idempotent by exchange trade id. `fill_sync_required` keeps terminal
    intents in the reconciliation set until fills match executed quantity.
@@ -224,3 +232,25 @@ database:
 .venv/bin/tg-ingest trading status
 .venv/bin/tg-ingest trading intents
 ```
+
+
+OCO retry scheduling does not create a second event type: when a trade-order
+state transition is a definitive retryable rejection, its `trade_order.state_changed`
+event includes `attempt`, `retryable=true`, and `next_attempt_at`, with
+`WARNING` severity. The dispatcher renders the failed attempt and next scheduled
+attempt separately. Uncertain submissions remain UNKNOWN and are reconciled;
+they are not represented as scheduled retries.
+
+`trade.state_changed` payloads include a bounded `reason` when supplied by the
+state transition. `trade_order.state_changed` payloads include order kind,
+price, quantity, stop trigger, client/exchange identifiers, exchange status,
+attempt/retry metadata, and a bounded transition reason so the dispatcher can
+replace duplicate formatted TP/OCO notices without losing operational detail.
+Unknown order submission is `CRITICAL`, definitive rejection `ERROR`, retry
+scheduled `WARNING`; `needs_reconciliation` trade transitions are at least
+`WARNING`.
+
+`intent.state_changed` carries a bounded transition `reason` alongside exchange
+order/status and fill fields. The dispatcher uses this payload for the entry
+acknowledgement/rejection message; the old post-submit formatted summary is no
+longer enqueued, avoiding a second message for the same intent transition.

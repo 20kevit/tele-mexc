@@ -21,6 +21,12 @@ from typing import Any
 from ..config import TradingConfig
 from ..db import Database
 from .audit import normalize_event_type, normalize_severity, redact_payload, redact_text
+from .domain_events import (
+    DomainEvent,
+    DomainEventConflict,
+    build_domain_event,
+    validate_domain_event,
+)
 from .parser import PARSER_VERSION, ParsedSignal
 
 _APPLICATION_VERSION = "0.1.0"
@@ -277,6 +283,126 @@ class TradingStore:
                 _insert(tx)
         return event_id
 
+    # ------------------------------------------------------ domain events
+
+    def record_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        """Append one immutable domain event to the trading audit journal.
+
+        When ``conn`` is supplied the insert participates in that caller's
+        SQLite transaction.  Otherwise a short local transaction is opened.
+        This method performs no network I/O and never constructs a Telegram or
+        MEXC client.
+
+        Retrying the exact same event envelope returns the existing event_id.
+        Reusing an event_id with a different immutable envelope is a conflict;
+        there is no content-based dedupe or coalescing.
+        """
+
+        validate_domain_event(event)
+        if conn is not None:
+            self._insert_domain_event(conn, event)
+            return event.event_id
+        with self.db.transaction() as tx:
+            self._insert_domain_event(tx, event)
+        return event.event_id
+
+    def _insert_domain_event(self, conn: sqlite3.Connection, event: DomainEvent) -> None:
+        existing = conn.execute(
+            "SELECT event_id, event_type, schema_version, occurred_at_utc, aggregate_type, "
+            "aggregate_id, correlation_id, causation_id, symbol, payload_json, category, "
+            "severity, audience_json, event_class "
+            "FROM audit_events WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()
+        if existing is not None:
+            comparable = (
+                str(existing["event_id"]),
+                str(existing["event_type"] or ""),
+                str(existing["schema_version"] or ""),
+                str(existing["occurred_at_utc"] or ""),
+                str(existing["aggregate_type"] or ""),
+                str(existing["aggregate_id"] or ""),
+                str(existing["correlation_id"] or ""),
+                str(existing["causation_id"] or ""),
+                str(existing["symbol"] or ""),
+                str(existing["payload_json"] or ""),
+                str(existing["category"] or ""),
+                str(existing["severity"] or ""),
+                str(existing["audience_json"] or ""),
+                str(existing["event_class"] or ""),
+            )
+            expected = (
+                event.event_id,
+                event.event_type,
+                str(event.schema_version),
+                event.occurred_at_utc,
+                event.aggregate_type,
+                event.aggregate_id,
+                event.correlation_id,
+                event.causation_id or "",
+                event.symbol or "",
+                event.payload_json,
+                event.category,
+                event.severity,
+                event.audience_json,
+                event.event_class,
+            )
+            if comparable != expected:
+                raise DomainEventConflict(
+                    f"event_id {event.event_id!r} already exists with a different immutable envelope"
+                )
+            return
+
+        now = self._ts()
+        conn.execute(
+            """
+            INSERT INTO audit_events
+                (schema_version, event_id, event, event_type, severity, occurred_at_utc,
+                 recorded_at_utc, monotonic_elapsed_ns, clock_health, process_id,
+                 hostname, instance_id, application_version, component, operation,
+                 correlation_id, causation_id, telegram_channel_id, telegram_message_id,
+                 message_edit_version, signal_id, intent_id, trade_id, order_id,
+                 exchange_order_id, symbol, reason_code, outcome, source_ref,
+                 evidence_source, evidence_limitations, payload_json, actor, dedupe_key,
+                 detail, secrets_redacted, correlation, category, created_at,
+                 event_class, aggregate_type, aggregate_id, audience_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL, ?, 'trading.domain_events',
+                    ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL,
+                    NULL, ?, 'domain_event', NULL, ?, 'system', NULL, NULL, 1, ?, ?, ?,
+                    ?, ?, ?, ?)
+            """,
+            (
+                str(event.schema_version),
+                event.event_id,
+                event.event_type,
+                event.event_type,
+                event.severity,
+                event.occurred_at_utc,
+                now,
+                os.getpid(),
+                socket.gethostname(),
+                _APPLICATION_VERSION,
+                event.event_type,
+                event.correlation_id,
+                event.causation_id,
+                event.symbol,
+                None,
+                event.payload_json,
+                event.correlation_id,
+                event.category,
+                now,
+                event.event_class,
+                event.aggregate_type,
+                event.aggregate_id,
+                event.audience_json,
+            ),
+        )
+
     # -------------------------------------------------- exchange evidence
 
     def begin_exchange_operation(
@@ -380,6 +506,9 @@ class TradingStore:
     ) -> None:
         now = self._ts()
         with self.db.transaction() as conn:
+            operation = conn.execute(
+                "SELECT * FROM exchange_operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
             conn.execute(
                 """UPDATE exchange_operations SET
                     request_finished_at = ?, response_received = ?,
@@ -411,6 +540,29 @@ class TradingStore:
                     operation_id,
                 ),
             )
+            if operation is not None and str(operation["operation_class"]) == "write":
+                outcome = "success" if success else (
+                    "uncertain" if uncertainty in ("uncertain", "unknown") else "error"
+                )
+                severity = "INFO" if outcome == "success" else ("CRITICAL" if outcome == "uncertain" else "ERROR")
+                self.record_domain_event(
+                    build_domain_event(
+                        "exchange.write_outcome",
+                        aggregate_id=operation_id,
+                        correlation_id=str(operation["correlation_id"] or operation["intent_id"] or operation_id),
+                        symbol=operation["symbol"],
+                        occurred_at=now,
+                        severity=severity,
+                        payload={
+                            "operation_type": str(operation["operation_type"]),
+                            "outcome": outcome,
+                            "response_status": redact_text(response_status, limit=80),
+                            "error_class": error_class,
+                            "exchange_code": exchange_code,
+                        },
+                    ),
+                    conn=conn,
+                )
 
     def mark_operation_uncertain(self, operation_id: str, *, reason: str, uncertainty: str = "uncertain") -> None:
         with self.db.transaction() as conn:
@@ -465,6 +617,7 @@ class TradingStore:
         edit_version: int,
         status: str = "parsed",
         rejection_reason: str | None = None,
+        emit_event: bool = False,
     ) -> tuple[str, bool]:
         """Insert a parsed signal version; older versions of the same message
         are superseded atomically. Returns (signal_id, inserted)."""
@@ -511,15 +664,67 @@ class TradingStore:
                 ),
             )
             inserted = cur.rowcount > 0
+            if inserted and emit_event:
+                self.record_domain_event(
+                    build_domain_event(
+                        "signal.received",
+                        aggregate_id=signal_id,
+                        correlation_id=signal_id,
+                        symbol=parsed.symbol,
+                        occurred_at=now,
+                        payload={
+                            "state": status,
+                            "signal_kind": parsed.kind,
+                            "side": parsed.action,
+                            "entry_price": dec_str(parsed.entry_price),
+                            "tp1_price": dec_str(parsed.target_prices[0]) if parsed.target_prices else None,
+                            "tp2_price": dec_str(parsed.target_prices[1]) if len(parsed.target_prices) > 1 else None,
+                            "stop_loss_price": dec_str(parsed.stop_loss),
+                            "order_type": parsed.order_type,
+                        },
+                    ),
+                    conn=conn,
+                )
         return signal_id, inserted
 
-    def update_signal(self, signal_id: str, status: str, reason: str | None = None) -> None:
+    def update_signal(
+        self,
+        signal_id: str,
+        status: str,
+        reason: str | None = None,
+        *,
+        emit_rejection_event: bool = True,
+    ) -> None:
+        now = self._ts()
         with self.db.transaction() as conn:
+            previous = conn.execute(
+                "SELECT status, symbol, signal_kind FROM signals WHERE signal_id = ?",
+                (signal_id,),
+            ).fetchone()
+            if previous is None:
+                return
             conn.execute(
                 "UPDATE signals SET status = ?, rejection_reason = COALESCE(?, rejection_reason), "
                 "updated_at = ? WHERE signal_id = ?",
-                (status, reason, self._ts(), signal_id),
+                (status, reason, now, signal_id),
             )
+            if status == "rejected" and str(previous["status"]) != "rejected" and emit_rejection_event:
+                self.record_domain_event(
+                    build_domain_event(
+                        "signal.rejected",
+                        aggregate_id=signal_id,
+                        correlation_id=signal_id,
+                        symbol=previous["symbol"],
+                        occurred_at=now,
+                        payload={
+                            "reason": str(reason or "signal rejected")[:2000],
+                            "previous_state": str(previous["status"]),
+                            "new_state": "rejected",
+                            "signal_kind": str(previous["signal_kind"]),
+                        },
+                    ),
+                    conn=conn,
+                )
 
     def get_signal(self, signal_id: str) -> dict[str, Any] | None:
         return _row(self.db.conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone())
@@ -995,6 +1200,32 @@ class TradingStore:
             # another thread owns an open transaction.
             inserted_row = conn.execute("SELECT * FROM order_intents WHERE intent_id = ?", (intent_id,)).fetchone()
             assert inserted_row is not None
+            self.record_domain_event(
+                build_domain_event(
+                    "intent.created",
+                    aggregate_id=intent_id,
+                    correlation_id=signal_id,
+                    symbol=signal.symbol,
+                    occurred_at=now,
+                    payload={
+                        "state": "planned",
+                        "signal_id": signal_id,
+                        "symbol": signal.symbol,
+                        "side": signal.action,
+                        "order_type": order_type,
+                        "mode": mode,
+                        "quote_amount": dec_str(quote_amount),
+                        "base_quantity": dec_str(base_quantity),
+                        "limit_price": dec_str(limit_price),
+                        "entry_price": dec_str(signal.entry_price),
+                        "tp1_price": dec_str(signal.target_prices[0]) if signal.target_prices else None,
+                        "tp2_price": dec_str(signal.target_prices[1]) if len(signal.target_prices) > 1 else None,
+                        "stop_loss_price": dec_str(signal.stop_loss),
+                        "client_order_id": client_order_id,
+                    },
+                ),
+                conn=conn,
+            )
         return dict(inserted_row), True
 
     def get_message(self, channel_id: int, message_id: int) -> dict[str, Any] | None:
@@ -1263,6 +1494,19 @@ class TradingStore:
                 "VALUES (?, 'lifecycle', 'submission_claimed', ?, ?)",
                 (intent_id, note[:2000], now),
             )
+            self.record_domain_event(
+                build_domain_event(
+                    "intent.state_changed",
+                    aggregate_id=intent_id,
+                    correlation_id=intent_id,
+                    occurred_at=now,
+                    payload={
+                        "previous_state": "planned",
+                        "new_state": "submitting",
+                    },
+                ),
+                conn=conn,
+            )
         return True, None
 
     def transition_intent(
@@ -1283,7 +1527,7 @@ class TradingStore:
         terminal = new_state in TERMINAL_INTENT_STATES
         with self.db.transaction() as conn:
             current = conn.execute(
-                "SELECT state, signal_id FROM order_intents WHERE intent_id = ?", (intent_id,)
+                "SELECT state, signal_id, symbol, client_order_id FROM order_intents WHERE intent_id = ?", (intent_id,)
             ).fetchone()
             if current is None:
                 raise TradingError(f"intent {intent_id} not found")
@@ -1339,6 +1583,54 @@ class TradingStore:
                 "INSERT INTO audit_events (correlation, category, event, detail, created_at) VALUES (?, ?, ?, ?, ?)",
                 (intent_id, category, new_state, note[:2000], now),
             )
+            if str(current["state"]) != str(new_state):
+                self.record_domain_event(
+                    build_domain_event(
+                        "intent.state_changed",
+                        aggregate_id=intent_id,
+                        correlation_id=str(current["signal_id"] or intent_id),
+                        symbol=current["symbol"],
+                        occurred_at=now,
+                        severity=(
+                            "CRITICAL" if new_state == "unknown_requires_reconciliation"
+                            else "ERROR" if new_state in ("rejected", "failed")
+                            else None
+                        ),
+                        payload={
+                            "previous_state": str(current["state"]),
+                            "new_state": str(new_state),
+                            "exchange_order_id": exchange_order_id,
+                            "exchange_status": exchange_status,
+                            "executed_qty": dec_str(executed_qty),
+                            "cumulative_quote": dec_str(cumulative_quote),
+                            "fill_sync_required": fill_sync_required,
+                            "reason": str(note or "")[:1000] or None,
+                        },
+                    ),
+                    conn=conn,
+                )
+                # A definitive successful order-submit response is a distinct
+                # fact from the later open/fill/protection observations: record
+                # the exchange acknowledgement atomically with the `submitted`
+                # transition so the acceptance can never be conflated with (or
+                # deferred to) reconciliation. Only the confirmed-response
+                # boundary reaches `submitted`; ambiguous writes never do.
+                if new_state == "submitted":
+                    self.record_domain_event(
+                        build_domain_event(
+                            "intent.submission_accepted",
+                            aggregate_id=intent_id,
+                            correlation_id=str(current["signal_id"] or intent_id),
+                            symbol=current["symbol"],
+                            occurred_at=now,
+                            payload={
+                                "exchange_order_id": exchange_order_id,
+                                "exchange_status": exchange_status,
+                                "client_order_id": str(current["client_order_id"]),
+                            },
+                        ),
+                        conn=conn,
+                    )
             current_after = conn.execute(
                 "SELECT exchange_order_id, cumulative_quote FROM order_intents WHERE intent_id = ?",
                 (intent_id,),
@@ -1476,6 +1768,26 @@ class TradingStore:
                         exchange_order_id=str(exchange_order_id),
                         now=now,
                     )
+                self.record_domain_event(
+                    build_domain_event(
+                        "fill.recorded",
+                        aggregate_id=str(exchange_order_id),
+                        correlation_id=str(intent["intent_id"]) if intent is not None else str(exchange_order_id),
+                        symbol=symbol,
+                        occurred_at=now,
+                        payload={
+                            "exchange_trade_id": _trade_identity(raw, exchange_order_id),
+                            "price": str(raw.get("price")),
+                            "quantity": str(raw.get("qty")),
+                            "quote_amount": str(raw.get("quoteQty")) if raw.get("quoteQty") is not None else None,
+                            "fee_asset": raw.get("commissionAsset"),
+                            "fee_amount": str(raw.get("commission")) if raw.get("commission") is not None else None,
+                            "source": source,
+                            "intent_id": str(intent["intent_id"]) if intent is not None else None,
+                        },
+                    ),
+                    conn=conn,
+                )
             return inserted
 
     def fill_quantity_total(self, exchange_order_id: str) -> Decimal:
@@ -1509,13 +1821,58 @@ class TradingStore:
         detail: str,
         emit_audit: bool = True,
     ) -> None:
+        now = self._ts()
         with self.db.transaction() as conn:
+            previous = (
+                conn.execute(
+                    "SELECT outcome,local_state,exchange_state FROM reconciliation_results "
+                    "WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 1",
+                    (intent_id,),
+                ).fetchone()
+                if intent_id
+                else None
+            )
             conn.execute(
                 "INSERT INTO reconciliation_results "
                 "(intent_id, client_order_id, local_state, exchange_state, outcome, detail, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (intent_id, client_order_id, local_state, exchange_state, outcome, detail[:2000], self._ts()),
+                (intent_id, client_order_id, local_state, exchange_state, outcome, detail[:2000], now),
             )
+            current_reconciliation = (outcome, local_state, exchange_state)
+            previous_reconciliation = (
+                (str(previous["outcome"]), previous["local_state"], previous["exchange_state"])
+                if previous is not None
+                else None
+            )
+            settled_repeat = (
+                previous is not None
+                and str(previous["outcome"]) in ("resolved", "filled")
+                and outcome == "consistent"
+                and previous["exchange_state"] == exchange_state
+            )
+            if intent_id and current_reconciliation != previous_reconciliation and not settled_repeat:
+                intent = conn.execute(
+                    "SELECT symbol FROM order_intents WHERE intent_id = ?", (intent_id,)
+                ).fetchone()
+                severity = "ERROR" if outcome == "discrepancy" else (
+                    "WARNING" if outcome in ("ambiguous", "not_found") else "INFO"
+                )
+                self.record_domain_event(
+                    build_domain_event(
+                        "reconciliation.outcome",
+                        aggregate_id=intent_id,
+                        correlation_id=intent_id,
+                        symbol=str(intent["symbol"]) if intent is not None else None,
+                        occurred_at=now,
+                        severity=severity,
+                        payload={
+                            "outcome": outcome,
+                            "local_state": local_state,
+                            "exchange_state": exchange_state,
+                        },
+                    ),
+                    conn=conn,
+                )
             if emit_audit and intent_id:
                 self.audit(
                     intent_id,
@@ -1964,15 +2321,26 @@ class TradingStore:
         return data
 
     def consume_notification_callback(self, token: str, role: str) -> dict[str, Any] | None:
-        data = self.notification_callback(token)
-        if data is None or data.get("role") != role:
-            return None
+        """Atomically consume a single-use, role-bound, unexpired callback.
+
+        A replayed token, a token used by a different role, or an expired token
+        returns ``None``.  The single UPDATE is the replay guard: two concurrent
+        consumers cannot both observe ``use_count = 0``.
+        """
+
+        now = self._ts()
         with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE notification_callbacks SET use_count = use_count + 1, used_at = ? WHERE token = ?",
-                (self._ts(), token),
+            cur = conn.execute(
+                "UPDATE notification_callbacks SET use_count = use_count + 1, used_at = ? "
+                "WHERE token = ? AND role = ? AND use_count = 0 AND expires_at > ?",
+                (now, token, role, now),
             )
-        return data
+            if cur.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM notification_callbacks WHERE token = ?", (token,)
+            ).fetchone()
+        return dict(row) if row is not None else None
 
 
 def _trade_identity(raw: dict[str, Any], exchange_order_id: str) -> str:

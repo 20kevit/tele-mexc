@@ -217,6 +217,14 @@ def test_upward_crossing_activates_entry(env):
     assert t["trade_state"] == "entry_active"
     assert t["entry_order_id"] == "ex-1000"
     assert engine.intent_calls and engine.intent_calls[0][0] == intent["intent_id"]
+    events = store.db.conn.execute(
+        "SELECT event_type,payload_json FROM audit_events "
+        "WHERE event_class='domain' AND event_type='trade.state_changed' AND aggregate_id=?",
+        (trade["trade_id"],),
+    ).fetchall()
+    assert len(events) == 1
+    assert '"new_state":"entry_active"' in events[0]["payload_json"]
+    assert not any(key == "ENTRY_TRIGGER_ACTIVATED" for key, _, _ in notifier.trade_events)
 
 
 def test_single_activation_is_idempotent(env):

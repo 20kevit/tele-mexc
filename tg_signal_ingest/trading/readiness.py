@@ -24,7 +24,7 @@ FAIL = "FAIL"
 WARN = "WARN"
 NOT_VERIFIED = "NOT_VERIFIED"
 
-LATEST_MIGRATION = 24
+LATEST_MIGRATION = 25
 RECONCILIATION_BLOCKING_STATES = ("submitting", "reconciling", "unknown_requires_reconciliation")
 UNPROTECTED_TRADE_STATES = ("needs_reconciliation", "unprotected_critical")
 
@@ -381,9 +381,53 @@ def build_readiness_report(
     elif failed:
         report.add("notification outbox", WARN, f"{failed} definitively failed delivery(ies); inspect the outbox")
     elif pending:
-        report.add("notification outbox", PASS, f"{pending} pending/retry notification(s) will flush on startup")
+        report.add(
+            "notification outbox",
+            PASS,
+            f"{pending} pending/retry compatibility row(s); the independent dispatcher relays them",
+        )
     else:
         report.add("notification outbox", PASS, "no pending/failed deliveries")
+
+    # Delivery health lives in the dispatcher-owned database, never in the
+    # trading transaction path.  A missing ledger means the worker has not run
+    # yet; a stale heartbeat means it is dead or hung (static absence is not
+    # delivery proof).
+    from ..notification_dispatcher import inspect_delivery_db
+
+    delivery = inspect_delivery_db(cfg.data_dir / "notification-delivery.sqlite3")
+    if delivery is None:
+        report.add(
+            "notification dispatcher",
+            WARN,
+            "delivery ledger absent; worker has never run (start tg-notification-worker.service)",
+        )
+    else:
+        heartbeat = delivery.get("heartbeat") or {}
+        if heartbeat.get("heartbeat_stale") is True:
+            report.add(
+                "notification dispatcher",
+                WARN,
+                f"heartbeat stale at {heartbeat.get('last_cycle_at')}; worker dead or hung",
+            )
+        elif delivery.get("dead_letter"):
+            report.add(
+                "notification dispatcher",
+                WARN,
+                f"{delivery['dead_letter']} dead-letter delivery(ies); explicit operator requeue required",
+            )
+        elif delivery.get("ambiguous"):
+            report.add(
+                "notification dispatcher",
+                WARN,
+                f"{delivery['ambiguous']} ambiguous delivery(ies); certainty unresolved, never auto-retried",
+            )
+        else:
+            report.add(
+                "notification dispatcher",
+                PASS,
+                f"queue_depth={delivery.get('queue_depth', 0)} heartbeat={heartbeat.get('heartbeat_age_s')}s",
+            )
 
     audit_count = _count(conn, "SELECT COUNT(*) FROM audit_events")
     report.add("event journal", PASS, f"{audit_count} durable audit event(s) recorded")

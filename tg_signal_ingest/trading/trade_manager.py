@@ -35,6 +35,7 @@ import hashlib
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -56,6 +57,7 @@ from ..mexc.errors import (
     MexcUnexpectedResponse,
 )
 from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
+from .domain_events import DomainEventConflict, build_domain_event
 from .parser import ParsedSignal
 from .store import TERMINAL_INTENT_STATES, TradingError
 from .trade_store import TradeStore
@@ -469,7 +471,14 @@ class TradeManager:
                 self._notify_stale_config(intent["symbol"], "computed trigger price invalid")
                 self._reject_trade_intent(intent, "trigger price invalid; refusing conditional entry")
                 return None
-            entry_mode = "conditional"
+            # The initial reference price may already be at/above the computed
+            # trigger while still below Entry. Treat that as an already-fired
+            # trigger and submit the normal LIMIT at Entry immediately; waiting
+            # for another upward crossing would miss the valid entry window.
+            if current < trigger_price:
+                entry_mode = "conditional"
+            else:
+                trigger_price = None
 
         tp1_price = _first(parsed.target_prices)
         tp2_price = _second(parsed.target_prices)
@@ -850,7 +859,7 @@ class TradeManager:
         now = self._ts()
         with store.db.transaction() as conn:
             row = conn.execute(
-                "SELECT trade_state, entry_intent_id FROM trades WHERE trade_id = ?",
+                "SELECT trade_state, entry_intent_id, symbol FROM trades WHERE trade_id = ?",
                 (trade["trade_id"],),
             ).fetchone()
             if row is None:
@@ -864,6 +873,17 @@ class TradeManager:
                 "activated_at=COALESCE(activated_at, ?), updated_at=? WHERE trade_id=?",
                 (now, now, trade["trade_id"]),
             )
+            store.record_domain_event(
+                build_domain_event(
+                    "trade.state_changed",
+                    aggregate_id=str(trade["trade_id"]),
+                    correlation_id=str(trade["trade_id"]),
+                    symbol=row["symbol"],
+                    occurred_at=now,
+                    payload={"previous_state": "pending_entry", "new_state": "entry_active"},
+                ),
+                conn=conn,
+            )
         intent = store.get_intent(row[1])
         if intent is None:
             store.update_trade_state(trade["trade_id"], "needs_reconciliation", note="entry intent missing")
@@ -871,7 +891,6 @@ class TradeManager:
         refreshed = store.get_trade(trade["trade_id"])
         if refreshed is not None:
             trade = refreshed
-        self._notify_trade(trade, "ENTRY_TRIGGER_ACTIVATED", "submitting Limit Buy at entry price")
         if self.engine is None:
             self._record_error(trade, "engine unavailable", "runtime")
             return
@@ -896,7 +915,6 @@ class TradeManager:
         refreshed = store.get_trade(trade["trade_id"])
         if refreshed is not None:
             trade = refreshed
-        self._notify_trade(trade, "ENTRY_SUBMITTED", "Limit Buy submitted at entry price")
 
     def _settle_entry_state(self, trade: dict[str, Any]) -> None:
         """Advance an entry-state trade once the entry intent is terminal.
@@ -945,11 +963,6 @@ class TradeManager:
                     "needs_reconciliation",
                     note="entry activated but no submission was claimed; operator review required",
                 )
-                self._notify_trade(
-                    trade,
-                    "ENTRY_NOT_SUBMITTED",
-                    "entry activation did not record a submission; manual reconciliation required",
-                )
             return
         if acquired > 0:
             if state in ("pending_entry", "entry_active"):
@@ -965,12 +978,6 @@ class TradeManager:
                 note=f"entry intent {intent_state} with no fills; no position opened",
                 sl_state="dormant",
             )
-            refreshed = self.store.get_trade(trade["trade_id"])
-            self._notify_trade(
-                refreshed or trade,
-                "ENTRY_NOT_FILLED",
-                f"entry {intent_state}; no position opened, no exit orders placed",
-            )
         elif intent_state == "filled":
             # Filled according to the exchange but no fill records: never treat
             # this as a zero position.  Fail closed for manual reconciliation.
@@ -978,11 +985,6 @@ class TradeManager:
                 trade["trade_id"],
                 "needs_reconciliation",
                 note="entry reports filled but no fill records were persisted",
-            )
-            self._notify_trade(
-                trade,
-                "ENTRY_FILLS_MISSING",
-                "entry filled but fills could not be persisted; manual reconciliation required",
             )
 
     # ===================================================================
@@ -1022,10 +1024,12 @@ class TradeManager:
         """Atomically move trade state. Returns True if transitioned."""
         now = self._ts()
         with self.store.db.transaction() as conn:
-            row = conn.execute("SELECT trade_state FROM trades WHERE trade_id = ?", (trade["trade_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade["trade_id"],)
+            ).fetchone()
             if row is None:
                 return False
-            state = row[0]
+            state = str(row["trade_state"])
             if state in (
                 "tp2_completed",
                 "closed",
@@ -1041,10 +1045,25 @@ class TradeManager:
                 "UPDATE trades SET trade_state=?, updated_at=? WHERE trade_id=?",
                 (new_state, now, trade["trade_id"]),
             )
-        refreshed = self.store.get_trade(trade["trade_id"])
-        if refreshed is not None:
-            trade = refreshed
-        self._notify_trade(trade, "STATE_TRANSITION", f"trade -> {new_state}")
+            if state != new_state:
+                self.store.record_domain_event(
+                    build_domain_event(
+                        "trade.state_changed",
+                        aggregate_id=str(trade["trade_id"]),
+                        correlation_id=str(trade["trade_id"]),
+                        symbol=row["symbol"],
+                        occurred_at=now,
+                        severity=(
+                            "CRITICAL" if new_state == "unprotected_critical"
+                            else "WARNING" if new_state == "needs_reconciliation"
+                            else None
+                        ),
+                        payload={"previous_state": state, "new_state": new_state},
+                    ),
+                    conn=conn,
+                )
+        # The transactional domain event replaces the old generic
+        # STATE_TRANSITION outbox notice; do not enqueue a duplicate message.
         return True
 
     def _disable_legacy_exit(self, trade: dict[str, Any], target: str) -> None:
@@ -1055,7 +1074,6 @@ class TradeManager:
             "no order was submitted — manual reconciliation required"
         )
         self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-        self._notify_trade(trade, "LEGACY_EXIT_DISABLED", detail)
 
     def _do_tp_sale(self, trade: dict[str, Any], target: str) -> None:
         """Disabled: standalone take-profit orders are not part of the product."""
@@ -1355,7 +1373,6 @@ class TradeManager:
         except Exception as exc:  # noqa: BLE001 - definitive rejection before submission
             self.store.transition_trade_order(order["trade_order_id"], "rejected", note=str(exc)[:500])
             self._record_error(trade, f"TP rejected: {exc}", "exchange")
-            self._notify_trade(trade, "TP_REJECTED", str(exc)[:500])
             return
 
         exchange_id = result.get("exchange_order_id") or result.get("order_id")
@@ -1376,8 +1393,6 @@ class TradeManager:
             exchange_status=result.get("state") or result.get("status"),
             sold_qty=executed,
         )
-        label = "TP_SUBMITTED" if target == "tp1" else "TP2_SUBMITTED"
-        self._notify_trade(trade, label, f"{target} sell {qty} @ {price}")
         # Refresh immediately so a fast fill is not lost if the process exits.
         self._reconcile_trade_orders(trade)
 
@@ -1566,7 +1581,6 @@ class TradeManager:
                 "needs_reconciliation",
                 note=f"OCO not placed: {problem}",
             )
-            self._notify_trade(trade, "OCO_CONFIG_REJECTED", problem)
             self._refresh_buy_block()
             return
 
@@ -1631,7 +1645,6 @@ class TradeManager:
                 "needs_reconciliation",
                 note="sellable quantity is zero; cannot allocate OCO exits",
             )
-            self._notify_trade(trade, "OCO_ALLOCATION_TOO_SMALL", "sellable quantity is zero")
             return
         tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
         tp2_pct = _dec(trade.get("tp2_allocation_pct")) or Decimal("100")
@@ -1659,11 +1672,6 @@ class TradeManager:
                 trade["trade_id"],
                 "needs_reconciliation",
                 note="OCO allocations are below the symbol lot size; position remains unprotected",
-            )
-            self._notify_trade(
-                trade,
-                "OCO_ALLOCATION_TOO_SMALL",
-                "acquired quantity is below the lot size; no OCO exit could be placed",
             )
             self._refresh_buy_block()
             return
@@ -1967,12 +1975,6 @@ class TradeManager:
                 attempt=attempt,
             )
             self._record_error(trade, f"{target} OCO submission outcome unknown: {exc}", "exchange")
-            self._notify_trade(
-                trade,
-                f"OCO_ATTEMPT_{attempt + 1}_UNCERTAIN",
-                f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} outcome unknown: {str(exc)[:400]}; "
-                "read-only reconciliation will decide, no replacement is submitted",
-            )
             return None
         except Exception as exc:
             attempt = int(str(order.get("attempt") or 0))
@@ -1992,13 +1994,6 @@ class TradeManager:
                 retryable=retryable,
             )
             self._record_error(trade, f"{target} OCO rejected: {exc}", "exchange")
-            remaining_attempts = 0 if not retryable else max(0, MAX_OCO_ATTEMPTS - (attempt + 1))
-            self._notify_trade(
-                trade,
-                f"OCO_ATTEMPT_{attempt + 1}_REJECTED",
-                f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} rejected: {str(exc)[:400]}; "
-                f"retryable={retryable} remaining_attempts={remaining_attempts}",
-            )
             return None
 
         exchange_id = result.get("orderId") or result.get("exchange_order_id")
@@ -2021,12 +2016,6 @@ class TradeManager:
             stop_trigger_price=_dec(result.get("trigger_price")),
         )
         attempt = int(order.get("attempt") or 0)
-        self._notify_trade(
-            trade,
-            f"OCO_SUBMITTED_{target.upper()}_ATTEMPT_{attempt + 1}",
-            f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} accepted: {qty} @ {price} "
-            f"SL @ {stop_price} trigger @ {result.get('trigger_price')}",
-        )
         self._reconcile_trade_orders(trade)
         return {
             "exchange_order_id": str(exchange_id),
@@ -2347,11 +2336,6 @@ class TradeManager:
                 "needs_reconciliation",
                 note=f"close refused: {remaining} base quantity remains unsold",
             )
-            self._notify_trade(
-                trade,
-                "TRADE_CLOSE_REFUSED",
-                f"{remaining} base quantity remains; manual reconciliation required",
-            )
             self._refresh_buy_block()
             return
         self.store.update_trade_state(trade["trade_id"], "closed", note="position fully exited", sl_state="completed")
@@ -2368,7 +2352,6 @@ class TradeManager:
             intent_id=trade.get("entry_intent_id"),
             outcome="closed",
         )
-        self._notify_trade(trade, "TRADE_CLOSED", "trade fully closed")
         self._refresh_buy_block()
 
     # ===================================================================
@@ -2604,12 +2587,6 @@ class TradeManager:
                         ),
                         sl_state="completed",
                     )
-                    refreshed2 = self._refresh(refreshed)
-                    self._notify_trade(
-                        refreshed2 or refreshed,
-                        "TRADE_CLOSED_RECONCILED",
-                        "trade conclusively closed via read-only reconciliation",
-                    )
                     self.store.audit(
                         trade_id, "lifecycle", "closed_via_reconciliation", "all orders terminal, sellable 0"
                     )
@@ -2670,11 +2647,6 @@ class TradeManager:
                     "legacy standalone take-profit state; automatic exit disabled "
                     "(OCO-only policy) — manual reconciliation required"
                 ),
-            )
-            self._notify_trade(
-                trade,
-                "LEGACY_EXIT_DISABLED",
-                "legacy TP state encountered; no standalone exit order was submitted",
             )
             return
         if state in ("oco_submitting", "oco_active", "oco_partial"):
@@ -3097,11 +3069,39 @@ class TradeManager:
     # ===================================================================
 
     def _notify_trade(self, trade: dict[str, Any] | None, event_key: str, text: str, **extra: Any) -> None:
-        """Notify via the notifier when a trade transitions. Never blocks trading."""
-        if self.notifier is None:
-            return
+        """Persist critical protection alerts as domain events; never blocks trading."""
+        critical_keys = {
+            "SL_UNPROTECTED_CRITICAL",
+            "OCO_INVARIANT_UNKNOWN",
+            "OCO_INVARIANT_WOULD_VIOLATE",
+            "OCO_INVARIANT_VIOLATED",
+            "TRADE_CLOSE_REFUSED_UNKNOWN",
+        }
         try:
-            self.notifier.notify_trade(trade, event_key, text, **extra)
+            if event_key in critical_keys or event_key.startswith("BUY_BLOCK_ACTIVE_"):
+                trade_id = str((trade or {}).get("trade_id") or "global")
+                symbol = (trade or {}).get("symbol")
+                # Stable for identical repeated observations, distinct when the
+                # evidence text changes. This preserves alert-on-change semantics.
+                event_id = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"tele-mexc:trade-protection:{trade_id}:{event_key}:{text}",
+                ).hex
+                with contextlib.suppress(DomainEventConflict):
+                    self.store.record_domain_event(
+                        build_domain_event(
+                            "trade.protection_critical",
+                            aggregate_id=trade_id,
+                            correlation_id=trade_id,
+                            symbol=str(symbol) if symbol else None,
+                            event_id=event_id,
+                            severity="CRITICAL",
+                            payload={"event_key": event_key, "detail": str(text)[:2000]},
+                        )
+                    )
+                return
+            if self.notifier is not None:
+                self.notifier.notify_trade(trade, event_key, text, **extra)
         except Exception as exc:  # noqa: BLE001 - notifications never block trading
             log.warning("notify_trade failed (%s); trading continues", exc)
 

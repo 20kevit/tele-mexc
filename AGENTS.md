@@ -99,9 +99,12 @@ Do not silently change behavior to match an old doc.
   fills, and OCO exits are reconciled read-only; uncertain submissions are never
   resubmitted.
 - Two owners (Owner A, Owner B) have owner-level controls. The programmer has
-  read-only technical/diagnostic access and is never an owner. Every recorded
-  operational event is routed to both owners and the programmer; severity or
-  category never suppresses the owners' event stream.
+  read-only technical/diagnostic access and is never an owner. Trading producers
+  only append local events; the independent notification worker delivers them.
+  CRITICAL and owner-safety alerts always reach both owners. INFO+ follows
+  per-recipient category/minimum preferences; DEBUG chatter is programmer-only.
+  Suppressed events remain in delivery history. See
+  `docs/notification-readiness.md`.
 - Every intent reserves its full quote notional plus the fee buffer in
   `trading_budget_ledger` inside the intent-creation transaction. This is a
   technical/idempotency reservation, not a portfolio budget or spending cap.

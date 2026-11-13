@@ -20,7 +20,12 @@ import uuid
 from collections.abc import Iterable
 from typing import Any
 
-from ..control.bot_api import BotApiError, BotApiForbiddenError, BotApiRateLimitError
+from ..control.bot_api import (
+    BotApiError,
+    BotApiForbiddenError,
+    BotApiNotSentError,
+    BotApiRateLimitError,
+)
 from .store import SEVERITY_LEVELS, TradingStore
 
 log = logging.getLogger("ingest.trading.notify")
@@ -32,7 +37,7 @@ TELEGRAM_CHUNK_SIZE = 4000
 
 # Backoff ceiling in seconds.  Retry-after values from Telegram are honored
 # and capped here so a stuck notification never starves the whole outbox.
-MAX_BACKOFF_S = 24 * 3600
+MAX_BACKOFF_S = 300
 
 
 def classify_severity(category: str, event_key: str, explicit: str | None = None) -> str:
@@ -162,7 +167,13 @@ class TradingNotifier:
         compact_text: str | None = None,
         severity: str | None = None,
     ) -> None:
-        """Enqueue + best-effort immediate delivery (never raises to caller)."""
+        """Persist local notification rows and return.
+
+        The synchronous ``flush()`` is intentionally removed from the producer
+        path. Producers append durable local state only; the independent
+        notification worker handles Telegram delivery. A Telegram outage or
+        slow Bot API call therefore cannot delay or fail an order/trade transition.
+        """
 
         self.enqueue(
             event_key=event_key,
@@ -175,10 +186,6 @@ class TradingNotifier:
             compact_text=compact_text,
             severity=severity,
         )
-        try:
-            self.flush()
-        except Exception as exc:  # noqa: BLE001 - notifications never break trading
-            log.warning("notification flush failed (%s)", exc.__class__.__name__)
 
     def notify_trade(
         self,
@@ -187,7 +194,7 @@ class TradingNotifier:
         text: str,
         **extra: Any,
     ) -> None:
-        """Route a trade-lifecycle event to both owner and developer."""
+        """Route a trade-lifecycle event to all configured recipients."""
         signal_id = trade.get("signal_id") if trade else None
         intent_id = trade.get("entry_intent_id") if trade else None
         scope = (trade or {}).get("trade_id") or intent_id or "global"
@@ -200,7 +207,7 @@ class TradingNotifier:
         )
 
     def notify_intent(self, intent: dict[str, Any], event_key: str, text: str) -> None:
-        """Route an entry-intent event to both owner and developer."""
+        """Route an entry-intent event to all configured recipients."""
         self.notify(
             event_key=event_key,
             text=text,
@@ -255,6 +262,13 @@ class TradingNotifier:
                 # retry; record suppression and keep the outbox clean.
                 log.warning("notification suppressed for chat %s (%s)", row["chat_id"], exc)
                 self.store.finish_notification(notification_id, outcome="suppressed", error=str(exc))
+            except BotApiNotSentError as exc:
+                # DNS/connect failure: definitely not sent, safe to retry.
+                self.store.finish_notification(
+                    notification_id,
+                    outcome="retry",
+                    error=f"{exc.__class__.__name__}",
+                )
             except BotApiRateLimitError as exc:
                 # Honor Telegram's ``retry_after`` but cap it so one chat cannot
                 # starve the whole outbox forever.
@@ -273,9 +287,11 @@ class TradingNotifier:
                     error=f"BotApiError: {exc}",
                 )
             except Exception as exc:  # noqa: BLE001 - transport boundary
+                # A generic transport exception cannot prove the message was
+                # not accepted.  Preserve uncertainty instead of retrying.
                 self.store.finish_notification(
                     notification_id,
-                    outcome="retry",
+                    outcome="ambiguous",
                     error=f"{exc.__class__.__name__}",
                 )
         return sent

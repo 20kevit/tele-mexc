@@ -18,6 +18,7 @@ from typing import Any
 from ..config import AppConfig
 from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..repository import Repository
+from ..trading.domain_events import DomainEventConflict, build_domain_event
 from ..trading.gate import GateTimeout, SubmissionGate
 from ..version import format_version_text, get_version_info
 from .auth import AuthFlowError, TelegramLoginManager
@@ -120,15 +121,34 @@ class ControlBot:
         self._engine = engine
 
     def _notify_control_event(self, event_key: str, text: str, *, category: str = "critical") -> None:
-        """Route a control-plane state transition to both owners + programmer."""
+        """Persist a control-plane transition as a domain event.
 
-        notifier = getattr(self._engine, "notifier", None) if self._engine is not None else None
-        if notifier is None:
+        Delivery is owned by the independent notification worker; this method
+        performs no Telegram I/O and must never block or fail a control action.
+        """
+
+        store = getattr(self._engine, "store", None) if self._engine is not None else None
+        if store is None:
             return
         try:
-            notifier.notify(event_key=event_key, text=text, category=category, event_type=event_key)
+            is_error = any(token in event_key for token in ("failed", "refused", "not_acknowledged"))
+            severity = "ERROR" if is_error else "INFO"
+            try:
+                store.record_domain_event(
+                    build_domain_event(
+                        "system.control_event",
+                        aggregate_id="control",
+                        correlation_id="control",
+                        severity=severity,
+                        payload={"event_key": event_key, "message": str(text)[:2000]},
+                    )
+                )
+            except DomainEventConflict:
+                # A UUID collision is not a reason to suppress a control event;
+                # record it under a fresh identity instead.
+                log.warning("control event id collision; retrying with a fresh id")
         except Exception:  # noqa: BLE001 - notification failure never blocks controls
-            log.warning("control event notification failed", exc_info=True)
+            log.warning("control event persistence failed", exc_info=True)
 
     # -------------------------------------------------------- bot transport
 
@@ -293,6 +313,30 @@ class ControlBot:
         if developer is not None and int(user_id) == developer:
             return "developer"
         return None
+
+    def _notification_role(self, user_id: int | None) -> str | None:
+        """Resolve the distinct notification recipient role for a Telegram ID."""
+
+        if user_id is None:
+            return None
+        control = self.cfg.control
+        if control.owner_user_id is not None and int(user_id) == int(control.owner_user_id):
+            return "owner"
+        if control.owner_b_user_id is not None and int(user_id) == int(control.owner_b_user_id):
+            return "owner_b"
+        if control.developer_user_id is not None and int(user_id) == int(control.developer_user_id):
+            return "developer"
+        return None
+
+    def _notification_target_roles(self) -> tuple[str, ...]:
+        """Return only notification recipients that are actually configured."""
+
+        roles = ["owner"]
+        if self.cfg.control.owner_b_user_id is not None:
+            roles.append("owner_b")
+        if self.cfg.control.developer_user_id is not None:
+            roles.append("developer")
+        return tuple(roles)
 
     def _authorized(self, user_id: int | None) -> bool:
         """Return True for either owner or the configured programmer."""
@@ -932,39 +976,77 @@ class ControlBot:
 
     # -------------------------------------------------- notification settings
 
-    async def _show_notification_settings(self, chat_id: int) -> None:
-        """One minimum severity threshold; recipient routing stays separate."""
+    async def _show_notification_settings(
+        self, chat_id: int, target_role: str | None = None
+    ) -> None:
+        """Show a per-recipient threshold; Owner A may manage all recipients."""
 
-        current = self.store.notification_min_severity()
-        rows = [
-            [_btn(f"{'✅ ' if current == level else ''}{level}", f"n:set:{level}")]
+        actor_role = self._notification_role(chat_id)
+        if actor_role not in {"owner", "owner_b"}:
+            await self._send(chat_id, "تنظیم سطح اعلان فقط برای مالکان فعال است.")
+            return
+        target_role = target_role or actor_role
+        if target_role not in self._notification_target_roles():
+            await self._send(chat_id, "گیرنده اعلان نامعتبر یا پیکربندی‌نشده است.")
+            return
+        if actor_role != "owner" and target_role != actor_role:
+            await self._send(chat_id, "فقط مالک A می‌تواند تنظیمات گیرندگان دیگر را تغییر دهد.")
+            return
+
+        labels = {"owner": "مالک A", "owner_b": "مالک B", "developer": "توسعه‌دهنده"}
+        current = self.store.notification_min_severity(target_role)
+        rows = []
+        if actor_role == "owner":
+            rows.append([
+                _btn(f"{'▶ ' if target_role == role else ''}{labels[role]}", f"n:recipient:{role}")
+                for role in self._notification_target_roles()
+            ])
+        rows.extend(
+            [_btn(f"{'✅ ' if current == level else ''}{level}", f"n:set:{target_role}:{level}")]
             for level in self.store.NOTIFICATION_LEVELS
-        ]
+        )
         rows.append([_btn("بازگشت", "m:status")])
         await self._send(
             chat_id,
             "🔔 حداقل سطح اعلان\n"
+            f"گیرنده: {labels[target_role]}\n"
             f"سطح فعلی: {current}\n"
-            "همه اعلان‌های این سطح و بالاتر ارسال می‌شوند. "
-            "مسیر گیرنده (مالک/توسعه‌دهنده) جدا از سطح اهمیت است.",
+            "این تنظیم فقط برای گیرنده انتخاب‌شده اعمال می‌شود؛ سایر گیرندگان مستقل هستند.",
             _kb(rows),
         )
 
     async def _notification_action(self, chat_id: int, parts: list[str]) -> None:
         head = parts[1] if len(parts) > 1 else ""
+        actor_role = self._notification_role(chat_id)
         if head == "settings":
             await self._show_notification_settings(chat_id)
             return
+        if head == "recipient" and len(parts) >= 3:
+            await self._show_notification_settings(chat_id, target_role=parts[2])
+            return
         if head == "set" and len(parts) >= 3:
-            level = parts[2].upper()
+            if len(parts) >= 4:
+                target_role, level = parts[2], parts[3].upper()
+            else:  # Backward-compatible old callback: n:set:LEVEL
+                target_role, level = actor_role or "", parts[2].upper()
+            if actor_role not in {"owner", "owner_b"}:
+                await self._send(chat_id, "تنظیم سطح اعلان فقط برای مالکان فعال است.")
+                return
+            if target_role not in self._notification_target_roles():
+                await self._send(chat_id, "گیرنده اعلان نامعتبر یا پیکربندی‌نشده است.")
+                return
+            if actor_role != "owner" and target_role != actor_role:
+                await self._send(chat_id, "فقط مالک A می‌تواند تنظیمات گیرندگان دیگر را تغییر دهد.")
+                return
             if level not in self.store.NOTIFICATION_LEVELS:
                 await self._send(chat_id, "سطح اعلان نامعتبر است.")
                 return
-            self.store.set_notification_min_severity(level)
+            self.store.set_notification_min_severity(level, role=target_role)
+            labels = {"owner": "مالک A", "owner_b": "مالک B", "developer": "توسعه‌دهنده"}
             await self._send(
                 chat_id,
-                f"حداقل سطح اعلان روی {level} تنظیم شد.",
-                _kb([[_btn("بازگشت به اعلان‌ها", "n:settings")]]),
+                f"حداقل سطح اعلان برای {labels[target_role]} روی {level} تنظیم شد.",
+                _kb([[_btn("بازگشت به اعلان‌ها", f"n:recipient:{target_role}")]]),
             )
             return
         await self._send(chat_id, "عملیات اعلان نامعتبر است.", self._menu_kb())
@@ -1105,54 +1187,16 @@ class ControlBot:
         await self._send(chat_id, "▶️ اجرای خودکار ادامه یافت.")
         await self._show_start(chat_id)
 
-    async def _sync_auto_notices(self) -> None:
-        if self._engine is None or self.store.setup().get("effective_state") not in ("ready", "automatic"):
-            return
-        cutoff = datetime.now(UTC).timestamp() - 6 * 3600
-        cutoff_iso = datetime.fromtimestamp(cutoff, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        rows = self.repo.db.conn.execute(
-            """
-            SELECT i.* FROM order_intents i
-            LEFT JOIN control_notices n ON n.intent_id = i.intent_id
-            WHERE n.intent_id IS NULL AND i.state <> 'planned'
-              AND i.planned_at >= ?
-            ORDER BY i.updated_at DESC LIMIT 10
-            """,
-            (cutoff_iso,),
-        ).fetchall()
-        for raw in rows:
-            intent = dict(raw)
-            if not self.store.notice_once(intent["intent_id"], "auto"):
-                continue
-            await self._send(
-                int(self.cfg.control.owner_user_id or 0),
-                "🤖 اجرای خودکار\n"
-                f"نماد: {intent['symbol']} — جهت: {intent['side']} — وضعیت: {intent['state']}\n"
-                f"شناسه سفارش: {_fmt(intent.get('exchange_order_id'))}",
-            )
-
     async def tick(self) -> None:
+        """Control polling never flushes notification delivery.
+
+        Telegram event delivery is owned by the separate notification worker;
+        the control bot only handles inbound commands and direct replies.
+        """
         now = time.monotonic()
         if now - self._last_tick < 3:
             return
         self._last_tick = now
-        # Recover deliveries that were in flight when the process ended; they
-        # are never retried automatically.  Then flush the trading outbox.
-        if self._engine is not None:
-            store = self._engine.store
-            try:
-                recovered = store.recover_ambiguous_sending(older_than_s=120)
-                if recovered:
-                    log.info("recovered %d ambiguous notifications", recovered)
-            except Exception:  # noqa: BLE001
-                log.warning("ambiguous-notification recovery failed", exc_info=True)
-            notifier = getattr(self._engine, "notifier", None)
-            if notifier is not None:
-                try:
-                    notifier.flush(limit=50)
-                except Exception:  # noqa: BLE001 - notifications never block control
-                    log.warning("notification flush failed", exc_info=True)
-        await self._sync_auto_notices()
 
     # --------------------------------------------------------------- loop
 

@@ -130,8 +130,8 @@ def test_v16_database_upgrades_to_current_and_preserves_rows(tmp_path, monkeypat
 
     monkeypatch.setattr(db_module, "MIGRATIONS", MIGRATIONS)
     applied = db.migrate()
-    assert applied == [17, 18, 19, 20, 21, 22, 23, 24]
-    assert db.schema_version() == 24
+    assert applied == [17, 18, 19, 20, 21, 22, 23, 24, 25]
+    assert db.schema_version() == 25
     assert db.conn.execute("SELECT trade_state FROM trades WHERE trade_id='t-1'").fetchone()[0] == "ignored_legacy"
     assert db.conn.execute("SELECT state FROM trade_orders WHERE trade_order_id='to-1'").fetchone()[0] == "open"
     assert db.conn.execute("SELECT value FROM app_state WHERE key='trading.new_buys_blocked'").fetchone()[0] == "0"

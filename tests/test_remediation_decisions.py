@@ -154,6 +154,7 @@ def _notifier(repo, cfg, bot, owner_b=333):
 def test_each_recipient_gets_its_own_row(cfg, repo) -> None:
     notifier, store = _notifier(repo, cfg, _Bot())
     notifier.notify(event_key="evt-1", text="hello", category="order_lifecycle")
+    notifier.flush()
 
     rows = repo.db.conn.execute(
         "SELECT role, chat_id, status FROM trading_notifications ORDER BY role"
@@ -166,6 +167,7 @@ def test_failure_for_one_recipient_does_not_mask_the_other(cfg, repo) -> None:
     bot = _Bot(fail_for=333)
     notifier, store = _notifier(repo, cfg, bot)
     notifier.notify(event_key="evt-2", text="hello", category="order_lifecycle")
+    notifier.flush()
 
     rows = {
         r["role"]: r["status"]
@@ -173,7 +175,9 @@ def test_failure_for_one_recipient_does_not_mask_the_other(cfg, repo) -> None:
     }
     assert rows["owner"] == "sent"
     assert rows["developer"] == "sent"
-    assert rows["owner_b"] in {"pending", "failed"}  # retried later, never silently dropped
+    # A generic transport exception cannot prove non-delivery: preserve it as
+    # ambiguous (never blindly retried) rather than marking it failed.
+    assert rows["owner_b"] == "ambiguous"
 
 
 def test_ambiguous_delivery_is_reported_to_both_recipients(cfg, repo) -> None:
@@ -266,7 +270,7 @@ def test_migration_22_upgrades_from_21_and_preserves_rows(tmp_path, monkeypatch)
     db = Database(path)
     applied = db.migrate()
     assert 22 in applied
-    assert db.schema_version() == 24
+    assert db.schema_version() == 25
     assert db.conn.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0] == 1
     cols = {r[1] for r in db.conn.execute("PRAGMA table_info(trade_orders)")}
     assert {"attempt", "next_attempt_at", "retryable"} <= cols
@@ -375,15 +379,19 @@ def test_manual_entry_cancel_closes_without_resubmission(cfg, repo) -> None:
             return {"state": "canceled", "executed_qty": Decimal("0")}
 
     engine = _Engine()
-    notified: list[str] = []
     tm = TradeManager(cfg.trading, store, engine=engine)
-    tm._notify_trade = lambda trade, key, text, **kw: notified.append(key)
 
     tm._settle_entry_state(store.get_trade("trade-m"))
 
     assert store.get_trade("trade-m")["trade_state"] == "closed"
     assert engine.place_calls == 0, "a manual cancel must never be resubmitted"
-    assert any(key == "ENTRY_NOT_FILLED" for key in notified)
+    event = store.db.conn.execute(
+        "SELECT payload_json FROM audit_events WHERE event_class='domain' AND event_type='trade.state_changed' "
+        "AND aggregate_id='trade-m' ORDER BY audit_id DESC LIMIT 1"
+    ).fetchone()
+    assert event is not None
+    assert '"new_state":"closed"' in event["payload_json"]
+    assert "no fills" in event["payload_json"]
 
 
 def test_persisted_signal_validity_applies_even_with_an_env_amount(cfg, repo) -> None:

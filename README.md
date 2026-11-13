@@ -67,12 +67,17 @@ Production service commands (owner/operator only):
 ```bash
 sudo systemctl start tg-ingest.service
 sudo systemctl restart tg-ingest.service
-systemctl status tg-ingest.service
+systemctl status tg-ingest.service tg-notification-worker.service
 journalctl -u tg-ingest.service -f
 .venv/bin/tg-ingest status
 .venv/bin/tg-ingest trading status
+.venv/bin/tg-ingest notifications status
 .venv/bin/tg-ingest queue list
 ```
+
+The notification worker is a separate, soft dependency; its failure never stops
+or restarts trading. `notifications status` reports queue depth, oldest age,
+dead-letter/ambiguous counts, and heartbeat staleness.
 
 ## Verification status
 
@@ -114,8 +119,10 @@ journalctl -u tg-ingest.service -f
   and control locks; `tg-ingest control run` is the standalone controller mode.
   Two configured owners (Owner A and Owner B) have full owner-level controls.
   The configured programmer has read-only technical/diagnostic access and is
-  never an owner. Both owners receive every operational event; notifications are
-  not filtered by severity or perceived importance. Its `/pause` and `/resume`
+  never an owner. Trading producers only append local events; an independent
+  `tg-ingest notifications worker` delivers them. CRITICAL and owner-safety
+  alerts always reach both owners, while routine DEBUG chatter stays
+  programmer-only. See `docs/notification-readiness.md`. Its `/pause` and `/resume`
   controls are enforced at the order-submission boundary with a kernel file lock
   and a transactional readiness check. See `docs/CONTROL_BOT_FA.md`.
 - Before the first controlled start, run the non-trading readiness report.

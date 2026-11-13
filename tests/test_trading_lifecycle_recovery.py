@@ -13,6 +13,7 @@ fills are confirmed:
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import pytest
@@ -402,6 +403,35 @@ def test_oco_partial_survives_restart(env):
     assert trade["trade_state"] == "oco_partial", trade
 
 
+def test_reconcile_legacy_tp_state_is_safe_and_records_needs_reconciliation(env):
+    """F1: reconciling a legacy standalone-TP state must not raise (TypeError)
+    and must record the canonical trade.state_changed -> needs_reconciliation."""
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store)
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100"))
+    trade = decision.trade
+    # Park the trade in a legacy standalone-TP state that the OCO-only policy
+    # no longer executes.
+    store.update_trade_state(trade["trade_id"], "tp1_active")
+
+    tm._reconcile_trade(trade["trade_id"])  # must not raise TypeError
+
+    refreshed = store.get_trade(trade["trade_id"])
+    assert refreshed["trade_state"] == "needs_reconciliation"
+    transitions = [
+        json.loads(row["payload_json"])
+        for row in store.db.conn.execute(
+            "SELECT payload_json FROM audit_events "
+            "WHERE event_class='domain' AND event_type='trade.state_changed' "
+            "ORDER BY audit_id"
+        ).fetchall()
+    ]
+    assert any(
+        t.get("previous_state") == "tp1_active" and t.get("new_state") == "needs_reconciliation"
+        for t in transitions
+    )
+
+
 # ---------------------------------------------------------------------------
 # Safety: no orders for non-tradeable / other symbols
 # ---------------------------------------------------------------------------
@@ -559,3 +589,23 @@ def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(en
     rendered = "\n".join(record.getMessage() for record in caplog.records)
     assert "trade_lock operation=reconcile_all_open" in rendered
     assert "trade_lock operation=on_intent_planned" in rendered
+
+
+def test_direct_state_transition_writes_domain_event_and_skips_legacy_duplicate(env):
+    _, store, _, _, notifier, tm = env
+    intent = _insert_intent(store)
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=ENTRY)
+    trade = decision.trade
+    assert trade is not None and trade["trade_state"] == "pending_entry"
+
+    assert tm._transition_state(trade, "needs_reconciliation", ("pending_entry",)) is True
+    event = store.db.conn.execute(
+        "SELECT event_type,aggregate_id,payload_json FROM audit_events "
+        "WHERE event_class='domain' AND event_type='trade.state_changed' AND aggregate_id=?",
+        (trade["trade_id"],),
+    ).fetchone()
+    assert event is not None
+    assert event["payload_json"] == (
+        '{"new_state":"needs_reconciliation","previous_state":"pending_entry"}'
+    )
+    assert not any(key == "STATE_TRANSITION" for key, _, _ in notifier.trade_events)

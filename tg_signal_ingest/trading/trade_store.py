@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .audit import redact_payload
+from .domain_events import build_domain_event
 from .store import TradingStore, _row, dec_str
 
 
@@ -22,6 +23,25 @@ def _optional_decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+# Only semantic OCO leg fields create a domain event. Poll bookkeeping fields
+# (evidence id, last observed time, not-observed reason) do not.
+_OCO_LEG_MEANINGFUL_FIELDS = (
+    "state",
+    "exchange_status",
+    "filled_qty",
+    "filled_quote",
+    "fee_amount",
+    "fee_asset",
+    "cancel_reason",
+    "canceled_by_target",
+    "verified",
+)
+
+
+def _oco_leg_changed(previous: Any, current: Any) -> bool:
+    return any((previous[field] or None) != (current[field] or None) for field in _OCO_LEG_MEANINGFUL_FIELDS)
 
 
 class TradeError(Exception):
@@ -219,12 +239,37 @@ class TradeStore(TradingStore):
             params.append(now)
         params.append(trade_id)
         with self.db.transaction() as conn:
+            previous = conn.execute(
+                "SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
             conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params)
             conn.execute(
                 "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
                 "VALUES (?, 'lifecycle', ?, ?, ?)",
                 (trade_id, new_state, note[:2000], now),
             )
+            if previous is not None and str(previous["trade_state"]) != str(new_state):
+                self.record_domain_event(
+                    build_domain_event(
+                        "trade.state_changed",
+                        aggregate_id=trade_id,
+                        correlation_id=trade_id,
+                        symbol=previous["symbol"],
+                        occurred_at=now,
+                        severity=(
+                            "CRITICAL" if new_state == "unprotected_critical"
+                            else "WARNING" if new_state == "needs_reconciliation"
+                            else None
+                        ),
+                        payload={
+                            "previous_state": str(previous["trade_state"]),
+                            "new_state": str(new_state),
+                            "sl_state": sl_state,
+                            "reason": str(note or "")[:1000] or None,
+                        },
+                    ),
+                    conn=conn,
+                )
         return self.get_trade(trade_id)
 
     def update_trade_fields(
@@ -539,7 +584,51 @@ class TradeStore(TradingStore):
                 params.append(dec_str(decimal))
         params.append(trade_order_id)
         with self.db.transaction() as conn:
+            previous = conn.execute(
+                "SELECT state, kind, trade_id, symbol, price, quantity, stop_trigger_price, "
+                "attempt, client_order_id FROM trade_orders WHERE trade_order_id = ?",
+                (trade_order_id,),
+            ).fetchone()
             conn.execute(f"UPDATE trade_orders SET {', '.join(sets)} WHERE trade_order_id = ?", params)
+            if previous is not None and str(previous["state"]) != str(new_state):
+                payload = {
+                    "kind": str(previous["kind"]),
+                    "previous_state": str(previous["state"]),
+                    "new_state": str(new_state),
+                    "exchange_order_id": exchange_order_id,
+                    "allocated_qty": dec_str(allocated_qty),
+                    "sold_qty": dec_str(sold_qty),
+                    "attempt": attempt if attempt is not None else int(previous["attempt"] or 0),
+                    "retryable": retryable,
+                    "price": previous["price"],
+                    "quantity": previous["quantity"],
+                    "stop_trigger_price": (
+                        dec_str(stop_trigger_price)
+                        if stop_trigger_price is not None
+                        else previous["stop_trigger_price"]
+                    ),
+                    "reason": str(note or "")[:500] or None,
+                    "exchange_status": exchange_status,
+                    "client_order_id": str(previous["client_order_id"]),
+                }
+                if next_attempt_at is not None:
+                    payload["next_attempt_at"] = next_attempt_at
+                self.record_domain_event(
+                    build_domain_event(
+                        "trade_order.state_changed",
+                        aggregate_id=trade_order_id,
+                        correlation_id=str(previous["trade_id"]),
+                        symbol=previous["symbol"],
+                        occurred_at=now,
+                        severity=(
+                            "CRITICAL" if new_state == "unknown_requires_reconciliation" else
+                            "ERROR" if new_state == "rejected" and not retryable else
+                            "WARNING" if retryable and next_attempt_at else None
+                        ),
+                        payload=payload,
+                    ),
+                    conn=conn,
+                )
         return self.get_trade_order(trade_order_id)
 
     # ------------------------------------------------------------ OCO groups
@@ -591,6 +680,7 @@ class TradeStore(TradingStore):
     ) -> None:
         now = self._ts()
         with self.db.transaction() as conn:
+            previous = conn.execute("SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)).fetchone()
             conn.execute(
                 "UPDATE oco_groups SET state = ?, protection_status = COALESCE(?, protection_status), "
                 "updated_at = ?, closed_at = CASE WHEN ? THEN ? ELSE closed_at END "
@@ -603,6 +693,38 @@ class TradeStore(TradingStore):
                     "updated_at = ? WHERE trade_id = ?",
                     (redact_payload({"last_oco_note": note}), now, trade_id),
                 )
+            if previous is not None:
+                current = conn.execute("SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)).fetchone()
+                assert current is not None
+                changed = (
+                    str(previous["state"]) != str(current["state"])
+                    or (previous["protection_status"] or None) != (current["protection_status"] or None)
+                    or (previous["closed_at"] is None and current["closed_at"] is not None)
+                )
+                if changed:
+                    protection = str(current["protection_status"] or "")
+                    group_severity = (
+                        "CRITICAL" if protection in ("unprotected", "unprotected_critical", "failed")
+                        else "WARNING" if str(current["state"]) == "needs_reconciliation"
+                        else None
+                    )
+                    self.record_domain_event(
+                        build_domain_event(
+                            "oco_group.state_changed",
+                            aggregate_id=str(current["oco_group_id"]),
+                            correlation_id=str(current["trade_id"]),
+                            symbol=current["symbol"],
+                            occurred_at=now,
+                            severity=group_severity,
+                            payload={
+                                "previous_state": str(previous["state"]),
+                                "new_state": str(current["state"]),
+                                "protection_status": current["protection_status"],
+                                "closed": current["closed_at"] is not None,
+                            },
+                        ),
+                        conn=conn,
+                    )
 
     def get_oco_group(self, trade_id: str) -> dict[str, Any] | None:
         return _row(self.db.conn.execute("SELECT * FROM oco_groups WHERE trade_id = ?", (trade_id,)).fetchone())
@@ -634,6 +756,7 @@ class TradeStore(TradingStore):
         kind = "stop_loss" if (target == "stop_loss" or target.endswith("_sl")) else "take_profit"
         leg_id = f"{group_id}:{target}"
         with self.db.transaction() as conn:
+            previous = conn.execute("SELECT * FROM oco_legs WHERE leg_id = ?", (leg_id,)).fetchone()
             conn.execute(
                 """
                 INSERT INTO oco_legs (
@@ -697,6 +820,41 @@ class TradeStore(TradingStore):
                     now,
                 ),
             )
+            current = conn.execute("SELECT * FROM oco_legs WHERE leg_id = ?", (leg_id,)).fetchone()
+            assert current is not None
+            if previous is None or _oco_leg_changed(previous, current):
+                leg_state = str(current["state"])
+                leg_severity = (
+                    "CRITICAL" if leg_state == "unknown_requires_reconciliation"
+                    else "ERROR" if leg_state == "rejected"
+                    else None
+                )
+                self.record_domain_event(
+                    build_domain_event(
+                        "oco_leg.state_changed",
+                        aggregate_id=leg_id,
+                        correlation_id=str(trade["trade_id"]),
+                        symbol=trade.get("symbol"),
+                        occurred_at=now,
+                        severity=leg_severity,
+                        payload={
+                            "kind": str(current["kind"]),
+                            "target": str(current["target"]),
+                            "previous_state": str(previous["state"]) if previous is not None else "absent",
+                            "new_state": str(current["state"]),
+                            "exchange_status": current["exchange_status"],
+                            "filled_qty": current["filled_qty"],
+                            "filled_quote": current["filled_quote"],
+                            "fee_amount": current["fee_amount"],
+                            "fee_asset": current["fee_asset"],
+                            "cancel_reason": current["cancel_reason"],
+                            "canceled_by_target": current["canceled_by_target"],
+                            "verified": bool(current["verified"]),
+                            "attempt": current["attempt"],
+                        },
+                    ),
+                    conn=conn,
+                )
         return leg_id
 
     def list_oco_legs(self, group_id: str) -> list[dict[str, Any]]:

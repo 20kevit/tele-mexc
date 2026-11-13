@@ -601,7 +601,11 @@ def cmd_control_status(_args) -> int:
         print(f"  MEXC: {setup['mexc_state']} — {setup['mexc_label'] or '-'}")
         print(f"  channel: {setup['selected_channel_title'] or 'not selected'}")
         print(f"  execution paused: {bool(int(setup['paused'] or 0))}")
-        print(f"  legacy notification minimum: {store.notification_min_severity()} (never suppresses owners)")
+        print(
+            f"  notification minimum (default): {store.notification_min_severity()} "
+            "(owners' CRITICAL/safety alerts bypass it; per-role overrides "
+            "notification_min_severity.<role> are read by the dispatcher)"
+        )
         print("  valid signals execute automatically when setup is ready and execution is not paused.")
     finally:
         db.close()
@@ -1457,6 +1461,109 @@ def cmd_queue_reprocess(args) -> int:
     return 0
 
 
+def cmd_notifications_status(args) -> int:
+    """Inspect the independent notification delivery ledger without writing it."""
+    cfg = _load_or_exit(require_credentials=False)
+    from .notification_dispatcher import inspect_delivery_db
+
+    result = inspect_delivery_db(
+        cfg.data_dir / "notification-delivery.sqlite3",
+        limit=args.limit,
+        status=getattr(args, "status", None),
+    )
+    if result is None:
+        print("notification dispatcher has not initialized its delivery database")
+        return 0
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0
+    if args.notifications_cmd == "status":
+        counts = result["counts"]
+        print("notification delivery status:")
+        print("  " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+        print(f"  queue_depth={result['queue_depth']} dead_letter={result['dead_letter']} "
+              f"ambiguous={result['ambiguous']}")
+        print(f"  worker_started_at={result['state'].get('worker_started_at', '-')} ")
+        print(f"  last_cycle_at={result['state'].get('last_cycle_at', '-')} ")
+        heartbeat = result.get("heartbeat") or {}
+        age = heartbeat.get("heartbeat_age_s")
+        stale = heartbeat.get("heartbeat_stale")
+        if age is None:
+            print("  worker_heartbeat=absent (worker never ran or never refreshed)")
+        else:
+            health = "STALE" if stale else "ok"
+            print(f"  worker_heartbeat_age_s={age} health={health}")
+            if stale:
+                print("  WARNING: worker heartbeat is stale; the dispatcher is dead or hung")
+        oldest_age = result["oldest_pending_age_s"]
+        print(
+            f"  oldest_pending_at={result['oldest_pending_at'] or '-'} "
+            f"oldest_pending_age_s={oldest_age if oldest_age is not None else '-'}"
+        )
+    print(f"recent deliveries ({len(result['deliveries'])}):")
+    for row in result["deliveries"]:
+        print(
+            f"  {row['status']} role={row['recipient_role']} category={row['notification_category']} "
+            f"severity={row['severity']} event={row['event_type']} attempts={row['attempts']} "
+            f"part={row.get('part_no', 1)}/{row.get('part_count', 1)} "
+            f"thread={row.get('thread_key') or '-'} message_id={row['telegram_message_id'] or '-'} "
+            f"error={row['last_error'] or '-'}"
+        )
+    return 0
+
+
+def cmd_notifications_requeue(args) -> int:
+    """Explicitly requeue one ambiguous/dead-letter delivery.
+
+    This is an operator action, never automatic. It preserves attempt history
+    and grants one additional attempt only while the shared event/recipient
+    budget permits it; it never submits or cancels an order.
+    """
+    cfg = _load_or_exit(require_credentials=False)
+    from .notification_dispatcher import requeue_delivery
+
+    result = requeue_delivery(cfg.data_dir / "notification-delivery.sqlite3", args.delivery_id)
+    print(f"notification delivery {args.delivery_id}: {result}")
+    if result == "budget_exhausted":
+        print("not requeued: the shared event/recipient attempt budget is exhausted", file=sys.stderr)
+    return 0 if result == "requeued" else 1
+
+
+def cmd_notifications_worker(args) -> int:
+    """Run the independent notification relay/delivery process."""
+    cfg = _load_or_exit(require_credentials=False)
+    if not cfg.control.bot_token:
+        print("CONTROL_BOT_TOKEN is required for the notification worker", file=sys.stderr)
+        return 2
+    recipients = {
+        "owner": cfg.control.owner_user_id,
+        "owner_b": cfg.control.owner_b_user_id,
+        "developer": cfg.control.developer_user_id,
+    }
+    recipients = {role: int(chat_id) for role, chat_id in recipients.items() if chat_id}
+    if not recipients:
+        print("at least one notification recipient must be configured", file=sys.stderr)
+        return 2
+    from .notification_dispatcher import NotificationDispatcher
+
+    worker = NotificationDispatcher(
+        cfg.db_path,
+        cfg.data_dir / "notification-delivery.sqlite3",
+        BotApiClient(cfg.control.bot_token, api_base=cfg.control.api_base),
+        recipients,
+    )
+    try:
+        if args.once:
+            print(json.dumps(worker.run_once(), ensure_ascii=False, sort_keys=True))
+        else:
+            worker.run_forever(poll_interval_s=args.poll_interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        worker.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tg-ingest",
@@ -1500,6 +1607,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", help="continuous ingestion (live monitoring + backfill + queue)")
     serve.set_defaults(func=cmd_serve)
+
+    notifications = sub.add_parser("notifications", help="independent Telegram notification delivery")
+    notifications_sub = notifications.add_subparsers(dest="notifications_cmd", required=True)
+    notification_worker = notifications_sub.add_parser(
+        "worker", help="relay domain events and deliver notifications"
+    )
+    notification_worker.add_argument("--once", action="store_true", help="run one relay/delivery cycle and exit")
+    notification_worker.add_argument(
+        "--poll-interval", type=float, default=1.0, help="idle polling interval in seconds"
+    )
+    notification_worker.set_defaults(func=cmd_notifications_worker)
+    notification_status = notifications_sub.add_parser("status", help="show delivery queue health and recent history")
+    notification_status.add_argument("--limit", type=int, default=20)
+    notification_status.add_argument("--json", action="store_true")
+    notification_status.set_defaults(func=cmd_notifications_status)
+    notification_list = notifications_sub.add_parser("list", help="list independent per-recipient deliveries")
+    notification_list.add_argument("--limit", type=int, default=50)
+    notification_list.add_argument(
+        "--status",
+        choices=("pending", "sending", "retry", "sent", "ambiguous", "suppressed", "dead_letter"),
+    )
+    notification_list.add_argument("--json", action="store_true")
+    notification_list.set_defaults(func=cmd_notifications_status)
+    notification_requeue = notifications_sub.add_parser(
+        "requeue", help="explicitly requeue one ambiguous/dead-letter delivery"
+    )
+    notification_requeue.add_argument("delivery_id", help="exact delivery_id from notifications list")
+    notification_requeue.set_defaults(func=cmd_notifications_requeue)
 
     status = sub.add_parser("status", help="offline health/sync overview")
     status.set_defaults(func=cmd_status)

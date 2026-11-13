@@ -50,6 +50,9 @@ def test_http_transport_is_direct_and_ignores_ambient_proxy_env(monkeypatch):
         def __init__(self, host: str, port: int, timeout: float):
             seen.update(host=host, port=port, timeout=timeout)
 
+        def connect(self):
+            seen["connected"] = True
+
         def request(self, method, path, body=None, headers=None):
             seen.update(method=method, path=path, body=body, headers=headers)
 
