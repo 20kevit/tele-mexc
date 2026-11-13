@@ -113,6 +113,21 @@ The worker remains a soft dependency (`Wants`) of the trading service. Its
 failure does not stop the trading service; it follows the main service lifecycle
 through `BindsTo`/`PartOf` and waits for the required DB schema before connecting.
 
+### Exchange-side boundary check after restart
+
+- The normal startup recovery sweep reported `0 gap message(s) fetched` and
+  `499 recent refreshed`; no historical signal replay occurred.
+- There were 40 MEXC operations after restart. Every one was `query_order`,
+  `operation_class=read`, `write_attempted=0`, and returned `NOT_FOUND` / `-2013`.
+- Four pre-existing intents (LINKUSDT twice, MYXUSDT, LPTUSDT) remained in
+  `unknown_requires_reconciliation`; 40 local history entries re-confirmed the
+  same UNKNOWN state. No automatic retry or state transition occurred.
+- No exchange order create/cancel call was attempted; zero new
+  `exchange_orders`, `order_fills`, `trade_orders`, or `order_protection` rows
+  were created/updated during the restart window. The only local order-related
+  updates were the repeated UNKNOWN reconciliation history entries.
+
+
 ## Rollout checklist
 
 1. Create and verify a consistent SQLite backup of `data/ingest.sqlite3` using
