@@ -8,9 +8,11 @@ trading handler), not just the engine in isolation.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 from tests.test_trading_engine import (
     ALERT,
+    NOW,
     FakeMexc,
     Msg,
     _engine,
@@ -126,6 +128,9 @@ def test_live_pipeline_submits_reconciles_and_records_fills(cfg, repo):
     intent = engine.store.list_intents(limit=10)[0]
     assert intent["state"] == "open"
 
+    # The submit callback already performed one successful order query.
+    # Advance beyond the 5s success coalescing window to model the next sweep.
+    engine._now = lambda: NOW + timedelta(seconds=6)
     sweep = engine.reconcile_pending()
     assert sweep.checked == 1 and sweep.resolved == 1
     final = engine.store.get_intent(intent["intent_id"])

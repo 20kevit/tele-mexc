@@ -64,6 +64,30 @@ OPEN_INTENT_STATES = (
 )
 RECONCILABLE_INTENT_STATES = tuple(s for s in OPEN_INTENT_STATES if s != "planned")
 TERMINAL_INTENT_STATES = ("filled", "canceled", "failed", "rejected", "canceled_local")
+
+ACKNOWLEDGED_INTENT_STATES = frozenset({
+    "submitted",
+    "open",
+    "partially_filled",
+    "filled",
+    "canceled",
+    "reconciling",
+    "unknown_requires_reconciliation",
+})
+
+
+def submission_acknowledged(intent: dict[str, Any] | None) -> bool:
+    """Return True only when a durable MEXC order ID proves acceptance.
+
+    UNKNOWN after a successful POST may still carry the acknowledged order ID;
+    UNKNOWN without that ID is never a successful submission.
+    """
+
+    if not intent:
+        return False
+    state = str(intent.get("state") or "").lower()
+    order_id = str(intent.get("exchange_order_id") or "").strip()
+    return bool(order_id) and state in ACKNOWLEDGED_INTENT_STATES
 PROTECTION_STATES = (
     "not_requested",
     "unverified",

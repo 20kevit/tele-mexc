@@ -254,6 +254,11 @@ class FakeEngine:
         self.intent_calls.append((intent_id, dict(refreshed)))
         return refreshed
 
+    def reconcile_intent_if_due(
+        self, intent_id: str, *, notify: bool = True, urgent_after_cancel: bool = False
+    ) -> dict[str, Any] | None:
+        return self.reconcile_intent(intent_id, notify=notify)
+
     def reconcile_intent(self, intent_id: str, *, notify: bool = True) -> dict[str, Any]:
         """Read-only-ish fake reconciliation: adopt exchange state and fills."""
         intent = self.store.get_intent(intent_id)

@@ -784,8 +784,8 @@ class IngestService:
             try:
                 reconcile_stats = await asyncio.to_thread(self.trading.reconcile_pending)
                 if getattr(reconcile_stats, "parked", 0):
-                    log.info(
-                        "reconciliation backoff parked %s intent(s) after repeated MEXC order-not-found responses",
+                    log.debug(
+                        "reconciliation deferred %s intent(s) by eligibility/backoff gate",
                         reconcile_stats.parked,
                     )
                 resume = getattr(self.trading, "resume_planned_intents", None)

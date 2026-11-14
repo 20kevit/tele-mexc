@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +23,7 @@ from tg_signal_ingest.mexc.errors import (
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import SignalParser, TradingEngine, TradingStore
+from tg_signal_ingest.trading.store import submission_acknowledged
 from tg_signal_ingest.trading.trade_manager import _is_retryable_oco_error
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
@@ -462,6 +465,7 @@ def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     assert engine.store.fills_count() == 1
 
     client.query_results.append(canceled)
+    engine._now = lambda: NOW + timedelta(seconds=6)
     engine.reconcile_pending()
     final = engine.store.get_intent(intent["intent_id"])
     assert final is not None
@@ -483,6 +487,208 @@ def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     again = engine.reconcile_pending()
     assert again.checked == 0
     assert engine.store.fills_count() == 1
+
+
+def test_planned_and_fresh_submitting_intents_are_not_reconciled(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    store = engine.store
+    parsed = SignalParser().parse(ALERT)
+    signal_id, _ = store.record_signal(parsed, channel_id=100, message_id=101, edit_version=0)
+    intent, _ = store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=101,
+        edit_version=0,
+        idempotency_key=TradingEngine.idempotency_key(100, 101, parsed),
+        client_order_id="tsiplanned",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+
+    planned = engine.reconcile_intent(intent["intent_id"])
+    assert planned["state"] == "planned"
+    assert client.query_calls == 0
+
+    store.transition_intent(intent["intent_id"], "submitting", note="POST just claimed")
+    fresh_claim = engine.reconcile_intent(intent["intent_id"])
+    assert fresh_claim["state"] == "submitting"
+    assert client.query_calls == 0
+    count = store.db.conn.execute(
+        "SELECT COUNT(*) FROM reconciliation_results WHERE intent_id = ?", (intent["intent_id"],)
+    ).fetchone()[0]
+    assert count == 0
+
+    # A long WAF/rate-gate wait can outlive the transport timeout. While the
+    # POST is still in this process, even an aged submitting claim is ineligible.
+    engine._now = lambda: NOW + timedelta(seconds=120)
+    with engine._inflight_submission_lock:
+        engine._inflight_submission_ids.add(intent["intent_id"])
+    try:
+        assert engine.reconcile_intent_if_due(intent["intent_id"]) is None
+        assert client.query_calls == 0
+        store.transition_intent(
+            intent["intent_id"],
+            "submitted",
+            note="POST response persisted",
+            exchange_order_id="ex-inflight",
+            exchange_status="NEW",
+        )
+        # Even after the response is persisted, the inline reconciliation still
+        # owns this intent until its own read/settlement is complete.
+        assert engine.reconcile_intent_if_due(intent["intent_id"]) is None
+        assert client.query_calls == 0
+    finally:
+        with engine._inflight_submission_lock:
+            engine._inflight_submission_ids.discard(intent["intent_id"])
+    recovered = engine.reconcile_intent_if_due(intent["intent_id"])
+    assert recovered is not None and recovered["state"] == "open"
+    assert client.query_calls == 1
+
+
+def test_submit_inflight_is_not_reconciled_from_inside_place_order(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    original_place_order = client.place_order
+    observed_intents = []
+
+    def guarded_place_order(**payload):
+        current = engine.store.list_intents(limit=1)[0]
+        observed_intents.append(current["intent_id"])
+        assert current["state"] == "submitting"
+        assert engine.reconcile_intent_if_due(current["intent_id"]) is None
+        assert client.query_calls == 0
+        return original_place_order(**payload)
+
+    client.place_order = guarded_place_order
+    result = engine.process_item(_item(100, 108), _store_message(repo, 108, ALERT))
+
+    assert result is not None and result["state"] == "open"
+    assert observed_intents == [result["intent_id"]]
+    assert client.place_calls == 1
+    assert client.query_calls == 1  # only the inline post-ack reconciliation
+    assert engine.reconcile_intent_if_due(result["intent_id"]) is None
+    assert client.query_calls == 1
+
+
+def test_submission_acknowledgement_requires_exchange_order_id():
+    assert submission_acknowledged({"state": "submitted", "exchange_order_id": "ex-1"})
+    assert submission_acknowledged({"state": "unknown_requires_reconciliation", "exchange_order_id": "ex-1"})
+    assert not submission_acknowledged({"state": "unknown_requires_reconciliation", "exchange_order_id": None})
+    assert not submission_acknowledged({"state": "submitting", "exchange_order_id": "ex-1"})
+    assert not submission_acknowledged({"state": "submitted", "exchange_order_id": ""})
+
+
+def test_engine_does_not_call_success_callback_for_unknown_submission(cfg, repo):
+    client = FakeMexc(place_error=MexcNetworkError("timeout after send"))
+    engine = _engine(cfg, repo, client, mode="live")
+
+    class SpyTradeManager:
+        def __init__(self):
+            self.success_calls = []
+
+        def on_intent_planned(self, *args):
+            return SimpleNamespace(rejected=False, deferred=False, trade=None)
+
+        def on_intent_executed(self, intent):
+            self.success_calls.append(intent)
+
+    spy = SpyTradeManager()
+    engine.trade_manager = spy
+    result = engine.process_item(_item(100, 102), _store_message(repo, 102, ALERT))
+
+    assert result is not None and result["state"] == "unknown_requires_reconciliation"
+    assert not result.get("exchange_order_id")
+    assert spy.success_calls == []
+    assert client.place_calls == 1
+    domain_events = repo.db.conn.execute(
+        "SELECT payload_json FROM audit_events WHERE event_class = 'domain'"
+    ).fetchall()
+    assert all(json.loads(row["payload_json"]).get("new_state") != "submitted" for row in domain_events)
+
+
+def test_fresh_successful_snapshot_requires_a_durable_exchange_order_id(cfg, repo):
+    engine = _engine(cfg, repo, FakeMexc())
+    intent = engine.process_item(_item(100, 104), _store_message(repo, 104, ALERT))
+    assert intent is not None and intent["state"] == "open"
+    assert intent.get("exchange_order_id")
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is True
+
+    with engine.repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE reconciliation_results SET exchange_state='FILLED' "
+            "WHERE recon_id=(SELECT MAX(recon_id) FROM reconciliation_results WHERE intent_id=?)",
+            (intent["intent_id"],),
+        )
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is False
+
+    with engine.repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE reconciliation_results SET exchange_state='NEW' "
+            "WHERE recon_id=(SELECT MAX(recon_id) FROM reconciliation_results WHERE intent_id=?)",
+            (intent["intent_id"],),
+        )
+        conn.execute(
+            "UPDATE order_intents SET exchange_order_id=NULL WHERE intent_id=?",
+            (intent["intent_id"],),
+        )
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is False
+
+
+def test_urgent_post_cancel_reconcile_bypasses_only_success_coalescing(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 107), _store_message(repo, 107, ALERT))
+    assert intent is not None and intent["state"] == "open"
+    first_queries = client.query_calls
+
+    engine._now = lambda: NOW + timedelta(seconds=1)
+    refreshed = engine.reconcile_intent_if_due(
+        intent["intent_id"], notify=False, urgent_after_cancel=True
+    )
+    assert refreshed is not None
+    assert client.query_calls == first_queries + 1
+
+    engine.store.record_reconciliation(
+        intent_id=intent["intent_id"],
+        client_order_id=intent["client_order_id"],
+        local_state="open",
+        exchange_state=None,
+        outcome="not_found",
+        detail="test: cancellation lookup not found",
+    )
+    assert (
+        engine.reconcile_intent_if_due(
+            intent["intent_id"], notify=False, urgent_after_cancel=True
+        )
+        is None
+    )
+    assert client.query_calls == first_queries + 1
+
+
+def test_ambiguous_reconciliation_uses_persisted_backoff(cfg, repo):
+    client = FakeMexc(place_error=MexcNetworkError("timeout after send"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 103), _store_message(repo, 103, ALERT))
+    assert intent is not None and intent["state"] == "unknown_requires_reconciliation"
+
+    client.query_error = MexcNetworkError("read timeout")
+    first = engine.reconcile_pending()
+    assert first.checked == 1 and first.ambiguous == 1
+    queries_after_first = client.query_calls
+
+    second = engine.reconcile_pending()
+    assert second.checked == 0 and second.parked == 1
+    assert client.query_calls == queries_after_first
+
+    engine._now = lambda: NOW + timedelta(seconds=6)
+    third = engine.reconcile_pending()
+    assert third.checked == 1 and third.ambiguous == 1
+    assert client.query_calls == queries_after_first + 1
 
 
 def test_restart_reconciles_intent_left_submitting(cfg, repo):
@@ -521,6 +727,10 @@ def test_restart_reconciles_intent_left_submitting(cfg, repo):
         limit_price=Decimal("100"),
     )
     store.transition_intent(intent["intent_id"], "submitting", note="process crashed after submit")
+    store.db.conn.execute(
+        "UPDATE order_intents SET updated_at = ? WHERE intent_id = ?",
+        ((NOW - timedelta(seconds=30)).isoformat(), intent["intent_id"]),
+    )
 
     stats = engine.reconcile_pending()
 
@@ -609,6 +819,10 @@ def test_database_failure_after_submit_does_not_resubmit(cfg, repo):
     assert retried is not None
     assert retried["state"] == "submitting"
     assert client.place_calls == 1
+    engine.store.db.conn.execute(
+        "UPDATE order_intents SET updated_at = ? WHERE intent_id = ?",
+        ((NOW - timedelta(seconds=30)).isoformat(), retried["intent_id"]),
+    )
 
     engine.reconcile_pending()
     resolved = engine.store.get_intent(retried["intent_id"])
@@ -778,6 +992,7 @@ def test_not_found_for_open_intent_never_becomes_terminal_failed(cfg, repo):
     assert intent is not None and intent["state"] == "open"
 
     client.query_error = MexcOrderNotFound("gone")
+    engine._now = lambda: NOW + timedelta(seconds=6)
     stats = engine.reconcile_pending()
     assert stats.not_found == 1
     final = engine.store.get_intent(intent["intent_id"])
@@ -1116,6 +1331,7 @@ def test_transient_my_trades_failure_keeps_fill_sync_pending_then_recovers(cfg, 
     assert intent is not None and intent["state"] == "open"
     assert int(intent["fill_sync_required"]) == 0
 
+    engine._now = lambda: NOW + timedelta(seconds=6)
     stats = engine.reconcile_pending()
     after_failure = engine.store.get_intent(intent["intent_id"])
     assert stats.checked == 1 and stats.ambiguous == 1

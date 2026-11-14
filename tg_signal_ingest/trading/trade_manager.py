@@ -59,7 +59,7 @@ from ..mexc.errors import (
 from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
 from .domain_events import DomainEventConflict, build_domain_event
 from .parser import ParsedSignal
-from .store import TERMINAL_INTENT_STATES, TradingError
+from .store import TERMINAL_INTENT_STATES, TradingError, submission_acknowledged
 from .trade_store import TradeStore
 
 log = logging.getLogger("ingest.trading.trade_manager")
@@ -348,7 +348,9 @@ class TradeManager:
             return TradeDecision(trade=trade, deferred=False, reason="direct entry")
 
     def on_intent_executed(self, intent: dict[str, Any]) -> None:
-        """Called by the engine after ``_execute_intent`` placed the entry order."""
+        """Called only after a durable MEXC order acknowledgement."""
+        if not submission_acknowledged(intent):
+            return
         intent_id = intent.get("intent_id")
         if intent_id is None:
             return
@@ -910,7 +912,7 @@ class TradeManager:
             return
         # Sync the exchange order id/state that _execute_intent just recorded.
         executed_intent = store.get_intent(intent["intent_id"])
-        if executed_intent is not None:
+        if executed_intent is not None and submission_acknowledged(executed_intent):
             self.on_intent_executed(executed_intent)
         refreshed = store.get_trade(trade["trade_id"])
         if refreshed is not None:
@@ -2392,51 +2394,62 @@ class TradeManager:
         self._refresh_buy_block()
 
     def _cancel_entry_remainder(self, trade: dict[str, Any]) -> bool:
-        """Cancel the entry order and confirm a terminal intent state."""
+        """Cancel a confirmed working entry and verify it without query bursts."""
         intent_id = trade.get("entry_intent_id")
         if not intent_id:
             return True
         engine = self.engine
-        reconciler = getattr(engine, "reconcile_intent", None) if engine else None
-        for _ in range(4):
-            intent = self.store.get_intent(intent_id)
-            if intent is None:
-                return False
-            if intent.get("state") in TERMINAL_INTENT_STATES:
-                return True
-            if reconciler is None:
-                # Legacy/test engine without reconciliation: request the cancel
-                # and treat a non-raising call as confirmed.
-                if engine is None:
+        if engine is None:
+            return False
+        intent = self.store.get_intent(intent_id)
+        if intent is None:
+            return False
+        if intent.get("state") in TERMINAL_INTENT_STATES:
+            return True
+
+        due_reconciler = getattr(engine, "reconcile_intent_if_due", None)
+        fresh_snapshot = getattr(engine, "has_fresh_successful_reconciliation", None)
+        reconciler = getattr(engine, "reconcile_intent", None)
+        try:
+            if callable(due_reconciler):
+                checked = due_reconciler(intent_id, notify=False)
+                if checked is None and not (callable(fresh_snapshot) and fresh_snapshot(intent_id)):
                     return False
-                try:
-                    engine.cancel_intent_order(intent)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
-                    return False
-                return True
-            # Query before cancelling: the order may have filled while the tick
-            # was being processed, and an unconditional cancel would discard
-            # the fill evidence we need for quantity accounting.
-            state = intent.get("state")
-            if state in ("open", "partially_filled") and intent.get("exchange_order_id"):
-                if engine is None:
-                    return False
-                try:
-                    engine.cancel_intent_order(intent)
-                except Exception as exc:  # noqa: BLE001 - reconcile below decides
-                    log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
-            try:
+            elif callable(reconciler):
+                # Compatibility for legacy/test engines without the central gate.
                 reconciler(intent_id, notify=False)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("entry reconcile failed for %s: %s", trade["trade_id"], exc)
+            else:
                 return False
-            intent = self.store.get_intent(intent_id)
-            if intent is None:
-                return False
-            if intent.get("state") in TERMINAL_INTENT_STATES:
-                return True
-        return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("entry reconcile failed for %s: %s", trade["trade_id"], exc)
+            return False
+
+        intent = self.store.get_intent(intent_id)
+        if intent is None:
+            return False
+        if intent.get("state") in TERMINAL_INTENT_STATES:
+            return True
+        if intent.get("state") not in ("open", "partially_filled") or not intent.get("exchange_order_id"):
+            # Unknown, planned, submitting, or unacknowledged intents are never
+            # queried in a tight retry loop and are never cancelled by guess.
+            return False
+
+        # One immediate reconciliation after the actual cancel request is
+        # needed for safety. If it remains non-terminal, later sweeps use the
+        # persisted scheduler/backoff rather than four GET bursts.
+        try:
+            engine.cancel_intent_order(intent)
+        except Exception as exc:  # noqa: BLE001 - the refreshed state decides
+            log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
+        try:
+            if callable(due_reconciler):
+                due_reconciler(intent_id, notify=False, urgent_after_cancel=True)
+            elif callable(reconciler):
+                reconciler(intent_id, notify=False)
+        except Exception as exc:  # noqa: BLE001 - cancellation verification is fail-closed
+            log.warning("entry cancel verification failed for %s: %s", trade["trade_id"], exc)
+        refreshed = self.store.get_intent(intent_id)
+        return bool(refreshed and refreshed.get("state") in TERMINAL_INTENT_STATES)
 
     def _cancel_orders_of_kind(self, trade: dict[str, Any], kind: str) -> bool:
         ok = True
@@ -2685,10 +2698,12 @@ class TradeManager:
     def _reconcile_entry_fills(self, trade: dict[str, Any]) -> bool:
         """Record entry fills; return True only when accounting is trustworthy.
 
-        When the engine exposes ``reconcile_intent`` (the production engine),
-        the entry intent is queried read-only *before* any TP/SL quantity is
-        computed.  A network/ambiguous result returns False so callers fail
-        closed rather than acting on stale local fills.
+        When the engine exposes ``reconcile_intent_if_due`` (the production
+        engine), reconciliation is routed through its single persisted
+        backoff/eligibility gate before any TP/SL quantity is computed. A skipped
+        check is reusable only when a fresh successful exchange snapshot, durable
+        order acknowledgement, and completed fill sync are already persisted.
+        Otherwise callers fail closed rather than acting on stale local fills.
         """
         intent_id = trade.get("entry_intent_id")
         if not intent_id:
@@ -2697,7 +2712,7 @@ class TradeManager:
         if intent is None:
             return False
         synced = True
-        reconciler = getattr(self.engine, "reconcile_intent", None) if self.engine else None
+        reconciler = getattr(self.engine, "reconcile_intent_if_due", None) if self.engine else None
         if (
             reconciler is not None
             and intent.get("mode") == "live"
@@ -2708,18 +2723,28 @@ class TradeManager:
             )
             if needs_sync:
                 try:
-                    reconciler(intent_id, notify=False)
+                    checked = reconciler(intent_id, notify=False)
+                    if checked is None:
+                        fresh_snapshot = getattr(self.engine, "has_fresh_successful_reconciliation", None)
+                        synced = bool(fresh_snapshot and fresh_snapshot(intent_id))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("entry fill sync failed for %s: %s", trade["trade_id"], exc)
                     synced = False
                 intent = self.store.get_intent(intent_id) or intent
                 if (
-                    intent.get("state") in ("unknown_requires_reconciliation", "reconciling")
+                    intent.get("state") in (
+                        "planned", "submitting", "unknown_requires_reconciliation", "reconciling"
+                    )
                     or int(intent.get("fill_sync_required") or 0) == 1
                 ):
                     synced = False
 
         exchange_order_id = intent.get("exchange_order_id")
+        if (
+            intent.get("state") in ("submitted", "open", "partially_filled")
+            and not submission_acknowledged(intent)
+        ):
+            synced = False
         fills = self.store.fills_for_order(exchange_order_id) if exchange_order_id else []
         executed_qty = Decimal("0")
         cumulative_quote = Decimal("0")
@@ -2743,7 +2768,16 @@ class TradeManager:
             fees_paid=fees,
             entry_filled_qty=_dec(intent.get("executed_qty")) or Decimal("0"),
             entry_exchange_status=intent.get("state"),
+            entry_order_id=exchange_order_id,
         )
+        if (
+            submission_acknowledged(intent)
+            and intent.get("state") in ("submitted", "open", "partially_filled")
+            and trade.get("trade_state") == "pending_entry"
+        ):
+            self.store.update_trade_state(
+                trade["trade_id"], "entry_active", note="entry order acknowledgement reconciled"
+            )
         # Once fills are confirmed and the entry intent is terminal, settle the
         # entry state and place OCO exits.  An open/partially filled entry is
         # never treated as a finished position.

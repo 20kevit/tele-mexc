@@ -57,6 +57,7 @@ from .store import (
     RiskLimitExceeded,
     TradingError,
     dec_str,
+    submission_acknowledged,
 )
 
 log = logging.getLogger("ingest.trading")
@@ -154,6 +155,10 @@ class TradingEngine:
         # delivery/retry can call this from more than one thread. Serializing
         # the whole decision keeps the DB reservation and execution atomic.
         self._process_lock = threading.RLock()
+        # Keep reconciliation away from a POST that is still waiting behind
+        # WAF cooldown/rate gates or executing inside this process.
+        self._inflight_submission_ids: set[str] = set()
+        self._inflight_submission_lock = threading.Lock()
         # Per-symbol lock covers the exchange open-order check plus the BUY
         # submission, so two concurrent same-symbol signals cannot both observe
         # an empty book and submit duplicate entries.  Different symbols use
@@ -582,7 +587,7 @@ class TradingEngine:
             return intent
         with self._measure_signal_stage(item, "order_execution"):
             result = self._execute_intent(intent["intent_id"])
-            if self.trade_manager is not None and result is not None:
+            if self.trade_manager is not None and submission_acknowledged(result):
                 self.trade_manager.on_intent_executed(result)
         return result
 
@@ -624,7 +629,7 @@ class TradingEngine:
                 )
                 return current
         result = self._execute_intent(current["intent_id"])
-        if self.trade_manager is not None and result is not None:
+        if self.trade_manager is not None and submission_acknowledged(result):
             self.trade_manager.on_intent_executed(result)
         return result
 
@@ -669,10 +674,11 @@ class TradingEngine:
             if trade.get("entry_mode") == "conditional" and trade.get("trade_state") == "pending_entry":
                 continue
             result = self.execute_intent(intent["intent_id"])
-            if result is None or result.get("state") not in ("submitting", "submitted", "open", "filled"):
+            if not submission_acknowledged(result):
                 continue
+            if self.trade_manager is not None:
+                self.trade_manager.on_intent_executed(result)
             resumed += 1
-            self.trade_manager.on_intent_executed(result)
         return resumed
 
     def _cancel_stale_planned_intent(
@@ -1543,6 +1549,8 @@ class TradingEngine:
         if protection_requested:
             payload["take_profit_price"] = tp_price
             payload["stop_loss_price"] = sl_price
+        with self._inflight_submission_lock:
+            self._inflight_submission_ids.add(intent_id)
         try:
             with self.evidence.operation(
                 operation_type="place_order",
@@ -1645,6 +1653,9 @@ class TradingEngine:
                     )
                     self._verify_protection(intent_id)
                 self.reconcile_intent(intent_id, notify=False)
+        finally:
+            with self._inflight_submission_lock:
+                self._inflight_submission_ids.discard(intent_id)
 
         result = self.store.get_intent(intent_id)
         assert result is not None
@@ -2093,10 +2104,89 @@ class TradingEngine:
 
     # -------------------------------------------------------- reconciliation
 
+    def _submission_reconciliation_grace_seconds(self) -> float:
+        """Bound the in-flight POST window using the configured transport timeout."""
+
+        mexc_cfg = getattr(self.cfg, "mexc", None)
+        request_timeout = float(getattr(mexc_cfg, "request_timeout_s", 10.0) or 10.0)
+        connect_timeout = float(getattr(mexc_cfg, "connect_timeout_s", 5.0) or 0.0)
+        configured_cli_timeout = float(getattr(mexc_cfg, "cli_timeout_s", 0.0) or 0.0)
+        client_request_timeout = float(getattr(self.client, "request_timeout_s", 0.0) or 0.0)
+        client_connect_timeout = float(getattr(self.client, "connect_timeout_s", 0.0) or 0.0)
+        client_timeout = float(getattr(self.client, "timeout_s", 0.0) or 0.0)
+        transport_bound = max(
+            request_timeout + connect_timeout,
+            configured_cli_timeout,
+            client_request_timeout + client_connect_timeout,
+            client_timeout,
+            15.0,
+        )
+        # Five seconds of scheduling/clock margin beyond the configured request bound.
+        return transport_bound + 5.0
+
+    def _submission_claim_expired(self, intent: dict[str, Any]) -> bool:
+        intent_id = str(intent.get("intent_id") or "")
+        with self._inflight_submission_lock:
+            if intent_id and intent_id in self._inflight_submission_ids:
+                return False
+        updated_at = _parse_signal_time(intent.get("updated_at"))
+        if updated_at is None:
+            return False
+        age = (self._now() - updated_at).total_seconds()
+        return age >= self._submission_reconciliation_grace_seconds()
+
+    def reconcile_intent_if_due(
+        self,
+        intent_id: str,
+        *,
+        notify: bool = True,
+        urgent_after_cancel: bool = False,
+    ) -> dict[str, Any] | None:
+        """Single backoff-aware entry point for scheduled/lifecycle reconciliation.
+
+        ``None`` means no exchange query was due or safe. In particular, a
+        conditional ``planned`` intent is not an exchange order, and a fresh
+        ``submitting`` claim may still have its POST in flight. The post-cancel
+        override bypasses only a recent-success coalescing delay, never an
+        ambiguous/not-found backoff.
+        """
+
+        intent = self.store.get_intent(intent_id)
+        if intent is None:
+            raise RuntimeError(f"intent {intent_id} not found")
+        if intent.get("mode") != "live" or self.client is None:
+            return None
+        with self._inflight_submission_lock:
+            if intent_id in self._inflight_submission_ids:
+                return None
+        state = str(intent.get("state") or "")
+        if state == "planned":
+            return None
+        if state == "submitting" and not self._submission_claim_expired(intent):
+            return None
+        if state in TERMINAL_INTENT_STATES and int(intent.get("fill_sync_required") or 0) != 1:
+            return None
+        remaining = self._reconciliation_backoff_remaining(intent_id)
+        if remaining > 0:
+            if not urgent_after_cancel:
+                return None
+            latest = self.repo.db.conn.execute(
+                "SELECT outcome FROM reconciliation_results WHERE intent_id = ? "
+                "ORDER BY recon_id DESC LIMIT 1",
+                (intent_id,),
+            ).fetchone()
+            if latest is None or str(latest["outcome"]) not in ("consistent", "resolved"):
+                return None
+        return self.reconcile_intent(intent_id, notify=notify)
+
     def reconcile_intent(self, intent_id: str, *, notify: bool = True) -> dict[str, Any]:
         intent = self.store.get_intent(intent_id)
         if intent is None:
             raise RuntimeError(f"intent {intent_id} not found")
+        if intent.get("state") == "planned":
+            return intent
+        if intent.get("state") == "submitting" and not self._submission_claim_expired(intent):
+            return intent
         if intent["mode"] != "live" or self.client is None:
             self.store.record_reconciliation(
                 intent_id=intent_id,
@@ -2363,50 +2453,87 @@ class TradingEngine:
             return mapped, "consistent", f"exchange status {exchange_status} matches local state"
         return mapped, "resolved", f"local {local_state} -> exchange {exchange_status}"
 
-    def _not_found_backoff_remaining(self, intent_id: str) -> float:
-        """Persistently back off repeated missing-order query responses.
+    def _reconciliation_backoff_remaining(self, intent_id: str) -> float:
+        """Persistently back off repeated ambiguous/not-found queries.
 
-        A missing query result never resolves an uncertain submission. It stays
-        in the reconciliation set, but repeated -2011/-2013 responses use an
-        exponential 60s, 120s, 240s... cadence capped at 15 minutes. The most
-        recent durable reconciliation rows survive process restarts.
+        Not-found responses use 60s, 120s, 240s... capped at 15 minutes.
+        Ambiguous transport/timestamp outcomes use 5s, 10s, 20s... capped at
+        60 seconds. Successful queries are throttled for five seconds to
+        coalesce lifecycle and periodic callers.
+        Results are durable across restarts.
         """
+
         rows = self.repo.db.conn.execute(
             "SELECT outcome, created_at FROM reconciliation_results "
             "WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 8",
             (intent_id,),
         ).fetchall()
-        streak = 0
-        latest_at: str | None = None
-        for row in rows:
-            if str(row["outcome"]) != "not_found":
-                break
-            streak += 1
-            if latest_at is None:
-                latest_at = str(row["created_at"])
-        if streak == 0 or latest_at is None:
+        if not rows:
             return 0.0
-        last = _parse_signal_time(latest_at)
+        latest_outcome = str(rows[0]["outcome"])
+        if latest_outcome in ("not_found", "ambiguous"):
+            streak = 0
+            for row in rows:
+                if str(row["outcome"]) != latest_outcome:
+                    break
+                streak += 1
+            base_delay = 60.0 if latest_outcome == "not_found" else 5.0
+            maximum_delay = 900.0 if latest_outcome == "not_found" else 60.0
+            delay = min(base_delay * (2 ** max(0, streak - 1)), maximum_delay)
+        else:
+            delay = 5.0
+        last = _parse_signal_time(rows[0]["created_at"])
         if last is None:
             return 0.0
-        delay = min(60.0 * (2 ** (streak - 1)), 900.0)
         elapsed = max(0.0, (self._now() - last).total_seconds())
         return max(0.0, delay - elapsed)
+
+    def has_fresh_successful_reconciliation(self, intent_id: str) -> bool:
+        """Whether the persisted exchange snapshot is still inside its success coalescing window.
+
+        This lets lifecycle callers reuse already-persisted order/fill facts
+        without issuing a duplicate GET. It is deliberately false for uncertain
+        states and whenever terminal fill synchronization is still outstanding.
+        """
+
+        intent = self.store.get_intent(intent_id)
+        if (
+            intent is None
+            or not submission_acknowledged(intent)
+            or intent.get("state") in ("planned", "submitting", "unknown_requires_reconciliation", "reconciling")
+        ):
+            return False
+        if int(intent.get("fill_sync_required") or 0) == 1:
+            return False
+        row = self.repo.db.conn.execute(
+            "SELECT outcome, local_state, exchange_state, client_order_id "
+            "FROM reconciliation_results WHERE intent_id = ? ORDER BY recon_id DESC LIMIT 1",
+            (intent_id,),
+        ).fetchone()
+        if row is None or str(row["outcome"]) not in ("consistent", "resolved"):
+            return False
+        if row["client_order_id"] != intent.get("client_order_id") or not row["exchange_state"]:
+            return False
+        mapped, outcome, _ = self._map_exchange_state(
+            str(row["local_state"] or ""), str(row["exchange_state"])
+        )
+        if outcome not in ("consistent", "resolved") or mapped != intent.get("state"):
+            return False
+        return self._reconciliation_backoff_remaining(intent_id) > 0
+
+    # Backwards-compatible name used by older operational tests/tools.
+    def _not_found_backoff_remaining(self, intent_id: str) -> float:
+        return self._reconciliation_backoff_remaining(intent_id)
 
     def reconcile_pending(self, limit: int = 50) -> ReconcileStats:
         stats = ReconcileStats()
         for intent in self.store.pending_reconciliation(limit=limit):
-            remaining = self._not_found_backoff_remaining(str(intent["intent_id"]))
-            if remaining > 0:
-                stats.parked += 1
-                log.debug(
-                    "reconciliation parked for %s after repeated order-not-found responses; retry in %.1fs",
-                    intent["intent_id"], remaining,
-                )
-                continue
-            stats.checked += 1
             try:
-                result = self.reconcile_intent(intent["intent_id"])
+                result = self.reconcile_intent_if_due(intent["intent_id"])
+                if result is None:
+                    stats.parked += 1
+                    continue
+                stats.checked += 1
             except Exception as exc:  # noqa: BLE001 - one bad intent must not stop the sweep
                 stats.errors += 1
                 self.store.record_reconciliation(

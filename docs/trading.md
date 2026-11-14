@@ -506,7 +506,37 @@ applies only to that path.
 ## Reconciliation
 
 `reconcile_pending()` selects live intents in non-terminal/open states or with
-`fill_sync_required = 1`.
+`fill_sync_required = 1`. All scheduled and lifecycle entry-intent reads pass
+through `reconcile_intent_if_due()`; TradeManager must not call the raw
+`reconcile_intent()` in a recurring sweep.
+
+Eligibility and persisted retry timing:
+
+- `planned` is not an exchange order and is never queried.
+- `submitting` is not queried while its POST is in flight. The process keeps an
+  in-memory in-flight marker from before `place_order` through durable response
+  handling and inline reconciliation. After a process crash, a stale claim is
+  eligible only after the configured transport timeout bound (minimum 15 s)
+  plus a 5 s margin. An unparseable claim timestamp fails closed.
+- Consecutive `not_found` results back off at 60, 120, 240, ... seconds, capped
+  at 15 minutes. Consecutive `ambiguous` results back off at 5, 10, 20, ...
+  seconds, capped at 60 seconds. A successful `consistent`/`resolved` query is
+  coalesced for 5 seconds to prevent duplicate reads from lifecycle and periodic
+  callers. The outcome and timestamp are persisted in `reconciliation_results`.
+- A skipped read may reuse a recent successful snapshot only when the intent
+  still has a durable exchange order ID, the client order ID and exchange status
+  match the recorded result, the status maps back to the current local state,
+  and no terminal fill synchronization is pending.
+- The one immediate reconciliation after an actual entry-cancel request may
+  bypass only the 5 s successful-query coalescing window. It never bypasses
+  `not_found` or `ambiguous` backoff. If the latest result is still uncertain,
+  cancelling the entry remainder is deferred until the next eligible read;
+  repeated `not_found` can therefore delay TP settlement up to the 15 min cap.
+  This is fail-closed: the bot does not cancel an order whose current exchange
+  state it cannot verify.
+- The in-flight marker described here is specific to entry-intent submissions.
+  OCO/SELL trade-order submission and cancellation use their own reconciliation
+  lifecycle and do not inherit this entry-intent guard.
 
 | Exchange result | Local effect |
 | --- | --- |
