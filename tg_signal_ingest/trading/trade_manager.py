@@ -35,6 +35,7 @@ import hashlib
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -56,8 +57,9 @@ from ..mexc.errors import (
     MexcUnexpectedResponse,
 )
 from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
+from .domain_events import DomainEventConflict, build_domain_event
 from .parser import ParsedSignal
-from .store import TERMINAL_INTENT_STATES, TradingError
+from .store import TERMINAL_INTENT_STATES, TradingError, submission_acknowledged
 from .trade_store import TradeStore
 
 log = logging.getLogger("ingest.trading.trade_manager")
@@ -105,6 +107,21 @@ UNPROTECTED_CRITICAL = "unprotected_critical"
 # Owner-agreed OCO retry policy (F-02): one initial attempt plus eight retries.
 OCO_RETRY_DELAYS_S: tuple[int, ...] = (5, 10, 15, 30, 30, 30, 30, 30)
 MAX_OCO_ATTEMPTS = 1 + len(OCO_RETRY_DELAYS_S)
+
+# OCO child discovery.  MEXC returns the TP and stop children of a resolved
+# native OCO as separate allOrders rows with ``orderListId = -1`` and null
+# client ids.  There is no exchange parent/child link, and the OCO trigger is
+# not exposed (``stopPrice`` is null/absent), so a sibling is only accepted
+# when every observable field matches exactly and the result is unique:
+# symbol, side, type, ``time`` (same millisecond), ``origQty``, and the
+# stop-limit ``price``.  ``price`` on the stop child is the stop-limit price,
+# which equals ``trades.sl_price``; it is *not* the trigger stored in
+# ``trade_orders.stop_trigger_price`` for legacy rows (historically SL+ticks).
+OCO_CHILD_DISCOVERY_MARGIN_MS = 10 * 60 * 1000
+OCO_CHILD_DISCOVERY_HISTORY_MS = 7 * 24 * 60 * 60 * 1000
+OCO_CHILD_DISCOVERY_BACKOFF_PREFIX = "OCO_STOP_CHILD_DISCOVERY:"
+OCO_CHILD_DISCOVERY_BACKOFF_MAX_S = 900.0
+OCO_CHILD_DISCOVERY_QUERY_LIMIT = 1000
 
 # Deterministic exchange validations that can never succeed by resubmitting
 # the same payload.  They are terminal for the leg (no retry, no replacement).
@@ -171,6 +188,15 @@ def _dec_ts(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _int_ms(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_retryable_oco_error(exc: BaseException) -> bool:
@@ -282,7 +308,11 @@ class TradeManager:
                 log.log(
                     level,
                     "trade_lock operation=%s signal_or_trade=%s wait_ms=%s hold_ms=%s outcome=%s",
-                    operation, key, wait_ms, hold_ms, outcome,
+                    operation,
+                    key,
+                    wait_ms,
+                    hold_ms,
+                    outcome,
                 )
 
     @property
@@ -312,7 +342,18 @@ class TradeManager:
         with self._hold_trade_lock(str(intent["signal_id"]), "on_intent_planned"):
             existing = self.store.get_trade_by_signal(intent["signal_id"])
             if existing is not None:
-                if existing.get("entry_mode") == "conditional" and existing.get("trade_state") == "pending_entry":
+                trade_state = str(existing.get("trade_state") or "")
+                if trade_state != "pending_entry":
+                    # Duplicate Telegram delivery reaches this method through
+                    # _resume_planned_intent(), outside the periodic resume guard.
+                    # Fail closed for every lifecycle state except pending_entry.
+                    return TradeDecision(
+                        trade=existing,
+                        deferred=False,
+                        rejected=True,
+                        reason=(f"existing trade state {trade_state!r} is not eligible for planned entry submission"),
+                    )
+                if existing.get("entry_mode") == "conditional":
                     return TradeDecision(
                         trade=existing,
                         deferred=True,
@@ -346,7 +387,9 @@ class TradeManager:
             return TradeDecision(trade=trade, deferred=False, reason="direct entry")
 
     def on_intent_executed(self, intent: dict[str, Any]) -> None:
-        """Called by the engine after ``_execute_intent`` placed the entry order."""
+        """Called only after a durable MEXC order acknowledgement."""
+        if not submission_acknowledged(intent):
+            return
         intent_id = intent.get("intent_id")
         if intent_id is None:
             return
@@ -366,8 +409,28 @@ class TradeManager:
                 entry_filled_qty=_dec(intent.get("executed_qty")) or Decimal("0"),
             )
             intent_state = intent.get("state")
-            if intent_state in ("open", "partially_filled", "submitted"):
-                self.store.update_trade_state(trade["trade_id"], "entry_active", note="entry order open")
+            if intent_state in (
+                "open",
+                "partially_filled",
+                "submitted",
+                "reconciling",
+                "unknown_requires_reconciliation",
+            ):
+                self.store.update_trade_state(
+                    trade["trade_id"],
+                    "entry_active",
+                    note=(
+                        "entry order acknowledged; exchange state requires reconciliation"
+                        if intent_state in ("reconciling", "unknown_requires_reconciliation")
+                        else "entry order open"
+                    ),
+                )
+                # The acknowledgement can already include a partial execution.
+                # Sync myTrades now and protect the confirmed acquired quantity;
+                # do not wait for the next 60-second reconciliation sweep.
+                refreshed = self.store.get_trade(trade["trade_id"])
+                if refreshed is not None:
+                    self._reconcile_entry_fills(refreshed)
                 return
             refreshed = self.store.get_trade(trade["trade_id"])
             if refreshed is not None:
@@ -469,7 +532,14 @@ class TradeManager:
                 self._notify_stale_config(intent["symbol"], "computed trigger price invalid")
                 self._reject_trade_intent(intent, "trigger price invalid; refusing conditional entry")
                 return None
-            entry_mode = "conditional"
+            # The initial reference price may already be at/above the computed
+            # trigger while still below Entry. Treat that as an already-fired
+            # trigger and submit the normal LIMIT at Entry immediately; waiting
+            # for another upward crossing would miss the valid entry window.
+            if current < trigger_price:
+                entry_mode = "conditional"
+            else:
+                trigger_price = None
 
         tp1_price = _first(parsed.target_prices)
         tp2_price = _second(parsed.target_prices)
@@ -603,6 +673,33 @@ class TradeManager:
         except Exception as exc:  # noqa: BLE001
             log.error("could not list trades for the new-BUY block: %s", exc)
             return None
+
+    def _active_oco_coverage(self, trade: dict[str, Any]) -> Decimal:
+        """Quantity covered by currently working native OCO parent orders."""
+        covered = Decimal("0")
+        for kind in ("tp1", "tp2"):
+            for order in self._oco_orders(trade, kind):
+                if order.get("state") not in ("open", "partially_filled"):
+                    continue
+                quantity = _dec(order.get("quantity")) or Decimal("0")
+                sold = _dec(order.get("sold_qty")) or Decimal("0")
+                covered += max(Decimal("0"), quantity - sold)
+        return covered
+
+    def _entry_remainder_outgrows_oco_coverage(self, trade: dict[str, Any]) -> bool:
+        """Detect later entry fills that exceed the already-active OCO sizes."""
+        intent_id = trade.get("entry_intent_id")
+        if not intent_id:
+            return False
+        intent = self.store.get_intent(intent_id)
+        if intent is None or intent.get("state") not in ("open", "partially_filled"):
+            return False
+        if self._unattributed_oco_parent_cancellations(trade):
+            return False  # the parent/child containment path owns this case
+        sellable = self._remaining_base(trade)
+        if sellable is None or sellable <= 0:
+            return False
+        return self._active_oco_coverage(trade) < sellable
 
     def _verified_exit_coverage(self, trade: dict[str, Any]) -> Decimal:
         """Working, exchange-confirmed sell quantity covering the remainder."""
@@ -845,58 +942,87 @@ class TradeManager:
     # ===================================================================
 
     def _submit_entry_order(self, trade: dict[str, Any]) -> None:
-        """Submit the Limit Buy (conditional trigger hit) through the engine gate."""
+        """Submit a triggered LIMIT entry; activate only after durable MEXC ack.
+
+        A blocked submission leaves the trade pending so a later fresh tick can
+        retry after Pause/new-BUY gates clear. A claimed but uncertain submission
+        is parked for reconciliation and is never blindly retried.
+        """
         store = self.store
-        now = self._ts()
         with store.db.transaction() as conn:
             row = conn.execute(
                 "SELECT trade_state, entry_intent_id FROM trades WHERE trade_id = ?",
                 (trade["trade_id"],),
             ).fetchone()
-            if row is None:
-                return
-            if row[0] != "pending_entry":
-                return  # idempotent: already activated
-            # Atomically flip pending_entry -> entry_active. If submission
-            # then fails the reconciler parks/retries the trade safely.
-            conn.execute(
-                "UPDATE trades SET trade_state='entry_active', "
-                "activated_at=COALESCE(activated_at, ?), updated_at=? WHERE trade_id=?",
-                (now, now, trade["trade_id"]),
-            )
-        intent = store.get_intent(row[1])
-        if intent is None:
-            store.update_trade_state(trade["trade_id"], "needs_reconciliation", note="entry intent missing")
+        if row is None or row[0] != "pending_entry":
             return
-        refreshed = store.get_trade(trade["trade_id"])
-        if refreshed is not None:
-            trade = refreshed
-        self._notify_trade(trade, "ENTRY_TRIGGER_ACTIVATED", "submitting Limit Buy at entry price")
+        intent_id = row[1]
+        intent = store.get_intent(intent_id) if intent_id else None
+        if intent is None:
+            store.update_trade_state(
+                trade["trade_id"],
+                "needs_reconciliation",
+                note="conditional entry intent missing before submission",
+            )
+            return
         if self.engine is None:
             self._record_error(trade, "engine unavailable", "runtime")
             return
-        # Reuse the engine's full live gate: reservation + balance preflight + order.
+
         try:
+            # TradingEngine claims planned -> submitting atomically inside its
+            # pause/readiness gate. Do not mutate the trade before that claim.
             self.engine._execute_intent(intent["intent_id"])
         except Exception as exc:  # noqa: BLE001
             self._record_error(trade, f"entry submission failed: {exc}", "exchange")
             self._notify_trade(trade, "ENTRY_SUBMISSION_FAILED", str(exc)[:500])
-            # A failed submission may be a definitive local rejection (no
-            # exchange order) or an uncertain outcome.  Reconcile the intent so
-            # the trade does not stay stuck in entry_active forever.
-            self._reconcile_entry_fills(trade)
+            current = store.get_intent(intent["intent_id"])
+            if current is not None and submission_acknowledged(current):
+                self.on_intent_executed(current)
+            elif current is not None and current.get("state") in (
+                "submitting",
+                "reconciling",
+                "unknown_requires_reconciliation",
+            ):
+                store.update_trade_state(
+                    trade["trade_id"],
+                    "needs_reconciliation",
+                    note="entry submission was claimed but its exchange outcome is uncertain",
+                )
+            elif current is not None and current.get("state") in TERMINAL_INTENT_STATES:
+                refreshed = store.get_trade(trade["trade_id"])
+                if refreshed is not None:
+                    self._settle_entry_state(refreshed)
+            # A still-planned intent was not claimed (for example, Pause or a
+            # new-BUY block). Keep pending_entry; the next fresh trigger can retry.
+            return
+
+        current = store.get_intent(intent["intent_id"])
+        if current is None:
+            store.update_trade_state(
+                trade["trade_id"],
+                "needs_reconciliation",
+                note="entry intent disappeared after submission attempt",
+            )
+            return
+        if submission_acknowledged(current):
+            # This is the only path that advances pending_entry to entry_active.
+            self.on_intent_executed(current)
+        elif current.get("state") == "planned":
+            # The engine's atomic submission gate declined the claim. Preserve
+            # the waiting state; do not make a planned intent look submitted.
+            return
+        elif current.get("state") in TERMINAL_INTENT_STATES:
             refreshed = store.get_trade(trade["trade_id"])
             if refreshed is not None:
                 self._settle_entry_state(refreshed)
-            return
-        # Sync the exchange order id/state that _execute_intent just recorded.
-        executed_intent = store.get_intent(intent["intent_id"])
-        if executed_intent is not None:
-            self.on_intent_executed(executed_intent)
-        refreshed = store.get_trade(trade["trade_id"])
-        if refreshed is not None:
-            trade = refreshed
-        self._notify_trade(trade, "ENTRY_SUBMITTED", "Limit Buy submitted at entry price")
+        else:
+            # A claimed intent without durable acknowledgement is not retryable.
+            store.update_trade_state(
+                trade["trade_id"],
+                "needs_reconciliation",
+                note=f"entry submission state {current.get('state')} is not a durable acknowledgement",
+            )
 
     def _settle_entry_state(self, trade: dict[str, Any]) -> None:
         """Advance an entry-state trade once the entry intent is terminal.
@@ -945,11 +1071,6 @@ class TradeManager:
                     "needs_reconciliation",
                     note="entry activated but no submission was claimed; operator review required",
                 )
-                self._notify_trade(
-                    trade,
-                    "ENTRY_NOT_SUBMITTED",
-                    "entry activation did not record a submission; manual reconciliation required",
-                )
             return
         if acquired > 0:
             if state in ("pending_entry", "entry_active"):
@@ -965,12 +1086,6 @@ class TradeManager:
                 note=f"entry intent {intent_state} with no fills; no position opened",
                 sl_state="dormant",
             )
-            refreshed = self.store.get_trade(trade["trade_id"])
-            self._notify_trade(
-                refreshed or trade,
-                "ENTRY_NOT_FILLED",
-                f"entry {intent_state}; no position opened, no exit orders placed",
-            )
         elif intent_state == "filled":
             # Filled according to the exchange but no fill records: never treat
             # this as a zero position.  Fail closed for manual reconciliation.
@@ -978,11 +1093,6 @@ class TradeManager:
                 trade["trade_id"],
                 "needs_reconciliation",
                 note="entry reports filled but no fill records were persisted",
-            )
-            self._notify_trade(
-                trade,
-                "ENTRY_FILLS_MISSING",
-                "entry filled but fills could not be persisted; manual reconciliation required",
             )
 
     # ===================================================================
@@ -1022,10 +1132,12 @@ class TradeManager:
         """Atomically move trade state. Returns True if transitioned."""
         now = self._ts()
         with self.store.db.transaction() as conn:
-            row = conn.execute("SELECT trade_state FROM trades WHERE trade_id = ?", (trade["trade_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade["trade_id"],)
+            ).fetchone()
             if row is None:
                 return False
-            state = row[0]
+            state = str(row["trade_state"])
             if state in (
                 "tp2_completed",
                 "closed",
@@ -1041,10 +1153,27 @@ class TradeManager:
                 "UPDATE trades SET trade_state=?, updated_at=? WHERE trade_id=?",
                 (new_state, now, trade["trade_id"]),
             )
-        refreshed = self.store.get_trade(trade["trade_id"])
-        if refreshed is not None:
-            trade = refreshed
-        self._notify_trade(trade, "STATE_TRANSITION", f"trade -> {new_state}")
+            if state != new_state:
+                self.store.record_domain_event(
+                    build_domain_event(
+                        "trade.state_changed",
+                        aggregate_id=str(trade["trade_id"]),
+                        correlation_id=str(trade["trade_id"]),
+                        symbol=row["symbol"],
+                        occurred_at=now,
+                        severity=(
+                            "CRITICAL"
+                            if new_state == "unprotected_critical"
+                            else "WARNING"
+                            if new_state == "needs_reconciliation"
+                            else None
+                        ),
+                        payload={"previous_state": state, "new_state": new_state},
+                    ),
+                    conn=conn,
+                )
+        # The transactional domain event replaces the old generic
+        # STATE_TRANSITION outbox notice; do not enqueue a duplicate message.
         return True
 
     def _disable_legacy_exit(self, trade: dict[str, Any], target: str) -> None:
@@ -1055,7 +1184,6 @@ class TradeManager:
             "no order was submitted — manual reconciliation required"
         )
         self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-        self._notify_trade(trade, "LEGACY_EXIT_DISABLED", detail)
 
     def _do_tp_sale(self, trade: dict[str, Any], target: str) -> None:
         """Disabled: standalone take-profit orders are not part of the product."""
@@ -1292,9 +1420,12 @@ class TradeManager:
         price: Decimal | None,
         *,
         order_type: str,
+        tranche_id: str | None = None,
+        attempt: int = 1,
+        stop_trigger_price: Decimal | None = None,
     ) -> dict[str, Any]:
-        attempt = len(self.store.list_trade_orders(trade["trade_id"], kind=kind)) + 1
-        client_order_id = self._client_order_id(trade["trade_id"], kind, attempt)
+        group_id = tranche_id or self._oco_group_id(trade)
+        client_order_id = self._client_order_id(trade["trade_id"], kind, attempt, tranche_id=tranche_id)
         return self.store.create_trade_order(
             trade_order_id=f"to-{client_order_id}",
             trade_id=trade["trade_id"],
@@ -1306,8 +1437,9 @@ class TradeManager:
             price=price,
             quantity=qty,
             allocated_qty=qty,
+            stop_trigger_price=stop_trigger_price,
             attempt=attempt,
-            oco_group_id=self._oco_group_id(trade),
+            oco_group_id=group_id,
             leg_role=kind,
         )
 
@@ -1316,9 +1448,7 @@ class TradeManager:
     ) -> None:
         """Refuse standalone TP submission; exits are native OCO pairs only."""
 
-        raise TradingError(
-            "standalone take-profit orders are disabled; exits must be native OCO pairs"
-        )
+        raise TradingError("standalone take-profit orders are disabled; exits must be native OCO pairs")
         engine = self.engine  # noqa: F841 - unreachable, kept for historical context
         if engine is None:
             self._record_error(trade, "no engine available for TP sale", "runtime")
@@ -1355,7 +1485,6 @@ class TradeManager:
         except Exception as exc:  # noqa: BLE001 - definitive rejection before submission
             self.store.transition_trade_order(order["trade_order_id"], "rejected", note=str(exc)[:500])
             self._record_error(trade, f"TP rejected: {exc}", "exchange")
-            self._notify_trade(trade, "TP_REJECTED", str(exc)[:500])
             return
 
         exchange_id = result.get("exchange_order_id") or result.get("order_id")
@@ -1376,8 +1505,6 @@ class TradeManager:
             exchange_status=result.get("state") or result.get("status"),
             sold_qty=executed,
         )
-        label = "TP_SUBMITTED" if target == "tp1" else "TP2_SUBMITTED"
-        self._notify_trade(trade, label, f"{target} sell {qty} @ {price}")
         # Refresh immediately so a fast fill is not lost if the process exits.
         self._reconcile_trade_orders(trade)
 
@@ -1396,45 +1523,258 @@ class TradeManager:
         group = self.store.get_oco_group(trade["trade_id"])
         return str(group["oco_group_id"]) if group else None
 
-    def _sync_oco_legs(self, trade: dict[str, Any]) -> str | None:
-        """Project both legs of each OCO order into ``oco_groups``/``oco_legs``.
+    def _list_oco_legs(self, group_id: str | None) -> list[dict[str, Any]]:
+        """Defensive wrapper around store.list_oco_legs (mock stores may lack it)."""
 
-        A native OCO order carries a take-profit leg *and* a stop-loss leg.  The
-        historical projection only stored the take-profit leg, so a stop-loss
-        execution looked indistinguishable from a cancellation.  Both legs are
-        now persisted with group attribution so MEXC-confirmed state can be
-        compared with what the bot believes.
+        if group_id is None:
+            return []
+        lister = getattr(self.store, "list_oco_legs", None)
+        if lister is None:
+            return []
+        try:
+            return list(lister(group_id))
+        except Exception as exc:  # noqa: BLE001 - projection must not crash a tick
+            log.warning("OCO leg lookup failed for %s: %s", group_id, exc)
+            return []
+
+    def _oco_leg_targets(
+        self,
+        order: dict[str, Any],
+        group_id: str,
+        kind: str,
+        *,
+        siblings: list[dict[str, Any]] | None = None,
+        existing_legs: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[str, str]:
+        """Return unique (TP, SL) projection targets for one OCO order row.
+
+        Legacy single-tranche groups keep the historical ``tp1``/``tp1_sl``
+        targets.  Whenever a group holds more than one row of the same kind
+        (retry attempts or several same-kind rows), every row after the legacy
+        owner gets a stable per-parent suffix derived from ``trade_order_id`` so
+        two stop children can never overwrite each other in the same group.
         """
+
+        siblings = list(siblings if siblings is not None else [order])
+        existing_legs = existing_legs or {}
+        legacy_tp, legacy_sl = kind, f"{kind}_sl"
+        order_id = str(order.get("trade_order_id") or "")
+
+        def _owned_by(order_leg: dict[str, Any] | None) -> bool:
+            if order_leg is None:
+                return False
+            owner = str(order_leg.get("trade_order_id") or "")
+            if owner:
+                return bool(order_id) and owner == order_id
+            # A legacy projection without an owner can only be claimed when
+            # there is exactly one row of this kind to claim it.
+            return len(siblings) == 1
+
+        if _owned_by(existing_legs.get(legacy_tp)) or _owned_by(existing_legs.get(legacy_sl)):
+            return legacy_tp, legacy_sl
+        if len(siblings) == 1 and str(order.get("oco_group_id") or group_id) == group_id:
+            return legacy_tp, legacy_sl
+        order_key = order_id or str(order.get("client_order_id") or order.get("exchange_order_id") or "")
+        if not order_key:
+            # ``trade_order_id`` is the storage primary key; without a stable
+            # identity a unique target cannot be derived, so keep the legacy
+            # name rather than inventing a non-deterministic key.
+            return legacy_tp, legacy_sl
+        return f"{kind}:{order_key}", f"{kind}_sl:{order_key}"
+
+    @staticmethod
+    def _stop_leg_is_resolved(leg: dict[str, Any] | None, tp_order: dict[str, Any]) -> bool:
+        """True when the stop leg is an independently observed child order."""
+
+        if not leg:
+            return False
+        if str(leg.get("kind") or "") != "stop_loss":
+            return False
+        child_id = str(leg.get("exchange_order_id") or "")
+        tp_id = str(tp_order.get("exchange_order_id") or "")
+        if not child_id:
+            return False
+        if tp_id and child_id == tp_id:
+            # Legacy projection copied the TP parent identity into the stop row.
+            return False
+        leg_owner = str(leg.get("trade_order_id") or "")
+        tp_owner = str(tp_order.get("trade_order_id") or "")
+        if leg_owner and tp_owner and leg_owner != tp_owner:
+            # Never let a stop row belonging to another parent satisfy this one.
+            return False
+        if str(leg.get("not_observed_reason") or "").strip():
+            return False
+        if not leg.get("last_observed_at"):
+            return False
+        return str(leg.get("state") or "") in ("open", "partially_filled", "filled", "canceled", "rejected")
+
+    def _unsettled_oco_stop_child_reason(self, trade: dict[str, Any]) -> str | None:
+        """Describe a stop child that may still fill, so no replacement overlaps it."""
 
         group_id = self._oco_group_id(trade)
         if group_id is None:
             return None
+        for leg in self._list_oco_legs(group_id):
+            if str(leg.get("kind") or "") != "stop_loss":
+                continue
+            if str(leg.get("not_observed_reason") or "").strip():
+                continue
+            child_id = str(leg.get("exchange_order_id") or "")
+            if not child_id:
+                continue
+            state = str(leg.get("state") or "")
+            filled = _dec(leg.get("filled_qty")) or Decimal("0")
+            intended = _dec(leg.get("intended_qty")) or Decimal("0")
+            if state in ("open", "partially_filled"):
+                return f"{child_id} state={state} filled={filled}/{intended}"
+            if filled > 0 and intended > 0 and filled < intended:
+                return f"{child_id} partial fill {filled}/{intended}"
+        return None
 
-        def _project(order: dict[str, Any], leg_role: str) -> None:
+    def _oco_stop_children_settled(self, trade: dict[str, Any]) -> bool:
+        """True only when terminal OCO parents have proven terminal stop children.
+
+        Active parents may legitimately keep an invisible stop placeholder while
+        the native OCO is working.  Once a parent is terminal, however, its
+        independently identified stop child must exist and be terminal before
+        the trade can close.  A missing, ambiguous, open, or partial child fails
+        closed.
+        """
+
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return True
+        legs = {str(leg.get("target") or ""): leg for leg in self._list_oco_legs(group_id)}
+        parents = self._list_trade_orders(trade["trade_id"])
+        parents_by_id = {
+            str(order.get("trade_order_id") or ""): order for order in parents if order.get("kind") in ("tp1", "tp2")
+        }
+
+        # Every terminal TP parent must have its own independently observed
+        # stop child.  A missing leg or a legacy TP-id projection is unresolved.
+        for kind in ("tp1", "tp2"):
+            siblings = self._oco_orders(trade, kind)
+            for order in siblings:
+                if str(order.get("state") or "") not in TERMINAL_ORDER_STATES:
+                    continue
+                _tp_target, sl_target = self._oco_leg_targets(
+                    order, group_id, kind, siblings=siblings, existing_legs=legs
+                )
+                if not self._stop_leg_is_resolved(legs.get(sl_target), order):
+                    return False
+
+        for leg in legs.values():
+            if str(leg.get("kind") or "") != "stop_loss":
+                continue
+            reason = str(leg.get("not_observed_reason") or "").strip()
+            if reason:
+                # Only an active parent may keep this harmless placeholder.
+                # A terminal parent with the same reason is not settled.
+                if reason == "oco_stop_child_not_yet_visible" and not leg.get("exchange_order_id"):
+                    parent = parents_by_id.get(str(leg.get("trade_order_id") or ""))
+                    if parent and str(parent.get("state") or "") in ("open", "partially_filled"):
+                        continue
+                return False
+            if str(leg.get("state") or "") not in TERMINAL_ORDER_STATES:
+                return False
+        return True
+
+    def _sync_oco_legs(self, trade: dict[str, Any]) -> str | None:
+        """Project every tranche OCO parent with unique TP and SL evidence keys."""
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return None
+        existing = {str(leg.get("target") or ""): leg for leg in self._list_oco_legs(group_id)}
+
+        def _project(
+            order: dict[str, Any],
+            target: str,
+            leg_role: str,
+            *,
+            filled_qty: Decimal | None = None,
+            not_observed_reason: str | None = None,
+            verified: bool | None = None,
+        ) -> None:
+            projected = dict(order)
+            projected["target"] = target
             self.store.upsert_oco_leg(
                 group_id=group_id,
                 trade=trade,
-                order=order,
+                order=projected,
                 state=str(order.get("state") or "unknown"),
                 leg_role=leg_role,
                 exchange_status=order.get("exchange_status"),
                 cancel_reason=order.get("cancel_reason"),
                 canceled_by_leg=order.get("canceled_by_leg"),
                 evidence_id=order.get("evidence_id"),
-                not_observed_reason=order.get("not_observed_reason"),
+                not_observed_reason=not_observed_reason,
+                filled_qty=filled_qty,
                 filled_quote=_dec(order.get("filled_quote")),
                 fee_amount=_dec(order.get("fee_amount")),
                 fee_asset=order.get("fee_asset"),
                 attempt=int(str(order.get("attempt") or 0)),
-                verified=order.get("not_observed_reason") in (None, ""),
+                verified=(verified if verified is not None else order.get("not_observed_reason") in (None, "")),
             )
 
         for kind in ("tp1", "tp2"):
-            for order in self._oco_orders(trade, kind):
-                _project(order, kind)
-                stop_order = dict(order)
-                stop_order["target"] = f"{kind}_sl"
-                _project(stop_order, f"{kind}_sl")
+            siblings = self._oco_orders(trade, kind)
+            for order in siblings:
+                tp_target, sl_target = self._oco_leg_targets(
+                    order, group_id, kind, siblings=siblings, existing_legs=existing
+                )
+                _project(order, tp_target, kind)
+                existing_stop = existing.get(sl_target)
+                if self._stop_leg_is_resolved(existing_stop, order):
+                    # An independently discovered child owns this row.  Never
+                    # overwrite its identity/state with the TP parent.
+                    continue
+                if existing_stop is not None and str(existing_stop.get("not_observed_reason") or "").startswith(
+                    OCO_CHILD_DISCOVERY_BACKOFF_PREFIX
+                ):
+                    # Preserve the discovery retry clock; re-projecting the TP
+                    # parent here would otherwise reset ``last_observed_at`` on
+                    # every reconcile tick and park the retry forever.
+                    continue
+                state = str(order.get("state") or "unknown")
+                if state in ("open", "partially_filled"):
+                    # MEXC may not list the stop child until the OCO resolves.
+                    # Keep an explicit placeholder, but never project the TP
+                    # fill quantity into the stop leg.
+                    placeholder = dict(order)
+                    placeholder["exchange_order_id"] = None
+                    placeholder["exchange_status"] = None
+                    placeholder["state"] = "open"
+                    placeholder["filled_quote"] = None
+                    placeholder["fee_amount"] = None
+                    placeholder["fee_asset"] = None
+                    _project(
+                        placeholder,
+                        sl_target,
+                        f"{kind}_sl",
+                        filled_qty=Decimal("0"),
+                        not_observed_reason="oco_stop_child_not_yet_visible",
+                        verified=False,
+                    )
+                else:
+                    # A terminal TP parent without a discovered child is
+                    # unresolved.  Preserve the explicit reason and never copy
+                    # the TP identity/fill into the stop leg.
+                    unresolved = dict(existing_stop) if existing_stop else dict(order)
+                    unresolved["target"] = sl_target
+                    if str(unresolved.get("exchange_order_id") or "") == str(order.get("exchange_order_id") or ""):
+                        unresolved["exchange_order_id"] = None
+                    unresolved["state"] = "unknown_requires_reconciliation"
+                    self.store.upsert_oco_leg(
+                        group_id=group_id,
+                        trade=trade,
+                        order=unresolved,
+                        state="unknown_requires_reconciliation",
+                        leg_role=f"{kind}_sl",
+                        exchange_status=unresolved.get("exchange_status"),
+                        not_observed_reason=(unresolved.get("not_observed_reason") or "oco_stop_child_unresolved"),
+                        filled_qty=Decimal("0"),
+                        verified=False,
+                    )
         return group_id
 
     def _sync_oco_group_state(self, trade: dict[str, Any], *, note: str | None = None) -> None:
@@ -1461,39 +1801,14 @@ class TradeManager:
         )
 
     def _attribute_oco_siblings(self, trade: dict[str, Any]) -> dict[str, str]:
-        """Attribute a canceled OCO leg to a filled sibling.
+        """Do not infer TP1/TP2 as siblings; each is a separate native OCO parent.
 
-        This is observation only: it records *why* a leg disappeared.  It never
-        resubmits an exit and never marks a partially exited trade as closed.
+        The true sibling is the stop child inside that same parent. Its execution
+        must be attributed from exchange child-order/fill evidence, not another
+        TP parent (especially when several fill tranches exist).
         """
-
-        group_id = self._oco_group_id(trade)
-        if group_id is None:
-            return {}
-        filled = [kind for kind in ("tp1", "tp2") if any(o["state"] == "filled" for o in self._oco_orders(trade, kind))]
-        attributed: dict[str, str] = {}
-        if len(filled) != 1:
-            return attributed
-        winner = filled[0]
-        for kind in ("tp1", "tp2"):
-            if kind == winner:
-                continue
-            for order in self._oco_orders(trade, kind):
-                if (
-                    order["state"] == "canceled"
-                    and not order.get("canceled_by_leg")
-                    and (_dec(order.get("sold_qty")) or Decimal("0")) <= 0
-                ):
-                    self.store.transition_trade_order(
-                        order["trade_order_id"],
-                        "canceled",
-                        note=f"OCO sibling {winner} filled; {kind} canceled by the exchange",
-                        cancel_reason="oco_sibling_filled",
-                        canceled_by_leg=winner,
-                    )
-                    self.store.attribute_sibling_cancel(group_id, filled_target=winner, canceled_target=kind)
-                    attributed[kind] = winner
-        return attributed
+        del trade
+        return {}
 
     def _list_trade_orders(self, trade_id: str, kind: str | None = None) -> list[dict[str, Any]]:
         """Defensive wrapper around store.list_trade_orders (mock stores may lack it)."""
@@ -1510,6 +1825,612 @@ class TradeManager:
         """True when either OCO exit order is still live or uncertain."""
         return self._oco_order_active(trade, "tp1") or self._oco_order_active(trade, "tp2")
 
+    def _unattributed_oco_parent_cancellations(self, trade: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return canceled native-OCO parent rows whose executed child is unknown.
+
+        MEXC can report the OCO parent as CANCELED when either its TP or SL
+        child executes.  The parent row alone cannot identify the executed child
+        or its fills, so it is unsafe to re-arm that allocation.  A canceled
+        parent is cleared only after its stop child has been uniquely matched in
+        allOrders and its status was queryable by the exact child id.
+        """
+
+        group_id = self._oco_group_id(trade)
+        legs = {str(leg.get("target") or ""): leg for leg in self._list_oco_legs(group_id)} if group_id else {}
+        unresolved: list[dict[str, Any]] = []
+        siblings_by_kind = {kind: self._oco_orders(trade, kind) for kind in ("tp1", "tp2")}
+        for order in self._list_trade_orders(trade["trade_id"]):
+            if order.get("kind") not in ("tp1", "tp2") or order.get("state") != "canceled":
+                continue
+            if group_id is not None:
+                kind = str(order.get("kind"))
+                _tp_target, sl_target = self._oco_leg_targets(
+                    order,
+                    group_id,
+                    kind,
+                    siblings=siblings_by_kind.get(kind, []),
+                    existing_legs=legs,
+                )
+                if self._stop_leg_is_resolved(legs.get(sl_target), order):
+                    continue
+            unresolved.append(order)
+        return unresolved
+
+    # ------------------------------------------------- OCO child discovery
+
+    def _discover_oco_stop_children(self, trade: dict[str, Any]) -> None:
+        """Find stop children for terminal TP parents using exact allOrders rows.
+
+        Discovery is deliberately limited to terminal (FILLED/CANCELED) TP
+        parents: MEXC does not reliably list the stop child while the OCO is
+        still active, and the TP parent already provides coverage then.
+        """
+
+        engine = self.engine
+        if engine is None or not hasattr(engine, "query_all_orders"):
+            return
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return
+        legs = {str(leg.get("target") or ""): leg for leg in self._list_oco_legs(group_id)}
+        all_orders = self._list_trade_orders(trade["trade_id"])
+        tp_parent_ids = {
+            str(order.get("exchange_order_id"))
+            for order in all_orders
+            if order.get("kind") in ("tp1", "tp2") and order.get("exchange_order_id")
+        }
+        claimed: dict[str, str] = {
+            str(leg.get("exchange_order_id")): str(leg.get("trade_order_id") or "")
+            for leg in legs.values()
+            if str(leg.get("kind") or "") == "stop_loss"
+            and leg.get("exchange_order_id")
+            and str(leg.get("exchange_order_id")) not in tp_parent_ids
+        }
+        for kind in ("tp1", "tp2"):
+            siblings = self._oco_orders(trade, kind)
+            for order in siblings:
+                if str(order.get("state") or "") not in ("filled", "canceled"):
+                    continue
+                if not order.get("exchange_order_id"):
+                    continue
+                _tp_target, sl_target = self._oco_leg_targets(
+                    order, group_id, kind, siblings=siblings, existing_legs=legs
+                )
+                existing = legs.get(sl_target)
+                if self._stop_leg_is_resolved(existing, order):
+                    child_id = str((existing or {}).get("exchange_order_id") or "")
+                    if child_id:
+                        claimed[child_id] = str(order.get("trade_order_id") or "")
+                    self._refresh_discovered_oco_stop_child(trade, existing, group_id, sl_target)
+                    continue
+                if existing is not None and self._oco_discovery_backoff_remaining(existing) > 0:
+                    log.debug(
+                        "OCO stop-child discovery parked for %s after %s",
+                        order.get("trade_order_id"),
+                        existing.get("not_observed_reason"),
+                    )
+                    continue
+                discovered_id = self._discover_one_oco_stop_child(
+                    trade, order, kind, sl_target, group_id, existing=existing, claimed=claimed
+                )
+                if discovered_id:
+                    claimed[discovered_id] = str(order.get("trade_order_id") or "")
+
+    @staticmethod
+    def _oco_discovery_streak(reason: str) -> int:
+        prefix = OCO_CHILD_DISCOVERY_BACKOFF_PREFIX
+        if not reason.startswith(prefix):
+            return 0
+        for part in reason[len(prefix) :].split(":"):
+            if part.startswith("count="):
+                try:
+                    return max(0, int(part.split("=", 1)[1]))
+                except ValueError:
+                    return 0
+        return 0
+
+    def _oco_discovery_backoff_remaining(self, leg: dict[str, Any]) -> float:
+        """Reuse the bounded exponential backoff policy for discovery retries."""
+
+        streak = self._oco_discovery_streak(str(leg.get("not_observed_reason") or ""))
+        if streak <= 0:
+            return 0.0
+        last = _dec_ts(leg.get("last_observed_at"))
+        if last is None:
+            return 0.0
+        delay = min(60.0 * (2 ** (streak - 1)), OCO_CHILD_DISCOVERY_BACKOFF_MAX_S)
+        elapsed = max(0.0, (self._now() - last).total_seconds())
+        return max(0.0, delay - elapsed)
+
+    @staticmethod
+    def _oco_claimed_for_parent(claimed_ids: dict[str, str] | None, parent_order_id: str) -> set[str]:
+        """Exclude other parents' children, but allow this parent's prior candidate.
+
+        A stop child whose exact status query failed is persisted with its
+        order id plus an unresolved reason.  On retry that same id is still the
+        parent's candidate and must not be filtered out as "already claimed".
+        """
+
+        return {child_id for child_id, owner in (claimed_ids or {}).items() if owner != parent_order_id}
+
+    @staticmethod
+    def _select_oco_stop_child(
+        rows: list[dict[str, Any]],
+        *,
+        tp_id: str,
+        expected_stop_limit: Decimal | None,
+        claimed_ids: set[str],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return the single exact stop child for one TP parent, or a reason.
+
+        No order-id arithmetic and no fuzzy fallback is permitted.  A candidate
+        must agree on every observable field, and a row already claimed by
+        another parent is not eligible.  Anything else fails closed.
+        """
+
+        if expected_stop_limit is None:
+            return None, "oco_stop_child_missing_stop_limit_price"
+        tp_row = next(
+            (row for row in rows if isinstance(row, dict) and str(row.get("orderId")) == tp_id),
+            None,
+        )
+        if tp_row is None:
+            return None, "oco_stop_child_tp_not_found"
+        if str(tp_row.get("type") or "").upper() != "OCO_LIMIT_ORDER":
+            return None, "oco_stop_child_tp_type_mismatch"
+        tp_time = _int_ms(tp_row.get("time"))
+        tp_orig = _dec(tp_row.get("origQty"))
+        if tp_time is None or tp_orig is None:
+            return None, "oco_stop_child_tp_row_incomplete"
+        symbol = str(tp_row.get("symbol") or "").upper()
+        side = str(tp_row.get("side") or "").upper()
+        if not symbol or not side:
+            return None, "oco_stop_child_tp_row_incomplete"
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("orderId")) == tp_id:
+                continue
+            if str(row.get("orderId") or "") in claimed_ids:
+                continue
+            if str(row.get("type") or "").upper() != "OCO_STOP_LIMIT_ORDER":
+                continue
+            if str(row.get("symbol") or "").upper() != symbol:
+                continue
+            if str(row.get("side") or "").upper() != side:
+                continue
+            if _int_ms(row.get("time")) != tp_time:
+                continue
+            if _dec(row.get("origQty")) != tp_orig:
+                continue
+            if _dec(row.get("price")) != expected_stop_limit:
+                continue
+            candidates.append(row)
+
+        if len(candidates) != 1:
+            return None, f"oco_stop_child_candidate_count:{len(candidates)}"
+        child = candidates[0]
+        child_id = str(child.get("orderId") or "")
+        if not child_id or child_id == tp_id:
+            return None, "oco_stop_child_invalid_order_id"
+        return child, ""
+
+    def _discover_one_oco_stop_child(
+        self,
+        trade: dict[str, Any],
+        tp_order: dict[str, Any],
+        kind: str,
+        sl_target: str,
+        group_id: str,
+        *,
+        existing: dict[str, Any] | None = None,
+        claimed: dict[str, str] | None = None,
+    ) -> str | None:
+        engine = self.engine
+        if engine is None or not hasattr(engine, "query_all_orders"):
+            self._discover_stop_unresolved(
+                trade, tp_order, kind, sl_target, group_id, "oco_stop_child_engine_unavailable", existing
+            )
+            return None
+        tp_id = str(tp_order.get("exchange_order_id") or "")
+        trigger_price = _dec(tp_order.get("stop_trigger_price"))
+        # ``price`` on an OCO_STOP_LIMIT_ORDER row is the stop-limit price, not
+        # the trigger.  The limit is the trade's configured SL; legacy local
+        # rows stored the trigger (SL+ticks) in ``stop_trigger_price``.
+        # The trigger is not a safe substitute for the stop-limit price.
+        # If the persisted SL limit is missing, discovery must fail closed.
+        stop_limit_price = _dec(trade.get("sl_price"))
+        if not tp_id:
+            self._discover_stop_unresolved(
+                trade, tp_order, kind, sl_target, group_id, "oco_stop_child_missing_tp_order_id", existing
+            )
+            return None
+        if stop_limit_price is None:
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                "oco_stop_child_missing_stop_limit_price",
+                existing,
+            )
+            return None
+        created = _dec_ts(tp_order.get("created_at"))
+        if created is None:
+            self._discover_stop_unresolved(
+                trade, tp_order, kind, sl_target, group_id, "oco_stop_child_missing_creation_time", existing
+            )
+            return None
+        created_ms = int(created.timestamp() * 1000)
+        now_ms = int(self._now().timestamp() * 1000)
+        if created_ms < now_ms - OCO_CHILD_DISCOVERY_HISTORY_MS:
+            self._discover_stop_unresolved(
+                trade, tp_order, kind, sl_target, group_id, "oco_stop_child_history_expired", existing
+            )
+            return None
+        start_ms = max(0, created_ms - OCO_CHILD_DISCOVERY_MARGIN_MS)
+        end_ms = created_ms + OCO_CHILD_DISCOVERY_MARGIN_MS
+        try:
+            rows = engine.query_all_orders(
+                symbol=str(trade["symbol"]),
+                start_time_ms=start_ms,
+                end_time_ms=end_ms,
+                limit=OCO_CHILD_DISCOVERY_QUERY_LIMIT,
+                trade=trade,
+                trade_order_id=tp_order.get("trade_order_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 - history read is fail-closed
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                f"oco_stop_child_query_failed:{exc.__class__.__name__}",
+                existing,
+            )
+            return None
+        if not isinstance(rows, list):
+            self._discover_stop_unresolved(
+                trade, tp_order, kind, sl_target, group_id, "oco_stop_child_query_not_a_list", existing
+            )
+            return None
+        if len(rows) >= OCO_CHILD_DISCOVERY_QUERY_LIMIT:
+            # allOrders has a hard 1000-row ceiling and no pagination cursor.
+            # A saturated response cannot prove candidate uniqueness.
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                "oco_stop_child_history_result_limit_reached",
+                existing,
+                stop_trigger_price=trigger_price,
+                stop_limit_price=stop_limit_price,
+            )
+            return None
+
+        child, reason = self._select_oco_stop_child(
+            rows,
+            tp_id=tp_id,
+            expected_stop_limit=stop_limit_price,
+            claimed_ids=self._oco_claimed_for_parent(claimed, str(tp_order.get("trade_order_id") or "")),
+        )
+        if child is None:
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                reason,
+                existing,
+                stop_trigger_price=trigger_price,
+                stop_limit_price=stop_limit_price,
+            )
+            return None
+        return self._query_and_persist_oco_stop_child(
+            trade,
+            tp_order,
+            kind,
+            sl_target,
+            group_id,
+            child,
+            stop_limit_price=stop_limit_price,
+            stop_trigger_price=trigger_price,
+            previous=existing,
+        )
+
+    def _query_and_persist_oco_stop_child(
+        self,
+        trade: dict[str, Any],
+        tp_order: dict[str, Any],
+        kind: str,
+        sl_target: str,
+        group_id: str,
+        child: dict[str, Any],
+        *,
+        stop_limit_price: Decimal,
+        stop_trigger_price: Decimal | None,
+        previous: dict[str, Any] | None = None,
+    ) -> str | None:
+        child_id = str(child.get("orderId") or "")
+        child_order = {
+            "trade_order_id": tp_order.get("trade_order_id"),
+            "trade_id": trade.get("trade_id"),
+            "symbol": trade.get("symbol"),
+            "exchange_order_id": child_id,
+            "client_order_id": None,
+        }
+        fresh = self._query_order(child_order)
+        if fresh is None:
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                "oco_stop_child_status_query_failed",
+                existing=previous,
+                exchange_order_id=child_id,
+                child=child,
+                stop_trigger_price=stop_trigger_price,
+                stop_limit_price=stop_limit_price,
+            )
+            return None
+        raw_state = str(fresh.get("state") or fresh.get("status") or "")
+        mapped = self._map_order_state(raw_state)
+        sold = _dec(fresh.get("executed_qty")) or Decimal("0")
+        reported = _dec(child.get("executedQty")) or Decimal("0")
+        sold = max(sold, reported)
+        if mapped == "filled" and sold <= 0:
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                "oco_stop_child_filled_without_quantity",
+                existing=previous,
+                exchange_order_id=child_id,
+                child=child,
+                stop_trigger_price=stop_trigger_price,
+                stop_limit_price=stop_limit_price,
+            )
+            return None
+        if mapped not in ("open", "partially_filled", "filled", "canceled", "rejected"):
+            self._discover_stop_unresolved(
+                trade,
+                tp_order,
+                kind,
+                sl_target,
+                group_id,
+                f"oco_stop_child_status_{mapped}",
+                existing=previous,
+                exchange_order_id=child_id,
+                child=child,
+                stop_trigger_price=stop_trigger_price,
+                stop_limit_price=stop_limit_price,
+            )
+            return None
+        fee_amount: Decimal | None = None
+        fee_asset: str | None = None
+        if sold > 0:
+            fee_amount, fee_asset = self._query_oco_child_fees(trade, child_id)
+        self.store.upsert_oco_leg(
+            group_id=group_id,
+            trade=trade,
+            order={
+                "trade_order_id": tp_order.get("trade_order_id"),
+                "target": sl_target,
+                "symbol": trade.get("symbol"),
+                "price": child.get("price") or str(stop_limit_price),
+                "stop_trigger_price": (
+                    str(stop_trigger_price) if stop_trigger_price is not None else tp_order.get("stop_trigger_price")
+                ),
+                "quantity": child.get("origQty"),
+                "exchange_order_id": child_id,
+            },
+            state=mapped,
+            leg_role=f"{kind}_sl",
+            exchange_status=raw_state or str(child.get("status") or ""),
+            filled_qty=sold,
+            filled_quote=_dec(fresh.get("cumulative_quote")),
+            fee_amount=fee_amount,
+            fee_asset=fee_asset,
+            not_observed_reason="",
+            verified=True,
+        )
+        return child_id
+
+    def _refresh_discovered_oco_stop_child(
+        self,
+        trade: dict[str, Any],
+        leg: dict[str, Any] | None,
+        group_id: str,
+        sl_target: str,
+    ) -> None:
+        """Refresh fills for a discovered stop child that is still working."""
+
+        if not leg:
+            return
+        if str(leg.get("state") or "") not in ("open", "partially_filled"):
+            return
+        child_id = str(leg.get("exchange_order_id") or "")
+        if not child_id:
+            return
+        parent_order_id = leg.get("trade_order_id")
+        fresh = self._query_order(
+            {
+                "trade_order_id": parent_order_id,
+                "trade_id": trade.get("trade_id"),
+                "symbol": trade.get("symbol"),
+                "exchange_order_id": child_id,
+                "client_order_id": None,
+            }
+        )
+        if fresh is None:
+            return
+        raw_state = str(fresh.get("state") or fresh.get("status") or "")
+        mapped = self._map_order_state(raw_state)
+        if mapped not in ("open", "partially_filled", "filled", "canceled", "rejected"):
+            return
+        previous_filled = _dec(leg.get("filled_qty")) or Decimal("0")
+        sold = _dec(fresh.get("executed_qty")) or Decimal("0")
+        sold = max(sold, previous_filled)
+        fee_amount = _dec(leg.get("fee_amount"))
+        fee_asset = leg.get("fee_asset")
+        # Fee evidence is only complete once fills stop advancing.  Refresh it
+        # when the child becomes terminal (or its fill quantity advances) so a
+        # child first seen open cannot keep a null/partial fee forever.
+        if sold > 0 and (mapped in TERMINAL_ORDER_STATES or sold > previous_filled or fee_amount is None):
+            refreshed_fee, refreshed_asset = self._query_oco_child_fees(trade, child_id)
+            if refreshed_fee is not None:
+                fee_amount, fee_asset = refreshed_fee, refreshed_asset
+        self.store.upsert_oco_leg(
+            group_id=group_id,
+            trade=trade,
+            order={
+                "trade_order_id": parent_order_id,
+                "target": sl_target,
+                "symbol": trade.get("symbol"),
+                "price": leg.get("intended_price"),
+                "stop_trigger_price": leg.get("intended_trigger_price"),
+                "quantity": leg.get("intended_qty"),
+                "exchange_order_id": child_id,
+            },
+            state=mapped,
+            leg_role="stop_loss",
+            exchange_status=raw_state,
+            filled_qty=sold,
+            filled_quote=_dec(fresh.get("cumulative_quote")),
+            fee_amount=fee_amount,
+            fee_asset=fee_asset,
+            not_observed_reason="",
+            verified=True,
+        )
+
+    def _discover_stop_unresolved(
+        self,
+        trade: dict[str, Any],
+        tp_order: dict[str, Any],
+        kind: str,
+        sl_target: str,
+        group_id: str,
+        reason: str,
+        existing: dict[str, Any] | None = None,
+        *,
+        exchange_order_id: str | None = None,
+        child: dict[str, Any] | None = None,
+        stop_trigger_price: Decimal | None = None,
+        stop_limit_price: Decimal | None = None,
+    ) -> None:
+        """Persist a failed discovery outcome and arm the bounded retry clock."""
+
+        previous_reason = str((existing or {}).get("not_observed_reason") or "")
+        streak = self._oco_discovery_streak(previous_reason) + 1
+        tagged = f"{OCO_CHILD_DISCOVERY_BACKOFF_PREFIX}count={streak}:reason={reason}"
+        self._persist_oco_stop_unresolved(
+            trade,
+            tp_order,
+            kind,
+            sl_target,
+            group_id,
+            tagged,
+            exchange_order_id=exchange_order_id,
+            child=child,
+            stop_trigger_price=stop_trigger_price,
+            stop_limit_price=stop_limit_price,
+        )
+
+    def _persist_oco_stop_unresolved(
+        self,
+        trade: dict[str, Any],
+        tp_order: dict[str, Any],
+        kind: str,
+        sl_target: str,
+        group_id: str,
+        reason: str,
+        *,
+        exchange_order_id: str | None = None,
+        child: dict[str, Any] | None = None,
+        stop_trigger_price: Decimal | None = None,
+        stop_limit_price: Decimal | None = None,
+    ) -> None:
+        try:
+            self.store.upsert_oco_leg(
+                group_id=group_id,
+                trade=trade,
+                order={
+                    "trade_order_id": tp_order.get("trade_order_id"),
+                    "target": sl_target,
+                    "symbol": trade.get("symbol"),
+                    "price": (
+                        (child or {}).get("price")
+                        or (str(stop_limit_price) if stop_limit_price is not None else None)
+                        or tp_order.get("price")
+                    ),
+                    "stop_trigger_price": (
+                        str(stop_trigger_price)
+                        if stop_trigger_price is not None
+                        else tp_order.get("stop_trigger_price")
+                    ),
+                    "quantity": (child or {}).get("origQty") or tp_order.get("quantity"),
+                    "exchange_order_id": exchange_order_id,
+                },
+                state="unknown_requires_reconciliation",
+                leg_role=f"{kind}_sl",
+                not_observed_reason=reason,
+                filled_qty=Decimal("0"),
+                verified=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence persistence must not crash
+            log.warning("could not persist unresolved OCO stop child for %s: %s", trade.get("trade_id"), exc)
+        try:
+            self.store.audit(
+                trade["trade_id"],
+                "reconcile",
+                "oco_stop_child_unresolved",
+                reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - audit is advisory
+            log.warning("could not audit unresolved OCO stop child for %s: %s", trade.get("trade_id"), exc)
+
+    def _query_oco_child_fees(self, trade: dict[str, Any], child_id: str) -> tuple[Decimal | None, str | None]:
+        """Aggregate myTrades fees for one child id; unknown stays unknown."""
+
+        if self.engine is None or not hasattr(self.engine, "query_order_trades"):
+            return None, None
+        try:
+            rows = self.engine.query_order_trades(
+                symbol=str(trade["symbol"]),
+                exchange_order_id=child_id,
+                limit=1000,
+                trade=trade,
+            )
+        except Exception:  # noqa: BLE001 - fee evidence is advisory only
+            return None, None
+        if not isinstance(rows, list):
+            return None, None
+        totals: dict[str, Decimal] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                return None, None
+            amount = _dec(row.get("commission"))
+            asset = row.get("commissionAsset")
+            if amount is None or not asset:
+                continue
+            key = str(asset)
+            totals[key] = totals.get(key, Decimal("0")) + amount
+        if len(totals) == 1:
+            asset, amount = next(iter(totals.items()))
+            return amount, asset
+        return None, None
+
     def _ocos_terminal(self, trade: dict[str, Any]) -> bool:
         """True when both OCO orders have reached a terminal state."""
         orders = self._list_trade_orders(trade["trade_id"])
@@ -1518,35 +2439,116 @@ class TradeManager:
             return False
         return all(o["state"] in TERMINAL_ORDER_STATES for o in oco_orders)
 
+    def _oco_tranche_ids(self, trade: dict[str, Any]) -> list[str]:
+        base = self._oco_group_id(trade)
+        if base is None:
+            return []
+        ids = {
+            str(order.get("oco_group_id") or base)
+            for order in self._list_trade_orders(trade["trade_id"])
+            if order.get("kind") in ("tp1", "tp2")
+        }
+        return sorted(ids, key=lambda value: (value != base, value))
+
+    def _planned_oco_reserved(self, trade: dict[str, Any], group_id: str) -> Decimal:
+        """Latest intended/live allocation per tranche target, including pending rows."""
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for order in self._list_trade_orders(trade["trade_id"]):
+            if order.get("kind") not in ("tp1", "tp2"):
+                continue
+            tranche = str(order.get("oco_group_id") or group_id)
+            key = (tranche, str(order.get("kind")))
+            previous = latest.get(key)
+            rank = (int(str(order.get("attempt") or 0)), str(order.get("created_at") or ""))
+            previous_rank = (
+                (int(str(previous.get("attempt") or 0)), str(previous.get("created_at") or "")) if previous else None
+            )
+            if previous is None or (previous_rank is not None and rank >= previous_rank):
+                latest[key] = order
+        reserving = {
+            "pending",
+            "submitting",
+            "open",
+            "partially_filled",
+            "cancel_requested",
+            "unknown_requires_reconciliation",
+            "rejected",
+        }
+        total = Decimal("0")
+        for order in latest.values():
+            if order.get("state") not in reserving:
+                continue
+            qty = _dec(order.get("quantity")) or Decimal("0")
+            sold = _dec(order.get("sold_qty")) or Decimal("0")
+            total += max(Decimal("0"), qty - sold)
+        return total
+
+    def _next_oco_tranche_id(self, trade: dict[str, Any], group_id: str) -> str:
+        prefix = f"{group_id}:t"
+        highest = 0
+        for tranche_id in self._oco_tranche_ids(trade):
+            if tranche_id.startswith(prefix):
+                suffix = tranche_id[len(prefix) :]
+                if suffix.isdigit():
+                    highest = max(highest, int(suffix))
+        return f"{prefix}{highest + 1:04d}"
+
+    def _create_oco_tranche(
+        self,
+        trade: dict[str, Any],
+        tranche_id: str,
+        allocations: dict[str, Decimal],
+        prices: dict[str, Decimal],
+        stop_price: Decimal,
+    ) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for kind in ("tp1", "tp2"):
+            client_order_id = self._client_order_id(trade["trade_id"], kind, 1, tranche_id=tranche_id)
+            qty = allocations[kind]
+            specs.append(
+                {
+                    "trade_order_id": f"to-{client_order_id}",
+                    "trade_id": trade["trade_id"],
+                    "kind": kind,
+                    "client_order_id": client_order_id,
+                    "symbol": trade["symbol"],
+                    "side": "sell",
+                    "order_type": "OCO_STOP_LIMIT_ORDER",
+                    "price": prices[kind],
+                    "quantity": qty,
+                    "allocated_qty": qty,
+                    "stop_trigger_price": stop_price,
+                    "attempt": 1,
+                    "oco_group_id": tranche_id,
+                    "leg_role": kind,
+                }
+            )
+        create_pair = getattr(self.store, "create_trade_order_pair", None)
+        if callable(create_pair):
+            return create_pair(specs)
+        # Compatibility for small test doubles; production TradeStore persists
+        # the two pending rows atomically before either exchange write.
+        return [self.store.create_trade_order(**spec) for spec in specs]
+
     def _place_oco_exits(self, trade: dict[str, Any]) -> None:
-        """Place two native OCO SELL exit orders once entry fills are confirmed.
-
-        OCO 1: ~50% of acquired quantity at TP1 with stop-loss at SL.
-        OCO 2: the remainder at TP2 with the same stop-loss.
-
-        Idempotency is per leg, not per trade: an already confirmed leg is never
-        resubmitted, a ``pending`` leg (never sent) is safely reused/rebased, a
-        bounded number of outright rejections is retried, and an uncertain
-        submission is only reconciled — never resent with a new client id.
-        Protection is reported as active only when every required leg is
-        confirmed by the exchange.
-        """
+        """Protect each incremental Entry-fill tranche with two independent OCOs."""
         if self.engine is None:
             self._record_error(trade, "no engine available for OCO exits", "runtime")
             self._refresh_buy_block()
             return
 
-        previous_state = trade.get("trade_state")
-        # Protection may be placed as soon as a quantity is confirmed (F-05).
-        # The entry order itself may still be working: the remainder is tracked
-        # separately and cancelled if the acquired position is exited.  Only an
-        # unsynchronised fill history blocks protection, because it would be
-        # sized from unverified quantity.
         intent_id = trade.get("entry_intent_id")
         acquired = _dec(trade.get("acquired_base_qty")) or Decimal("0")
         if intent_id:
             intent = self.store.get_intent(intent_id)
-            if intent is not None and int(intent.get("fill_sync_required") or 0) == 1 and acquired <= 0:
+            if intent is not None and int(intent.get("fill_sync_required") or 0) == 1:
+                detail = (
+                    "entry fill synchronization is incomplete; existing OCO coverage "
+                    "cannot be treated as complete until MEXC fills are reconciled"
+                )
+                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._sync_oco_group_state(trade, note=detail)
                 self._refresh_buy_block()
                 return
         if acquired <= 0:
@@ -1558,30 +2560,26 @@ class TradeManager:
         tp1_price = _dec(trade.get("tp1_price"))
         tp2_price = _dec(trade.get("tp2_price"))
         entry_price = _dec(trade.get("entry_price")) or _dec(trade.get("avg_entry_price"))
-
         problem = self._exit_ladder_problem(trade)
         if problem is not None:
-            self.store.update_trade_state(
-                trade["trade_id"],
-                "needs_reconciliation",
-                note=f"OCO not placed: {problem}",
-            )
-            self._notify_trade(trade, "OCO_CONFIG_REJECTED", problem)
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=f"OCO not placed: {problem}")
             self._refresh_buy_block()
             return
-
-        # The validation above guarantees a usable, ordered exit ladder.
         assert sl_price is not None and tp1_price is not None and tp2_price is not None
 
-        # If the existing exit legs already sold the whole position, close it
-        # before trying to allocate new orders.  Otherwise sellable==0 makes
-        # the allocator reject and a fully completed trade is mislabelled.
-        remaining = self._remaining_base(trade)
-        if remaining is not None and remaining <= 0:
-            existing = self._list_trade_orders(trade["trade_id"])
-            if any(order.get("kind") in ("tp1", "tp2") and order.get("state") == "filled" for order in existing):
-                self._finalize_trade(trade, reason="all allocated exits already filled")
-                return
+        sellable = self._sellable_quantity(trade)
+        if sellable is None:
+            detail = (
+                f"OCO tranche sizing unknown for {trade.get('trade_id')} {trade.get('symbol')}; fill/fee sync required"
+            )
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._refresh_buy_block()
+            return
+        if sellable <= 0:
+            if any(o.get("state") == "filled" for o in self._list_trade_orders(trade["trade_id"])):
+                self._finalize_trade(trade, reason="all acquired tranche allocations exited")
+            return
 
         group_id = self.store.ensure_oco_group(
             trade,
@@ -1592,229 +2590,278 @@ class TradeManager:
                 "stop_loss_price": str(sl_price),
                 "tp1_allocation_pct": str(trade.get("tp1_allocation_pct")),
                 "tp2_allocation_pct": str(trade.get("tp2_allocation_pct")),
+                "allocation_policy": "per_entry_fill_tranche",
             },
             protection_status="placing",
         )
-        self.store.set_oco_group_state(trade["trade_id"], "submitting")
+        current_group = self.store.get_oco_group(trade["trade_id"])
+        if current_group is None or str(current_group.get("state")) == "intended":
+            self.store.set_oco_group_state(trade["trade_id"], "submitting")
         trade = self._refresh(trade)
-        self.store.audit(
-            trade["trade_id"],
-            "lifecycle",
-            "oco_group_created",
-            f"intended {len(('tp1', 'tp2'))} legs for {trade['symbol']}",
-            event_type="oco.intended",
-            trade_id=trade["trade_id"],
-            intent_id=trade.get("entry_intent_id"),
-            symbol=trade["symbol"],
-            payload={"oco_group_id": group_id, "stop_loss": str(sl_price)},
-            dedupe_key=f"oco-intended:{group_id}",
-        )
 
-        # Allocations from *net* sellable quantity (owner-confirmed §5.2).
-        # Gross acquired is incorrect when base-asset commission reduces
-        # inventory.  Use sellable = acquired - base_fees - already_sold.
-        # Allocations are computed once from the actual acquired position.
-        # A restart must never shrink or re-expand an existing allocation.
-        sellable_for_allocation = self._sellable_quantity(trade)
-        if sellable_for_allocation is None:
+        if self._unattributed_oco_parent_cancellations(trade):
             detail = (
-                f"OCO allocation unprovable: sellable quantity is unknown for "
-                f"{trade.get('trade_id')} {trade.get('symbol')} "
-                f"(acquired={trade.get('acquired_base_qty')}); reconciliation required"
+                "an OCO parent is canceled with child execution not independently "
+                "attributed; no new tranche may be submitted"
+            )
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._sync_oco_group_state(trade, note=detail)
+            return
+
+        unsettled_child = self._unsettled_oco_stop_child_reason(trade)
+        if unsettled_child is not None:
+            detail = (
+                f"an OCO stop child is only partially resolved ({unsettled_child}); "
+                "remaining inventory cannot be re-protected without overlapping an "
+                "order that may still fill — no new OCO submitted"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
             self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
-            return
-        if sellable_for_allocation <= 0:
-            self.store.update_trade_state(
-                trade["trade_id"],
-                "needs_reconciliation",
-                note="sellable quantity is zero; cannot allocate OCO exits",
-            )
-            self._notify_trade(trade, "OCO_ALLOCATION_TOO_SMALL", "sellable quantity is zero")
-            return
-        tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
-        tp2_pct = _dec(trade.get("tp2_allocation_pct")) or Decimal("100")
-        tp1_allocated = _dec(trade.get("tp1_allocated_qty")) or Decimal("0")
-        tp2_allocated = _dec(trade.get("tp2_allocated_qty")) or Decimal("0")
-        updates: dict[str, Any] = {}
-        if tp1_allocated <= 0:
-            tp1_allocated = self._quantize_qty(trade, sellable_for_allocation * tp1_pct / Decimal("100"))
-            updates["tp1_allocated_qty"] = tp1_allocated
-        if tp2_allocated <= 0:
-            pool = max(Decimal("0"), sellable_for_allocation - tp1_allocated)
-            tp2_allocated = self._quantize_qty(trade, pool * tp2_pct / Decimal("100"))
-            updates["tp2_allocated_qty"] = tp2_allocated
-        if updates:
-            self.store.update_trade_fields(trade["trade_id"], **updates)
-            trade = self._refresh(trade)
-
-        required: dict[str, tuple[Decimal, Decimal]] = {
-            "tp1": (tp1_allocated, tp1_price),
-            "tp2": (tp2_allocated, tp2_price),
-        }
-        required = {k: v for k, v in required.items() if v[0] > 0}
-        if not required:
-            self.store.update_trade_state(
-                trade["trade_id"],
-                "needs_reconciliation",
-                note="OCO allocations are below the symbol lot size; position remains unprotected",
-            )
-            self._notify_trade(
-                trade,
-                "OCO_ALLOCATION_TOO_SMALL",
-                "acquired quantity is below the lot size; no OCO exit could be placed",
-            )
-            self._refresh_buy_block()
+            self._sync_oco_group_state(trade, note=detail)
             return
 
-        # Critical invariant pre-check BEFORE any exchange submission (§5.1).
-        # 1. If the current invariant cannot be proven or is already violated,
-        #    persist needs_reconciliation, notify, and *return without submitting
-        #    or increasing any OCO reservation*.
         ok, detail = self._verify_oco_invariant(trade)
         if not ok:
-            # _verify_oco_invariant already persisted needs_reconciliation and
-            # notified.  Do not submit any OCO.
+            self._sync_oco_group_state(trade, note=detail[:2000])
             return
 
-        results: dict[str, str] = {}
-        invariant_blocked = False
-        for kind, (qty, price) in required.items():
-            # 3-4. Hypothetical combined reservation check BEFORE submitting this leg.
-            # Existing reservations for both OCOs, accounting for reuse.
-            existing_other = self._oco_reserved_quantity(trade, "tp2" if kind == "tp1" else "tp1")
-            existing_this = self._oco_reserved_quantity(trade, kind)
-            sellable = self._sellable_quantity(trade)
-            if sellable is None:
+        for order in self._list_trade_orders(trade["trade_id"]):
+            if order.get("kind") not in ("tp1", "tp2") or order.get("state") != "filled":
+                continue
+            allocated = _dec(order.get("allocated_qty")) or _dec(order.get("quantity")) or Decimal("0")
+            sold = _dec(order.get("sold_qty")) or Decimal("0")
+            if allocated > 0 and sold < allocated:
                 detail = (
-                    f"OCO invariant unprovable for {trade.get('trade_id')}: sellable is unknown; "
-                    "cannot verify hypothetical reservation — aborting submission"
+                    f"OCO parent {order.get('trade_order_id')} is FILLED but executed "
+                    f"quantity {sold} is below allocation {allocated}; tranche sizing is ambiguous"
                 )
+                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._sync_oco_group_state(trade, note=detail)
+                return
+
+        # Complete a legacy single-tranche group that has exactly one target
+        # row. Reuse its existing size and create only the missing counterpart;
+        # an oversized target is never resized or reinterpreted as a new tranche.
+        existing_tranches = self._oco_tranche_ids(trade)
+        if existing_tranches == [group_id]:
+            by_kind = {
+                kind: [
+                    order
+                    for order in self._oco_orders(trade, kind)
+                    if str(order.get("oco_group_id") or group_id) == group_id
+                ]
+                for kind in ("tp1", "tp2")
+            }
+            present = [kind for kind, rows in by_kind.items() if rows]
+            missing = [kind for kind, rows in by_kind.items() if not rows]
+            if len(present) == 1 and len(missing) == 1:
+                present_kind, missing_kind = present[0], missing[0]
+                existing = by_kind[present_kind][0]
+                if existing.get("state") not in ("open", "partially_filled", "pending", "rejected"):
+                    detail = (
+                        "legacy OCO tranche has only one target with a terminal/uncertain "
+                        "outcome; missing target cannot be inferred"
+                    )
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+                tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
+                tp2_pct = _dec(trade.get("tp2_allocation_pct")) or Decimal("100")
+                expected_tp1 = self._quantize_qty(trade, sellable * tp1_pct / Decimal("100"))
+                expected_tp2 = self._quantize_qty(
+                    trade, max(Decimal("0"), sellable - expected_tp1) * tp2_pct / Decimal("100")
+                )
+                expected = {"tp1": expected_tp1, "tp2": expected_tp2}
+                existing_qty = _dec(existing.get("quantity")) or Decimal("0")
+                if existing_qty != expected[present_kind]:
+                    detail = (
+                        f"legacy {present_kind} allocation {existing_qty} does not match "
+                        f"expected tranche allocation {expected[present_kind]} for sellable "
+                        f"inventory {sellable}; refusing resize"
+                    )
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self.store.audit(trade["trade_id"], "risk", "oco_invariant_would_violate", detail)
+                    self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+                missing_price = tp1_price if missing_kind == "tp1" else tp2_price
+                missing_qty = expected[missing_kind]
+                reason = (
+                    self._validate_sell(
+                        trade, missing_qty, self._quantize_price(trade, missing_price), order_type="LIMIT"
+                    )
+                    if missing_qty > 0
+                    else "missing target allocation is below lot size"
+                )
+                if reason:
+                    detail = f"legacy OCO tranche missing {missing_kind} cannot be completed: {reason}"
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self._notify_trade(trade, "OCO_MINIMUM_NOT_MET", detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+                self._create_trade_order(
+                    trade,
+                    missing_kind,
+                    missing_qty,
+                    self._quantize_price(trade, missing_price),
+                    order_type="OCO_STOP_LIMIT_ORDER",
+                    tranche_id=group_id,
+                    attempt=1,
+                    stop_trigger_price=sl_price,
+                )
+                self.store.update_trade_fields(
+                    trade["trade_id"], tp1_allocated_qty=expected_tp1, tp2_allocated_qty=expected_tp2
+                )
+                trade = self._refresh(trade)
+
+        planned_reserved = self._planned_oco_reserved(trade, group_id)
+        if planned_reserved > sellable:
+            detail = (
+                f"planned OCO tranche allocations {planned_reserved} exceed "
+                f"sellable inventory {sellable}; no further OCO writes"
+            )
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+            self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+            self._sync_oco_group_state(trade, note=detail)
+            return
+
+        uncovered = max(Decimal("0"), sellable - planned_reserved)
+        if uncovered > 0:
+            tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
+            tp2_pct = _dec(trade.get("tp2_allocation_pct")) or Decimal("100")
+            tp1_qty = self._quantize_qty(trade, uncovered * tp1_pct / Decimal("100"))
+            tp2_pool = max(Decimal("0"), uncovered - tp1_qty)
+            tp2_qty = self._quantize_qty(trade, tp2_pool * tp2_pct / Decimal("100"))
+            allocations = {"tp1": tp1_qty, "tp2": tp2_qty}
+            prices = {"tp1": self._quantize_price(trade, tp1_price), "tp2": self._quantize_price(trade, tp2_price)}
+            for kind in ("tp1", "tp2"):
+                qty = allocations[kind]
+                reason = (
+                    self._validate_sell(trade, qty, prices[kind], order_type="LIMIT")
+                    if qty > 0
+                    else "allocation below lot size"
+                )
+                if reason:
+                    detail = f"new OCO tranche cannot be fully allocated ({kind}={qty}): {reason}"
+                    self._record_residual(trade, kind, uncovered, detail)
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
+                    self._notify_trade(trade, "OCO_MINIMUM_NOT_MET", detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+            tranche_id = self._next_oco_tranche_id(trade, group_id)
+            try:
+                self._create_oco_tranche(trade, tranche_id, allocations, prices, sl_price)
+            except Exception as exc:
+                detail = f"could not durably create both OCO rows for tranche {tranche_id}: {exc}"
                 self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
                 self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
-                results[kind] = "failed"
-                continue
-            if existing_this > 0:
-                hypothetical = existing_other + existing_this
-            else:
-                hypothetical = existing_other + qty
-            if hypothetical > sellable:
-                detail = (
-                    f"pre-submit OCO invariant would be violated: "
-                    f"existing OCO1+OCO2 {existing_other}+{existing_this} + proposed {kind} {qty} "
-                    f"= hypothetical {hypothetical} > sellable {sellable}; "
-                    "OCO submission blocked, persisting needs_reconciliation"
-                )
-                self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-                self._notify_trade(trade, "OCO_INVARIANT_WOULD_VIOLATE", detail)
-                self.store.audit(trade["trade_id"], "risk", "oco_invariant_would_violate", detail[:2000])
-                results[kind] = "failed"
-                invariant_blocked = True
-                continue
-            # 5. Only then call the exchange submission method.
-            results[kind] = self._ensure_oco_leg(trade, kind, qty, price, sl_price)
-            # 6. After submission, _ensure_oco_leg reconciles actual exchange
-            #    order identity and state via _submit_oco_order → _reconcile.
-            # 7. Recalculate invariant after confirmed submission (and every
-            #    subsequent fill/cancel/reconciliation is covered in
-            #    _reconcile_trade_orders).
-            # Re-verify after each leg (fee/lot-size rebasing can change sellable)
-            post_ok, post_detail = self._verify_oco_invariant(self._refresh(trade))
-            if not post_ok:
-                # Stop submitting further legs — reconciliation required.
-                for pending_kind in list(required.keys()):
-                    if pending_kind not in results:
-                        results[pending_kind] = "failed"
-                break
+                self._sync_oco_group_state(trade, note=detail)
+                return
+            self.store.update_trade_fields(
+                trade["trade_id"],
+                tp1_allocated_qty=(_dec(trade.get("tp1_allocated_qty")) or Decimal("0")) + tp1_qty,
+                tp2_allocated_qty=(_dec(trade.get("tp2_allocated_qty")) or Decimal("0")) + tp2_qty,
+            )
             trade = self._refresh(trade)
 
-        working = [k for k, v in results.items() if v == "confirmed"]
-        completed = [k for k, v in results.items() if v == "filled"]
+        tranche_ids = self._oco_tranche_ids(trade)
+        required: list[tuple[str, str, Decimal, Decimal]] = []
+        for tranche_id in tranche_ids:
+            for kind, price in (("tp1", tp1_price), ("tp2", tp2_price)):
+                rows = [
+                    order
+                    for order in self._oco_orders(trade, kind)
+                    if str(order.get("oco_group_id") or group_id) == tranche_id
+                ]
+                if not rows:
+                    detail = (
+                        f"OCO tranche {tranche_id} is missing required {kind} order row; refusing inferred replacement"
+                    )
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+                initial = min(
+                    rows, key=lambda row: (int(str(row.get("attempt") or 0)), str(row.get("created_at") or ""))
+                )
+                qty = _dec(initial.get("allocated_qty")) or _dec(initial.get("quantity")) or Decimal("0")
+                if qty <= 0:
+                    detail = f"OCO tranche {tranche_id} has invalid {kind} quantity"
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self._sync_oco_group_state(trade, note=detail)
+                    return
+                required.append((tranche_id, kind, qty, self._quantize_price(trade, price)))
+
+        results: dict[str, str] = {}
+        for tranche_id, kind, qty, price in required:
+            results[f"{tranche_id}:{kind}"] = self._ensure_oco_leg(
+                trade, kind, qty, price, sl_price, tranche_id=tranche_id
+            )
+            post_ok, post_detail = self._verify_oco_invariant(self._refresh(trade))
+            if not post_ok:
+                self._sync_oco_group_state(trade, note=post_detail[:2000])
+                return
+            trade = self._refresh(trade)
+
+        working = [key for key, value in results.items() if value == "confirmed"]
+        completed = [key for key, value in results.items() if value == "filled"]
         confirmed = working + completed
-        uncertain = [k for k, v in results.items() if v == "uncertain"]
-        failed = [k for k, v in results.items() if v in ("rejected", "failed", "canceled")]
+        uncertain = [key for key, value in results.items() if value in ("uncertain", "retry_pending")]
+        failed = [key for key, value in results.items() if value in ("rejected", "failed", "canceled")]
         trade = self._refresh(trade)
         self._sync_oco_legs(trade)
-
-        def _publish(new_state: str, note: str, event_key: str, text: str) -> None:
-            self.store.update_trade_state(trade["trade_id"], new_state, note=note)
-            self._sync_oco_group_state(trade, note=note)
+        coverage = self._active_oco_coverage(trade)
+        remaining_cov = self._remaining_base(trade)
+        if remaining_cov is None:
+            detail = "sellable quantity became unknown after OCO tranche submission"
+            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._sync_oco_group_state(trade, note=detail)
+            return
+        if remaining_cov <= 0:
+            self._finalize_trade(trade, reason="all tranche allocations filled")
+            return
+        if len(confirmed) == len(required) and coverage >= remaining_cov:
+            self.store.update_trade_state(
+                trade["trade_id"],
+                "oco_active",
+                note=f"{len(tranche_ids)} fill tranche(s) protected by independent OCO allocations",
+            )
+            self._sync_oco_group_state(trade, note="all fill tranches protected")
             self.store.audit(
                 trade["trade_id"],
                 "lifecycle",
-                event_key.lower(),
-                text,
+                "oco_tranches_active",
+                f"{len(tranche_ids)} tranche(s); {len(working)} working and {len(completed)} completed OCO target(s)",
                 event_type="oco.state",
                 trade_id=trade["trade_id"],
                 symbol=trade["symbol"],
-                outcome=new_state,
-                payload={"legs": results},
-            )
-            if new_state != previous_state:
-                self._notify_trade(trade, event_key, text)
-
-        if invariant_blocked:
-            # Any leg blocked due to would-violate invariant means the allocation
-            # plan is inconsistent with verified sellable — position is unprotected
-            # and requires reconciliation, even if other legs are already confirmed.
-            refreshed = self._refresh(trade)
-            if refreshed is not None and refreshed.get("trade_state") != "needs_reconciliation":
-                self.store.update_trade_state(
-                    trade["trade_id"],
-                    "needs_reconciliation",
-                    note=detail[:2000] if "detail" in locals() else "OCO invariant would-violate blocked submission",
-                )
-            return
-        if len(completed) == len(required):
-            self._finalize_trade(trade)
-            self._refresh_buy_block()
-            return
-        coverage = sum(
-            (
-                max(
-                    Decimal("0"),
-                    (_dec(order.get("quantity")) or Decimal("0")) - (_dec(order.get("sold_qty")) or Decimal("0")),
-                )
-                for kind in working
-                for order in self._oco_orders(trade, kind)
-                if order["state"] in ("open", "partially_filled")
-            ),
-            Decimal("0"),
-        )
-        remaining_cov = self._remaining_base(trade)
-        if remaining_cov is None:
-            # Unknown sellable → cannot prove full coverage; treat as not fully covered
-            remaining_cov = Decimal(
-                "0"
-            )  # will fail coverage check and go to partial, but also already handled via invariant
-        if len(confirmed) == len(required) and coverage >= remaining_cov:
-            _publish(
-                "oco_active",
-                "remaining position covered by working OCO allocations",
-                "OCO_PROTECTION_ACTIVE",
-                f"{len(working)} working OCO allocation(s); {len(completed)} completed",
+                payload={
+                    "tranches": tranche_ids,
+                    "results": results,
+                    "coverage": str(coverage),
+                    "sellable": str(remaining_cov),
+                },
             )
         elif confirmed:
-            _publish(
-                "oco_partial",
-                "partial OCO protection: confirmed="
-                f"{','.join(confirmed) or '-'}; uncertain={','.join(uncertain) or '-'}; "
-                f"failed={','.join(failed) or '-'}",
-                "OCO_PROTECTION_PARTIAL",
-                f"only {','.join(confirmed)} confirmed; incomplete protection",
+            detail = (
+                f"partial OCO tranche protection; confirmed={','.join(confirmed)}; "
+                f"uncertain={','.join(uncertain) or '-'}; failed={','.join(failed) or '-'}"
             )
+            self.store.update_trade_state(trade["trade_id"], "oco_partial", note=detail[:2000])
+            self._sync_oco_group_state(trade, note=detail)
+            self._notify_trade(trade, "OCO_PROTECTION_PARTIAL", detail)
         else:
-            # No exchange-confirmed exit leg.  The position owns base quantity
-            # without verified protection, so mark it critical (reconciliation
-            # keeps retrying protection) and keep the global new-BUY block on.
-            detail = f"uncertain={','.join(uncertain) or '-'}; failed={','.join(failed) or '-'}"
-            _publish(
-                UNPROTECTED_CRITICAL,
-                f"no OCO exit is confirmed; position is unprotected ({detail})",
-                "OCO_PROTECTION_UNVERIFIED",
-                "no OCO exit is confirmed; position is unprotected and new BUYs are blocked",
+            detail = (
+                f"no OCO tranche is fully confirmed; uncertain={','.join(uncertain) or '-'}; "
+                f"failed={','.join(failed) or '-'}"
             )
+            self.store.update_trade_state(trade["trade_id"], UNPROTECTED_CRITICAL, note=detail[:2000])
+            self._sync_oco_group_state(trade, note=detail)
+            self._notify_trade(trade, "OCO_PROTECTION_UNVERIFIED", detail)
         self._refresh_buy_block()
 
     def _ensure_oco_leg(
@@ -1824,89 +2871,92 @@ class TradeManager:
         wanted_qty: Decimal,
         price: Decimal,
         stop_price: Decimal,
+        *,
+        tranche_id: str | None = None,
     ) -> str:
-        """Return the per-leg state: confirmed/filled/uncertain/rejected/failed/canceled."""
-
-        orders = self._list_trade_orders(trade["trade_id"], kind=kind)
+        """Ensure one target order for one tranche; never confuse other tranches."""
+        base_group_id = self._oco_group_id(trade)
+        if tranche_id is None:
+            candidate_groups = {
+                str(order.get("oco_group_id") or base_group_id) for order in self._oco_orders(trade, kind)
+            }
+            if len(candidate_groups) > 1:
+                return "uncertain"
+            group_id = next(iter(candidate_groups), base_group_id)
+        else:
+            group_id = tranche_id
+        if group_id is None:
+            return "failed"
+        orders = [
+            order
+            for order in self._oco_orders(trade, kind)
+            if str(order.get("oco_group_id") or base_group_id) == group_id
+        ]
         if any(
-            order["state"]
-            in (
-                "submitting",
-                "cancel_requested",
-                "unknown_requires_reconciliation",
-            )
-            for order in orders
+            order["state"] in ("submitting", "cancel_requested", "unknown_requires_reconciliation") for order in orders
         ):
-            # A write claim or a previously assigned exchange id is not proof
-            # of current protection. Reconcile these rows; never resend them.
             return "uncertain"
-        filled = [order for order in orders if order["state"] == "filled"]
         active = [order for order in orders if order["state"] in ("open", "partially_filled")]
-        if filled:
-            # Completion is not active protection. Contradictory overlapping
-            # orders or incomplete execution evidence must be reviewed.
-            sold = sum((_dec(order.get("sold_qty")) or Decimal("0") for order in orders), Decimal("0"))
-            return "filled" if not active and sold >= wanted_qty else "uncertain"
         if len(active) > 1:
             return "uncertain"
+        filled = [order for order in orders if order["state"] == "filled"]
+        if filled:
+            sold = sum((_dec(order.get("sold_qty")) or Decimal("0") for order in orders), Decimal("0"))
+            return "filled" if not active and sold >= wanted_qty else "uncertain"
         if active:
             return "confirmed"
         if any(order["state"] == "canceled" for order in orders):
-            # An OCO leg can only disappear because it was canceled/replaced on
-            # the exchange; resubmitting automatically could oversell.
             return "canceled"
 
         rejected = [order for order in orders if order["state"] == "rejected"]
         if rejected:
-            # A deterministic rejection is terminal for this leg: retrying the
-            # same payload can never succeed and must not look like a transient
-            # failure to the operator.
             retryable_flags = [
                 int(str(order.get("retryable") if order.get("retryable") is not None else 1)) for order in rejected
             ]
-            if 0 in retryable_flags:
+            if 0 in retryable_flags or len(rejected) >= MAX_OCO_ATTEMPTS:
                 return "failed"
-            if len(rejected) >= MAX_OCO_ATTEMPTS:
-                return "failed"
-            next_at = _dec_ts(rejected[-1].get("next_attempt_at"))
+            last_rejected = max(rejected, key=lambda row: int(str(row.get("attempt") or 0)))
+            next_at = _dec_ts(last_rejected.get("next_attempt_at"))
             if next_at is not None and self._now() < next_at:
                 return "retry_pending"
-
-        remaining_oco = self._remaining_base(trade)
-        if remaining_oco is None:
-            detail = f"{kind} sellable unknown — cannot size OCO; needs_reconciliation"
-            self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
-            self.store.audit(trade["trade_id"], "risk", "oco_invariant_unknown", detail[:2000])
-            return "failed"
-        qty = self._quantize_qty(trade, min(wanted_qty, remaining_oco))
-        price_q = self._quantize_price(trade, price)
-        if qty <= 0:
-            self._record_residual(trade, kind, wanted_qty, f"{kind} remainder below lot size")
-            return "failed"
-        reason = self._validate_sell(trade, qty, price_q, order_type="LIMIT")
-        if reason:
-            self._record_residual(trade, kind, qty, f"{kind}: {reason}")
-            self._notify_trade(trade, "OCO_MINIMUM_NOT_MET", f"{kind}: {reason}")
-            return "failed"
-
-        pending = [order for order in orders if order["state"] == "pending"]
-        next_order: dict[str, Any] | None = pending[0] if pending else None
-        if next_order is not None:
-            existing_qty = _dec(next_order.get("quantity")) or Decimal("0")
-            existing_price = _dec(next_order.get("price")) or Decimal("0")
-            if existing_qty != qty or existing_price != price_q:
-                # Never sent: replace it with the corrected amount/price.
-                self.store.transition_trade_order(
-                    next_order["trade_order_id"],
-                    "canceled",
-                    note=f"not sent; rebased {existing_qty}->{qty} @ {price_q}",
+            attempt = max(int(str(row.get("attempt") or 0)) for row in orders) + 1
+            next_order = self._create_trade_order(
+                trade,
+                kind,
+                wanted_qty,
+                price,
+                order_type="OCO_STOP_LIMIT_ORDER",
+                tranche_id=group_id,
+                attempt=attempt,
+                stop_trigger_price=stop_price,
+            )
+        else:
+            pending = [order for order in orders if order["state"] == "pending"]
+            if pending:
+                next_order = max(pending, key=lambda row: int(str(row.get("attempt") or 0)))
+                existing_qty = _dec(next_order.get("quantity")) or Decimal("0")
+                existing_price = _dec(next_order.get("price")) or Decimal("0")
+                if existing_qty != wanted_qty or existing_price != price:
+                    detail = (
+                        f"pending OCO row mismatch for {kind}/{group_id}: "
+                        f"{existing_qty}@{existing_price} != {wanted_qty}@{price}"
+                    )
+                    self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
+                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    return "failed"
+            else:
+                next_order = self._create_trade_order(
+                    trade,
+                    kind,
+                    wanted_qty,
+                    price,
+                    order_type="OCO_STOP_LIMIT_ORDER",
+                    tranche_id=group_id,
+                    attempt=1,
+                    stop_trigger_price=stop_price,
                 )
-                next_order = None
-        if next_order is None:
-            next_order = self._create_trade_order(trade, kind, qty, price_q, order_type="OCO_STOP_LIMIT_ORDER")
 
-        self._submit_oco_order(trade, kind, next_order, qty, price_q, stop_price)
+        self._submit_oco_order(trade, kind, next_order, wanted_qty, price, stop_price)
         refreshed = self.store.get_trade_order(next_order["trade_order_id"])
         state = (refreshed or {}).get("state")
         if state in ("open", "partially_filled"):
@@ -1967,22 +3017,12 @@ class TradeManager:
                 attempt=attempt,
             )
             self._record_error(trade, f"{target} OCO submission outcome unknown: {exc}", "exchange")
-            self._notify_trade(
-                trade,
-                f"OCO_ATTEMPT_{attempt + 1}_UNCERTAIN",
-                f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} outcome unknown: {str(exc)[:400]}; "
-                "read-only reconciliation will decide, no replacement is submitted",
-            )
             return None
         except Exception as exc:
             attempt = int(str(order.get("attempt") or 0))
             retryable = _is_retryable_oco_error(exc)
             delay = oco_retry_delay_s(attempt)
-            next_at = (
-                (self._now() + timedelta(seconds=delay)).isoformat()
-                if retryable and delay is not None
-                else None
-            )
+            next_at = (self._now() + timedelta(seconds=delay)).isoformat() if retryable and delay is not None else None
             self.store.transition_trade_order(
                 order["trade_order_id"],
                 "rejected",
@@ -1992,13 +3032,6 @@ class TradeManager:
                 retryable=retryable,
             )
             self._record_error(trade, f"{target} OCO rejected: {exc}", "exchange")
-            remaining_attempts = 0 if not retryable else max(0, MAX_OCO_ATTEMPTS - (attempt + 1))
-            self._notify_trade(
-                trade,
-                f"OCO_ATTEMPT_{attempt + 1}_REJECTED",
-                f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} rejected: {str(exc)[:400]}; "
-                f"retryable={retryable} remaining_attempts={remaining_attempts}",
-            )
             return None
 
         exchange_id = result.get("orderId") or result.get("exchange_order_id")
@@ -2021,12 +3054,6 @@ class TradeManager:
             stop_trigger_price=_dec(result.get("trigger_price")),
         )
         attempt = int(order.get("attempt") or 0)
-        self._notify_trade(
-            trade,
-            f"OCO_SUBMITTED_{target.upper()}_ATTEMPT_{attempt + 1}",
-            f"{target} attempt {attempt + 1}/{MAX_OCO_ATTEMPTS} accepted: {qty} @ {price} "
-            f"SL @ {stop_price} trigger @ {result.get('trigger_price')}",
-        )
         self._reconcile_trade_orders(trade)
         return {
             "exchange_order_id": str(exchange_id),
@@ -2347,11 +3374,35 @@ class TradeManager:
                 "needs_reconciliation",
                 note=f"close refused: {remaining} base quantity remains unsold",
             )
-            self._notify_trade(
-                trade,
-                "TRADE_CLOSE_REFUSED",
-                f"{remaining} base quantity remains; manual reconciliation required",
+            self._refresh_buy_block()
+            return
+        if self._oco_group_id(trade) is not None and (
+            not self._ocos_terminal(trade) or not self._oco_stop_children_settled(trade)
+        ):
+            child_reason = self._unsettled_oco_stop_child_reason(trade)
+            detail = (
+                f"close refused: OCO parent/stop-child lifecycle is not settled for "
+                f"{trade.get('symbol')} trade {trade.get('trade_id')}; "
+                f"{child_reason or 'terminal parent/child evidence is incomplete'}"
             )
+            previous_state = str(trade.get("trade_state") or "")
+            self.store.update_trade_state(
+                trade["trade_id"],
+                "needs_reconciliation",
+                note=detail[:2000],
+            )
+            self._sync_oco_group_state(trade, note=detail)
+            self.store.audit(
+                trade["trade_id"],
+                "risk",
+                "trade_close_refused_oco_unsettled",
+                detail[:2000],
+                event_type="trading.trade_close_refused",
+                outcome="blocked",
+                dedupe_key=f"trade-close-refused-oco:{trade['trade_id']}",
+            )
+            if previous_state != "needs_reconciliation":
+                self._notify_trade(trade, "OCO_PROTECTION_UNVERIFIED", detail)
             self._refresh_buy_block()
             return
         self.store.update_trade_state(trade["trade_id"], "closed", note="position fully exited", sl_state="completed")
@@ -2368,14 +3419,13 @@ class TradeManager:
             intent_id=trade.get("entry_intent_id"),
             outcome="closed",
         )
-        self._notify_trade(trade, "TRADE_CLOSED", "trade fully closed")
         self._refresh_buy_block()
 
     # ===================================================================
     # Cancellation
     # ===================================================================
 
-    def _cancel_entry_remainder_when_exited(self, trade: dict[str, Any]) -> None:
+    def _cancel_entry_remainder_when_exited(self, trade: dict[str, Any], *, force: bool = False) -> None:
         """Cancel a still-working entry remainder once the position is exited.
 
         F-05: with a partial fill the exchange still holds an unfilled entry
@@ -2394,7 +3444,18 @@ class TradeManager:
         if acquired <= 0:
             return
         remaining = self._remaining_base(trade)
-        exited = self._tp_done(trade, "tp1") or (remaining is not None and remaining <= 0)
+        tp1_tranche_exited = any(
+            order.get("state") == "filled"
+            and (_dec(order.get("sold_qty")) or Decimal("0"))
+            >= (_dec(order.get("allocated_qty")) or _dec(order.get("quantity")) or Decimal("0"))
+            for order in self._oco_orders(trade, "tp1")
+        )
+        exited = tp1_tranche_exited or self._tp_done(trade, "tp1") or (remaining is not None and remaining <= 0)
+        if force and self._unattributed_oco_parent_cancellations(trade):
+            # A canceled OCO parent may mean TP or SL child execution. Either
+            # way, do not allow the still-working BUY remainder to create a new
+            # position while the child outcome is unresolved.
+            exited = True
         if not exited:
             return
         if not self._cancel_entry_remainder(trade):
@@ -2409,51 +3470,62 @@ class TradeManager:
         self._refresh_buy_block()
 
     def _cancel_entry_remainder(self, trade: dict[str, Any]) -> bool:
-        """Cancel the entry order and confirm a terminal intent state."""
+        """Cancel a confirmed working entry and verify it without query bursts."""
         intent_id = trade.get("entry_intent_id")
         if not intent_id:
             return True
         engine = self.engine
-        reconciler = getattr(engine, "reconcile_intent", None) if engine else None
-        for _ in range(4):
-            intent = self.store.get_intent(intent_id)
-            if intent is None:
-                return False
-            if intent.get("state") in TERMINAL_INTENT_STATES:
-                return True
-            if reconciler is None:
-                # Legacy/test engine without reconciliation: request the cancel
-                # and treat a non-raising call as confirmed.
-                if engine is None:
+        if engine is None:
+            return False
+        intent = self.store.get_intent(intent_id)
+        if intent is None:
+            return False
+        if intent.get("state") in TERMINAL_INTENT_STATES:
+            return True
+
+        due_reconciler = getattr(engine, "reconcile_intent_if_due", None)
+        fresh_snapshot = getattr(engine, "has_fresh_successful_reconciliation", None)
+        reconciler = getattr(engine, "reconcile_intent", None)
+        try:
+            if callable(due_reconciler):
+                checked = due_reconciler(intent_id, notify=False)
+                if checked is None and not (callable(fresh_snapshot) and fresh_snapshot(intent_id)):
                     return False
-                try:
-                    engine.cancel_intent_order(intent)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
-                    return False
-                return True
-            # Query before cancelling: the order may have filled while the tick
-            # was being processed, and an unconditional cancel would discard
-            # the fill evidence we need for quantity accounting.
-            state = intent.get("state")
-            if state in ("open", "partially_filled") and intent.get("exchange_order_id"):
-                if engine is None:
-                    return False
-                try:
-                    engine.cancel_intent_order(intent)
-                except Exception as exc:  # noqa: BLE001 - reconcile below decides
-                    log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
-            try:
+            elif callable(reconciler):
+                # Compatibility for legacy/test engines without the central gate.
                 reconciler(intent_id, notify=False)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("entry reconcile failed for %s: %s", trade["trade_id"], exc)
+            else:
                 return False
-            intent = self.store.get_intent(intent_id)
-            if intent is None:
-                return False
-            if intent.get("state") in TERMINAL_INTENT_STATES:
-                return True
-        return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("entry reconcile failed for %s: %s", trade["trade_id"], exc)
+            return False
+
+        intent = self.store.get_intent(intent_id)
+        if intent is None:
+            return False
+        if intent.get("state") in TERMINAL_INTENT_STATES:
+            return True
+        if intent.get("state") not in ("open", "partially_filled") or not intent.get("exchange_order_id"):
+            # Unknown, planned, submitting, or unacknowledged intents are never
+            # queried in a tight retry loop and are never cancelled by guess.
+            return False
+
+        # One immediate reconciliation after the actual cancel request is
+        # needed for safety. If it remains non-terminal, later sweeps use the
+        # persisted scheduler/backoff rather than four GET bursts.
+        try:
+            engine.cancel_intent_order(intent)
+        except Exception as exc:  # noqa: BLE001 - the refreshed state decides
+            log.warning("entry cancel failed for %s: %s", trade["trade_id"], exc)
+        try:
+            if callable(due_reconciler):
+                due_reconciler(intent_id, notify=False, urgent_after_cancel=True)
+            elif callable(reconciler):
+                reconciler(intent_id, notify=False)
+        except Exception as exc:  # noqa: BLE001 - cancellation verification is fail-closed
+            log.warning("entry cancel verification failed for %s: %s", trade["trade_id"], exc)
+        refreshed = self.store.get_intent(intent_id)
+        return bool(refreshed and refreshed.get("state") in TERMINAL_INTENT_STATES)
 
     def _cancel_orders_of_kind(self, trade: dict[str, Any], kind: str) -> bool:
         ok = True
@@ -2566,19 +3638,24 @@ class TradeManager:
             try:
                 orders = self._list_trade_orders(refreshed["trade_id"])
                 has_unknown = any(
-                    o["state"] in ("unknown_requires_reconciliation", "submitting", "cancel_requested") for o in orders
+                    o["state"] in ("unknown_requires_reconciliation", "submitting", "cancel_requested")
+                    or bool(o.get("not_observed_reason"))
+                    or (o.get("state") in ("open", "partially_filled") and not o.get("last_observed_at"))
+                    for o in orders
                 )
+                has_ambiguous_oco_parent = bool(self._unattributed_oco_parent_cancellations(refreshed))
+                stop_children_settled = self._oco_stop_children_settled(refreshed)
                 intent_id = refreshed.get("entry_intent_id")
                 intent = store.get_intent(intent_id) if intent_id else None
                 intent_unknown = False
                 if intent is not None and (
-                    intent.get("state") in ("unknown_requires_reconciliation", "reconciling")
+                    intent.get("state") in ("planned", "submitting", "unknown_requires_reconciliation", "reconciling")
                     or int(intent.get("fill_sync_required") or 0) == 1
                 ):
                     intent_unknown = True
                 sellable = self._sellable_quantity(refreshed)
                 # Unknown evidence → retain
-                if has_unknown or intent_unknown or sellable is None:
+                if has_unknown or has_ambiguous_oco_parent or intent_unknown or sellable is None:
                     # Record revisit without duplicating user notifications
                     # (initial entry already notified SL_UNPROTECTED_CRITICAL /
                     # OCO_INVARIANT_*).  Use audit only, idempotent.
@@ -2587,13 +3664,15 @@ class TradeManager:
                         "reconcile",
                         "needs_reconciliation_revisited",
                         "read-only reconciliation; still unresolved "
-                        f"(has_unknown={has_unknown} intent_unknown={intent_unknown} "
-                        f"sellable={sellable})",
+                        f"(has_unknown={has_unknown} has_ambiguous_oco_parent={has_ambiguous_oco_parent} "
+                        f"stop_children_settled={stop_children_settled} "
+                        f"intent_unknown={intent_unknown} sellable={sellable})",
                     )
                     return
                 all_terminal = all(o["state"] in TERMINAL_ORDER_STATES for o in orders) if orders else True
-                # Conclusive close: sellable 0 and all orders terminal
-                if all_terminal and sellable == Decimal("0"):
+                # Conclusive close: sellable 0, all orders terminal, and every
+                # known stop child is terminal/unambiguous.
+                if all_terminal and sellable == Decimal("0") and stop_children_settled:
                     # Explicit auditable transition — not an automatic active resumption
                     self.store.update_trade_state(
                         trade_id,
@@ -2604,14 +3683,56 @@ class TradeManager:
                         ),
                         sl_state="completed",
                     )
-                    refreshed2 = self._refresh(refreshed)
-                    self._notify_trade(
-                        refreshed2 or refreshed,
-                        "TRADE_CLOSED_RECONCILED",
-                        "trade conclusively closed via read-only reconciliation",
-                    )
                     self.store.audit(
                         trade_id, "lifecycle", "closed_via_reconciliation", "all orders terminal, sellable 0"
+                    )
+                    return
+                # Recover only from a transient observation failure when both
+                # OCO parent orders have just been freshly observed as working,
+                # the complete remaining inventory is covered, and the combined
+                # reservation invariant is satisfied. Any terminal/ambiguous
+                # parent remains parked for explicit child attribution.
+                oco_orders = [o for o in orders if o.get("kind") in ("tp1", "tp2")]
+                relevant_oco = [o for o in oco_orders if o.get("state") in ("open", "partially_filled", "filled")]
+                active_oco = [o for o in relevant_oco if o.get("state") in ("open", "partially_filled")]
+                fresh_active = (
+                    bool(active_oco)
+                    and bool(relevant_oco)
+                    and all(o.get("last_observed_at") and not o.get("not_observed_reason") for o in relevant_oco)
+                )
+                active_coverage = sum(
+                    (
+                        max(
+                            Decimal("0"),
+                            (_dec(o.get("quantity")) or Decimal("0")) - (_dec(o.get("sold_qty")) or Decimal("0")),
+                        )
+                        for o in active_oco
+                    ),
+                    Decimal("0"),
+                )
+                reserved = self._combined_oco_reserved(refreshed)
+                if (
+                    fresh_active
+                    and sellable > 0
+                    and active_coverage >= sellable
+                    and reserved <= sellable
+                    and not has_ambiguous_oco_parent
+                ):
+                    self.store.update_trade_state(
+                        trade_id,
+                        "oco_active",
+                        note=(
+                            "read-only reconciliation recovered transient observation failure; "
+                            "both OCO parents freshly confirmed and full sellable quantity is covered"
+                        ),
+                    )
+                    recovered = self._refresh(refreshed)
+                    self._sync_oco_group_state(recovered or refreshed, note="fresh OCO coverage re-confirmed")
+                    self.store.audit(
+                        trade_id,
+                        "reconcile",
+                        "needs_reconciliation_recovered",
+                        "both OCO parents freshly confirmed; full remaining quantity covered; no ambiguous child state",
                     )
                     return
                 # Otherwise retain needs_reconciliation — do not auto-transition to active
@@ -2671,11 +3792,6 @@ class TradeManager:
                     "(OCO-only policy) — manual reconciliation required"
                 ),
             )
-            self._notify_trade(
-                trade,
-                "LEGACY_EXIT_DISABLED",
-                "legacy TP state encountered; no standalone exit order was submitted",
-            )
             return
         if state in ("oco_submitting", "oco_active", "oco_partial"):
             # Reconcile OCO exit orders against the exchange.  All required legs
@@ -2697,6 +3813,21 @@ class TradeManager:
                 )
             self._sync_oco_legs(trade)
             self._sync_oco_group_state(trade)
+            if self._unattributed_oco_parent_cancellations(trade):
+                # Do not infer TP-vs-SL from the parent OCO status and do not
+                # create a replacement OCO. First stop any live entry remainder,
+                # then park the trade for child/fill attribution.
+                self._cancel_entry_remainder_when_exited(trade, force=True)
+                detail = (
+                    "native OCO parent is canceled but MEXC child execution and fills are not "
+                    "independently attributed; entry remainder was canceled where safely "
+                    "confirmable and OCO re-arming is blocked"
+                )
+                self.store.update_trade_state(trade_id, "needs_reconciliation", note=detail)
+                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._sync_oco_group_state(trade, note=detail)
+                self.store.audit(trade_id, "reconcile", "oco_parent_child_unresolved", detail)
+                return
             self._cancel_entry_remainder_when_exited(trade)
             if self._ocos_terminal(trade):
                 self._finalize_trade(trade)
@@ -2713,10 +3844,12 @@ class TradeManager:
     def _reconcile_entry_fills(self, trade: dict[str, Any]) -> bool:
         """Record entry fills; return True only when accounting is trustworthy.
 
-        When the engine exposes ``reconcile_intent`` (the production engine),
-        the entry intent is queried read-only *before* any TP/SL quantity is
-        computed.  A network/ambiguous result returns False so callers fail
-        closed rather than acting on stale local fills.
+        When the engine exposes ``reconcile_intent_if_due`` (the production
+        engine), reconciliation is routed through its single persisted
+        backoff/eligibility gate before any TP/SL quantity is computed. A skipped
+        check is reusable only when a fresh successful exchange snapshot, durable
+        order acknowledgement, and completed fill sync are already persisted.
+        Otherwise callers fail closed rather than acting on stale local fills.
         """
         intent_id = trade.get("entry_intent_id")
         if not intent_id:
@@ -2725,7 +3858,7 @@ class TradeManager:
         if intent is None:
             return False
         synced = True
-        reconciler = getattr(self.engine, "reconcile_intent", None) if self.engine else None
+        reconciler = getattr(self.engine, "reconcile_intent_if_due", None) if self.engine else None
         if (
             reconciler is not None
             and intent.get("mode") == "live"
@@ -2736,18 +3869,23 @@ class TradeManager:
             )
             if needs_sync:
                 try:
-                    reconciler(intent_id, notify=False)
+                    checked = reconciler(intent_id, notify=False)
+                    if checked is None:
+                        fresh_snapshot = getattr(self.engine, "has_fresh_successful_reconciliation", None)
+                        synced = bool(fresh_snapshot and fresh_snapshot(intent_id))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("entry fill sync failed for %s: %s", trade["trade_id"], exc)
                     synced = False
                 intent = self.store.get_intent(intent_id) or intent
                 if (
-                    intent.get("state") in ("unknown_requires_reconciliation", "reconciling")
+                    intent.get("state") in ("planned", "submitting", "unknown_requires_reconciliation", "reconciling")
                     or int(intent.get("fill_sync_required") or 0) == 1
                 ):
                     synced = False
 
         exchange_order_id = intent.get("exchange_order_id")
+        if intent.get("state") in ("submitted", "open", "partially_filled") and not submission_acknowledged(intent):
+            synced = False
         fills = self.store.fills_for_order(exchange_order_id) if exchange_order_id else []
         executed_qty = Decimal("0")
         cumulative_quote = Decimal("0")
@@ -2771,7 +3909,16 @@ class TradeManager:
             fees_paid=fees,
             entry_filled_qty=_dec(intent.get("executed_qty")) or Decimal("0"),
             entry_exchange_status=intent.get("state"),
+            entry_order_id=exchange_order_id,
         )
+        if (
+            submission_acknowledged(intent)
+            and intent.get("state") in ("submitted", "open", "partially_filled")
+            and trade.get("trade_state") == "pending_entry"
+        ):
+            self.store.update_trade_state(
+                trade["trade_id"], "entry_active", note="entry order acknowledgement reconciled"
+            )
         # Once fills are confirmed and the entry intent is terminal, settle the
         # entry state and place OCO exits.  An open/partially filled entry is
         # never treated as a finished position.
@@ -2786,7 +3933,7 @@ class TradeManager:
         prefix = "MEXC_ORDER_NOT_FOUND:"
         if not reason.startswith(prefix):
             return 0
-        for part in reason[len(prefix):].split(":"):
+        for part in reason[len(prefix) :].split(":"):
             if part.startswith("count="):
                 try:
                     return max(0, int(part.split("=", 1)[1]))
@@ -2810,7 +3957,7 @@ class TradeManager:
         if not self.engine:
             return
         for order in self.store.list_trade_orders(trade["trade_id"]):
-            if order["state"] in TERMINAL_ORDER_STATES:
+            if order["state"] in TERMINAL_ORDER_STATES and not order.get("not_observed_reason"):
                 continue
             if order["state"] == "pending":
                 continue  # never sent; the submit path will send it
@@ -2818,7 +3965,8 @@ class TradeManager:
             if remaining > 0:
                 log.debug(
                     "trade-order reconciliation parked for %s after MEXC order-not-found; retry in %.1fs",
-                    order["trade_order_id"], remaining,
+                    order["trade_order_id"],
+                    remaining,
                 )
                 continue
             updated = self._reconcile_single_order(trade, order)
@@ -2832,6 +3980,10 @@ class TradeManager:
                     self.engine.cancel_trade_order(updated)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cancel retry failed for %s: %s", updated["trade_order_id"], exc)
+        try:
+            self._discover_oco_stop_children(trade)
+        except Exception as exc:  # noqa: BLE001 - discovery must not break reconciliation
+            log.warning("OCO stop child discovery failed for %s: %s", trade.get("trade_id"), exc)
         self._refresh_sold_fields(trade)
         # §5.3 — recompute combined OCO invariant after every reconciliation.
         try:
@@ -2874,6 +4026,26 @@ class TradeManager:
                     self._finalize_trade(trade, residual=remaining, reason="dust below minimum after TP2")
         if state in ("oco_active", "oco_partial") and self._ocos_terminal(trade):
             self._finalize_trade(trade)
+            return
+        if state in ("needs_reconciliation", UNPROTECTED_CRITICAL) and self._ocos_terminal(trade):
+            # A legacy OCO can enter needs_reconciliation solely because its TP
+            # child was CANCELED while the stop sibling identity was unknown.
+            # Once the stop child is independently observed and its fills are
+            # included in sl_executed_qty, a zero remaining balance is enough
+            # to close this trade.  Require real OCO rows and no unresolved
+            # canceled parent; an empty/unknown trade must never be closed here.
+            oco_orders = [
+                order for order in self._list_trade_orders(trade["trade_id"]) if order.get("kind") in ("tp1", "tp2")
+            ]
+            remaining = self._remaining_base(trade)
+            if (
+                oco_orders
+                and remaining is not None
+                and remaining <= 0
+                and not self._unattributed_oco_parent_cancellations(trade)
+                and self._oco_stop_children_settled(trade)
+            ):
+                self._finalize_trade(trade)
 
     def _reconcile_single_order(self, trade: dict[str, Any], order: dict[str, Any]) -> dict[str, Any] | None:
         if order["state"] in TERMINAL_ORDER_STATES or order["state"] == "pending":
@@ -2899,9 +4071,7 @@ class TradeManager:
                 previous = str(order.get("not_observed_reason") or "")
                 streak = self._trade_order_not_found_streak(previous) + 1
                 fresh = dict(fresh)
-                fresh["not_observed_reason"] = (
-                    f"MEXC_ORDER_NOT_FOUND:count={streak}:code={error_code}"
-                )
+                fresh["not_observed_reason"] = f"MEXC_ORDER_NOT_FOUND:count={streak}:code={error_code}"
             mapped = "unknown_requires_reconciliation"
             raw_state = "NOT_FOUND"
         # FILLED with no executed quantity is not trustworthy enough to size a
@@ -2961,8 +4131,39 @@ class TradeManager:
 
     def _sold_for_kind(self, trade: dict[str, Any], kind: str) -> Decimal:
         total = Decimal("0")
+        covered_ids: set[str] = set()
         for order in self.store.list_trade_orders(trade["trade_id"], kind=kind):
             total += _dec(order.get("sold_qty")) or Decimal("0")
+            if order.get("exchange_order_id"):
+                covered_ids.add(str(order["exchange_order_id"]))
+        if kind != "stop_loss":
+            return total
+        # Actual native OCO stop children are persisted in oco_legs, not as
+        # separate trade_orders rows.  Count only independently discovered
+        # children: never a legacy projection that copied the TP identity, and
+        # never an unresolved placeholder.
+        group_id = self._oco_group_id(trade)
+        if group_id is None:
+            return total
+        tp_parent_ids = {
+            str(order.get("exchange_order_id"))
+            for tp_kind in ("tp1", "tp2")
+            for order in self.store.list_trade_orders(trade["trade_id"], kind=tp_kind)
+            if order.get("exchange_order_id")
+        }
+        counted_ids: set[str] = set()
+        for leg in self._list_oco_legs(group_id):
+            if str(leg.get("kind") or "") != "stop_loss":
+                continue
+            if str(leg.get("not_observed_reason") or "").strip():
+                continue
+            leg_id = str(leg.get("exchange_order_id") or "")
+            if not leg_id or leg_id in tp_parent_ids or leg_id in covered_ids:
+                continue
+            if leg_id in counted_ids:
+                continue
+            counted_ids.add(leg_id)
+            total += _dec(leg.get("filled_qty")) or Decimal("0")
         return total
 
     def _has_unconfirmed_order(self, trade: dict[str, Any], kind: str) -> bool:
@@ -3006,9 +4207,10 @@ class TradeManager:
     # ===================================================================
 
     @staticmethod
-    def _client_order_id(trade_id: str, kind: str, attempt: int) -> str:
+    def _client_order_id(trade_id: str, kind: str, attempt: int, *, tranche_id: str | None = None) -> str:
         """Stable, exchange-safe client id (max 32 chars, ASCII)."""
-        digest = hashlib.sha256(f"{trade_id}:{kind}:{attempt}".encode("ascii")).hexdigest()[:16]
+        identity = f"{trade_id}:{kind}:{attempt}" if tranche_id is None else f"{trade_id}:{tranche_id}:{kind}:{attempt}"
+        digest = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
         prefix = {"tp1": "t1", "tp2": "t2", "stop_loss": "sl"}[kind]
         return f"{prefix}-{digest}"
 
@@ -3097,11 +4299,39 @@ class TradeManager:
     # ===================================================================
 
     def _notify_trade(self, trade: dict[str, Any] | None, event_key: str, text: str, **extra: Any) -> None:
-        """Notify via the notifier when a trade transitions. Never blocks trading."""
-        if self.notifier is None:
-            return
+        """Persist critical protection alerts as domain events; never blocks trading."""
+        critical_keys = {
+            "SL_UNPROTECTED_CRITICAL",
+            "OCO_INVARIANT_UNKNOWN",
+            "OCO_INVARIANT_WOULD_VIOLATE",
+            "OCO_INVARIANT_VIOLATED",
+            "TRADE_CLOSE_REFUSED_UNKNOWN",
+        }
         try:
-            self.notifier.notify_trade(trade, event_key, text, **extra)
+            if event_key in critical_keys or event_key.startswith("BUY_BLOCK_ACTIVE_"):
+                trade_id = str((trade or {}).get("trade_id") or "global")
+                symbol = (trade or {}).get("symbol")
+                # Stable for identical repeated observations, distinct when the
+                # evidence text changes. This preserves alert-on-change semantics.
+                event_id = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"tele-mexc:trade-protection:{trade_id}:{event_key}:{text}",
+                ).hex
+                with contextlib.suppress(DomainEventConflict):
+                    self.store.record_domain_event(
+                        build_domain_event(
+                            "trade.protection_critical",
+                            aggregate_id=trade_id,
+                            correlation_id=trade_id,
+                            symbol=str(symbol) if symbol else None,
+                            event_id=event_id,
+                            severity="CRITICAL",
+                            payload={"event_key": event_key, "detail": str(text)[:2000]},
+                        )
+                    )
+                return
+            if self.notifier is not None:
+                self.notifier.notify_trade(trade, event_key, text, **extra)
         except Exception as exc:  # noqa: BLE001 - notifications never block trading
             log.warning("notify_trade failed (%s); trading continues", exc)
 

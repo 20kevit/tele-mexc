@@ -202,15 +202,14 @@ def test_standalone_tp_path_is_disabled():
 
     tm = object.__new__(TradeManager)
     tm.store = Store()
-    notified: list[str] = []
-    tm._notify_trade = lambda trade, key, text, **kw: notified.append(key)
+    tm._notifier = None
+    tm.engine = None
     trade = {"trade_id": "t1", "symbol": "BTCUSDT", "tp1_price": "110", "sl_price": "95"}
 
     tm._enter_tp1(trade)
     tm._enter_tp2(trade)
 
     assert tm.store.states == [("t1", "needs_reconciliation"), ("t1", "needs_reconciliation")]
-    assert notified == ["LEGACY_EXIT_DISABLED", "LEGACY_EXIT_DISABLED"]
 
 
 def test_submit_tp_order_refuses_to_submit():

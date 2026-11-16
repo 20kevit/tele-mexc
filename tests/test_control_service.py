@@ -627,11 +627,13 @@ async def test_notification_severity_is_one_selected_level(cfg, repo):
     await control.handle_update(_callback(1, "n:settings"))
     keyboard = fake.sent[-1].get("reply_markup") or {}
     callbacks = [button["callback_data"] for row in keyboard.get("inline_keyboard", []) for button in row]
-    assert {f"n:set:{level}" for level in store.NOTIFICATION_LEVELS} <= set(callbacks)
+    assert {f"n:set:owner:{level}" for level in store.NOTIFICATION_LEVELS} <= set(callbacks)
+    assert "n:recipient:owner" in callbacks
     assert not any(callback.startswith("n:toggle:") for callback in callbacks)
 
-    await control.handle_update(_callback(2, "n:set:WARNING"))
-    assert store.notification_min_severity() == "WARNING"
+    await control.handle_update(_callback(2, "n:set:owner:WARNING"))
+    assert store.notification_min_severity("owner") == "WARNING"
+    assert store.notification_min_severity() == "INFO"
     assert any("WARNING" in item["text"] for item in fake.sent)
 
 

@@ -181,16 +181,28 @@ class ControlStore:
 
     NOTIFICATION_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
-    def notification_min_severity(self) -> str:
-        value = (self.get_setting("notification_min_severity", "INFO") or "INFO").upper()
-        return value if value in self.NOTIFICATION_LEVELS else "INFO"
+    @staticmethod
+    def _notification_level_key(role: str | None = None) -> str:
+        return "notification_min_severity" if role is None else f"notification_min_severity.{role}"
 
-    def set_notification_min_severity(self, level: str) -> None:
+    def notification_min_severity(self, role: str | None = None) -> str:
+        """Return a recipient override, falling back to the shared default.
+
+        Developer receives DEBUG by default; owners inherit the legacy shared
+        threshold until an explicit per-recipient value is configured.
+        """
+
+        default = "INFO" if role is None else self.notification_min_severity()
+        value = (self.get_setting(self._notification_level_key(role), default) or default).upper()
+        return value if value in self.NOTIFICATION_LEVELS else default
+
+    def set_notification_min_severity(self, level: str, role: str | None = None) -> None:
         value = str(level).upper()
         if value not in self.NOTIFICATION_LEVELS:
             raise ValueError(f"unknown notification level {level!r}")
-        self.set_setting("notification_min_severity", value)
-        self.audit("notification_level_changed", f"minimum severity={value}")
+        self.set_setting(self._notification_level_key(role), value)
+        scope = "default" if role is None else f"role={role}"
+        self.audit("notification_level_changed", f"minimum severity={value} scope={scope}")
 
     # ---------------------------------------------------------------- flow
 

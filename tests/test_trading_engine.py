@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +23,8 @@ from tg_signal_ingest.mexc.errors import (
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import SignalParser, TradingEngine, TradingStore
-from tg_signal_ingest.trading.trade_manager import _is_retryable_oco_error
+from tg_signal_ingest.trading.store import submission_acknowledged
+from tg_signal_ingest.trading.trade_manager import TradeManager, _is_retryable_oco_error
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 MSG_DATE = NOW - timedelta(seconds=20)
@@ -90,6 +93,12 @@ class FakeMeta:
         return None
 
 
+class ConditionalMeta(FakeMeta):
+    """FakeMeta plus the exchange tick size needed to compute a trigger."""
+
+    price_step = Decimal("0.01")
+
+
 class FakeRegistry:
     def get(self, symbol):
         return FakeMeta()
@@ -111,6 +120,7 @@ class FakeMexc:
         account_errors=None,
         open_orders_results=None,
         open_orders_error=None,
+        all_orders_rows=None,
     ):
         self.price = price
         self.place_response = place_response or {"orderId": "ex-1", "status": "NEW"}
@@ -124,6 +134,7 @@ class FakeMexc:
         self.account_errors = list(account_errors or [])
         self.open_orders_results = open_orders_results
         self.open_orders_error = open_orders_error
+        self.all_orders_rows = list(all_orders_rows or [])
         self.symbols = FakeRegistry()
         self.place_calls = 0
         self.test_calls = 0
@@ -132,6 +143,7 @@ class FakeMexc:
         self.account_calls = 0
         self.trades_calls = 0
         self.open_orders_calls = 0
+        self.all_orders_calls = 0
 
     def ticker_price(self, symbol=None):
         return {"symbol": symbol, "price": self.price}
@@ -198,6 +210,10 @@ class FakeMexc:
                 rows = [r for r in rows if str(r.get("symbol") or "").upper() == str(symbol).upper()]
             return rows
         return [{"orderId": "external-1", "symbol": "GOLD(XAUT)USDT", "status": "NEW"}]
+
+    def all_orders(self, *, symbol, start_time_ms, end_time_ms, limit=1000):
+        self.all_orders_calls += 1
+        return list(self.all_orders_rows)
 
 
 ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
@@ -421,6 +437,90 @@ def test_submitted_requires_exchange_order_evidence(cfg, repo):
     assert client.place_calls == 1
 
 
+def test_query_all_orders_wrapper_records_read_evidence(cfg, repo):
+    rows = [
+        {
+            "orderId": "C02__tp",
+            "symbol": "APEUSDT",
+            "side": "SELL",
+            "type": "OCO_LIMIT_ORDER",
+            "status": "CANCELED",
+            "price": "0.0813",
+            "origQty": "18.58",
+            "executedQty": "0",
+            "time": 1794784085000,
+        }
+    ]
+    client = FakeMexc(all_orders_rows=rows)
+    engine = _engine(cfg, repo, client)
+    trade = {"trade_id": "trade-ape", "symbol": "APEUSDT"}
+
+    result = engine.query_all_orders(
+        symbol="APEUSDT",
+        start_time_ms=1794784000000,
+        end_time_ms=1794784100000,
+        limit=50,
+        trade=trade,
+        trade_order_id="to-ape-tp1",
+    )
+
+    assert result == rows
+    assert client.all_orders_calls == 1
+    op = repo.db.conn.execute(
+        "SELECT operation_type, operation_class, purpose, endpoint, symbol, "
+        "response_classification, request_payload FROM exchange_operations "
+        "WHERE operation_type = 'query_all_orders'"
+    ).fetchone()
+    assert op is not None
+    assert op["operation_class"] == "read"
+    assert op["purpose"] == "oco_child_discovery"
+    assert op["endpoint"] == "/api/v3/allOrders"
+    assert op["symbol"] == "APEUSDT"
+    assert op["response_classification"] == "success"
+    payload = json.loads(op["request_payload"])
+    assert payload == {
+        "symbol": "APEUSDT",
+        "start_time_ms": 1794784000000,
+        "end_time_ms": 1794784100000,
+        "limit": 50,
+    }
+    assert "signature" not in op["request_payload"].lower()
+
+
+def test_query_order_trades_wrapper_records_read_evidence(cfg, repo):
+    trades = [
+        {
+            "id": "t1",
+            "orderId": "C02__sl",
+            "price": "0.0786",
+            "qty": "18.58",
+            "quoteQty": "1.460388",
+            "commission": "0.001",
+            "commissionAsset": "USDT",
+        }
+    ]
+    client = FakeMexc(trades=trades)
+    engine = _engine(cfg, repo, client)
+
+    result = engine.query_order_trades(
+        symbol="APEUSDT",
+        exchange_order_id="C02__sl",
+        limit=100,
+        trade={"trade_id": "trade-ape"},
+    )
+
+    assert result == trades
+    assert client.trades_calls == 1
+    op = repo.db.conn.execute(
+        "SELECT operation_type, operation_class, endpoint, exchange_order_id "
+        "FROM exchange_operations WHERE operation_type = 'query_my_trades'"
+    ).fetchone()
+    assert op is not None
+    assert op["operation_class"] == "read"
+    assert op["endpoint"] == "/api/v3/myTrades"
+    assert op["exchange_order_id"] == "C02__sl"
+
+
 def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     partial = {
         "orderId": "ex-2",
@@ -462,6 +562,7 @@ def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     assert engine.store.fills_count() == 1
 
     client.query_results.append(canceled)
+    engine._now = lambda: NOW + timedelta(seconds=6)
     engine.reconcile_pending()
     final = engine.store.get_intent(intent["intent_id"])
     assert final is not None
@@ -483,6 +584,208 @@ def test_partial_fill_is_preserved_then_canceled(cfg, repo):
     again = engine.reconcile_pending()
     assert again.checked == 0
     assert engine.store.fills_count() == 1
+
+
+def test_planned_and_fresh_submitting_intents_are_not_reconciled(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    store = engine.store
+    parsed = SignalParser().parse(ALERT)
+    signal_id, _ = store.record_signal(parsed, channel_id=100, message_id=101, edit_version=0)
+    intent, _ = store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=101,
+        edit_version=0,
+        idempotency_key=TradingEngine.idempotency_key(100, 101, parsed),
+        client_order_id="tsiplanned",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+
+    planned = engine.reconcile_intent(intent["intent_id"])
+    assert planned["state"] == "planned"
+    assert client.query_calls == 0
+
+    store.transition_intent(intent["intent_id"], "submitting", note="POST just claimed")
+    fresh_claim = engine.reconcile_intent(intent["intent_id"])
+    assert fresh_claim["state"] == "submitting"
+    assert client.query_calls == 0
+    count = store.db.conn.execute(
+        "SELECT COUNT(*) FROM reconciliation_results WHERE intent_id = ?", (intent["intent_id"],)
+    ).fetchone()[0]
+    assert count == 0
+
+    # A long WAF/rate-gate wait can outlive the transport timeout. While the
+    # POST is still in this process, even an aged submitting claim is ineligible.
+    engine._now = lambda: NOW + timedelta(seconds=120)
+    with engine._inflight_submission_lock:
+        engine._inflight_submission_ids.add(intent["intent_id"])
+    try:
+        assert engine.reconcile_intent_if_due(intent["intent_id"]) is None
+        assert client.query_calls == 0
+        store.transition_intent(
+            intent["intent_id"],
+            "submitted",
+            note="POST response persisted",
+            exchange_order_id="ex-inflight",
+            exchange_status="NEW",
+        )
+        # Even after the response is persisted, the inline reconciliation still
+        # owns this intent until its own read/settlement is complete.
+        assert engine.reconcile_intent_if_due(intent["intent_id"]) is None
+        assert client.query_calls == 0
+    finally:
+        with engine._inflight_submission_lock:
+            engine._inflight_submission_ids.discard(intent["intent_id"])
+    recovered = engine.reconcile_intent_if_due(intent["intent_id"])
+    assert recovered is not None and recovered["state"] == "open"
+    assert client.query_calls == 1
+
+
+def test_submit_inflight_is_not_reconciled_from_inside_place_order(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    original_place_order = client.place_order
+    observed_intents = []
+
+    def guarded_place_order(**payload):
+        current = engine.store.list_intents(limit=1)[0]
+        observed_intents.append(current["intent_id"])
+        assert current["state"] == "submitting"
+        assert engine.reconcile_intent_if_due(current["intent_id"]) is None
+        assert client.query_calls == 0
+        return original_place_order(**payload)
+
+    client.place_order = guarded_place_order
+    result = engine.process_item(_item(100, 108), _store_message(repo, 108, ALERT))
+
+    assert result is not None and result["state"] == "open"
+    assert observed_intents == [result["intent_id"]]
+    assert client.place_calls == 1
+    assert client.query_calls == 1  # only the inline post-ack reconciliation
+    assert engine.reconcile_intent_if_due(result["intent_id"]) is None
+    assert client.query_calls == 1
+
+
+def test_submission_acknowledgement_requires_exchange_order_id():
+    assert submission_acknowledged({"state": "submitted", "exchange_order_id": "ex-1"})
+    assert submission_acknowledged({"state": "unknown_requires_reconciliation", "exchange_order_id": "ex-1"})
+    assert not submission_acknowledged({"state": "unknown_requires_reconciliation", "exchange_order_id": None})
+    assert not submission_acknowledged({"state": "submitting", "exchange_order_id": "ex-1"})
+    assert not submission_acknowledged({"state": "submitted", "exchange_order_id": ""})
+
+
+def test_engine_does_not_call_success_callback_for_unknown_submission(cfg, repo):
+    client = FakeMexc(place_error=MexcNetworkError("timeout after send"))
+    engine = _engine(cfg, repo, client, mode="live")
+
+    class SpyTradeManager:
+        def __init__(self):
+            self.success_calls = []
+
+        def on_intent_planned(self, *args):
+            return SimpleNamespace(rejected=False, deferred=False, trade=None)
+
+        def on_intent_executed(self, intent):
+            self.success_calls.append(intent)
+
+    spy = SpyTradeManager()
+    engine.trade_manager = spy
+    result = engine.process_item(_item(100, 102), _store_message(repo, 102, ALERT))
+
+    assert result is not None and result["state"] == "unknown_requires_reconciliation"
+    assert not result.get("exchange_order_id")
+    assert spy.success_calls == []
+    assert client.place_calls == 1
+    domain_events = repo.db.conn.execute(
+        "SELECT payload_json FROM audit_events WHERE event_class = 'domain'"
+    ).fetchall()
+    assert all(json.loads(row["payload_json"]).get("new_state") != "submitted" for row in domain_events)
+
+
+def test_fresh_successful_snapshot_requires_a_durable_exchange_order_id(cfg, repo):
+    engine = _engine(cfg, repo, FakeMexc())
+    intent = engine.process_item(_item(100, 104), _store_message(repo, 104, ALERT))
+    assert intent is not None and intent["state"] == "open"
+    assert intent.get("exchange_order_id")
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is True
+
+    with engine.repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE reconciliation_results SET exchange_state='FILLED' "
+            "WHERE recon_id=(SELECT MAX(recon_id) FROM reconciliation_results WHERE intent_id=?)",
+            (intent["intent_id"],),
+        )
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is False
+
+    with engine.repo.db.transaction() as conn:
+        conn.execute(
+            "UPDATE reconciliation_results SET exchange_state='NEW' "
+            "WHERE recon_id=(SELECT MAX(recon_id) FROM reconciliation_results WHERE intent_id=?)",
+            (intent["intent_id"],),
+        )
+        conn.execute(
+            "UPDATE order_intents SET exchange_order_id=NULL WHERE intent_id=?",
+            (intent["intent_id"],),
+        )
+    assert engine.has_fresh_successful_reconciliation(intent["intent_id"]) is False
+
+
+def test_urgent_post_cancel_reconcile_bypasses_only_success_coalescing(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 107), _store_message(repo, 107, ALERT))
+    assert intent is not None and intent["state"] == "open"
+    first_queries = client.query_calls
+
+    engine._now = lambda: NOW + timedelta(seconds=1)
+    refreshed = engine.reconcile_intent_if_due(
+        intent["intent_id"], notify=False, urgent_after_cancel=True
+    )
+    assert refreshed is not None
+    assert client.query_calls == first_queries + 1
+
+    engine.store.record_reconciliation(
+        intent_id=intent["intent_id"],
+        client_order_id=intent["client_order_id"],
+        local_state="open",
+        exchange_state=None,
+        outcome="not_found",
+        detail="test: cancellation lookup not found",
+    )
+    assert (
+        engine.reconcile_intent_if_due(
+            intent["intent_id"], notify=False, urgent_after_cancel=True
+        )
+        is None
+    )
+    assert client.query_calls == first_queries + 1
+
+
+def test_ambiguous_reconciliation_uses_persisted_backoff(cfg, repo):
+    client = FakeMexc(place_error=MexcNetworkError("timeout after send"))
+    engine = _engine(cfg, repo, client, mode="live")
+    intent = engine.process_item(_item(100, 103), _store_message(repo, 103, ALERT))
+    assert intent is not None and intent["state"] == "unknown_requires_reconciliation"
+
+    client.query_error = MexcNetworkError("read timeout")
+    first = engine.reconcile_pending()
+    assert first.checked == 1 and first.ambiguous == 1
+    queries_after_first = client.query_calls
+
+    second = engine.reconcile_pending()
+    assert second.checked == 0 and second.parked == 1
+    assert client.query_calls == queries_after_first
+
+    engine._now = lambda: NOW + timedelta(seconds=6)
+    third = engine.reconcile_pending()
+    assert third.checked == 1 and third.ambiguous == 1
+    assert client.query_calls == queries_after_first + 1
 
 
 def test_restart_reconciles_intent_left_submitting(cfg, repo):
@@ -521,6 +824,10 @@ def test_restart_reconciles_intent_left_submitting(cfg, repo):
         limit_price=Decimal("100"),
     )
     store.transition_intent(intent["intent_id"], "submitting", note="process crashed after submit")
+    store.db.conn.execute(
+        "UPDATE order_intents SET updated_at = ? WHERE intent_id = ?",
+        ((NOW - timedelta(seconds=30)).isoformat(), intent["intent_id"]),
+    )
 
     stats = engine.reconcile_pending()
 
@@ -609,6 +916,10 @@ def test_database_failure_after_submit_does_not_resubmit(cfg, repo):
     assert retried is not None
     assert retried["state"] == "submitting"
     assert client.place_calls == 1
+    engine.store.db.conn.execute(
+        "UPDATE order_intents SET updated_at = ? WHERE intent_id = ?",
+        ((NOW - timedelta(seconds=30)).isoformat(), retried["intent_id"]),
+    )
 
     engine.reconcile_pending()
     resolved = engine.store.get_intent(retried["intent_id"])
@@ -778,6 +1089,7 @@ def test_not_found_for_open_intent_never_becomes_terminal_failed(cfg, repo):
     assert intent is not None and intent["state"] == "open"
 
     client.query_error = MexcOrderNotFound("gone")
+    engine._now = lambda: NOW + timedelta(seconds=6)
     stats = engine.reconcile_pending()
     assert stats.not_found == 1
     final = engine.store.get_intent(intent["intent_id"])
@@ -966,8 +1278,16 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
     assert signal is not None and "SHORT/SELL" in signal["rejection_reason"]
     rendered = "\n".join(record.getMessage() for record in caplog.records)
     assert "signal_stage" in rendered and "stage=parse" in rendered
-    assert "stage=notification_enqueue" in rendered
     assert "signal_lock scope=process_item" in rendered
+    # The rejection is recorded as a durable domain event (no legacy outbox
+    # duplicate), so the canonical signal.rejected fact is present.
+    events = [
+        row["event_type"]
+        for row in engine.store.db.conn.execute(
+            "SELECT event_type FROM audit_events WHERE event_class='domain' ORDER BY audit_id"
+        ).fetchall()
+    ]
+    assert events == ["signal.received", "signal.rejected"]
 
 
 def test_balance_api_failure_rejects_without_submitting(cfg, repo):
@@ -1108,6 +1428,7 @@ def test_transient_my_trades_failure_keeps_fill_sync_pending_then_recovers(cfg, 
     assert intent is not None and intent["state"] == "open"
     assert int(intent["fill_sync_required"]) == 0
 
+    engine._now = lambda: NOW + timedelta(seconds=6)
     stats = engine.reconcile_pending()
     after_failure = engine.store.get_intent(intent["intent_id"])
     assert stats.checked == 1 and stats.ambiguous == 1
@@ -1294,6 +1615,199 @@ def test_planned_intent_resumes_after_crash_without_duplicate_submission(cfg, re
     again = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert again is not None and again["state"] == "open"
     assert client.place_calls == 1
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "entry_active", "needs_reconciliation", None])
+def test_duplicate_telegram_delivery_never_posts_for_non_pending_trade(cfg, repo, trade_state):
+    """Exercise the real process_item duplicate branch with a fake exchange."""
+    client = FakeMexc(open_orders_results=[])
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-" + (trade_state or "missing"),
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    if trade_state is not None:
+        trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("100")).trade
+        assert trade is not None
+        engine.store.update_trade_state(trade["trade_id"], trade_state, note="duplicate delivery regression")
+    else:
+        assert engine.store.get_trade_by_intent(intent["intent_id"]) is None
+
+    # The exact same Telegram message is delivered again. This must reach the
+    # existing-intent -> _resume_planned_intent branch and never POST to MEXC.
+    record = _store_message(repo, 1, ALERT)
+    result = engine.process_item(_item(100, 1), record)
+
+    assert result is not None and result["state"] == "planned"
+    assert client.place_calls == 0
+    assert engine.store.get_intent(intent["intent_id"])["state"] == "planned"
+    if trade_state is None:
+        assert engine.store.get_trade_by_intent(intent["intent_id"]) is None
+    else:
+        assert engine.store.get_trade_by_intent(intent["intent_id"])["trade_state"] == trade_state
+
+
+def test_duplicate_telegram_delivery_still_resumes_pending_direct_entry(cfg, repo):
+    client = FakeMexc(open_orders_results=[])
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-pending-direct",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("100")).trade
+    assert trade is not None and trade["entry_mode"] == "direct"
+
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+
+    assert result is not None and result["state"] == "open"
+    assert client.place_calls == 1
+
+
+def test_duplicate_telegram_delivery_keeps_pending_conditional_entry_deferred(cfg, repo):
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-pending-conditional",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("90")).trade
+    assert trade is not None and trade["entry_mode"] == "conditional"
+
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+
+    assert result is not None and result["state"] == "planned"
+    assert client.place_calls == 0
+    assert engine.store.get_trade_by_intent(intent["intent_id"])["trade_state"] == "pending_entry"
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "entry_active", "needs_reconciliation"])
+def test_process_item_duplicate_delivery_never_posts_for_created_conditional_entry(cfg, repo, trade_state):
+    """First process_item creates the durable planned intent and pending trade.
+
+    A duplicate delivery of the exact same Telegram message must then be
+    refused by the real process_item -> _resume_planned_intent route whenever
+    the associated trade is no longer pending_entry.
+    """
+
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+
+    record = _store_message(repo, 1, ALERT)
+    item = _item(100, 1)
+
+    first = engine.process_item(item, record)
+    assert first is not None
+    assert first["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    trade = engine.store.get_trade_by_intent(first["intent_id"])
+    assert trade is not None
+    assert trade["entry_mode"] == "conditional"
+    assert trade["trade_state"] == "pending_entry"
+
+    engine.store.update_trade_state(trade["trade_id"], trade_state, note="duplicate delivery e2e regression")
+    assert engine.store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+    duplicate = engine.process_item(item, record)
+
+    assert duplicate is not None
+    assert duplicate["intent_id"] == first["intent_id"]
+    assert duplicate["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    assert engine.store.get_intent(first["intent_id"])["state"] == "planned"
+    assert engine.store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+
+def test_process_item_duplicate_delivery_without_trade_never_posts(cfg, repo):
+    """A duplicate delivery with no trade lifecycle row must also stay inert."""
+
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+
+    record = _store_message(repo, 1, ALERT)
+    item = _item(100, 1)
+
+    first = engine.process_item(item, record)
+    assert first is not None
+    assert first["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    trade = engine.store.get_trade_by_intent(first["intent_id"])
+    assert trade is not None and trade["trade_state"] == "pending_entry"
+
+    with repo.db.transaction() as conn:
+        conn.execute("DELETE FROM trades WHERE trade_id = ?", (trade["trade_id"],))
+    assert engine.store.get_trade_by_intent(first["intent_id"]) is None
+
+    duplicate = engine.process_item(item, record)
+
+    assert duplicate is not None
+    assert duplicate["intent_id"] == first["intent_id"]
+    assert duplicate["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    assert engine.store.get_intent(first["intent_id"])["state"] == "planned"
+    assert engine.store.get_trade_by_intent(first["intent_id"]) is None
 
 
 def test_claimed_submitting_intent_is_never_retried(cfg, repo):

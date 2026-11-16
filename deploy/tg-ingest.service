@@ -2,6 +2,11 @@
 Description=Telegram signal-channel ingestion service
 After=network-online.target
 Wants=network-online.target
+# Start the independent notification dispatcher alongside ingestion. This is a
+# soft pull-in: a Telegram/worker failure never affects, restarts, or stalls
+# this trading service. The worker unit declares the reverse BindsTo/PartOf so
+# it follows this service's stop/restart lifecycle.
+Wants=tg-notification-worker.service
 
 [Service]
 Type=simple

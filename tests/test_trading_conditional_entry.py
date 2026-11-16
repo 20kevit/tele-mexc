@@ -7,6 +7,7 @@ real :class:`TradeStore` on a temporary SQLite database.
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +16,7 @@ from _trading_fakes import FakeClient, FakeEngine, FakeNotifier
 
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.repository import Repository
+from tg_signal_ingest.trading.engine import TradingEngine
 from tg_signal_ingest.trading.parser import ParsedSignal
 from tg_signal_ingest.trading.trade_manager import TradeManager
 from tg_signal_ingest.trading.trade_store import TradeStore
@@ -217,6 +219,14 @@ def test_upward_crossing_activates_entry(env):
     assert t["trade_state"] == "entry_active"
     assert t["entry_order_id"] == "ex-1000"
     assert engine.intent_calls and engine.intent_calls[0][0] == intent["intent_id"]
+    events = store.db.conn.execute(
+        "SELECT event_type,payload_json FROM audit_events "
+        "WHERE event_class='domain' AND event_type='trade.state_changed' AND aggregate_id=?",
+        (trade["trade_id"],),
+    ).fetchall()
+    assert len(events) == 1
+    assert '"new_state":"entry_active"' in events[0]["payload_json"]
+    assert not any(key == "ENTRY_TRIGGER_ACTIVATED" for key, _, _ in notifier.trade_events)
 
 
 def test_single_activation_is_idempotent(env):
@@ -366,3 +376,349 @@ def test_parsed_prices_attached_to_trade(env):
     assert int(t["trigger_offset_ticks"]) == 2
     assert t["tp1_allocation_pct"] == "50.0"
     assert t["tp2_allocation_pct"] == "100.0"
+
+
+def test_entry_fill_sync_uses_central_reconciliation_scheduler(env):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-central-reconcile")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100"))
+    assert decision.trade is not None
+    calls = []
+    original = engine.reconcile_intent_if_due
+
+    def spy(intent_id: str, *, notify: bool = True):
+        calls.append(intent_id)
+        return original(intent_id, notify=notify)
+
+    engine.reconcile_intent_if_due = spy
+    synced = tm._reconcile_entry_fills(decision.trade)
+
+    assert calls == [intent["intent_id"]]
+    assert synced is False
+    assert client.orders == {}
+
+
+def test_recent_successful_snapshot_syncs_recovered_order_without_duplicate_query(env):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-recovered-ack")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.trade is not None
+    trade = decision.trade
+
+    with store.db.transaction() as conn:
+        conn.execute(
+            "UPDATE order_intents SET state='open', exchange_order_id='ex-recovered', "
+            "exchange_status='NEW', submitted_at='now' WHERE intent_id=?",
+            (intent["intent_id"],),
+        )
+    engine.reconcile_intent_if_due = lambda intent_id, *, notify=True: None
+    engine.has_fresh_successful_reconciliation = lambda intent_id: True
+
+    synced = tm._reconcile_entry_fills(trade)
+    refreshed = store.get_trade(trade["trade_id"])
+
+    assert synced is True
+    assert refreshed is not None
+    assert refreshed["entry_order_id"] == "ex-recovered"
+    assert refreshed["entry_exchange_status"] == "open"
+    assert refreshed["trade_state"] == "entry_active"
+    assert client.query_calls == []
+
+
+def test_entry_remainder_cancel_uses_central_gate_for_unknown_intents(env):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-cancel-unknown")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.trade is not None
+    trade = decision.trade
+    store.transition_intent(intent["intent_id"], "unknown_requires_reconciliation", note="uncertain")
+
+    due_calls = []
+    raw_calls = []
+    cancel_calls = []
+    engine.reconcile_intent_if_due = lambda intent_id, *, notify=True: due_calls.append(intent_id)
+    engine.has_fresh_successful_reconciliation = lambda intent_id: False
+    engine.reconcile_intent = lambda intent_id, *, notify=True: raw_calls.append(intent_id)
+    engine.cancel_intent_order = lambda current: cancel_calls.append(current["intent_id"])
+
+    assert tm._cancel_entry_remainder(trade) is False
+    assert due_calls == [intent["intent_id"]]
+    assert raw_calls == []
+    assert cancel_calls == []
+
+
+def test_entry_remainder_cancel_uses_only_one_post_cancel_reconcile(env):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-cancel-open")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.trade is not None
+    trade = decision.trade
+    store.transition_intent(
+        intent["intent_id"], "open", note="acknowledged", exchange_order_id="ex-cancel-open"
+    )
+
+    due_calls = []
+    raw_calls = []
+    cancel_calls = []
+
+    def due_reconcile(intent_id, *, notify=True, urgent_after_cancel=False):
+        due_calls.append((intent_id, urgent_after_cancel))
+        return store.get_intent(intent_id)
+
+    def raw_reconcile(intent_id, *, notify=True):
+        raw_calls.append(intent_id)
+        return store.get_intent(intent_id)
+
+    engine.reconcile_intent_if_due = due_reconcile
+    engine.has_fresh_successful_reconciliation = lambda intent_id: False
+    engine.reconcile_intent = raw_reconcile
+    engine.cancel_intent_order = lambda current: cancel_calls.append(current["intent_id"])
+
+    assert tm._cancel_entry_remainder(trade) is False
+    assert due_calls == [(intent["intent_id"], False), (intent["intent_id"], True)]
+    assert raw_calls == []
+    assert cancel_calls == [intent["intent_id"]]
+
+
+def test_open_state_without_exchange_order_id_is_not_acknowledged(env):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-open-without-id")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.trade is not None
+    trade = decision.trade
+
+    with store.db.transaction() as conn:
+        conn.execute(
+            "UPDATE order_intents SET state='open', exchange_order_id=NULL, "
+            "exchange_status='NEW' WHERE intent_id=?",
+            (intent["intent_id"],),
+        )
+    engine.reconcile_intent_if_due = lambda intent_id, *, notify=True: None
+    engine.has_fresh_successful_reconciliation = lambda intent_id: True
+
+    synced = tm._reconcile_entry_fills(trade)
+    refreshed = store.get_trade(trade["trade_id"])
+
+    assert synced is False
+    assert refreshed is not None
+    assert not refreshed.get("entry_order_id")
+    assert refreshed["trade_state"] == "pending_entry"
+    assert client.query_calls == []
+
+
+def test_trigger_unknown_without_exchange_order_id_is_not_successfully_processed(env):
+    cfg, store, engine, client, notifier, tm = env
+    _apply_conditional(cfg, ticks=2)
+    intent = _insert_intent(store, client_order_id="tsi-trigger-unknown")
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90"))
+    assert decision.trade is not None and decision.deferred
+    trade = decision.trade
+
+    def uncertain_submit(intent_id: str):
+        store.transition_intent(
+            intent_id,
+            "unknown_requires_reconciliation",
+            note="simulated ambiguous POST without exchange acknowledgement",
+        )
+        return store.get_intent(intent_id)
+
+    engine._execute_intent = uncertain_submit
+    tm.on_tick(SYMBOL, Decimal(str(trade["trigger_price"])), received_at=time.monotonic())
+
+    refreshed_intent = store.get_intent(intent["intent_id"])
+    refreshed_trade = store.get_trade(trade["trade_id"])
+    assert refreshed_intent is not None
+    assert refreshed_intent["state"] == "unknown_requires_reconciliation"
+    assert not refreshed_intent.get("exchange_order_id")
+    assert refreshed_trade is not None
+    assert not refreshed_trade.get("entry_order_id")
+    assert client.orders == {}
+
+
+def test_blocked_conditional_trigger_stays_pending_and_retries_after_gate_clears(env, monkeypatch):
+    cfg, store, engine, client, notifier, tm = env
+    _apply_conditional(cfg, ticks=2)
+    cfg.trading.entry_trigger_stale_threshold_s = 60.0
+    now = [1.0]
+    tm._clock = lambda: now[0]
+
+    intent = _insert_intent(store, client_order_id="tsi-paused-trigger")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90")).trade
+    assert trade is not None
+
+    original_execute = engine._execute_intent
+    blocked_calls = []
+
+    def blocked_execute(intent_id):
+        blocked_calls.append(intent_id)
+        # This mirrors TradingEngine's atomic gate declining a claim: no state
+        # transition and no exchange POST; the durable intent remains planned.
+        return store.get_intent(intent_id)
+
+    monkeypatch.setattr(engine, "_execute_intent", blocked_execute)
+    tm.on_tick(SYMBOL, Decimal("99.99"), received_at=1.0)
+
+    assert blocked_calls == [intent["intent_id"]]
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "pending_entry"
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+    assert client.place_calls == []
+
+    # Reconciliation must not mistake a blocked, never-claimed intent for a
+    # completed zero-inventory trade.
+    tm._reconcile_trade_inner(trade["trade_id"])
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "pending_entry"
+
+    # Once the gate clears, the next fresh trigger can claim and submit once.
+    monkeypatch.setattr(engine, "_execute_intent", original_execute)
+    now[0] = 2.0
+    tm.on_tick(SYMBOL, Decimal("100.00"), received_at=2.0)
+    refreshed = store.get_trade(trade["trade_id"])
+    assert refreshed["trade_state"] == "entry_active"
+    assert refreshed["entry_order_id"] == "ex-1000"
+    assert store.get_intent(intent["intent_id"])["state"] == "open"
+    assert len(client.place_calls) == 1
+
+
+def test_needs_reconciliation_does_not_close_while_entry_intent_is_still_planned(env):
+    cfg, store, engine, client, notifier, tm = env
+    _apply_conditional(cfg, ticks=2)
+    intent = _insert_intent(store, client_order_id="tsi-planned-unknown")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90")).trade
+    assert trade is not None
+
+    # Reproduce the pre-fix state: activation was persisted before the intent
+    # claim, leaving entry_active + planned after a blocked trigger.
+    store.update_trade_state(
+        trade["trade_id"],
+        "entry_active",
+        note="simulated interrupted conditional activation",
+    )
+    tm._reconcile_trade_inner(trade["trade_id"])
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "needs_reconciliation"
+
+    # A later read-only sweep must not mistake the still-planned intent for a
+    # conclusively closed zero-inventory trade.
+    tm._reconcile_trade_inner(trade["trade_id"])
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "needs_reconciliation"
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "needs_reconciliation", "entry_active"])
+def test_resume_planned_intents_never_submits_for_non_pending_trade(env, monkeypatch, trade_state):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id=f"tsi-resume-{trade_state}")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100")).trade
+    assert trade is not None
+    store.update_trade_state(trade["trade_id"], trade_state, note="resume guard test")
+
+    # Build the narrowest engine shell needed to exercise the real resume method.
+    runner = object.__new__(TradingEngine)
+    runner.store = store
+    runner.trade_manager = tm
+    runner._intent_expired = lambda _intent: False
+    runner.execute_intent = lambda _intent_id: pytest.fail("non-pending trade must never be submitted")
+    monkeypatch.setattr(store, "activation_boundary", lambda _channel_id: 0)
+
+    assert runner.resume_planned_intents() == 0
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+    assert store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "needs_reconciliation", "entry_active"])
+def test_duplicate_delivery_never_submits_planned_intent_for_non_pending_trade(env, monkeypatch, trade_state):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id=f"tsi-duplicate-{trade_state}")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100")).trade
+    assert trade is not None
+    store.update_trade_state(trade["trade_id"], trade_state, note="duplicate delivery guard test")
+
+    # The existing-intent branch of _process_item() delegates duplicate
+    # Telegram deliveries to this resume path.
+    runner = object.__new__(TradingEngine)
+    runner.store = store
+    runner.trade_manager = tm
+    submits = []
+    monkeypatch.setattr(runner, "_execute_intent", lambda intent_id: submits.append(intent_id))
+
+    result = runner._resume_planned_intent(intent, _parsed(), Decimal("100"))
+
+    assert submits == []
+    assert result["state"] == "planned"
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+    assert store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+
+def test_duplicate_delivery_preserves_pending_direct_entry_resume(env, monkeypatch):
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store, client_order_id="tsi-duplicate-pending-direct")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("100")).trade
+    assert trade is not None and trade["entry_mode"] == "direct"
+
+    runner = object.__new__(TradingEngine)
+    runner.store = store
+    runner.trade_manager = tm
+    submits = []
+    def resume_submit(intent_id):
+        submits.append(intent_id)
+        return store.get_intent(intent_id)
+
+    monkeypatch.setattr(runner, "_execute_intent", resume_submit)
+
+    runner._resume_planned_intent(intent, _parsed(), Decimal("100"))
+
+    assert submits == [intent["intent_id"]]
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+
+
+def test_duplicate_delivery_keeps_pending_conditional_entry_deferred(env, monkeypatch):
+    cfg, store, engine, client, notifier, tm = env
+    _apply_conditional(cfg)
+    intent = _insert_intent(store, client_order_id="tsi-duplicate-pending-conditional")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90")).trade
+    assert trade is not None and trade["entry_mode"] == "conditional"
+
+    runner = object.__new__(TradingEngine)
+    runner.store = store
+    runner.trade_manager = tm
+    submits = []
+    monkeypatch.setattr(runner, "_execute_intent", lambda intent_id: submits.append(intent_id))
+
+    runner._resume_planned_intent(intent, _parsed(), Decimal("90"))
+
+    assert submits == []
+    assert store.get_intent(intent["intent_id"])["state"] == "planned"
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "pending_entry"
+
+
+def test_claimed_but_unacknowledged_conditional_entry_is_parked_without_retry(env, monkeypatch):
+    cfg, store, engine, client, notifier, tm = env
+    _apply_conditional(cfg, ticks=2)
+    cfg.trading.entry_trigger_stale_threshold_s = 60.0
+    tm._clock = lambda: 1.0
+    intent = _insert_intent(store, client_order_id="tsi-uncertain-trigger")
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90")).trade
+    assert trade is not None
+
+    attempts = []
+
+    def uncertain_execute(intent_id):
+        attempts.append(intent_id)
+        store.transition_intent(
+            intent_id,
+            "unknown_requires_reconciliation",
+            note="simulated lost response after submission claim",
+        )
+        return store.get_intent(intent_id)
+
+    monkeypatch.setattr(engine, "_execute_intent", uncertain_execute)
+    tm.on_tick(SYMBOL, Decimal("99.99"), received_at=1.0)
+
+    assert attempts == [intent["intent_id"]]
+    assert store.get_trade(trade["trade_id"])["trade_state"] == "needs_reconciliation"
+    assert store.get_intent(intent["intent_id"])["state"] == "unknown_requires_reconciliation"
+    assert client.place_calls == []
+
+    # Further ticks cannot retry an ambiguous POST.
+    tm.on_tick(SYMBOL, Decimal("100.00"), received_at=1.0)
+    assert attempts == [intent["intent_id"]]
+    assert client.place_calls == []

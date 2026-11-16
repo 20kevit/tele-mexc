@@ -7,8 +7,11 @@ All exchange/Telegram clients are fakes; no test can reach MEXC or Telegram.
 
 from __future__ import annotations
 
+import contextlib
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from pathlib import Path
 
 from tests.test_trading_engine import (
     ALERT,
@@ -19,6 +22,7 @@ from tests.test_trading_engine import (
     _store_message,
 )
 from tg_signal_ingest.mexc.errors import MexcNetworkError
+from tg_signal_ingest.notification_dispatcher import NotificationDispatcher
 from tg_signal_ingest.trading import SignalParser, TradingStore
 from tg_signal_ingest.trading.notify import TradingNotifier
 from tg_signal_ingest.trading.store import RiskLimitExceeded
@@ -36,10 +40,41 @@ class FlakyBot:
         return {"message_id": len(self.sent)}
 
 
+class _NotificationHarness:
+    """Exercise the independent dispatcher while preserving producer wiring."""
+
+    def __init__(self, engine, bot):
+        self.legacy = TradingNotifier(engine.store, bot, owner_id=OWNER, developer_id=DEVELOPER)
+        engine.notifier = self.legacy
+        self._tempdir = tempfile.TemporaryDirectory(prefix="tele-mexc-notify-test-")
+        self.dispatcher = NotificationDispatcher(
+            engine.store.db.path,
+            Path(self._tempdir.name) / "delivery.sqlite3",
+            bot,
+            {"owner": OWNER, "developer": DEVELOPER},
+        )
+
+    def flush(self, limit: int = 100) -> int:
+        return int(self.dispatcher.run_once(delivery_limit=limit)["attempted"])
+
+    def pending_count(self) -> int:
+        counts = self.dispatcher.store.counts()
+        return counts.get("pending", 0) + counts.get("retry", 0)
+
+    def close(self) -> None:
+        self.dispatcher.close()
+        self._tempdir.cleanup()
+
+    def __getattr__(self, name):
+        return getattr(self.legacy, name)
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self.close()
+
+
 def _notifier(engine, bot):
-    notifier = TradingNotifier(engine.store, bot, owner_id=OWNER, developer_id=DEVELOPER)
-    engine.notifier = notifier
-    return notifier
+    return _NotificationHarness(engine, bot)
 
 
 def _ledger(store: TradingStore) -> list[dict]:
@@ -226,15 +261,16 @@ def test_three_usdt_signal_below_symbol_minimum_is_skipped(cfg, repo):
 def test_genuine_signal_result_notifies_both_with_original_text(cfg, repo):
     engine = _engine(cfg, repo)
     bot = FlakyBot()
-    _notifier(engine, bot)
+    notifier = _notifier(engine, bot)
 
     engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+    notifier.flush()
     texts = [text for _, text in bot.sent]
     joined = "\n".join(texts)
-    assert len(bot.sent) == 2
-    assert not any("سیگنال جدید دریافت شد" in text for text in texts)
-    assert all(ALERT in text for text in texts)
-    assert "exchange submission attempted: yes" in joined
+    assert len(bot.sent) >= 2
+    assert any("سیگنال جدید دریافت شد" in text for text in texts)
+    assert any("ورود: 100" in text for text in texts)
+    assert "exchange submission attempted: yes" not in joined
     assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
 
 
@@ -242,16 +278,18 @@ def test_sell_signal_is_reported_ignored_and_never_ordered(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
-    _notifier(engine, bot)
+    notifier = _notifier(engine, bot)
 
     result = engine.process_item(
         _item(100, 1),
         _store_message(repo, 1, "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"),
     )
+    notifier.flush()
     assert result is None
     assert client.place_calls == 0
     joined = "\n".join(text for _, text in bot.sent)
-    assert "سیگنال فروش نادیده گرفته می‌شود❌" in joined
+    assert "Spot BUY only" in joined
+    assert "سیگنال رد شد" in joined
     assert "سفارش واقعی" not in joined
 
 
@@ -274,12 +312,13 @@ def test_live_result_notification_contains_exchange_identity(cfg, repo):
     )
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
-    _notifier(engine, bot)
+    notifier = _notifier(engine, bot)
 
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+    notifier.flush()
     assert result is not None and result["state"] == "filled"
     joined = "\n".join(text for _, text in bot.sent)
-    assert "✅ سفارش واقعی در MEXC ثبت" in joined
+    assert "سفارش ورود کامل پر شد" in joined
     assert "ex-notify" in joined
     assert "cumulative tracked spend" not in joined
 

@@ -467,3 +467,76 @@ def test_create_order_not_found_is_logged_as_unknown_write_outcome(caplog):
     get_lines = [r.getMessage() for r in caplog.records if "method=GET" in r.getMessage()]
     assert get_lines, "no GET telemetry recorded"
     assert all("outcome=exchange_error" in line for line in get_lines)
+
+
+def test_all_orders_uses_signed_get_weight_10_and_exact_window():
+    general = RecordingGate()
+    uid = RecordingGate()
+    payload = [
+        {
+            "orderId": "C02__750788171028987905033",
+            "symbol": "APEUSDT",
+            "side": "SELL",
+            "type": "OCO_LIMIT_ORDER",
+            "status": "CANCELED",
+            "price": "0.0813",
+            "origQty": "18.58",
+            "executedQty": "0",
+            "time": 1794784085000,
+        }
+    ]
+    transport = Transport(payload=payload)
+    client = MexcSpotClient(
+        API_KEY,
+        API_SECRET,
+        transport=transport,
+        clock=lambda: CLOCK_MS,
+        general_gate=general,
+        uid_gate=uid,
+    )
+
+    rows = client.all_orders(
+        symbol="APEUSDT",
+        start_time_ms=1794784000000,
+        end_time_ms=1794784100000,
+        limit=50,
+    )
+
+    assert rows == payload
+    assert general.weights == [10]
+    assert uid.weights == [1]
+    call = transport.calls[0]
+    assert call["method"] == "GET"
+    parsed = urlparse(call["url"])
+    assert parsed.path == "/api/v3/allOrders"
+    query = parse_qs(parsed.query)
+    assert query["symbol"] == ["APEUSDT"]
+    assert query["startTime"] == ["1794784000000"]
+    assert query["endTime"] == ["1794784100000"]
+    assert query["limit"] == ["50"]
+    assert "signature" in query and query["signature"][0]
+    assert call["headers"]["X-MEXC-APIKEY"] == API_KEY
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"symbol": "", "start_time_ms": 1, "end_time_ms": 2, "limit": 10},
+        {"symbol": "APEUSDT", "start_time_ms": -1, "end_time_ms": 2, "limit": 10},
+        {"symbol": "APEUSDT", "start_time_ms": 2, "end_time_ms": 1, "limit": 10},
+        {"symbol": "APEUSDT", "start_time_ms": 1, "end_time_ms": 2, "limit": 0},
+        {"symbol": "APEUSDT", "start_time_ms": 1, "end_time_ms": 2, "limit": 1001},
+        {
+            "symbol": "APEUSDT",
+            "start_time_ms": 0,
+            "end_time_ms": 7 * 24 * 60 * 60 * 1000 + 1,
+            "limit": 10,
+        },
+    ],
+)
+def test_all_orders_validates_arguments(kwargs):
+    from tg_signal_ingest.mexc import MexcConfigError
+
+    client = _client(Transport())
+    with pytest.raises(MexcConfigError):
+        client.all_orders(**kwargs)

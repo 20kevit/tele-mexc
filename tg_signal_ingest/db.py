@@ -562,6 +562,55 @@ def _migration_21_second_owner_notifications(conn: sqlite3.Connection) -> None:
         conn.execute(sql)
 
 
+def _migration_25_domain_event_envelope(conn: sqlite3.Connection) -> None:
+    """Add the immutable Phase 2 domain-event envelope to ``audit_events``.
+
+    Existing rows stay labelled ``legacy`` and keep their current behaviour.
+    Only rows inserted with ``event_class='domain'`` are append-only.  The
+    triggers are intentionally scoped to that discriminator so historical
+    audit maintenance remains compatible with the pre-Phase-2 schema.
+    """
+
+    _add_columns(
+        conn,
+        "audit_events",
+        [
+            ("event_class", "TEXT NOT NULL DEFAULT 'legacy' CHECK (event_class IN ('legacy', 'domain'))"),
+            ("aggregate_type", "TEXT"),
+            ("aggregate_id", "TEXT"),
+            ("audience_json", "TEXT"),
+        ],
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_domain_aggregate "
+        "ON audit_events (event_class, aggregate_type, aggregate_id, occurred_at_utc)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_domain_type "
+        "ON audit_events (event_class, event_type, occurred_at_utc)"
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_audit_domain_no_update
+        BEFORE UPDATE ON audit_events
+        WHEN OLD.event_class = 'domain'
+        BEGIN
+            SELECT RAISE(ABORT, 'domain events are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_audit_domain_no_delete
+        BEFORE DELETE ON audit_events
+        WHEN OLD.event_class = 'domain'
+        BEGIN
+            SELECT RAISE(ABORT, 'domain events are immutable');
+        END
+        """
+    )
+
+
 def _migration_22_remediation_columns(conn: sqlite3.Connection) -> None:
     """Additive columns required by the remediation decisions.
 
@@ -1640,6 +1689,7 @@ MIGRATIONS: list[tuple[int, MigrationStep]] = [
             OR fill_sync_required = 1;
         """,
     ),
+    (25, _migration_25_domain_event_envelope),
 ]
 
 

@@ -24,6 +24,7 @@ the document.
 | `docs/DECISION_REGISTRY.md` | Authoritative audit-decision registry and per-item implementation status (machine-readable source: `docs/decisions/registry.json`) |
 | `docs/trading.md` | Operators, developers | Parsing, risk, fixed sizing, LIMIT execution, conditional entry, per-channel stale-signal boundary, two native OCO exits, restart recovery, reconciliation, readiness, notifications |
 | `docs/data-model.md` | Developers | Active and historical tables, migrations, enums, persistence invariants |
+| `docs/notification-readiness.md` | Operators, developers | Notification boundary, severity/routing/delivery policy, F-01…F-20 findings, residual gaps |
 | `docs/development.md` | Developers | Setup, test areas, lint/typecheck, migrations, change workflow |
 | `docs/documentation-index.md` | Everyone | This index |
 
@@ -59,7 +60,7 @@ instructions.
 | `docs/INDEPENDENT_AUDIT_2026-10-29.md` | Historical independent audit |
 | `docs/MAINTENANCE_AUDIT_2026-10-29.md` | Historical maintenance audit |
 | `docs/TRADING_RULES_COMPLIANCE_AUDIT.md` | Historical compliance audit |
-| `docs/trading-audit-notifications-design.md` | Unimplemented design proposal |
+| `docs/trading-audit-notifications-design.md` | Design proposal; a Phase 2 subset is implemented, current behavior is in `docs/notification-readiness.md` |
 | `docs/ui_audit_findings.md` | Historical audit of the removed management bot UI |
 | `docs/evidence/` | Historical forensic dossiers; see `docs/evidence/README.md` |
 | `reports/` | Historical investigations; see `reports/README.md` |

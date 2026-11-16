@@ -167,8 +167,12 @@ stdlib `urllib` in a worker thread. It provides:
   `-2013` are context-aware: on a query/cancel they mean "not currently visible"
   and keep an uncertain intent unresolved; on a create-order response they are
   treated as an ambiguous submission (never a rejection, never a resend).
-  Repeated entry and TP/SL not-found queries use durable exponential backoff
-  (60 s to 15 min), without changing uncertain-order state or retrying writes.
+  Entry-intent not-found queries use durable exponential backoff (60 s to
+  15 min), ambiguous reads use 5 s to 60 s, and successful reads are coalesced
+  for 5 s. An in-process entry POST is never reconciled while it is waiting or
+  executing; stale claims are checked only after the transport bound plus a
+  5 s margin. These read schedules never change uncertain-order state into a
+  rejection and never retry an order write.
 - Structured REST request logs include request id, endpoint, HTTP/exchange status,
   Retry-After, cooldown/rate-gate wait, network duration, and outcome. Signed
   parameters, credentials, and payloads are never logged.

@@ -113,6 +113,8 @@ class FakeClient:
         self.place_calls: list[dict[str, Any]] = []
         self.cancel_calls: list[dict[str, Any]] = []
         self.query_calls: list[dict[str, Any]] = []
+        self.all_orders_rows: list[dict[str, Any]] = []
+        self.all_orders_calls: list[dict[str, Any]] = []
         self._next_order_id = 1000
         self._next_trade_id = 5000
 
@@ -202,6 +204,29 @@ class FakeClient:
     def my_trades(self, *, symbol=None, order_id=None, limit=1000) -> list[dict[str, Any]]:
         return list(self.trades.get(str(order_id), []))
 
+    def all_orders(
+        self, *, symbol: str, start_time_ms: int, end_time_ms: int, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        self.all_orders_calls.append(
+            {
+                "symbol": symbol,
+                "start_time_ms": start_time_ms,
+                "end_time_ms": end_time_ms,
+                "limit": limit,
+            }
+        )
+        rows: list[dict[str, Any]] = []
+        for row in self.all_orders_rows:
+            if str(row.get("symbol") or "").upper() != str(symbol).upper():
+                continue
+            try:
+                when = int(row.get("time"))
+            except (TypeError, ValueError):
+                continue
+            if start_time_ms <= when <= end_time_ms:
+                rows.append(dict(row))
+        return rows[:limit]
+
 
 class FakeOrderNotFound(Exception):
     """Mirror of the typed exchange not-found error."""
@@ -227,6 +252,8 @@ class FakeEngine:
         self.cancel_intent_calls: list[dict[str, Any]] = []
         self.cancel_trade_calls: list[dict[str, Any]] = []
         self.query_trade_calls: list[dict[str, Any]] = []
+        self.query_all_orders_calls: list[dict[str, Any]] = []
+        self.query_order_trades_calls: list[dict[str, Any]] = []
 
     # --- entry submission (conditional activation path) -------------------
     def _execute_intent(self, intent_id: str) -> dict[str, Any]:
@@ -253,6 +280,11 @@ class FakeEngine:
         assert refreshed is not None
         self.intent_calls.append((intent_id, dict(refreshed)))
         return refreshed
+
+    def reconcile_intent_if_due(
+        self, intent_id: str, *, notify: bool = True, urgent_after_cancel: bool = False
+    ) -> dict[str, Any] | None:
+        return self.reconcile_intent(intent_id, notify=notify)
 
     def reconcile_intent(self, intent_id: str, *, notify: bool = True) -> dict[str, Any]:
         """Read-only-ish fake reconciliation: adopt exchange state and fills."""
@@ -361,6 +393,7 @@ class FakeEngine:
             "state": "NEW",
             "executed_qty": Decimal("0"),
             "cumulative_quote": Decimal("0"),
+            "trigger_price": str(stop_price),
         }
         self.tp_orders.append({"kind": kind, "client_order_id": client_order_id, **order})
         return order
@@ -408,3 +441,48 @@ class FakeEngine:
             "cumulative_quote": _optional_decimal(raw.get("cumulativeQuoteQty")),
             "exchange_order_id": str(raw.get("orderId") or ""),
         }
+
+    def query_all_orders(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int = 1000,
+        trade: dict[str, Any] | None = None,
+        trade_order_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.query_all_orders_calls.append(
+            {
+                "symbol": symbol,
+                "start_time_ms": start_time_ms,
+                "end_time_ms": end_time_ms,
+                "limit": limit,
+                "trade": trade,
+                "trade_order_id": trade_order_id,
+            }
+        )
+        return self.client.all_orders(
+            symbol=symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+        )
+
+    def query_order_trades(
+        self,
+        *,
+        symbol: str,
+        exchange_order_id: str,
+        limit: int = 1000,
+        trade: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.query_order_trades_calls.append(
+            {
+                "symbol": symbol,
+                "exchange_order_id": exchange_order_id,
+                "limit": limit,
+                "trade": trade,
+            }
+        )
+        return self.client.my_trades(symbol=symbol, order_id=exchange_order_id, limit=limit)

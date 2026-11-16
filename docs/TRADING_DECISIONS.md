@@ -176,6 +176,11 @@ orders; request timeout after the exchange may have accepted it.
 7. Notifications
 ---------------------------------------------------------------
 
+> Historical decision record. The 2026-11-13 approved policy supersedes the
+> "every event / never suppresses" routing below: CRITICAL and owner-safety
+> alerts always reach both owners, INFO+ follows per-recipient preferences, and
+> DEBUG chatter is programmer-only. Current behavior: `docs/notification-readiness.md`.
+
 - Centralized durable outbox (`trading_notifications`) written before delivery;
   retry is independent of order execution and can never resubmit an order.
 - Two configured owners (Owner A and Owner B) receive **every** operational
