@@ -464,18 +464,28 @@ Intent states (DB check constraint): `planned`, `submitting`, `submitted`,
 
 The current live backend (`HybridMexcClient`) reports
 `supports_attached_protection = False`: entries are not sent with attached
-take-profit/stop-loss triggers. Instead, once the entry intent is terminal and
-`fill_sync_required` is clear, `TradeManager._place_oco_exits()` places two
-native MEXC OCO SELL orders against the **actual acquired base quantity**:
+take-profit/stop-loss triggers. Once an incremental acquired quantity is
+confirmed and its fill history is synchronized, `TradeManager._place_oco_exits()`
+creates a durable **fill tranche** and places two native MEXC OCO SELL orders
+for that tranche. This can happen on the acknowledgement callback for an
+already-partial entry; the unfilled entry remainder may still be working:
 
-- OCO 1: `tp1_allocation_pct` (default 50%) at TP1, with a stop-limit leg whose
-  *execution price* and *activation trigger* are both exactly the configured
-  stop-loss. No tick offset is applied.
-- OCO 2: the remaining allocation at TP2, with the same exact Stop-Loss trigger
-  and execution price.
+- OCO 1: `tp1_allocation_pct` (default 50%) of this tranche at TP1, with a
+  stop-limit leg whose *execution price* and *activation trigger* are both
+  exactly the configured stop-loss. No tick offset is applied.
+- OCO 2: the remaining allocation of this tranche at TP2, with the same exact
+  Stop-Loss trigger and execution price.
 - Each OCO is one exchange order with two linked legs; when one leg activates,
-  the exchange cancels the other leg inside that OCO. The two OCO orders do not
-  cancel each other.
+  the exchange cancels only its own linked sibling. TP1 and TP2 are separate OCO
+  parents, and OCOs belonging to different fill tranches are never siblings.
+- Every later incremental Entry fill creates another tranche with its own TP1
+  and TP2 OCO orders. The bot does not edit or cancel/replace an already-active
+  OCO. Fills discovered together in one fresh reconciliation snapshot may be
+  combined into one tranche; the durable pair of pending order rows is written
+  atomically before either exchange submission.
+- Tranche identity is persisted in the existing `trade_orders.oco_group_id`
+  field; the aggregate `oco_groups` record remains one per trade. Stable,
+  tranche-specific client IDs prevent duplicate submissions after restarts.
 - The activation trigger and the stop-limit execution price are distinct
   exchange fields (`triggerPrice` / `triggerLimitPrice` on `spot.trade.place-oco`),
   but both are set to the configured stop-loss price.
@@ -642,9 +652,11 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
 - Entry fills are read back from the exchange (`reconcile_intent`) before any
   OCO quantity is computed. If that query is ambiguous, the trade is held and
   retried on the next tick/sweep instead of acting on a stale local quantity.
-- OCO allocations are computed once from the **actual** acquired base and
-  persisted. A restart reuses `tp1_allocated_qty`/`tp2_allocated_qty`; it never
-  silently shrinks or re-expands an existing allocation.
+- Each OCO tranche allocation is computed once from the **incremental actual
+  sellable base quantity** and persisted. `tp1_allocated_qty` and
+  `tp2_allocated_qty` are aggregate totals across all tranches. A restart reuses
+  the persisted tranche rows; it never silently shrinks, re-expands, or
+  duplicates an existing allocation.
 - Each OCO leg is idempotent by kind and stable `clientOrderId`. A confirmed or
   filled leg is never resubmitted. A `pending` leg was never sent and may be
   safely rebased; a `submitting` or `unknown_requires_reconciliation` leg is
@@ -653,10 +665,20 @@ Trade-order states: `pending`, `submitting`, `open`, `partially_filled`,
   target below the exchange lot/minimum is recorded in
   `unsold_residual_qty`/`unsold_residual_reason`, and the trade is marked
   `needs_reconciliation` rather than being presented as protected.
-- A partial entry fill is protected immediately: OCO quantity equals the
-  acquired quantity, and the unfilled entry remainder stays working. If the
-  acquired position is exited (TP1 or stop-loss), the remainder is cancelled so
-  it cannot open a new position later (F-05).
+- A partial entry fill already visible at the durable order acknowledgement is
+  synchronized immediately by `on_intent_executed`; the acquired amount becomes
+  the first tranche while the unfilled Entry remainder stays working. Later
+  incremental fills create new independent tranches rather than attempting to
+  amend an existing OCO.
+- Before a new tranche is created, the bot subtracts the latest durable planned
+  allocations and all live/uncertain exchange reservations from the fresh
+  sellable quantity. If the invariant cannot be proven, a parent is canceled
+  with unresolved child attribution, or a submission is UNKNOWN, no new tranche
+  is submitted. Unknown submissions are reconciled by their original client ID.
+- A confirmed TP1 completion follows the existing Entry-remainder cancellation
+  rule; any already-acquired later tranche remains separately protected by its
+  own TP2/SL OCO. An SL child outcome that cannot be attributed remains
+  `needs_reconciliation` and blocks further tranche creation.
 - A rejected OCO leg is retried on the fixed owner-agreed schedule: initial
   attempt plus 8 retries at 5, 10, 15, 30, 30, 30, 30, 30 seconds. The attempt
   counter and `next_attempt_at` are persisted on `trade_orders`, so restarts do
@@ -699,6 +721,14 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
   that always reach both owners.
 - `oco_active` means every required leg has an exchange order id; it does not
   mean either leg has been observed triggered.
+- Group state describes aggregate protection, not each poll or repair
+  attempt. Only a newly-created group in `intended` enters `submitting`;
+  periodic reconciliation of an existing `active`, `partial`, or uncertain
+  group is observational and leaves its group state unchanged while individual
+  legs are reconciled/retried. A healthy or still-degraded poll therefore emits
+  no transient group-state event. If an allocation or invariant check fails
+  before the normal result projection, the group must still be synchronized to
+  `needs_review`; degraded protection must never remain displayed as active.
 - Each OCO order is tracked as its own target (`tp1`, `tp2`) with its own
   take-profit price, stop-loss activation trigger, exchange order id, fill
   quantity, and cancellation evidence. The two orders are reconciled
@@ -706,9 +736,18 @@ Each trade gets an explicit `oco_groups` row (`oco_group_id`, `state`, `intended
 - **Verified limitation:** the documented MEXC/CLI surface exposes the OCO
   order's aggregate status and fills, not a separate authoritative child-order
   state for the TP branch versus the SL branch. This repository therefore
-  records the OCO-level state and infers a sibling cancellation only from
-  exchange evidence (peer canceled with zero sells while its sibling filled). It
-  does not invent a branch-level child state that the API does not expose.
+  records the OCO-level state and does not invent a branch-level child state.
+  A canceled parent with unresolved child attribution is now fail-closed: the
+  entry remainder is canceled where safely confirmable, the trade is parked in
+  `needs_reconciliation`, and no replacement OCO is submitted.
+- A transient query failure does not permanently lock a trade if a later sweep
+  freshly confirms the remaining working OCO coverage. A completed TP1 parent
+  plus a still-open TP2 parent is a valid state (the LINKUSDT regression case):
+  recovery must not require TP1 to remain open or recreate it. Recovery to
+  `oco_active` is allowed only with fresh observations for relevant filled and
+  working parents, no unknown/canceled parent, and a valid combined reservation
+  invariant. A terminal order whose last observation failed is queried again
+  before this decision.
 
 - Conditional LIMIT entry is always the strategy when market is below Entry;
   the default trigger is exactly 3 exchange ticks below Entry.

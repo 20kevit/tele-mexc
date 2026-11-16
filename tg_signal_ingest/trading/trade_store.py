@@ -239,9 +239,7 @@ class TradeStore(TradingStore):
             params.append(now)
         params.append(trade_id)
         with self.db.transaction() as conn:
-            previous = conn.execute(
-                "SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade_id,)
-            ).fetchone()
+            previous = conn.execute("SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
             conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?", params)
             conn.execute(
                 "INSERT INTO audit_events (correlation, category, event, detail, created_at) "
@@ -257,8 +255,10 @@ class TradeStore(TradingStore):
                         symbol=previous["symbol"],
                         occurred_at=now,
                         severity=(
-                            "CRITICAL" if new_state == "unprotected_critical"
-                            else "WARNING" if new_state == "needs_reconciliation"
+                            "CRITICAL"
+                            if new_state == "unprotected_critical"
+                            else "WARNING"
+                            if new_state == "needs_reconciliation"
                             else None
                         ),
                         payload={
@@ -445,6 +445,82 @@ class TradeStore(TradingStore):
             assert row is not None
             return dict(row)
 
+    def create_trade_order_pair(self, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Atomically persist both OCO target orders for one fill tranche.
+
+        No exchange write occurs here. Persisting both pending rows in one
+        transaction ensures a restart cannot mistake a half-created tranche
+        for new uncovered inventory and allocate it twice.
+        """
+        if len(specs) != 2 or {str(item.get("kind")) for item in specs} != {"tp1", "tp2"}:
+            raise ValueError("an OCO tranche must contain exactly one tp1 and one tp2 order")
+        now = self._ts()
+        result: list[dict[str, Any]] = []
+        with self.db.transaction() as conn:
+            for spec in specs:
+                existing = conn.execute(
+                    "SELECT * FROM trade_orders WHERE client_order_id = ?",
+                    (spec["client_order_id"],),
+                ).fetchone()
+                if existing is not None:
+                    result.append(dict(existing))
+                    continue
+                cols = [
+                    "trade_order_id",
+                    "trade_id",
+                    "kind",
+                    "client_order_id",
+                    "symbol",
+                    "side",
+                    "order_type",
+                    "price",
+                    "quantity",
+                    "allocated_qty",
+                    "sold_qty",
+                    "state",
+                    "exchange_order_id",
+                    "exchange_status",
+                    "stop_trigger_price",
+                    "attempt",
+                    "oco_group_id",
+                    "leg_role",
+                    "created_at",
+                    "updated_at",
+                ]
+                values = (
+                    spec["trade_order_id"],
+                    spec["trade_id"],
+                    spec["kind"],
+                    spec["client_order_id"],
+                    spec["symbol"],
+                    spec["side"],
+                    spec["order_type"],
+                    dec_str(spec.get("price")),
+                    dec_str(spec["quantity"]),
+                    dec_str(spec.get("allocated_qty", spec["quantity"])),
+                    "0",
+                    "pending",
+                    None,
+                    None,
+                    dec_str(spec.get("stop_trigger_price")),
+                    int(spec.get("attempt", 1)),
+                    spec.get("oco_group_id"),
+                    spec.get("leg_role"),
+                    now,
+                    now,
+                )
+                conn.execute(
+                    f"INSERT INTO trade_orders ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                    values,
+                )
+                row = conn.execute(
+                    "SELECT * FROM trade_orders WHERE trade_order_id = ?",
+                    (spec["trade_order_id"],),
+                ).fetchone()
+                assert row is not None
+                result.append(dict(row))
+        return result
+
     def get_trade_order(self, trade_order_id: str) -> dict[str, Any] | None:
         return _row(
             self.db.conn.execute("SELECT * FROM trade_orders WHERE trade_order_id = ?", (trade_order_id,)).fetchone()
@@ -621,9 +697,13 @@ class TradeStore(TradingStore):
                         symbol=previous["symbol"],
                         occurred_at=now,
                         severity=(
-                            "CRITICAL" if new_state == "unknown_requires_reconciliation" else
-                            "ERROR" if new_state == "rejected" and not retryable else
-                            "WARNING" if retryable and next_attempt_at else None
+                            "CRITICAL"
+                            if new_state == "unknown_requires_reconciliation"
+                            else "ERROR"
+                            if new_state == "rejected" and not retryable
+                            else "WARNING"
+                            if retryable and next_attempt_at
+                            else None
                         ),
                         payload=payload,
                     ),
@@ -704,8 +784,10 @@ class TradeStore(TradingStore):
                 if changed:
                     protection = str(current["protection_status"] or "")
                     group_severity = (
-                        "CRITICAL" if protection in ("unprotected", "unprotected_critical", "failed")
-                        else "WARNING" if str(current["state"]) == "needs_reconciliation"
+                        "CRITICAL"
+                        if protection in ("unprotected", "unprotected_critical", "failed")
+                        else "WARNING"
+                        if str(current["state"]) == "needs_reconciliation"
                         else None
                     )
                     self.record_domain_event(
@@ -753,7 +835,7 @@ class TradeStore(TradingStore):
 
         now = self._ts()
         target = str(order.get("target") or order.get("kind") or leg_role or "unknown")
-        kind = "stop_loss" if (target == "stop_loss" or target.endswith("_sl")) else "take_profit"
+        kind = "stop_loss" if (target == "stop_loss" or target.endswith("_sl") or "_sl:" in target) else "take_profit"
         leg_id = f"{group_id}:{target}"
         with self.db.transaction() as conn:
             previous = conn.execute("SELECT * FROM oco_legs WHERE leg_id = ?", (leg_id,)).fetchone()
@@ -825,8 +907,10 @@ class TradeStore(TradingStore):
             if previous is None or _oco_leg_changed(previous, current):
                 leg_state = str(current["state"])
                 leg_severity = (
-                    "CRITICAL" if leg_state == "unknown_requires_reconciliation"
-                    else "ERROR" if leg_state == "rejected"
+                    "CRITICAL"
+                    if leg_state == "unknown_requires_reconciliation"
+                    else "ERROR"
+                    if leg_state == "rejected"
                     else None
                 )
                 self.record_domain_event(
@@ -877,8 +961,7 @@ class TradeStore(TradingStore):
                 (reason[:500], now, trade_order_id),
             )
             conn.execute(
-                "UPDATE oco_legs SET verified = 0, not_observed_reason = ?, updated_at = ? "
-                "WHERE trade_order_id = ?",
+                "UPDATE oco_legs SET verified = 0, not_observed_reason = ?, updated_at = ? WHERE trade_order_id = ?",
                 (reason[:500], now, trade_order_id),
             )
 

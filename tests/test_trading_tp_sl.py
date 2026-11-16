@@ -12,6 +12,7 @@ fills are confirmed:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -112,6 +113,68 @@ def _oco_orders(store: TradeStore, trade, kind: str = "tp1") -> list[dict]:
     orders = store.list_trade_orders(trade["trade_id"], kind=kind)
     assert orders, f"expected a {kind} OCO order"
     return orders
+
+
+def _register_canceled_stop_children(client, store, tp1_order: dict, tp2_order: dict) -> None:
+    tp1_time = int(datetime.fromisoformat(str(tp1_order["created_at"]).replace("Z", "+00:00")).timestamp() * 1000)
+    tp2_time = tp1_time + 1000
+    with store.db.transaction() as conn:
+        conn.execute(
+            "UPDATE trade_orders SET created_at=? WHERE trade_order_id=?",
+            (datetime.fromtimestamp(tp2_time / 1000, tz=UTC).isoformat(), tp2_order["trade_order_id"]),
+        )
+    tp2_order = store.get_trade_order(tp2_order["trade_order_id"])
+    assert tp2_order is not None
+
+    rows = []
+    for order, suffix, time_ms in (
+        (tp1_order, "tp1", tp1_time),
+        (tp2_order, "tp2", tp2_time),
+    ):
+        rows.append(
+            {
+                "symbol": SYMBOL,
+                "orderId": str(order["exchange_order_id"]),
+                "orderListId": -1,
+                "clientOrderId": None,
+                "side": "SELL",
+                "type": "OCO_LIMIT_ORDER",
+                "status": "FILLED",
+                "price": str(order["price"]),
+                "origQty": str(order["quantity"]),
+                "executedQty": str(order["quantity"]),
+                "time": time_ms,
+                "updateTime": time_ms,
+            }
+        )
+        child_id = f"C02__{suffix}-stop-canceled"
+        child = {
+            "symbol": SYMBOL,
+            "orderId": child_id,
+            "orderListId": -1,
+            "clientOrderId": None,
+            "side": "SELL",
+            "type": "OCO_STOP_LIMIT_ORDER",
+            "status": "CANCELED",
+            "price": str(SL),
+            "origQty": str(order["quantity"]),
+            "executedQty": "0",
+            "time": time_ms,
+            "updateTime": time_ms,
+        }
+        rows.append(child)
+        client.orders[child_id] = {
+            "orderId": child_id,
+            "symbol": SYMBOL,
+            "side": "SELL",
+            "type": "OCO_STOP_LIMIT_ORDER",
+            "status": "CANCELED",
+            "price": str(SL),
+            "origQty": str(order["quantity"]),
+            "executedQty": "0",
+            "cumulativeQuoteQty": "0",
+        }
+    client.all_orders_rows = rows
 
 
 def _setup_direct_entry(env, entry=ENTRY, fill_qty=Decimal("0")):
@@ -265,6 +328,7 @@ def test_oco_both_filled_closes_trade(env):
             "time": 3,
         },
     )
+    _register_canceled_stop_children(client, store, tp1_order, tp2_order)
     tm._reconcile_trade_orders(trade)
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "closed", trade
@@ -374,9 +438,7 @@ def test_partial_fill_cancels_entry_remainder_when_exited():
     tm._refresh_buy_block = lambda: None
     tm._notify_trade = lambda *a, **k: None
 
-    tm._cancel_entry_remainder_when_exited(
-        {"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"}
-    )
+    tm._cancel_entry_remainder_when_exited({"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"})
     assert cancelled, "the unfilled entry remainder must be cancelled"
 
 
@@ -396,9 +458,7 @@ def test_partial_fill_remainder_kept_while_position_open():
     tm._refresh_buy_block = lambda: None
     tm._notify_trade = lambda *a, **k: None
 
-    tm._cancel_entry_remainder_when_exited(
-        {"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"}
-    )
+    tm._cancel_entry_remainder_when_exited({"trade_id": "t1", "entry_intent_id": "i1", "acquired_base_qty": "0.06"})
     assert cancelled == []
 
 
@@ -526,3 +586,101 @@ def test_repeated_mexc_not_found_parks_trade_order_queries(env):
     tm._now = lambda: now + timedelta(seconds=121)
     tm._reconcile_trade_orders(trade)
     assert calls == ["queried"]
+
+
+def test_intent_ack_callback_protects_an_already_partial_entry(env):
+    """A partial fill visible at acknowledgement is protected immediately."""
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store)
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=ENTRY).trade
+    assert trade is not None
+    engine._execute_intent(intent["intent_id"])
+    acknowledged = store.get_intent(intent["intent_id"])
+    assert acknowledged is not None and acknowledged.get("exchange_order_id")
+
+    client.fill_order(acknowledged["exchange_order_id"], Decimal("0.06"), Decimal("6"), ENTRY)
+    store.add_fill(
+        exchange_order_id=acknowledged["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(ENTRY),
+            "qty": "0.06",
+            "quoteQty": "6",
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 1,
+            "isMaker": 0,
+            "time": 1,
+        },
+    )
+
+    tm.on_intent_executed(acknowledged)
+
+    refreshed = store.get_trade(trade["trade_id"])
+    assert Decimal(refreshed["acquired_base_qty"]) == Decimal("0.06")
+    assert refreshed["trade_state"] in ("oco_active", "oco_submitting", "oco_partial"), refreshed
+    assert len(store.list_trade_orders(trade["trade_id"], kind="tp1")) == 1
+    assert len(store.list_trade_orders(trade["trade_id"], kind="tp2")) == 1
+
+
+def test_later_entry_fill_creates_a_second_independent_oco_tranche(env):
+    """A later partial fill receives its own TP1/SL and TP2/SL OCOs."""
+    cfg, store, engine, client, notifier, tm = env
+    intent = _insert_intent(store)
+    trade = tm.on_intent_planned(intent, _parsed(), reference_price=ENTRY).trade
+    assert trade is not None
+    engine._execute_intent(intent["intent_id"])
+    acknowledged = store.get_intent(intent["intent_id"])
+    assert acknowledged is not None and acknowledged.get("exchange_order_id")
+
+    client.fill_order(acknowledged["exchange_order_id"], Decimal("0.06"), Decimal("6"), ENTRY)
+    store.add_fill(
+        exchange_order_id=acknowledged["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(ENTRY),
+            "qty": "0.06",
+            "quoteQty": "6",
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 1,
+            "isMaker": 0,
+            "time": 1,
+        },
+    )
+    tm.on_intent_executed(acknowledged)
+    current = store.get_trade(trade["trade_id"])
+    assert current["trade_state"] == "oco_active", current
+
+    # A later fill arrives while the original entry remainder is still working.
+    store.add_fill(
+        exchange_order_id=acknowledged["exchange_order_id"],
+        symbol=SYMBOL,
+        raw={
+            "price": str(ENTRY),
+            "qty": "0.02",
+            "quoteQty": "2",
+            "commission": "0",
+            "commissionAsset": "USDT",
+            "isBuyer": 1,
+            "isMaker": 0,
+            "time": 2,
+        },
+    )
+    tm._reconcile_trade(trade["trade_id"])
+
+    refreshed = store.get_trade(trade["trade_id"])
+    assert Decimal(refreshed["acquired_base_qty"]) == Decimal("0.08")
+    assert refreshed["trade_state"] == "oco_active", refreshed
+    tp1_orders = store.list_trade_orders(trade["trade_id"], kind="tp1")
+    tp2_orders = store.list_trade_orders(trade["trade_id"], kind="tp2")
+    assert len(tp1_orders) == 2 and len(tp2_orders) == 2
+    assert len({row["oco_group_id"] for row in tp1_orders + tp2_orders}) == 2
+    assert sorted(Decimal(row["quantity"]) for row in tp1_orders) == [Decimal("0.01"), Decimal("0.03")]
+    assert sorted(Decimal(row["quantity"]) for row in tp2_orders) == [Decimal("0.01"), Decimal("0.03")]
+    assert tm._active_oco_coverage(refreshed) == Decimal("0.08")
+    before = len(client.place_calls)
+    tm._reconcile_trade(trade["trade_id"])
+    assert len(store.list_trade_orders(trade["trade_id"], kind="tp1")) == 2
+    assert len(store.list_trade_orders(trade["trade_id"], kind="tp2")) == 2
+    assert len(client.place_calls) == before, "reconciliation must not duplicate an existing tranche"

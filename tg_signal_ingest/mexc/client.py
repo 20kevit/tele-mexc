@@ -71,6 +71,7 @@ USER_AGENT = "tg-signal-ingest/0.1 (spot-client)"
 ORDER_PLACEMENT_RPS = 12.0  # official shared place+cancel UID bucket: 12 requests/s
 DEFAULT_WAF_BACKOFF_S = 60.0  # no Retry-After header: stop instead of escalating a ban
 MAX_RECV_WINDOW_MS = 60000  # Introduction/docs: recvWindow max is 60000 ms
+ALL_ORDERS_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000  # documented history retention window
 
 # Official Spot v3 weights (verified against mexc.com/api-docs on 2026-10-27).
 # Unknown paths deliberately use the heaviest documented market-data weight so
@@ -84,6 +85,7 @@ ENDPOINT_RULES: dict[tuple[str, str], tuple[str, int]] = {
     ("GET", "/api/v3/depth"): ("ip", 3),
     ("GET", "/api/v3/order"): ("ip", 2),
     ("GET", "/api/v3/openOrders"): ("ip", 3),
+    ("GET", "/api/v3/allOrders"): ("ip", 10),
     ("GET", "/api/v3/myTrades"): ("ip", 10),
     ("GET", "/api/v3/account"): ("ip", 10),
     ("GET", "/api/v3/apiKeyInfo"): ("ip", 1),
@@ -910,6 +912,40 @@ class MexcSpotClient:
         if end_time_ms is not None:
             p["endTime"] = end_time_ms
         return self.request("GET", "/api/v3/myTrades", params=p, signed=True)
+
+    def all_orders(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Read-only order history used to identify an OCO stop child.
+
+        MEXC exposes the two children of a native OCO as separate rows with
+        ``orderListId = -1`` and no client id.  The only safe way to find the
+        stop sibling is therefore an exact-match scan of this history; no
+        order-id arithmetic is permitted.
+        """
+
+        if not symbol:
+            raise MexcConfigError("all_orders requires a symbol")
+        if not 1 <= limit <= 1000:
+            raise MexcConfigError("all_orders limit must be between 1 and 1000")
+        if start_time_ms < 0 or end_time_ms < 0:
+            raise MexcConfigError("all_orders startTime/endTime must be non-negative")
+        if end_time_ms < start_time_ms:
+            raise MexcConfigError("all_orders endTime must be >= startTime")
+        if end_time_ms - start_time_ms > ALL_ORDERS_MAX_WINDOW_MS:
+            raise MexcConfigError("all_orders window must not exceed 7 days")
+        p: dict[str, Any] = {
+            "symbol": symbol,
+            "startTime": int(start_time_ms),
+            "endTime": int(end_time_ms),
+            "limit": int(limit),
+        }
+        return self.request("GET", "/api/v3/allOrders", params=p, signed=True)
 
     async def run(self, method: str, path: str, **kw: Any) -> Any:
         return await asyncio.to_thread(self.request, method, path, **kw)

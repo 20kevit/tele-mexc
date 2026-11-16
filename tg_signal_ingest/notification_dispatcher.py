@@ -214,6 +214,19 @@ def delivery_decision(
     if severity_value == "CRITICAL":
         return "pending", None
 
+    # Routine OCO polling currently emits a transient active <-> submitting
+    # projection while the exchange-confirmed protection remains fully active.
+    # Suppress only this exact noise; degraded/unknown/critical protection
+    # transitions continue through the normal owner safety policy below.
+    payload_value = payload or {}
+    if (
+        event_type == "oco_group.state_changed"
+        and payload_value.get("protection_status") == "oco_active"
+        and (payload_value.get("previous_state"), payload_value.get("new_state"))
+        in (("active", "submitting"), ("submitting", "active"))
+    ):
+        return "suppressed", "routine OCO polling state transition"
+
     if owner_safety_alert_bypasses_preferences(role, severity_value, category, event_type, payload):
         return "pending", None
 

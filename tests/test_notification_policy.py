@@ -341,6 +341,46 @@ def test_owner_safety_states_bypass_minimum_and_category(tmp_path):
         source.close()
 
 
+
+def test_routine_oco_polling_state_transitions_are_suppressed_but_safety_alerts_survive(tmp_path):
+    bot = RecordingBot()
+    source, worker = _worker(tmp_path, bot)
+    try:
+        _insert(
+            source, 1, "oco_group.state_changed",
+            {"previous_state": "active", "new_state": "submitting", "protection_status": "oco_active"},
+            severity="INFO", aggregate_type="oco_group", aggregate_id="oco-1",
+        )
+        _insert(
+            source, 2, "oco_group.state_changed",
+            {"previous_state": "submitting", "new_state": "active", "protection_status": "oco_active"},
+            severity="INFO", aggregate_type="oco_group", aggregate_id="oco-1",
+        )
+        _insert(
+            source, 3, "oco_group.state_changed",
+            {
+                "previous_state": "active",
+                "new_state": "needs_reconciliation",
+                "protection_status": "unprotected_critical",
+            },
+            severity="CRITICAL", aggregate_type="oco_group", aggregate_id="oco-1",
+        )
+        worker.run_once()
+        assert _statuses(worker, "evt-1") == {
+            "developer": "suppressed", "owner": "suppressed", "owner_b": "suppressed"
+        }
+        assert _statuses(worker, "evt-2") == {
+            "developer": "suppressed", "owner": "suppressed", "owner_b": "suppressed"
+        }
+        assert _statuses(worker, "evt-3") == {
+            "developer": "sent", "owner": "sent", "owner_b": "sent"
+        }
+        assert len(bot.calls) == 3
+    finally:
+        worker.close()
+        source.close()
+
+
 def test_per_recipient_minimum_severity_is_independent(tmp_path):
     source, worker = _worker(
         tmp_path,

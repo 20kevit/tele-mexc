@@ -24,7 +24,7 @@ from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import SignalParser, TradingEngine, TradingStore
 from tg_signal_ingest.trading.store import submission_acknowledged
-from tg_signal_ingest.trading.trade_manager import _is_retryable_oco_error
+from tg_signal_ingest.trading.trade_manager import TradeManager, _is_retryable_oco_error
 
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 MSG_DATE = NOW - timedelta(seconds=20)
@@ -93,6 +93,12 @@ class FakeMeta:
         return None
 
 
+class ConditionalMeta(FakeMeta):
+    """FakeMeta plus the exchange tick size needed to compute a trigger."""
+
+    price_step = Decimal("0.01")
+
+
 class FakeRegistry:
     def get(self, symbol):
         return FakeMeta()
@@ -114,6 +120,7 @@ class FakeMexc:
         account_errors=None,
         open_orders_results=None,
         open_orders_error=None,
+        all_orders_rows=None,
     ):
         self.price = price
         self.place_response = place_response or {"orderId": "ex-1", "status": "NEW"}
@@ -127,6 +134,7 @@ class FakeMexc:
         self.account_errors = list(account_errors or [])
         self.open_orders_results = open_orders_results
         self.open_orders_error = open_orders_error
+        self.all_orders_rows = list(all_orders_rows or [])
         self.symbols = FakeRegistry()
         self.place_calls = 0
         self.test_calls = 0
@@ -135,6 +143,7 @@ class FakeMexc:
         self.account_calls = 0
         self.trades_calls = 0
         self.open_orders_calls = 0
+        self.all_orders_calls = 0
 
     def ticker_price(self, symbol=None):
         return {"symbol": symbol, "price": self.price}
@@ -201,6 +210,10 @@ class FakeMexc:
                 rows = [r for r in rows if str(r.get("symbol") or "").upper() == str(symbol).upper()]
             return rows
         return [{"orderId": "external-1", "symbol": "GOLD(XAUT)USDT", "status": "NEW"}]
+
+    def all_orders(self, *, symbol, start_time_ms, end_time_ms, limit=1000):
+        self.all_orders_calls += 1
+        return list(self.all_orders_rows)
 
 
 ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
@@ -422,6 +435,90 @@ def test_submitted_requires_exchange_order_evidence(cfg, repo):
     assert intent["exchange_status"] == "NEW"
     assert intent["state"] == "open"
     assert client.place_calls == 1
+
+
+def test_query_all_orders_wrapper_records_read_evidence(cfg, repo):
+    rows = [
+        {
+            "orderId": "C02__tp",
+            "symbol": "APEUSDT",
+            "side": "SELL",
+            "type": "OCO_LIMIT_ORDER",
+            "status": "CANCELED",
+            "price": "0.0813",
+            "origQty": "18.58",
+            "executedQty": "0",
+            "time": 1794784085000,
+        }
+    ]
+    client = FakeMexc(all_orders_rows=rows)
+    engine = _engine(cfg, repo, client)
+    trade = {"trade_id": "trade-ape", "symbol": "APEUSDT"}
+
+    result = engine.query_all_orders(
+        symbol="APEUSDT",
+        start_time_ms=1794784000000,
+        end_time_ms=1794784100000,
+        limit=50,
+        trade=trade,
+        trade_order_id="to-ape-tp1",
+    )
+
+    assert result == rows
+    assert client.all_orders_calls == 1
+    op = repo.db.conn.execute(
+        "SELECT operation_type, operation_class, purpose, endpoint, symbol, "
+        "response_classification, request_payload FROM exchange_operations "
+        "WHERE operation_type = 'query_all_orders'"
+    ).fetchone()
+    assert op is not None
+    assert op["operation_class"] == "read"
+    assert op["purpose"] == "oco_child_discovery"
+    assert op["endpoint"] == "/api/v3/allOrders"
+    assert op["symbol"] == "APEUSDT"
+    assert op["response_classification"] == "success"
+    payload = json.loads(op["request_payload"])
+    assert payload == {
+        "symbol": "APEUSDT",
+        "start_time_ms": 1794784000000,
+        "end_time_ms": 1794784100000,
+        "limit": 50,
+    }
+    assert "signature" not in op["request_payload"].lower()
+
+
+def test_query_order_trades_wrapper_records_read_evidence(cfg, repo):
+    trades = [
+        {
+            "id": "t1",
+            "orderId": "C02__sl",
+            "price": "0.0786",
+            "qty": "18.58",
+            "quoteQty": "1.460388",
+            "commission": "0.001",
+            "commissionAsset": "USDT",
+        }
+    ]
+    client = FakeMexc(trades=trades)
+    engine = _engine(cfg, repo, client)
+
+    result = engine.query_order_trades(
+        symbol="APEUSDT",
+        exchange_order_id="C02__sl",
+        limit=100,
+        trade={"trade_id": "trade-ape"},
+    )
+
+    assert result == trades
+    assert client.trades_calls == 1
+    op = repo.db.conn.execute(
+        "SELECT operation_type, operation_class, endpoint, exchange_order_id "
+        "FROM exchange_operations WHERE operation_type = 'query_my_trades'"
+    ).fetchone()
+    assert op is not None
+    assert op["operation_class"] == "read"
+    assert op["endpoint"] == "/api/v3/myTrades"
+    assert op["exchange_order_id"] == "C02__sl"
 
 
 def test_partial_fill_is_preserved_then_canceled(cfg, repo):
@@ -1518,6 +1615,199 @@ def test_planned_intent_resumes_after_crash_without_duplicate_submission(cfg, re
     again = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
     assert again is not None and again["state"] == "open"
     assert client.place_calls == 1
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "entry_active", "needs_reconciliation", None])
+def test_duplicate_telegram_delivery_never_posts_for_non_pending_trade(cfg, repo, trade_state):
+    """Exercise the real process_item duplicate branch with a fake exchange."""
+    client = FakeMexc(open_orders_results=[])
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-" + (trade_state or "missing"),
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    if trade_state is not None:
+        trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("100")).trade
+        assert trade is not None
+        engine.store.update_trade_state(trade["trade_id"], trade_state, note="duplicate delivery regression")
+    else:
+        assert engine.store.get_trade_by_intent(intent["intent_id"]) is None
+
+    # The exact same Telegram message is delivered again. This must reach the
+    # existing-intent -> _resume_planned_intent branch and never POST to MEXC.
+    record = _store_message(repo, 1, ALERT)
+    result = engine.process_item(_item(100, 1), record)
+
+    assert result is not None and result["state"] == "planned"
+    assert client.place_calls == 0
+    assert engine.store.get_intent(intent["intent_id"])["state"] == "planned"
+    if trade_state is None:
+        assert engine.store.get_trade_by_intent(intent["intent_id"]) is None
+    else:
+        assert engine.store.get_trade_by_intent(intent["intent_id"])["trade_state"] == trade_state
+
+
+def test_duplicate_telegram_delivery_still_resumes_pending_direct_entry(cfg, repo):
+    client = FakeMexc(open_orders_results=[])
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-pending-direct",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("100")).trade
+    assert trade is not None and trade["entry_mode"] == "direct"
+
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+
+    assert result is not None and result["state"] == "open"
+    assert client.place_calls == 1
+
+
+def test_duplicate_telegram_delivery_keeps_pending_conditional_entry_deferred(cfg, repo):
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    parsed = engine.parser.parse(ALERT)
+    signal_id, _ = engine.store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
+    key = engine.idempotency_key(100, 1, parsed)
+    intent, inserted = engine.store.create_intent(
+        signal=parsed,
+        signal_id=signal_id,
+        channel_id=100,
+        message_id=1,
+        edit_version=0,
+        idempotency_key=key,
+        client_order_id="tsi-duplicate-pending-conditional",
+        mode="live",
+        order_type="limit",
+        quote_amount=Decimal("10"),
+        base_quantity=Decimal("0.1"),
+        limit_price=Decimal("100"),
+    )
+    assert inserted is True
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+    trade = manager.on_intent_planned(intent, parsed, reference_price=Decimal("90")).trade
+    assert trade is not None and trade["entry_mode"] == "conditional"
+
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
+
+    assert result is not None and result["state"] == "planned"
+    assert client.place_calls == 0
+    assert engine.store.get_trade_by_intent(intent["intent_id"])["trade_state"] == "pending_entry"
+
+
+@pytest.mark.parametrize("trade_state", ["closed", "entry_active", "needs_reconciliation"])
+def test_process_item_duplicate_delivery_never_posts_for_created_conditional_entry(cfg, repo, trade_state):
+    """First process_item creates the durable planned intent and pending trade.
+
+    A duplicate delivery of the exact same Telegram message must then be
+    refused by the real process_item -> _resume_planned_intent route whenever
+    the associated trade is no longer pending_entry.
+    """
+
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+
+    record = _store_message(repo, 1, ALERT)
+    item = _item(100, 1)
+
+    first = engine.process_item(item, record)
+    assert first is not None
+    assert first["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    trade = engine.store.get_trade_by_intent(first["intent_id"])
+    assert trade is not None
+    assert trade["entry_mode"] == "conditional"
+    assert trade["trade_state"] == "pending_entry"
+
+    engine.store.update_trade_state(trade["trade_id"], trade_state, note="duplicate delivery e2e regression")
+    assert engine.store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+    duplicate = engine.process_item(item, record)
+
+    assert duplicate is not None
+    assert duplicate["intent_id"] == first["intent_id"]
+    assert duplicate["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    assert engine.store.get_intent(first["intent_id"])["state"] == "planned"
+    assert engine.store.get_trade(trade["trade_id"])["trade_state"] == trade_state
+
+
+def test_process_item_duplicate_delivery_without_trade_never_posts(cfg, repo):
+    """A duplicate delivery with no trade lifecycle row must also stay inert."""
+
+    cfg.trading.entry_trigger_offset_ticks = 2
+    client = FakeMexc(price="90", open_orders_results=[])
+    client.symbols = SimpleNamespace(get=lambda _symbol: ConditionalMeta())
+    engine = _engine(cfg, repo, client=client)
+    manager = TradeManager(cfg.trading, engine.store, engine=engine, client=client)
+    engine.trade_manager = manager
+
+    record = _store_message(repo, 1, ALERT)
+    item = _item(100, 1)
+
+    first = engine.process_item(item, record)
+    assert first is not None
+    assert first["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    trade = engine.store.get_trade_by_intent(first["intent_id"])
+    assert trade is not None and trade["trade_state"] == "pending_entry"
+
+    with repo.db.transaction() as conn:
+        conn.execute("DELETE FROM trades WHERE trade_id = ?", (trade["trade_id"],))
+    assert engine.store.get_trade_by_intent(first["intent_id"]) is None
+
+    duplicate = engine.process_item(item, record)
+
+    assert duplicate is not None
+    assert duplicate["intent_id"] == first["intent_id"]
+    assert duplicate["state"] == "planned"
+    assert client.place_calls == 0
+    assert client.test_calls == 0
+    assert engine.store.get_intent(first["intent_id"])["state"] == "planned"
+    assert engine.store.get_trade_by_intent(first["intent_id"]) is None
 
 
 def test_claimed_submitting_intent_is_never_retried(cfg, repo):

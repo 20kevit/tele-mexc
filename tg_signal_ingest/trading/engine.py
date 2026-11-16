@@ -165,6 +165,10 @@ class TradingEngine:
         # independent locks.
         self._symbol_locks: dict[str, threading.Lock] = {}
         self._symbol_locks_guard = threading.Lock()
+        # Reconciliation is shared by the periodic worker and lifecycle/cancel
+        # paths. Serialize eligibility checks and exchange reads per intent.
+        self._intent_reconcile_locks: dict[str, Any] = {}
+        self._intent_reconcile_locks_guard = threading.Lock()
 
     def _symbol_lock(self, symbol: str) -> threading.Lock:
         key = str(symbol).upper()
@@ -173,6 +177,15 @@ class TradingEngine:
             if lock is None:
                 lock = threading.Lock()
                 self._symbol_locks[key] = lock
+            return lock
+
+    def _intent_reconcile_lock(self, intent_id: str) -> Any:
+        key = str(intent_id)
+        with self._intent_reconcile_locks_guard:
+            lock = self._intent_reconcile_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._intent_reconcile_locks[key] = lock
             return lock
 
     def _same_symbol_open_order_blocker(self, intent: dict[str, Any]) -> str | None:
@@ -610,6 +623,21 @@ class TradingEngine:
         current = self.store.get_intent(intent["intent_id"]) or intent
         if current.get("state") != "planned":
             return current
+        if self.trade_manager is not None:
+            trade = self.store.get_trade_by_intent(str(current["intent_id"]))
+            trade_state = str((trade or {}).get("trade_state") or "")
+            if trade is None or trade_state != "pending_entry":
+                reason = (
+                    "duplicate delivery resume refused: "
+                    f"trade state {trade_state!r} is not eligible for planned entry submission"
+                )
+                self.store.audit(
+                    current["intent_id"],
+                    "lifecycle",
+                    "planned_resume_skipped",
+                    reason,
+                )
+                return current
         self.store.audit(
             current["intent_id"],
             "lifecycle",
@@ -671,7 +699,16 @@ class TradingEngine:
                     "no trade lifecycle row; refusing to submit without protection",
                 )
                 continue
-            if trade.get("entry_mode") == "conditional" and trade.get("trade_state") == "pending_entry":
+            trade_state = str(trade.get("trade_state") or "")
+            if trade_state != "pending_entry":
+                self.store.audit(
+                    intent["intent_id"],
+                    "lifecycle",
+                    "planned_resume_skipped",
+                    f"trade state {trade_state!r} is not eligible for planned-intent resume",
+                )
+                continue
+            if trade.get("entry_mode") == "conditional":
                 continue
             result = self.execute_intent(intent["intent_id"])
             if not submission_acknowledged(result):
@@ -2032,6 +2069,82 @@ class TradingEngine:
             "exchange_order_id": str(order_id) if order_id is not None else None,
         }
 
+    def query_all_orders(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int = 1000,
+        trade: dict[str, Any] | None = None,
+        trade_order_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read order history under durable evidence for OCO child discovery.
+
+        This is intentionally a raw, read-only list: no sibling inference is
+        performed here.  The caller must exact-match the returned rows.
+        """
+
+        client = self._live_client()
+        all_orders = getattr(client, "all_orders", None)
+        if all_orders is None:
+            raise MexcUnexpectedResponse("MEXC client does not expose allOrders")
+        with self.evidence.operation(
+            operation_type="query_all_orders",
+            purpose="oco_child_discovery",
+            endpoint="/api/v3/allOrders",
+            correlation_id=str(trade.get("trade_id")) if trade else trade_order_id,
+            trade_id=trade.get("trade_id") if trade else None,
+            trade_order_id=trade_order_id,
+            symbol=symbol,
+            request_payload={
+                "symbol": symbol,
+                "start_time_ms": int(start_time_ms),
+                "end_time_ms": int(end_time_ms),
+                "limit": int(limit),
+            },
+        ) as op:
+            rows = all_orders(
+                symbol=symbol,
+                start_time_ms=int(start_time_ms),
+                end_time_ms=int(end_time_ms),
+                limit=int(limit),
+            )
+            op.succeed(rows)
+        return list(rows) if isinstance(rows, list) else []
+
+    def query_order_trades(
+        self,
+        *,
+        symbol: str,
+        exchange_order_id: str,
+        limit: int = 1000,
+        trade: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read myTrades for one exact child order id under evidence."""
+
+        client = self._live_client()
+        my_trades = getattr(client, "my_trades", None)
+        if my_trades is None:
+            raise MexcUnexpectedResponse("MEXC client does not expose myTrades")
+        with self.evidence.operation(
+            operation_type="query_my_trades",
+            purpose="oco_child_fees",
+            endpoint="/api/v3/myTrades",
+            correlation_id=str(trade.get("trade_id")) if trade else exchange_order_id,
+            trade_id=trade.get("trade_id") if trade else None,
+            symbol=symbol,
+            exchange_order_id=exchange_order_id,
+            request_payload={
+                "symbol": symbol,
+                "order_id": exchange_order_id,
+                "limit": int(limit),
+            },
+        ) as op:
+            rows = my_trades(symbol=symbol, order_id=exchange_order_id, limit=int(limit))
+            op.succeed(rows)
+        return list(rows) if isinstance(rows, list) else []
+
     def _handle_cancel(self, parsed: ParsedSignal, signal_id: str, channel_id: int, message_id: int) -> None:
         symbol = parsed.symbol
         reason = f"cancel signal {signal_id}"
@@ -2090,7 +2203,7 @@ class TradingEngine:
                     )
                 )
         except MexcOrderNotFound:
-            self.reconcile_intent(intent_id)
+            self.reconcile_intent_if_due(intent_id, notify=False, urgent_after_cancel=True)
             return
         except MexcError as exc:
             self.store.audit(
@@ -2100,7 +2213,7 @@ class TradingEngine:
                 f"{exc.__class__.__name__}: {exc}. Order state left unchanged for reconciliation.",
             )
             return
-        self.reconcile_intent(intent_id)
+        self.reconcile_intent_if_due(intent_id, notify=False, urgent_after_cancel=True)
 
     # -------------------------------------------------------- reconciliation
 
@@ -2136,6 +2249,18 @@ class TradingEngine:
         return age >= self._submission_reconciliation_grace_seconds()
 
     def reconcile_intent_if_due(
+        self,
+        intent_id: str,
+        *,
+        notify: bool = True,
+        urgent_after_cancel: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._intent_reconcile_lock(intent_id):
+            return self._reconcile_intent_if_due_locked(
+                intent_id, notify=notify, urgent_after_cancel=urgent_after_cancel
+            )
+
+    def _reconcile_intent_if_due_locked(
         self,
         intent_id: str,
         *,
@@ -2180,6 +2305,10 @@ class TradingEngine:
         return self.reconcile_intent(intent_id, notify=notify)
 
     def reconcile_intent(self, intent_id: str, *, notify: bool = True) -> dict[str, Any]:
+        with self._intent_reconcile_lock(intent_id):
+            return self._reconcile_intent_locked(intent_id, notify=notify)
+
+    def _reconcile_intent_locked(self, intent_id: str, *, notify: bool = True) -> dict[str, Any]:
         intent = self.store.get_intent(intent_id)
         if intent is None:
             raise RuntimeError(f"intent {intent_id} not found")
