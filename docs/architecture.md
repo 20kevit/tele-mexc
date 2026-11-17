@@ -237,8 +237,8 @@ Implemented and covered by tests:
 
 Remaining limits:
 
-- `stop_loss_max_retries` caps definitive TP/SL rejection retries; recovery
-  cadence comes from the tick/reconciliation loop.
+- `stop_loss_max_retries` is a compatibility setting; the OCO retry schedule is
+  fixed. Recovery cadence comes from the tick/reconciliation loop.
 - The standalone CLI adapter resolves a client order id only within the first
   page of `current-orders`, then `history-orders`. The live hybrid client
   delegates single-order queries to REST; unresolved results remain uncertain.

@@ -1310,7 +1310,7 @@ def cmd_trading_readiness(args) -> int:
 
 
 def cmd_trading_cleanup_open_orders(args) -> int:
-    """One-time initial open-order cleanup (never sells positions)."""
+    """Inspect open orders; the legacy apply flag cannot cancel orders."""
 
     from .trading.cleanup import run_initial_open_order_cleanup
     from .trading.runtime import build_mexc_client
@@ -1793,9 +1793,9 @@ def build_parser() -> argparse.ArgumentParser:
     ts_preflight.set_defaults(func=cmd_trading_preflight)
     ts_cleanup = ts_sub.add_parser(
         "cleanup-open-orders",
-        help="one-time initial cleanup of open orders below 5 USD (never sells positions)",
+        help="inspect open orders without cancelling them",
     )
-    ts_cleanup.add_argument("--apply", action="store_true", help="perform cancellations; default is dry-run")
+    ts_cleanup.add_argument("--apply", action="store_true", help="legacy flag; cancellation remains disabled")
     ts_cleanup.set_defaults(func=cmd_trading_cleanup_open_orders)
     ts_readiness = ts_sub.add_parser(
         "readiness",

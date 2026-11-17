@@ -126,9 +126,8 @@ dead-letter/ambiguous counts, and heartbeat staleness.
   controls are enforced at the order-submission boundary with a kernel file lock
   and a transactional readiness check. See `docs/CONTROL_BOT_FA.md`.
 - Before the first controlled start, run the non-trading readiness report.
-  The authorized one-time initialization cleanup is
-  `tg-ingest trading cleanup-open-orders --apply` (open orders strictly below
-  5 USD only; never sells positions; recorded so it is not repeated).
+  `tg-ingest trading cleanup-open-orders` inspects open orders without canceling
+  them. Its legacy `--apply` flag cannot enable cancellation.
 
 ## Known limitations (platform-imposed)
 
