@@ -1,39 +1,41 @@
-# Codebase Simplification Audit — Tele-MEXC
+# Codebase Simplification Audit — Tele-MEXC (Revision 2)
 
-- **Date:** 2026-11-17
-- **Repo:** `20kevit/tele-mexc`, branch `arena/58c00512-tele-mexc`, HEAD `9ac46c0` (clean tree)
-- **Scope:** read-only audit of `tg_signal_ingest` (~29,000 LOC) + `tests/` (72 files, ~25,000 LOC, fully mocked/offline). No code, config, DB, service, or deployment changes were made; no exchange calls were performed.
-- **Goal:** eliminate unnecessary complexity while preserving order correctness and fund protection, verified against the product spec (BUY signal → entry order → exactly 2 protective OCOs → monitoring → minimal notifications).
-- **Evidence convention:** every finding cites `file:line` at HEAD `9ac46c0`. Confidence levels: **high** (read directly in this audit), **medium** (inferred from cross-references), **low** (historical, not reproducible in this tree). Historical incidents are explicitly separated from verified current behavior.
+- **Date:** 2026-11-17 (Rev 2 — correction & evidence-validation pass, same day)
+- **Repo:** `20kevit/tele-mexc`, branch `arena/58c00512-tele-mexc`
+- **Audited code state:** `9ac46c0` (base of this branch). The only commit on top of it, `9f6526f`, adds this document; no code file differs between `9ac46c0` and the current working tree. All `file:line` citations below refer to that code state.
+- **Rev 2 scope:** corrects the OCO terminology and per-position invariant (§2, §3, §10, §A.1), rewrites F-05 / F-06 / F-07 / F-08 / F-10 / F-12 / F-15 on re-verified evidence, replaces the un-auditable LOC claims (≈900–1,100 / 500–600) with an itemized, range-level register, fixes stale dispatcher/monitor line citations, replaces the overlapping "20/8/8/10 = 26" classification totals with a single authoritative table that reconciles to the 20 unique findings, and separates all recommendations into five change categories with prerequisites and acceptance criteria (§13). Sections whose substance did not change are carried from Rev 1 with citations re-spot-checked where touched.
+- **Scope of the audit itself:** read-only. No code, config, DB, service, or deployment changes were made; no migrations were run; no exchange calls were performed; no services were restarted. This document authorizes nothing by itself — every action it describes requires its own review, tests, and owner approval.
 
 ---
 
 ## 1. Executive Summary
 
-The codebase is **complex for defensible reasons, plus a meaningful layer of dead scar tissue**. The core trading path (parser → risk → intent → submission gate → exchange evidence → reconciliation → TradeManager OCO lifecycle) is deliberately fail-closed and evidence-first; most of its size exists because MEXC's native OCO API exposes no parent/child link for stop children and because several real incidents (duplicate submissions, unprotected positions, global BUY freezes) are encoded as permanent invariants.
+The codebase is **complex for defensible reasons, plus a smaller, precisely itemized layer of dead scar tissue**. The core trading path (parser → risk → intent → submission gate → exchange evidence → reconciliation → TradeManager OCO lifecycle) is deliberately fail-closed and evidence-first. Most of its size exists because MEXC's native OCO API exposes no parent/child link for stop children and because several real incidents (duplicate submissions, unprotected positions, global BUY freezes) are encoded as permanent invariants.
 
-Key numbers:
+**Corrected OCO model (authoritative, supersedes Rev 1):** a *position* is not protected by a fixed number of OCO orders. Each **fill tranche** — a durable grouping of entry fills — is protected by **exactly two native MEXC OCO SELL orders** (OCO 1 = `tp1_allocation_pct`, default 50%, of *the tranche* at TP1; OCO 2 = the remainder of *the tranche* at TP2), and **each native OCO is one exchange order with two linked legs** (a TP limit leg and an SL stop-limit leg whose trigger and execution price are both the configured stop-loss). Positions therefore have `2 × (number of fill tranches)` native OCO orders. Tranches are independent — OCOs of different tranches are never siblings. Rev 1's "exactly two protective OCOs per position" was wrong; see §A.1 for the full model and evidence.
+
+Key numbers (Rev 2, itemized in §12):
 
 | Metric | Value |
 |---|---|
-| Findings catalogued | 20 (F-01 … F-20) |
-| KEEP (justified complexity) | 8 findings, majority of LOC |
-| SIMPLIFY / MERGE | 8 findings |
-| REMOVE / DEFER | 10 findings (several overlap) |
-| Provably dead code identified | ≈ 900–1,100 LOC (dead methods, unreachable bodies, unused store methods, disabled-path helpers) |
-| Deletable with **zero** behavior change (P1) | ≈ 500–600 LOC |
-| Deletable with staged, low-risk refactors (P2) | ≈ 900–1,100 LOC + one duplicated notification ledger |
-| Schema/CLI simplifications (P3) | approval-era tables, CLI diag consolidation, WebSocket feed |
+| Findings catalogued | 20 unique (F-01 … F-20), one primary class each — §4 |
+| KEEP (load-bearing complexity) | 5 findings (F-01, F-16, F-17, F-19, F-20) |
+| Pure-deletion / merge candidates (zero runtime behavior change) | 6 findings (F-02, F-03, F-04, F-05 Tier-1, F-13, F-18) — ≈ 275 itemized dead-code LOC + duplicated-helper merges |
+| DEFER (evidence-gated, nothing removed/disabled) | 5 findings (F-06, F-07, F-08, F-10, F-12) |
+| Owner policy / consent decisions | 3 findings (F-09, F-14, F-15) |
+| Provably production-unreachable code, itemized by exact ranges | ≈ 275 LOC (§12.1) — **replaces Rev 1's "≈900–1,100"** |
+| Behavior-changing legacy-state/compat handling (not deletion) | ≈ 27 LOC + re-routing logic (§12.2) |
+| Config-conditional code (inactive under current config, not provably deletable) | ≈ 209 LOC by range, deletion deferred (§12.3) |
 
-**Top five findings:**
+**Top findings (Rev 2):**
 
-1. **Every notification is persisted twice and relayed twice** (F-08): domain events (in-transaction, relayed by `NotificationDispatcher.relay_once`) *and* a legacy `trading_notifications` outbox row (relayed by `relay_legacy_once`). Two independent delivery ledgers exist for the same facts. This is the largest architectural simplification available.
-2. **≈300 LOC of disabled legacy exit machinery** in `TradeManager` (`_enter_tp1/_enter_tp2/_do_tp_sale/_submit_tp_order/_enter_stop_loss/_resume_stop_loss/_submit_stop_loss_order/...`), several containing unreachable code after unconditional `return` (F-05), plus the dead attached-protection path in the engine (F-06).
-3. **The three historical incidents are correctly encoded in current code** (verified, §4): the entry edge case is *fixed*, the MYX metadata failure remains terminal *by design* (with an optional bounded-retry improvement, F-14), and the APE-style global BUY freeze is now coverage-based and instrumented instead of time-based — but it is still global in scope, which is a policy choice to reconfirm (F-15).
+1. **Notification architecture is a layered dual-ledger design with proven, localized duplicate visibility — not a wholesale "everything is written twice" defect** (F-08, rewritten): trade-layer critical alerts go *only* to the immutable domain ledger, routine trade alerts *only* to the legacy outbox; but specific rejection flows produce both a domain-row message and a decision message for the same business moment, and some flows emit two domain rows for one fact. The consolidation is a staged, owner-approved migration with a full compat case — **DEFER**, not a P2 simplification.
+2. **≈275 LOC of provably production-unreachable code, itemized line-by-line** (F-05 Tier-1): zero- or test-only-referenced methods in `trade_manager.py`, `store.py`, `engine.py`, and the never-called delivery half of `TradingNotifier`. Deletable with zero runtime behavior change after characterization tests — but several adjacent disabled methods are *live legacy-state handlers* and must not be deleted (§12.2).
+3. **The three historical incidents are correctly encoded in current code** (§4): the entry edge case is *fixed*, the MYX metadata failure remains terminal *by design* (optional bounded retry = owner decision, F-14), and the APE-style global BUY freeze is now coverage-based and instrumented instead of time-based — its global scope is an owner policy question (F-15), on which Rev 2 makes **no recommendation**.
 4. **Duplicated per-symbol conflict logic and decimal/backoff helpers** across `store.py`/`trade_store.py`/`trade_manager.py` (F-02, F-03, F-04) — pure maintenance risk, trivial merges.
-5. **A hand-rolled WebSocket client (~230 LOC) that has never been exercised against the real exchange** runs in parallel with the always-on polling feed, adding at best duplicate ticks (F-10).
+5. **The hand-rolled WebSocket feed is a documented deferred decision (N-03 in `docs/DECISION_REGISTRY.md`), not dead weight to delete** (F-10, rewritten): it has never been exercised against the real exchange, so its removal is **DEFER** until production evidence proves it redundant; Rev 2 lists the exact evidence required.
 
-**Guardrails:** §10 lists the fund-protection invariants that must not be weakened by any simplification. Nothing in the P0–P3 plan touches them; P0 itself is a test-freeze step, not a code change.
+**Guardrails:** §11 lists the fund-protection invariants that must not be weakened by any simplification. Nothing in the P0–P3 plan touches them; P0 is a test-freeze step, not a code change.
 
 ---
 
@@ -41,11 +43,11 @@ Key numbers:
 
 The audit measured every finding against the behavior documented in `README.md`, `AGENTS.md`, and `docs/trading.md` (the authoritative behavior spec), cross-checked against `docs/architecture.md` and `docs/data-model.md`. The contract that constrains simplification:
 
-1. Only Spot **BUY** signals execute; SHORT/SELL are parsed but refused before any REST call (`engine.py:580`, `parser.py` `_action`).
+1. Only Spot **BUY** signals execute; SHORT/SELL are parsed but refused before any REST call (`parser.py` `_action` classifies; refusal happens at parse/risk/planning layers, before submission).
 2. Entry is a **LIMIT** order at the signal entry price (never converted to market; `risk.py`, `engine.py`). Conditional entry waits for an upward crossing of `entry − offset·tick_size` (offset default 3 ticks, `config.py:137-141`).
-3. Exactly **two protective native OCO orders** per position (TP1 50% of acquired, TP2 100% of remainder), stop-loss trigger = configured SL price (`trade_manager.py:_place_oco_exits`, `config.py` TP percentages).
+3. **Each confirmed entry-fill tranche is protected by exactly two native OCO SELL orders** (OCO 1 = `tp1_allocation_pct`, default 50%, of the tranche at TP1; OCO 2 = the tranche remainder at TP2); **each native OCO carries a TP limit leg and an SL stop-limit leg** whose trigger and execution price are both the configured SL. Positions with multiple tranches have proportionally more OCO orders (`docs/trading.md:455-474`; `trade_manager.py:_place_oco_exits`; `config.py` TP percentages).
 4. A BUY may only be submitted when a complete ordered exit ladder (SL < Entry < TP1 ≤ TP2) and a working OCO path exist (`trade_manager.py:595-628 _pre_buy_exit_problem`).
-5. Uncertain exchange outcomes are **never retried blindly**; they park as `unknown_requires_reconciliation` and are reconciled read-only (`engine.py:1490-1530`, `trade_manager.py:_UNCERTAIN_ERRORS`).
+5. Uncertain exchange outcomes are **never retried blindly**; they park as `unknown_requires_reconciliation` and are reconciled read-only (`engine.py:1511-1526`, `trade_manager.py:_UNCERTAIN_ERRORS`).
 6. Notifications are durable (outbox before delivery), secrets-redacted, owner-visible for safety events; delivery is decoupled from trading (independent dispatcher worker).
 7. No test/simulation product mode exists; every valid new signal is eligible for automatic execution subject to the gates (`config.py` explicitly rejects legacy mode selectors).
 
@@ -83,8 +85,9 @@ Telegram (Telethon) ──► messages table ──► processing queue (single 
               ▼
    TradeManager (per-trade lock)
    ├─ entry fill sync (reconcile_intent_if_due, durable backoff)
-   ├─ OCO tranche placement: 2 × native OCO per fill tranche,
-   │   invariant checks (reserved ≤ sellable, sellable fail-closed)
+   ├─ OCO tranche placement: per fill tranche → 2 native OCO SELL orders
+   │   (each = TP limit leg + SL stop-limit leg), invariant checks
+   │   (reserved ≤ sellable, sellable fail-closed)
    ├─ periodic reconciliation (60s): order states, fills, stop-child
    │   discovery via allOrders exact match, buy-block refresh
    └─ price monitor (polling 2s + best-effort WS): conditional trigger,
@@ -104,7 +107,7 @@ Deploy units: `deploy/tg-ingest.service`, `deploy/tg-notification-worker.service
 ### 4.1 Entry edge case: entry 100 / market 99 → bot waited for 97 instead of placing a limit at 100
 
 - **History (reported):** with market below entry but already above the computed trigger, the bot chose the conditional path and waited for a *fresh upward crossing* of the trigger, missing the valid entry window.
-- **Verified current behavior (high confidence):** **fixed.** `_create_trade` computes the trigger and then explicitly handles this case: "The initial reference price may already be at/above the computed trigger while still below Entry. Treat that as an already-fired trigger and submit the normal LIMIT at Entry immediately" — `trade_manager.py:566-583`. When `current >= trigger_price`, `entry_mode` stays `direct` and `trigger_price` is nulled, so the LIMIT at Entry is submitted immediately. Only `current < trigger_price` selects the conditional path (`trade_manager.py:584-587`, evaluated per tick at `trade_manager.py:918-931 _check_entry_trigger`).
+- **Verified current behavior (high confidence):** **fixed.** `_create_trade` computes the trigger and then explicitly handles this case: "The initial reference price may already be at/above the computed trigger while still below Entry. Treat that as an already-fired trigger and submit the normal LIMIT at Entry immediately" — `trade_manager.py:540-587`. When `current >= trigger_price`, `entry_mode` stays `direct` and `trigger_price` is nulled, so the LIMIT at Entry is submitted immediately. Only `current < trigger_price` selects the conditional path (`trade_manager.py:584-587`, evaluated per tick at `trade_manager.py:918-931 _check_entry_trigger`).
 - **Residual risk:** none identified. A missing/invalid offset fails closed instead of silently choosing a path (`trade_manager.py:507-516`).
 
 ### 4.2 MYX metadata failure → terminal rejection
@@ -112,16 +115,16 @@ Deploy units: `deploy/tg-ingest.service`, `deploy/tg-notification-worker.service
 - **History (reported):** a transient symbol-metadata failure caused the signal to be rejected terminally even though a later retry would have succeeded.
 - **Verified current behavior (high confidence):** the failure is still **terminal at two checkpoints**:
   1. Planning: `_process_item` rejects the signal with "symbol metadata unavailable; refusing to trade without exchange constraints" (`engine.py:489-497`) — a terminal `rejected` state.
-  2. Pre-submit: `_execute_intent` re-validates and `_reject_before_submit` produces "pre-submit revalidation failed: symbol metadata is unavailable" (`engine.py:1164-1176`, revalidation near `engine.py:1425-1435`).
+  2. Pre-submit: `_execute_intent` re-validates and `_reject_before_submit` produces "pre-submit revalidation failed: symbol metadata is unavailable" (`engine.py:1164-1176`).
 - **Mechanism (high confidence):** `SymbolRegistry.get` (`mexc/symbols.py:278-291`) serves a 300 s TTL cache; on miss it performs a live `GET /api/v3/exchangeInfo` and **propagates any error** (network, WAF, 5xx). Failed lookups are not negatively cached, so a *subsequent* signal retries the fetch — but the signal that hit the transient failure is lost.
-- **Classification:** intentional fail-closed behavior (trading without exchange constraints is prohibited). It is safe (no position can become unprotected from a metadata failure because no BUY is ever placed), but it sacrifices availability on transient failures. Improvement candidate F-14 (bounded retry, P2) — not a correctness fix, an availability tweak requiring owner consent because it changes rejection statistics.
+- **Classification:** intentional fail-closed behavior (trading without exchange constraints is prohibited). It is safe (no position can become unprotected from a metadata failure because no BUY is ever placed), but it sacrifices availability on transient failures. Improvement candidate F-14 (bounded retry, owner decision) — not a correctness fix, an availability tweak requiring owner consent because it changes rejection statistics.
 
 ### 4.3 APE OCO-cancel → 26 h global new-BUY block on unrelated symbols
 
 - **History (reported):** an OCO cancellation on one symbol froze new BUYs across all symbols for ~26 hours.
 - **What the current code guarantees (high confidence):**
-  - There is **no time-based and no historical-state global block**. The gate reads a single durable flag (`gate.py:123-140 _buy_block_reason`); the comment at `gate.py:155-159` states: "There is intentionally no account-wide/history-wide entry lock here. Historical trade reconciliation state is per-order/per-trade and must never disable unrelated symbols." The historical global-state blocking was explicitly removed (`engine.py:1425-1427`).
-  - The flag is recomputed from **verified exit coverage**: `_refresh_buy_block` (`trade_manager.py:733-790`) lists non-terminal trades, computes `_is_unprotected_critical` (acquired > 0, remaining > 0, verified OCO coverage < remaining; `trade_manager.py:700-731`), and persists the block with a precise reason (`unprotected position(s): SYMBOL:trade_id…`) plus audit events `new_buys_blocked` / `new_buys_unblocked`. It is refreshed after every reconciliation sweep (`trade_manager.py:3302-3308`), after every OCO placement attempt, and around startup recovery.
+  - There is **no time-based and no historical-state global block**. The gate reads a single durable flag (`gate.py:123-140 _buy_block_reason`); the comment at `gate.py:155-159` states: "There is intentionally no account-wide/history-wide entry lock here. Historical trade reconciliation state is per-order/per-trade and must never disable unrelated symbols."
+  - The flag is recomputed from **verified exit coverage**: `_refresh_buy_block` (`trade_manager.py:733-790`) lists non-terminal trades, computes `_is_unprotected_critical` (acquired > 0, remaining > 0, verified OCO coverage < remaining; `trade_manager.py:700-731`), and persists the block with a precise reason (`unprotected position(s): SYMBOL:trade_id…`) plus audit events `new_buys_blocked` / `new_buys_unblocked`. It is refreshed after every reconciliation sweep (`trade_manager.py:3301-3309`), after every OCO placement attempt, and around startup recovery.
   - A **canceled OCO parent whose stop-child execution is not independently attributed** parks the trade in `needs_reconciliation` (`trade_manager.py:1560-1591 _unattributed_oco_parent_cancellations`; handling at `trade_manager.py:3430-3455`) and therefore keeps coverage unverified → the block stays. Clearing requires the stop child to be uniquely matched in `allOrders` (exact field match, no id arithmetic, `trade_manager.py:1693-1758 _select_oco_stop_child`) and its status queried by exact id — with bounded discovery backoff (15-min cap, `trade_manager.py:1631-1665`) instead of hot loops.
 - **Honest assessment:** the *mechanism* that made a 26 h freeze possible — "block until protection is proven, however long that takes" — is **still present by design** (`trade_manager.py:737-756`: "The block is never cleared by time. It clears only when every open bot-owned position is fully sold or has exchange-confirmed working coverage"). What changed versus the incident era: the reason is precise and audited, discovery is bounded and evidence-based, and readiness reporting marks the block as diagnostic context (`readiness.py:356-360`). Whether the historical 26 h came from the removed global-history blocking or from prolonged discovery failure cannot be established from this tree (**low confidence** on the original root cause; **high confidence** on current behavior). The *global scope* of the block is a policy question, not a bug — see §5.3 and F-15.
 
@@ -129,14 +132,14 @@ Deploy units: `deploy/tg-ingest.service`, `deploy/tg-notification-worker.service
 
 ## 5. Global Entry Gates — inventory and the "why global" answers
 
-All gates verified at HEAD. For each: what it blocks, where it lives, and the required answer to *"why must this block every new BUY instead of only the affected trade or symbol?"*
+All gates verified at the audited commit. For each: what it blocks, where it lives, and the required answer to *"why must this block every new BUY instead of only the affected trade or symbol?"*
 
 | # | Gate | Scope | Blocks | Verified at |
 |---|---|---|---|---|
 | G1 | Emergency stop | global | everything (entry + protection) | `gate.py:146-148`, `config.py` `emergency_stop` |
 | G2 | Owner pause | global | everything (entry + protection) | `gate.py:149-153` (`control_setup.paused`), atomic with the planned→submitting claim (`store.py:claim_intent_for_submission`) |
 | G3 | Durable new-BUY block | global, **entry purpose only** | new BUYs only; protection submissions pass | `gate.py:154-162` + `store.py:set_buy_block/buy_block_reason`; source of truth recomputed from coverage (`trade_manager.py:733-790`) |
-| G4 | Same-symbol open-order check | **per-symbol** (not global) | a second BUY on the same symbol while an exchange order is open | `engine.py:191-225`, applied at `engine.py:1462-1480` under a per-symbol lock (`engine.py:163`, `locking.py KeyedRLockPool`) |
+| G4 | Same-symbol open-order check | **per-symbol** (not global) | a second BUY on the same symbol while an exchange order is open | `engine.py:191-225`, applied under a per-symbol lock (`engine.py:163`, `locking.py KeyedRLockPool`) |
 | G5 | Activation boundary | per-channel, forward-only | messages at/below boundary; `None` boundary ⇒ refuse all | `engine.py:342-377, 418-433, 777-784`, `store.py:ensure_activation_boundary` |
 | G6 | Pre-buy exit-ladder/OCO-path check | per-trade | BUY without complete ladder or OCO path | `trade_manager.py:595-628` |
 | G7 | Balance preflight | per-submission (account read) | insufficient spendable after outstanding intents | `engine.py:1639-1680`, `trading/balance.py` |
@@ -153,16 +156,16 @@ The control bot's pause means "stop trading entirely" (single product, two owner
 
 **Engineering answer:** the root causes of "coverage cannot be verified" are frequently **systemic, not symbol-local**: entry fill synchronization (`fill_sync_required` gates OCO sizing, `trade_manager.py:2280-2298`), base-fee provability (`_total_base_fees` fail-closed across entry+exit fills, `trade_manager.py:2866-2967`), server-clock health for signed writes (`mexc/clock.py`), and the shared rate budget (`SharedWeightedRateGate`). A per-symbol block would assert that the failure on symbol A shares none of these causes with symbol B — an assertion the code cannot currently prove. Note also the block is already *asymmetric*: it stops entries only, never protection submissions, so it does not delay the fix of the unprotected position itself (`gate.py:139-144`).
 
-**Simplification option (deferred, F-15):** all block inputs are per-trade; a per-symbol block is technically feasible. It is a **policy reversal** of an owner-confirmed protection rule, so this audit classifies it as DEFER requiring explicit owner sign-off, with a supporting argument: same-symbol overlap is already prevented by G4/G6, and balance overspend by G7; the residual risk a per-symbol policy accepts is "a new unrelated BUY inherits exposure while global machinery (fee/fill/clock) is in an unproven state."
+**F-15 stance (Rev 2):** the global scope is an **owner policy decision**. This audit offers no argument for or against changing it and no default recommendation. Any scope change is a policy reversal of an owner-confirmed protection rule and requires explicit owner sign-off (see F-15).
 
 ---
 
 ## 6. Detailed Findings
 
-Each finding: evidence, classification (KEEP / SIMPLIFY-MERGE / REMOVE-DEFER), risk of acting, risk of not acting. Confidence: high unless stated.
+Each finding: evidence, one primary classification with secondary tags where applicable (§4), risk of acting, risk of not acting. Confidence: high unless stated. **Rev 2 re-verified every citation in F-05, F-06, F-07, F-08, F-10, F-12, F-15 and the dispatcher/monitor/notify/OCO citations; other sections carry Rev 1 citations over the same code state.**
 
 ### F-01 — Native-OCO stop-child discovery subsystem is forced complexity — **KEEP**
-- **Evidence:** `trade_manager.py:1272-2260` (≈ 1,000 LOC): `_oco_leg_targets`, `_sync_oco_legs`, `_oco_stop_children_settled`, `_discover_oco_stop_children`, `_select_oco_stop_child`, `_query_and_persist_oco_stop_child`. Root cause documented in-code (`trade_manager.py:112-127`): MEXC returns OCO children as separate `allOrders` rows with `orderListId = -1`, null client ids, and no exposed trigger; `mexc/client.py:all_orders` docstring repeats the constraint. Exact-match-only matching with a hard fail-closed path (`trade_manager.py:1705-1758`), bounded backoff (`trade_manager.py:1631-1665`), and a 7-day history window guard.
+- **Evidence:** `trade_manager.py:1272-2260` (≈ 1,000 LOC): `_oco_leg_targets`, `_sync_oco_legs`, `_oco_stop_children_settled`, `_discover_oco_stop_children`, `_select_oco_stop_child`, `_query_and_persist_oco_stop_child`. Root cause documented in-code (`trade_manager.py:112-127`): MEXC returns OCO children as separate `allOrders` rows with `orderListId = -1`, null client ids, and no exposed trigger; `mexc/client.py:all_orders` docstring repeats the constraint. Exact-match-only matching with a hard fail-closed path (`trade_manager.py:1705-1758`), bounded backoff (`trade_manager.py:1631-1665`), and a 7-day history window guard (`trade_manager.py:1763-1770`).
 - **Why KEEP:** there is no exchange-native alternative; guessing parent/child links would risk double-selling or miscounted inventory. This is the highest-complexity, highest-necessity subsystem in the repo.
 - **Risk of removal:** catastrophic (inventory misattribution). **Risk of keeping:** maintenance cost — mitigated by the P1 test freeze.
 
@@ -181,73 +184,142 @@ Each finding: evidence, classification (KEEP / SIMPLIFY-MERGE / REMOVE-DEFER), r
 - **Action:** extract one shared codec + delay function; keep the persisted string format for backward compatibility with existing rows.
 - **Risk:** low. **Risk of not acting:** two retry clocks drift (e.g. one gets a jitter fix, the other doesn't).
 
-### F-05 — Disabled legacy exit machinery in TradeManager — **REMOVE (P1 for provably dead, P2 for call-site surgery)**
-- **Evidence (high confidence, call-site greps included tests):**
-  - `_enter_tp1` (`trade_manager.py:1101`), `_enter_tp2` (`:1115`), `_do_tp_sale` (`:1187`): first statement disables and `return`s; the remaining bodies are **unreachable**.
-  - `_submit_tp_order` (`:1237`): unconditional raise.
-  - `_disable_legacy_exit` (`:1178`): reachable only from the above.
-  - `_target_qty`: **zero references** outside its definition.
-  - `_compute_available` (`:1193`): referenced only from the disabled path.
-  - `_transition_state` (`:1130`): one reference, from `_do_tp_sale`'s unreachable body.
-  - `_enter_stop_loss` (`:2799`), `_resume_stop_loss` (`:2812`), `_submit_stop_loss_order` (`:2828`): explicitly disabled per §7 (native OCO SL legs only); they exist to *prove* no Market Sell path exists. `engine.submit_stop_loss_market_sell` (`engine.py:1902`) intentionally raises `RuntimeError`.
-- **Action:** delete the unreachable bodies and the zero-reference methods; keep the §7 *guard* semantics by leaving the "legacy state ⇒ needs_reconciliation parking" in `_reconcile_trade_inner` (`trade_manager.py:3319-3337`, `:3384-3394`) so old DB rows are still handled safely. Keep one tiny `_enter_stop_loss`-style guard or an assertion test proving no Market Sell call site exists (the current grep-proof ritual).
-- **Risk:** low-medium: `_advance_trade_after_reconcile` (`:3666+`) calls `_enter_tp2` for legacy `tp1_active`/`tp2_active` states — those branches must be re-routed to the existing needs_reconciliation parking rather than deleted outright. Requires the P0 characterization tests first. **Risk of not acting:** readers must mentally execute dead code to conclude the strategy; the disabled bodies are a standing temptation and a maintenance trap.
+### F-05 — Disabled legacy exit machinery in TradeManager — **REMOVE (Tier-1 only) + DEFER (Tier-2 legacy-state handling)** *(rewritten in Rev 2)*
 
-### F-06 — Attached-protection path is dead in production — **REMOVE-DEFER (P2)**
-- **Evidence:** `HybridMexcClient.supports_attached_protection = False` (`mexc/hybrid.py:20`); engine attached-protection code (`engine.py:1298-1375 _protection_prices/_record_protection_intent/_verify_protection`, call sites `engine.py:1476, 1481, 1590, 2334`) therefore never executes on the only production backend (docs/trading.md confirms the backend has no attached TP/SL). The `order_protection` table (migration 7) and store methods exist for it; `pending_protection_verification` has **zero references**; `trade_manager._exchange_protection_active` (`trade_manager.py:934-955`) reads a table that is never written for live intents.
-- **Action:** delete the engine path and unused store method; **keep the DB table and historical rows**; keep `_exchange_protection_active` or simplify it with a comment (it is harmless defense if a future backend sets the flag).
-- **Risk:** low; must verify no CLI write backend roadmap depends on the flag (medium confidence on future plans). **Risk of not acting:** two protection models coexist in the reader's mind.
+Rev 2 splits this finding into three tiers with different reachability bases. The reachability basis for every item is a repo-wide grep over `tg_signal_ingest/` **and** `tests/` (definitions excluded), at the audited commit; "production-unreachable" means no call site outside the method's own body and disabled siblings, i.e. the runtime can never reach it.
 
-### F-07 — `TradingNotifier` delivery half is unreachable — **REMOVE-DEFER (P2)**
-- **Evidence:** `notify.py:flush/_deliver` (~150 LOC of Bot API delivery, claim, ambiguity recovery) exist, but the producer path intentionally never flushes (`notify.py:138-146`: "The synchronous `flush()` is intentionally removed from the producer path"), and `service.py`/`main.py` deliver exclusively through `NotificationDispatcher` (`main.py:cmd_notifications_worker`). No production caller of `flush` (grep: tests only).
-- **Action:** delete the delivery half; keep `enqueue` (the legacy outbox is still a relay *source*, see F-08 until cutover completes).
-- **Risk:** low. **Risk of not acting:** two delivery implementations invite accidental reuse.
+**Tier 1 — provably production-unreachable; pure deletion, zero runtime behavior change** (exact ranges in §12.1):
 
-### F-08 — Dual notification ledgers (domain events + legacy outbox) — **SIMPLIFY-MERGE (P2, staged) — highest-value simplification**
-- **Evidence:** every lifecycle fact is written twice:
-  1. **Domain event** into `audit_events` (immutable, migration 25 triggers) inside the business transaction — `store.py:transition_intent` / `trade_store.py:update_trade_state` / `transition_trade_order` / `upsert_oco_leg` / `set_oco_group_state` all call `record_domain_event` with `conn=`.
-  2. **Legacy outbox row** into `trading_notifications` via `TradingNotifier.notify/notify_trade/notify_intent` (`notify.py:147-186`) from engine/trade-manager call sites (e.g. `trade_manager.py:_notify_intent`, `_notify_trade` non-critical branch, `_record_error`).
-  The dispatcher then runs **two** relay loops against two cursors: `relay_once` (domain events, `notification_dispatcher.py:947-971`) and `relay_legacy_once` (legacy rows, `:1086-1153`), each producing deliveries in its own ledger. Dedupe exists per row (`UNIQUE(event_id, recipient_role, part_no)`), but the *same fact* legitimately produces two deliveries under two ids.
-- **Action (staged):** Phase 1 — stop writing legacy rows for events that already have a domain-event representation (the producers exist); keep `relay_legacy_once` for pre-cutover rows. Phase 2 — after drain, delete the legacy relay and the outbox write path (F-07 completes).
-- **Risk:** medium (notification behavior change; must map every legacy `event_key` to a domain event first — the taxonomy is already frozen in `domain_events.py:EVENT_REGISTRY`, and the dispatcher's category map covers all current types, `notification_dispatcher.py:42-58`). **Risk of not acting:** permanent double persistence, double relay logic, and a second vocabulary (`_legacy_severity`, `:1031-1063`) that must be maintained in parallel forever.
+| Item | Range | Refs (non-definition) | Basis |
+|---|---|---|---|
+| `trade_manager._target_qty` | `trade_manager.py:2705-2707` | **0** anywhere | unreferenced |
+| `trade_manager._transition_state` | `trade_manager.py:1130-1176` | 1 (test only: `test_trading_lifecycle_recovery.py:892`) | unreferenced in production |
+| `trade_manager._compute_available` | `trade_manager.py:1193-1204` | 2 (test only: `test_focused_followup_repair.py:876-877`) | unreferenced in production |
+| `trade_manager._enter_tp1` | `trade_manager.py:1101-1113` | 1 (test only: `test_trading_cli_protection.py:209`) | unreferenced in production |
+| `trade_manager._submit_tp_order` | `trade_manager.py:1237-1245` | 1 (test only: `test_trading_cli_protection.py:215-218`) | unreferenced in production; raises unconditionally |
+| `trade_manager._enter_stop_loss` | `trade_manager.py:2799-2810` | 0 call sites (its own name appears only in its own f-string) | unreferenced |
+| `trade_manager._resume_stop_loss` | `trade_manager.py:2812-2826` | 0 call sites (name appears only in its own f-string) | unreferenced |
+| `trade_manager._submit_stop_loss_order` | `trade_manager.py:2828-2844` | 0 call sites (name appears only in its own f-string) | unreferenced |
+| `store.pending_protection_verification` | `store.py:1414-1420` | **0** anywhere | unreferenced |
+| `store.clock_health_state` (function only) | `store.py:40-48` | **0** anywhere; the `CLOCK_SKEW_*` **constants** (`store.py:35-37`) ARE used (`main.py:785-787`) and stay | unreferenced |
+| `engine.submit_stop_loss_market_sell` | `engine.py:1902-1919` | 4 (comments only) | unreferenced; raises `RuntimeError` |
+| `TradingNotifier` delivery half (`flush`/`_report_ambiguous`/`_deliver`/`pending_count`) | `notify.py:225-337` | production callers **0** (tests only, 28 call sites) | unreferenced in production — but deletion is sequenced behind the F-08 ledger decision, so its *removal class* is DEFER (F-07) |
 
-### F-09 — Notification volume vs "minimal notifications" spec — **SIMPLIFY-DEFER (P3, owner-visible)**
-- **Evidence (high confidence, from producer enumeration):** one full trade emits ≈ 15–30 Telegram messages across recipients: `signal.received`, `intent.created`, every `intent.state_changed`, every `trade.state_changed`, per-leg `trade_order.state_changed`, `oco_group.state_changed`, per-leg `oco_leg.state_changed`, **per fill** `fill.recorded`, **per exchange write** `exchange.write_outcome`, and `reconciliation.outcome` on every change. Exactly one suppression rule exists (routine `active↔submitting` group flip, `notification_dispatcher.py:316-324`); threading (`event_thread_key`, `:390-424`) groups replies but does not reduce count.
-- **Action:** owner-approved coalescing (e.g. fold `fill.recorded` into intent summaries; suppress INFO group/leg state flips that carry no safety payload — the owner-safety bypass at `:117-143` already guarantees CRITICAL/uncertain events always arrive).
+Tier-1 deletions are behavior-neutral at runtime **because nothing can reach them**; the required work is test-side (update/remove the tests that exercise them directly) plus the P0 characterization freeze.
+
+**Tier 2 — live legacy-state handling; deletion = behavior change, not deletion** (§12.2):
+
+| Item | Range | Live caller |
+|---|---|---|
+| `trade_manager._enter_tp2` | `trade_manager.py:1115-1128` | `_advance_trade_after_reconcile` (`trade_manager.py:3717`) — for a legacy `tp1_active` trade whose TP1 completed, calls `_enter_tp2`, which **fails closed** into `needs_reconciliation` via `_disable_legacy_exit` |
+| `trade_manager._do_tp_sale` | `trade_manager.py:1187-1191` | `_enter_tp1`/`_enter_tp2` bodies |
+| `trade_manager._disable_legacy_exit` | `trade_manager.py:1178-1185` | `_do_tp_sale` |
+
+These methods are the **fail-closed parking behavior** for pre-OCO / legacy trade rows (`tp1_active`, `tp2_active`, legacy stop states): when reconciliation advances such a row, the current code routes it to `needs_reconciliation` with an explanatory note instead of submitting a standalone TP/Market-Sell order. **Rev 1's suggestion to "re-route those branches to the existing needs_reconciliation parking" is itself a behavior change** — the parking *is* what these methods do, and re-routing/deleting them alters what happens to legacy DB rows during reconciliation. Any change here requires: (a) an inventory of which legacy `trade_state` values can reach `_advance_trade_after_reconcile` (from a production DB snapshot, not from code alone); (b) a written decision on the desired handling of each legacy state; (c) characterization tests that pin the current parking behavior first. Until then: **DEFER — do not delete.**
+
+**Tier 3 — §7 "no Market Sell" proof surface.** `_enter_stop_loss`/`_resume_stop_loss`/`_submit_stop_loss_order` and `engine.submit_stop_loss_market_sell` are Tier-1-unreachable, but they also *document* the §7 policy ("Native OCO SL legs are the only authorized automatic stop-loss mechanism") in code. Deleting them is behavior-neutral; keeping a single assertion-style test that proves no Market Sell call site exists preserves the guarantee with less surface. This is a presentation choice for the owner, not a safety change either way.
+
+- **Risk of acting (Tier 1):** low; the only real hazard is deleting a Tier-2/Tier-3 item by name-similarity — hence the itemized register. **Risk of not acting:** readers must mentally execute dead code to conclude the strategy; the disabled bodies are a standing temptation and a maintenance trap.
+
+### F-06 — Attached-protection path is inactive under the current production backend — **DEFER (runtime evidence required)** *(revised in Rev 2)*
+
+Rev 2 downgrades "dead in production" to the precise claim: **inactive under current configuration**, which is not the same as deletable.
+
+- **Evidence:** `HybridMexcClient.supports_attached_protection = False` (`mexc/hybrid.py:20`); the engine attached-protection code (`engine.py:1298-1420` region: `_protection_prices`, `_record_protection_intent`, `_verify_protection`, `upsert_protection`/`update_protection` writers at `engine.py:1342-1547`, call sites `engine.py:1476, 1481, 1590, 2334`) therefore never executes its exchange path on the only production backend (`docs/trading.md:921` confirms the hybrid backend does not use the attached path). The `order_protection` table (migration 7, `db.py`) and store methods (`store.py:1335-1420`) exist for it; `pending_protection_verification` has zero references (F-05 Tier 1); `trade_manager._exchange_protection_active` (`trade_manager.py:934-955`) reads a table that is never written for live intents under the current backend.
+- **Why DEFER, not REMOVE:** the writers are config-conditional, not unreferenced — a future backend with `supports_attached_protection = True` reactivates the whole path. Removal requires runtime evidence that the path is operationally orphaned, not just statically inactive: (1) `SELECT COUNT(*) FROM order_protection` in the production DB (expected 0 or legacy-only rows); (2) owner confirmation that no CLI-backend/attached-protection roadmap exists; (3) a decision on whether historical `order_protection` rows (if any) are retained for audit. Nothing is removed or disabled by this audit.
+- **Action if evidence confirms orphanhood:** delete the engine path and unused store method; keep the DB table and historical rows; keep `_exchange_protection_active` (harmless defense if a future backend sets the flag).
+- **Risk of not acting:** two protection models coexist in the reader's mind.
+
+### F-07 — `TradingNotifier` delivery half is unreachable in production — **DEFER (sequenced behind F-08)** *(revised in Rev 2)*
+- **Evidence:** `notify.py:225-337` (`flush`, `_report_ambiguous`, `_deliver`, `pending_count`) implement Bot-API delivery, claim, and ambiguity recovery for the legacy outbox, but the producer path intentionally never flushes (`notify.py:138-146` docstring: the synchronous `flush()` is intentionally removed from the producer path), and `service.py`/`main.py` deliver exclusively through `NotificationDispatcher` (`main.py:cmd_notifications_worker`). Repo-wide grep: production callers of `flush` = **0** (33 test call sites only). Consequence: in production, legacy outbox rows sit at `status='pending'` until the dispatcher's `relay_legacy_once` bridges them (`notification_dispatcher.py:1245-1316`).
+- **Why DEFER rather than REMOVE:** the delivery half is the only in-process sender for the legacy outbox; whether it can be deleted depends on the F-08 ledger decision (if the legacy relay/outbox is retained indefinitely for outage recovery or operator requeue semantics, the delivery half's fate follows it). Deleting it now is behavior-neutral but forecloses an option the F-08 review has not yet decided.
+- **Action:** decide together with F-08; keep `enqueue` either way (the legacy outbox is a relay *source*).
+- **Risk:** low either way. **Risk of not acting:** two delivery implementations invite accidental reuse.
+
+### F-08 — Notification architecture: layered dual-ledger design with proven, localized duplicate visibility — **DEFER (staged consolidation, owner-approved, full migration case required)** *(fully rewritten in Rev 2)*
+
+Rev 1 claimed "every notification is persisted twice and relayed twice." **That claim is false**, and the required event mapping below replaces it.
+
+**The two ledgers and their complete producer/dispatcher mapping (all verified at the audited commit):**
+
+**Ledger B — immutable domain events** (`audit_events`, `event_class='domain'`, migration-25 append-only triggers; written **inside the business transaction** by `store.record_domain_event`, `store.py:312-336`):
+- `signal.received` (`store.py:693`), `signal.rejected` (`store.py:737`; suppressible per call via `emit_rejection_event=False`),
+- `intent.created` (`store.py:1228`), `intent.state_changed` (`store.py:1522` on claim; `store.py:1611-1621` on transitions — severity **CRITICAL** for `unknown_requires_reconciliation`, **ERROR** for `rejected`/`failed`, else INFO), `intent.submission_accepted` (`store.py:1644`),
+- `fill.recorded` (`store.py:1796`), `reconciliation.outcome` (`store.py:1885`), `exchange.write_outcome` (`store.py:573`),
+- `trade.state_changed` (`store.py` trade mutation path; `trade_store.py:251`), `trade_order.state_changed` (`trade_store.py:693`), `oco_group.state_changed` (`trade_store.py:794`), `oco_leg.state_changed` (`trade_store.py:917`), `trade.protection_critical` (`trade_manager.py:4016`; deterministic uuid5 `event_id` for alert-on-change semantics, `DomainEventConflict`-suppressed, severity CRITICAL),
+- default audience `(owner, owner_b, developer)` (`domain_events.py:36`).
+
+**Ledger A — legacy formatted outbox** (`trading_notifications`, one row per `(event_key#chunk, role)`; writer-side dedupe on the `(event_key, role)` uniqueness per `notify.py:130-141`): written by `TradingNotifier.notify/notify_trade/notify_intent` (`notify.py:157-218`) from engine/trade-manager call sites — signal decisions (`engine.py:467, 1086, 1112, 1243, 1272`), conditional-entry waiting (`engine.py:588`), startup recovery (`engine.py:763`), OCO placement failures (`trade_manager.py`, e.g. `OCO_MINIMUM_NOT_MET`, `OCO_INVARIANT_UNKNOWN`), and `Notify.notify` generic alerts (`engine.py:913, 1059`).
+
+**The trade layer deliberately routes, it does not duplicate** (`trade_manager._notify_trade`, `trade_manager.py:3997-4030`): `SL_UNPROTECTED_CRITICAL`, `OCO_INVARIANT_UNKNOWN/WOULD_VIOLATE/VIOLATED`, `TRADE_CLOSE_REFUSED_UNKNOWN`, and `BUY_BLOCK_ACTIVE_*` go **only** to Ledger B as `trade.protection_critical` (CRITICAL); everything else goes **only** to Ledger A. This is an either/or router, not a double writer.
+
+**Dispatcher (separate SQLite delivery ledger; source DB opened read-only via `PRAGMA query_only=ON`, `notification_dispatcher.py:1166`):** every cycle, `run_once` (`notification_dispatcher.py:1387-1400`) runs **both** relays — `relay_once` (Ledger B, cursor on `audit_id`, `:1197-1218` → `relay_batch` `:775-890`: renders text, applies audience — CRITICAL bypasses audience and reaches every configured recipient — chunks, per-recipient `delivery_decision`, `INSERT OR IGNORE` dedupe on `relayed_events.event_id` + `deliveries UNIQUE(event_id, recipient_role, part_no)`) and `relay_legacy_once` (Ledger A, monotonic `legacy_notification_cursor`, `:1245-1316`: `_legacy_severity` mapping `:1219-1244`, `delivery_decision`, chunk inserts, `relayed_legacy_notifications` bookkeeping). Delivery then goes through one pipeline: `deliver_one` (`:1326`), `MAX_ATTEMPTS = 10` shared per `(event_id, recipient_role)` via sibling-attempt summation (`:30`, claim `:927-971`, finish `:974-1069`), dead-letter on budget exhaustion, ambiguous sends never auto-retried, stale-claim recovery (`:898-925`), operator-only requeue for ambiguous/dead-letter (`:1088-1135`), Retry-After honored. Suppression: the only content rule is the routine `oco_group.state_changed` `active↔submitting` flip (`delivery_decision`, `:216-226`); owner-safety bypass guarantees CRITICAL and `signal.rejected_locally`-class events reach owners regardless of preferences (`:138-165`); suppression decisions are persisted, so operator history stays complete.
+
+**Where duplicate *user-visible* messages ARE proven (code-level):**
+1. **Submission-blocked flow:** `execute_intent`'s `SubmissionBlocked` handler (`engine.py:1253-1281`) runs `transition_intent(rejected)` → Ledger B emits `intent.state_changed` with severity **ERROR** (`store.py:1611-1621`) — and then calls `_notify_intent_decision(SUBMISSION_BLOCKED)` (`engine.py:1272`) → Ledger A writes a `signal.rejected_locally` decision message, which **bypasses owner preferences** (`notification_dispatcher.py:158-165`). Under default routing both rows deliver to the owners: **two Telegram messages, one business fact, different texts.**
+2. **Pre-submit expiry flow:** `_reject_before_submit` expiry path (`engine.py:1209-1219`) emits `intent.state_changed` (ERROR) *and* `update_signal(rejected)` → `signal.rejected` (INFO) — two domain rows for one decision, both rendered → **two messages** from Ledger B alone.
+3. **Planning rejections:** engine rejection sites that do NOT pass `emit_rejection_event=False` (e.g. `engine.py:413, 437, 443, 453, 480, 490, 503, 515, 545, 555, 1172, 1216, 1452`) emit `signal.rejected` rows; sites that pair the rejection with a decision message use `emit_rejection_event=False` (`engine.py:379`) specifically to avoid the double message — **the codebase already knows about this hazard and handles it inconsistently.**
+
+**Where duplication is NOT present:** the trade layer (router, above), trade/order/OCO state events (Ledger B only), and recovery/decision messages without a matching domain emit (Ledger A only). Ledger A's direct delivery half is never invoked in production (F-07), so outbox rows cannot double-send via two paths.
+
+- **Revised classification:** architectural overlap + migration risk, with proven duplicate visibility for the rejection class — **not** "two parallel systems doing the same thing."
+- **Action (staged, owner-approved; nothing executed by this audit):** Phase 0 — map every Ledger-A `event_key` to either a Ledger-B `event_type` or an explicit "Ledger-A-only" marker (the taxonomy exists in `domain_events.py:EVENT_REGISTRY`; the mapping table itself must be written and reviewed). Phase 1 — make rejection flows single-ledger (extend the `emit_rejection_event=False` pattern or route rejections exclusively through one ledger), eliminating the proven duplicates without touching the trade-layer router. Phase 2 — only after a defined soak window and a documented outage-recovery/compat case (backlog drain, `relayed_legacy_notifications`/cursor semantics, operator requeue expectations, retention of delivery history): decide whether the legacy relay and outbox write path retire (which would complete F-07) or remain as the formatted-message ledger. **No path is deleted by this audit, and no phase is authorized without the full migration + compatibility case (backlog behavior, outage recovery, recipient-specific severity/audience behavior, retry/requeue semantics).**
+- **Risk:** medium (notification behavior change; the trade-layer CRITICAL routing and owner-safety bypass must be preserved verbatim — `notification failures must not block trading` is unaffected since both ledgers are already decoupled from trading). **Risk of not acting:** permanent inconsistent rejection messaging (2–3 messages for one fact in some flows), two vocabularies (`_legacy_severity` `:1219-1244`) and two relay cursors maintained forever.
+
+### F-09 — Notification volume vs "minimal notifications" spec — **OWNER DECISION (P3)** *(citations corrected in Rev 2)*
+- **Evidence (from the producer enumeration above):** one full trade emits ≈ 15–30 Telegram messages across recipients: `signal.received`, `intent.created`, every `intent.state_changed`, every `trade.state_changed`, per-leg `trade_order.state_changed`, `oco_group.state_changed`, per-leg `oco_leg.state_changed`, **per fill** `fill.recorded`, **per exchange write** `exchange.write_outcome`, and `reconciliation.outcome` on every change. Exactly one content-suppression rule exists (routine `active↔submitting` group flip, `delivery_decision`, `notification_dispatcher.py:216-226`); threading (`event_thread_key`, `:543-580`) groups replies but does not reduce count.
+- **Action:** none by default. An owner-approved coalescing design (e.g. fold `fill.recorded` into intent summaries; suppress INFO group/leg state flips that carry no safety payload) must preserve the owner-safety bypass (`:138-165`) which guarantees CRITICAL/uncertain events always arrive.
 - **Risk:** owner-visible behavior change → requires explicit consent. **Risk of not acting:** alert fatigue; genuinely critical messages lose signal value in noise (this is the product's stated reason for the spec's "minimal notifications").
 
-### F-10 — Unexercised hand-rolled WebSocket feed — **REMOVE-DEFER (P3)**
-- **Evidence:** `monitor.py:236-456` implements a from-scratch WebSocket client (handshake, frame parser, ping/pong) for `wss://wbs.mexc.com/raw`; its own docstring says "behaviour against the real exchange has not been exercised in this tree". `_PrimaryWithFallback` (`:480-530`) subscribes the callback to **both** feeds and starts the polling fallback immediately — so a working WS only adds duplicate ticks (the polling feed never stops). Trigger latency requirement is 2 s polling (`config.py monitor_poll_interval_s`), which the spec allows.
-- **Action:** delete `MexcWebSocketFeed` and the composite; run `PollingPriceFeed` alone. Keep `_is_stale` gating.
-- **Risk:** low (loses a best-effort latency improvement that has never been validated). **Risk of not acting:** ~230 LOC of unexercised network code is a latent-failure surface (frame parsing bugs surface only if the WS ever connects in production).
+### F-10 — Unexercised hand-rolled WebSocket feed — **DEFER until production evidence proves redundancy** *(rewritten in Rev 2)*
+- **Evidence:** `MexcWebSocketFeed` (`monitor.py:267-499`) implements a from-scratch WebSocket client (handshake `:359`, frame parser `:384-392`, subscribe `:479-499` — raw JSON `{"method": "SUBSCRIPTION", …}` frames to `wss://wbs.mexc.com/raw`, `:41`) for which its own docstring says behavior against the real exchange "has not been exercised in this tree." Repo-wide grep: **zero references** to `MexcWebSocketFeed` outside `monitor.py` (production, tests, docs). `_PrimaryWithFallback` (`:583-634`) is referenced only by `tests/test_trading_monitor.py:25,169` and starts the polling fallback immediately, so a working WS would add duplicate ticks, never latency wins. The 2 s polling requirement is spec-compliant (`config.py monitor_poll_interval_s`).
+- **Documented decision status:** `docs/DECISION_REGISTRY.md` N-03 lists "MEXC WebSocket market data" as **runtime-confirmed / deferred**, and its preamble states deferred items are deliberate owner decisions, not unfinished work. Deleting the feed would therefore contradict a recorded owner decision, not just remove unexercised code. Separately, the raw-JSON subscribe framing is *suspected* to be incompatible with MEXC's documented WebSocket protocol (which requires a protobuf-based handshake/topic format) — this audit flags that as an **unverified claim** that only a runtime test can settle.
+- **Why DEFER, not REMOVE:** lack of references is not lack of operational value — the feed is the designated vehicle for a latency improvement the owner explicitly deferred, and "never worked" can only be proven at runtime, not statically. **Nothing is removed or disabled by this audit.**
+- **Required evidence before any removal decision (all must be recorded):** (1) a runtime connectivity test of `MexcWebSocketFeed` against `wbs.mexc.com/raw` with logs showing handshake, subscribe acceptance, and ticker frames (or a documented protocol analysis showing the framing cannot work); (2) if it connects: a measured latency comparison vs the 2 s poller on conditional-entry trigger handling; (3) an owner statement on whether sub-2 s trigger latency is a product requirement (the spec currently allows polling); (4) if both feeds ever run concurrently: a dedupe design for `_PrimaryWithFallback`'s duplicate ticks; (5) an updated N-03 registry entry recording the outcome.
+- **Risk of acting without evidence:** loses the only latency-improvement vehicle and reverses a documented decision. **Risk of not acting:** ~233 LOC (by range `monitor.py:267-499`) of unexercised network code remains a latent-failure surface — acceptable while deferred and never enabled.
 
 ### F-11 — `cleanup.py` inspection-only machinery — **SIMPLIFY (P2)**
 - **Evidence:** `trading/cleanup.py:212-219`: "inspection only: automatic order cancellation is permanently disabled… (apply requested but ignored)". The ~180 LOC of `CleanupCandidate` eligibility/threshold logic (`:29-140`) feeds a report that never cancels anything; the `apply` flag is ignored by design.
 - **Action:** reduce to open-order inspection + audit (or fold into a `diagnostics` command); delete eligibility/apply machinery.
 - **Risk:** low (CLI output changes shape only). **Risk of not acting:** the module's name and `apply` parameter suggest capabilities it deliberately lacks.
 
-### F-12 — Approval/learning-era schema residue — **REMOVE-DEFER (P3, needs migration)**
-- **Evidence:** `db.py` migrations create and retain tables outside the live execution path: `control_setup.execution_mode CHECK ('approval','auto')` (migration 5) — the approval mode was removed from the product; `control_flow`, `control_learning_samples`, `control_approvals`, `control_updates`, `control_secrets`, `control_audit`, `control_notices`; `signal_candidates`, `signal_candidate_reviews`, `analysis_runs`, `analysis_failures`, `channel_signals`, `signal_message_links`; the `mgmt_*` family (state/auth_flow/updates/callbacks/snapshots/ingestions/audit/operator flows/import requests/review drafts); `trading_daily_spend` (migration 2) — the daily cap is an explicitly rejected config knob (`config.py` obsolete list includes `daily_max_orders`).
-- **Action:** Phase 1: document as legacy (this report). Phase 2: a one-off archival+drop migration, only if no reporting depends on them (medium confidence: none of these tables appears in `store.py`/`engine.py`/`trade_manager.py` hot paths; `control/service.py` uses `control_setup`/`control_settings` only — medium confidence for the `mgmt_*` family, used by older operator tooling).
-- **Risk:** medium (migration + historical data retention policy). **Risk of not acting:** schema surface confuses every future audit; `execution_mode` CHECK still suggests an approval product that does not exist.
+### F-12 — Approval/learning-era schema residue — **DEFER (documentation now; archival/drop only after the dependency inventory below)** *(corrected in Rev 2)*
+
+**Rev 1 wrongly listed five live control tables as residue.** The control bot uses them in production: `control_flow` (`control/store.py:214-224`), `control_updates` (`:248`), `control_audit` (`:261`), `control_notices` (`:270`), `control_secrets` (`:285-313`). They are **not** simplification candidates.
+
+Corrected inventory at the audited commit (all "unreferenced" claims = repo-wide grep over `tg_signal_ingest/` + `tests/`, non-`db.py`):
+
+| Table(s) | Created at | Non-`db.py` refs | Status |
+|---|---|---|---|
+| `control_setup`, `control_settings`, `control_flow`, `control_updates`, `control_secrets`, `control_audit`, `control_notices` | migrations 5+ | `control/service.py`, `control/store.py` | **LIVE — keep** |
+| `control_learning_samples` (`db.py:960`), `control_approvals` (`db.py:980`) | migration 5 | **0** | residue — defer |
+| `trading_daily_spend` (`db.py:890`) | migration 2 | **0** | residue — defer (daily caps are an explicitly rejected config knob, `config.py` obsolete list) |
+| `signal_candidates` (`db.py:1181`), `signal_candidate_reviews` (`:1231`), `analysis_runs` (`:1244`), `analysis_failures` (`:1256`), `channel_signals` (`:1364`), `signal_message_links` (`:1412`) | migrations | **0** | residue — defer |
+| `mgmt_*` family (`db.py:1039-1313`, 12 tables) | migrations | **0** | residue — defer |
+| `order_protection` (migration 7) | migration 7 | writers `store.py:1335-1420` (called only from the F-06 inactive-under-config engine path); reader `pending_protection_verification` unreferenced | **config-conditional — see F-06, defer** |
+| `control_setup.execution_mode CHECK ('approval','auto')` | migration 5 | constraint only | misleading CHECK constraint; harmless at runtime |
+
+- **Why DEFER, not REMOVE:** absence of code references is not proof of no operational value. These tables may hold historical records (audit, retention), reporting dependencies outside this repo, or migration-history value. Dropping them is a **data migration** with a retention policy decision, not a code deletion.
+- **Required evidence/inventory before any archival-or-drop migration:** (1) row counts per table in the production DB; (2) owner confirmation of retention policy (archive-then-drop vs keep); (3) confirmation no external reporting/backup tooling reads them; (4) a written note that `sqlite_sequence`/migration history keeps recording them if dropped (migrations are append-only); (5) a restore path if any table turns out to be needed. Phase 1 (now): document as legacy — this section. Phase 2 (later, owner-approved): one-off archival+drop migration per table group.
+- **Risk:** medium (data loss if a hidden consumer exists). **Risk of not acting:** schema surface confuses every future audit; `execution_mode` CHECK still suggests an approval product that does not exist.
 
 ### F-13 — Misleading readiness-failure log — **SIMPLIFY (P1, log-only)**
 - **Evidence:** `service.py:313-320` logs "MEXC account readiness could not be verified; **new entries will be blocked**" when `verify_mexc_readiness` fails — but `gate.py:63-65` is explicit that runtime readiness callbacks "never block entries… are not read by `check`" (owner policy). The actual behavior: the failure is recorded; entries proceed subject to the real gates.
 - **Action:** correct the log text (and the comment in `service.py:_arm_trading_boundary`, which says "the submission gate stays closed" — the boundary is enforced per-message in `engine.process_item` (`engine.py:364-377`: boundary `None` ⇒ refuse), not by the gate; behavior is fail-closed either way, but the mechanism description is wrong).
 - **Risk:** none. **Risk of not acting:** an operator reading logs during an incident will mis-predict gate behavior.
 
-### F-14 — Metadata failure: optional bounded retry — **SIMPLIFY-DEFER (P2, small behavior change)**
+### F-14 — Metadata failure: optional bounded retry — **OWNER DECISION** *(reclassified from SIMPLIFY-DEFER; no default recommendation)*
 - **Evidence:** §4.2. `SymbolRegistry.get` performs one live call on cache miss and propagates errors (`mexc/symbols.py:278-291`).
-- **Action (optional):** one immediate retry on `MexcNetworkError`/`MexcServerError` (not on deterministic `MexcSymbolError`) inside `SymbolRegistry.get` before failing; keep both checkpoints terminal afterward. Alternatively a short negative-result cooldown to protect the rate budget.
+- **Action:** none by default. If the owner accepts fewer terminal rejections as a policy change: one immediate retry on `MexcNetworkError`/`MexcServerError` (not on deterministic `MexcSymbolError`) inside `SymbolRegistry.get` before failing; keep both checkpoints terminal afterward. Alternatively a short negative-result cooldown to protect the rate budget.
 - **Risk:** low; changes rejection statistics (fewer terminal rejections); the fail-closed property is preserved because deterministic errors remain terminal and retries are read-only. **Risk of not acting:** transient 5 s exchange hiccup permanently discards a tradeable signal — the MYX incident class.
 
-### F-15 — Global scope of the new-BUY block — **DEFER (owner decision)**
+### F-15 — Global scope of the new-BUY block — **OWNER POLICY DECISION ONLY** *(restated in Rev 2: no recommendation)*
 - **Evidence:** §5.3. All inputs are per-trade (`trade_manager.py:700-731`); the global scope is documented as deliberate (`trade_manager.py:737-756`, `store.py:set_buy_block` docstring).
-- **Action:** none by default. If the owner reconfirms policy, a per-symbol variant is implementable with the existing inputs plus a systemic-failure override (unreadable store state ⇒ global block, already the behavior at `trade_manager.py:651-663`).
-- **Risk:** policy change to fund protection — outside this audit's authority. **Risk of not acting:** unrelated symbols stay frozen while a single trade's discovery is stuck (bounded at the 7-day `allOrders` window, after which discovery fails permanently with `oco_stop_child_history_expired`, `trade_manager.py:1763-1770` — worth an owner-visible escalation notification, which currently exists only as an audit event).
+- **Action:** **none. This audit makes no recommendation for or against narrowing the scope, and silence here must not be read as approval of any variant.** The existing behavior (global, entry-only, coverage-derived, never time-cleared) stands. If the owner independently chooses to review the policy, the review must include: the systemic-failure modes listed in §5.3 (fill-sync, fee provability, clock health, rate budget), the existing per-symbol protections (G4/G6/G7), the 7-day `allOrders` discovery window (`trade_manager.py:1763-1770`) after which discovery fails permanently with `oco_stop_child_history_expired`, and whether the owner-visible escalation notification for that exhaustion exists beyond the audit event.
+- **Risk:** policy change to fund protection — outside this audit's authority.
 
 ### F-16 — Idempotency + evidence chain — **KEEP**
-- **Evidence:** sha256 idempotency keys over `channel:message:action:symbol` (`engine.py` planning), `client_order_id` scheme "tsi"+28 (entry) and digest-based OCO ids (`trade_manager.py:4011-4019`), `exchange_operations` insert-before-send (`store.py:begin_exchange_operation`, used by `trading/evidence.py:144-233`), `order_status_history` on every transition, immutable domain events (migration 25 triggers, `db.py:_migration_25_domain_event_envelope`). Complexity is the incident scar tissue that prevents duplicate orders and proves outcomes. No simplification proposed.
+- **Evidence:** sha256 idempotency keys over `channel:message:action:symbol` (`engine.py` planning), `client_order_id` scheme "tsi"+28 (entry) and digest-based OCO ids (`trade_manager.py:4011-4019`), `exchange_operations` insert-before-send (`store.py:begin_exchange_operation`, used by `trading/evidence.py:144-233`), `order_status_history` on every transition, immutable domain events (migration 25 triggers). Complexity is the incident scar tissue that prevents duplicate orders and proves outcomes. No simplification proposed.
 
 ### F-17 — Centralized reconciliation gate — **KEEP**
 - **Evidence:** `reconcile_intent_if_due` with durable per-intent backoff (`engine.py:2150+`; not_found 60 s→15 min cap, ambiguous 5 s→60 s, success coalesced; in-flight POST grace ≥ 15 s) replaced the historical pattern of per-tick REST queries — the trade-manager docstring records that the old design produced "≈57k checks per leg for a single stuck trade" (`trade_manager.py:875-884`). This is a prior, successful simplification; treat further removals in this area with the same care.
@@ -261,18 +333,49 @@ Each finding: evidence, classification (KEEP / SIMPLIFY-MERGE / REMOVE-DEFER), r
 - **Evidence:** `ServerClock` refuses signed writes without a fresh low-RTT sample (`mexc/clock.py:292+`, `client.py:_timestamp_for(for_write=)`), `recvWindow` bounds enforced locally (`client.py:170-176`), typed error taxonomy maps −2011/−2013 by method context (`client.py:385-392`: a create-order −2011 is *uncertain*, a query −2011 is *not found* — subtle and correct), shared UID/IP/order gates across processes (`client.py:150-230`). All complexity is correctness-bearing.
 
 ### F-20 — Two-process deployment + independent dispatcher worker — **KEEP**
-- **Evidence:** `deploy/tg-ingest.service` and `deploy/tg-notification-worker.service`; the dispatcher reads the trading DB read-only (`notification_dispatcher.py:899-905`, `PRAGMA query_only=ON`) and owns a separate delivery ledger, so Telegram I/O can never hold a trading transaction. Deliberate, correct, cheap.
+- **Evidence:** `deploy/tg-ingest.service` and `deploy/tg-notification-worker.service`; the dispatcher reads the trading DB read-only (`notification_dispatcher.py:1166`, `PRAGMA query_only=ON`) and owns a separate delivery ledger, so Telegram I/O can never hold a trading transaction. Deliberate, correct, cheap.
 
 ---
 
-## 7. Classification: KEEP (justified complexity)
+## 7. Authoritative Classification Table (Rev 2 — one row per unique finding)
+
+**This table replaces all Rev 1 classification totals** (Rev 1's "20 findings, 8 KEEP, 8 SIMPLIFY, 10 REMOVE/DEFER" summed to 26 and double-counted findings across categories; several findings also appeared in multiple tables). Each finding has **exactly one primary class**; secondary tags are listed separately and are not counted in the totals.
+
+| ID | Finding (short) | Primary class | Secondary tags |
+|---|---|---|---|
+| F-01 | OCO stop-child discovery subsystem | **KEEP** | — |
+| F-02 | Duplicated per-symbol conflict logic | **SIMPLIFY** (merge) | pure-deletion |
+| F-03 | Duplicated decimal/ISO helpers | **SIMPLIFY** (merge) | pure-deletion |
+| F-04 | Two backoff-streak codecs | **SIMPLIFY** (merge) | — |
+| F-05 | Disabled legacy exit machinery | **REMOVE** (Tier 1 only) | DEFER (Tier 2 legacy-state handling); behavior-equivalence refactor (Tier 3 presentation) |
+| F-06 | Attached-protection path | **DEFER** | production-evidence-required |
+| F-07 | `TradingNotifier` delivery half | **DEFER** | sequenced behind F-08 |
+| F-08 | Dual notification ledgers | **DEFER** | staged consolidation; compat-data migration in phase 2; behavior change in phase 1 |
+| F-09 | Notification volume | **OWNER-DECISION** | — |
+| F-10 | WebSocket feed | **DEFER** | production-evidence-required; documented owner deferral (N-03) |
+| F-11 | `cleanup.py` inspection-only machinery | **SIMPLIFY** | — |
+| F-12 | Approval/learning-era schema residue | **DEFER** | compat-data migration |
+| F-13 | Misleading readiness log | **SIMPLIFY** | log-only |
+| F-14 | Metadata bounded retry | **OWNER-DECISION** | small behavior change |
+| F-15 | Global scope of new-BUY block | **OWNER-DECISION** | policy; no recommendation offered |
+| F-16 | Idempotency + evidence chain | **KEEP** | — |
+| F-17 | Centralized reconciliation gate | **KEEP** | — |
+| F-18 | CLI surface | **SIMPLIFY** | — |
+| F-19 | Exchange/clock/rate-limit machinery | **KEEP** | — |
+| F-20 | Two-process deployment | **KEEP** | — |
+
+**Totals (reconcile exactly with the 20 unique findings):** KEEP **5** · SIMPLIFY **6** · REMOVE **1** · DEFER **5** · OWNER-DECISION **3** → **20**.
+
+Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) / Tier 3 (presentation choice) — the row keeps the primary class of its largest actionable tier and tags the rest. F-07 was REV-1 "REMOVE-DEFER" and is now DEFER-primary because its deletion is sequenced behind the F-08 decision. F-14 moved from SIMPLIFY to OWNER-DECISION because it changes rejection statistics (a policy-visible behavior change), not just mechanics. No finding was merged or dropped; the count remains 20.
+
+## 8. Classification: KEEP (justified complexity)
 
 | Item | Where | Why it must stay |
 |---|---|---|
 | OCO stop-child discovery | `trade_manager.py:1272-2260` | MEXC API exposes no parent/child link; guessing misattributes fills (F-01) |
-| Fail-closed sellable-quantity/fee provability | `trade_manager.py:2866-3002` | Prevents overselling; `None` ⇒ no submission |
-| OCO invariant (reserved ≤ sellable) | `trade_manager.py:3022-3058` | §5.1 critical invariant; re-verified after every reconcile |
-| Uncertain-never-retried semantics | `engine.py:1490-1530`, `trade_manager.py:108-124` | Duplicate-order protection; core incident scar tissue |
+| Fail-closed sellable-quantity/fee provability | `trade_manager.py:2866-3058` | Prevents overselling; `None` ⇒ no submission |
+| OCO invariant (reserved ≤ sellable) | `trade_manager.py:3022-3058` | §11.3 critical invariant; re-verified after every reconcile |
+| Uncertain-never-retried semantics | `engine.py:1511-1526`, `trade_manager.py:108-124` | Duplicate-order protection; core incident scar tissue |
 | Evidence-before-write chain | `trading/evidence.py`, `store.py:begin_exchange_operation` | Crash between send and response must remain provable |
 | Atomic claim + gate precheck in one transaction | `store.py:claim_intent_for_submission`, `gate.py` | Pause/block cannot race submission |
 | Activation boundary (forward-only, per-channel) | `engine.py:342-433`, `store.py` boundary methods | Downtime backlog must never replay as fresh orders |
@@ -281,41 +384,44 @@ Each finding: evidence, classification (KEEP / SIMPLIFY-MERGE / REMOVE-DEFER), r
 | Domain-event immutability triggers | `db.py` migration 25 | Audit integrity for the notification pipeline |
 | Dual deployment units | `deploy/*` | I/O isolation (F-20) |
 | Parser determinism (never guesses) | `trading/parser.py` | Ambiguous ⇒ rejected, not traded |
+| Trade-layer notification router (critical→domain-only) | `trade_manager.py:3997-4030` | Guarantees CRITICAL protection alerts are immutable and alert-on-change (F-08) |
 
-## 8. Classification: SIMPLIFY / MERGE
+## 9. Classification: SIMPLIFY / MERGE
 
 | ID | Item | Effort | Behavior change |
 |---|---|---|---|
 | F-02 | Deduplicate `CONFLICTING_TRADE_STATES`/`has_active_trade_for_symbol` | trivial | none |
 | F-03 | Consolidate decimal/ISO helpers | trivial | none |
-| F-04 | One backoff-streak codec | small | none (format preserved) |
-| F-08 | Single notification ledger (staged) | medium | delivery-neutral after mapping |
+| F-04 | One backoff-streak codec | small | none (persisted format preserved) |
 | F-11 | `cleanup.py` → inspection only | small | CLI output only |
 | F-13 | Fix readiness log/comment | trivial | none |
 | F-18 | Fold diag CLI commands; drop dead config knob | small | CLI ergonomics |
-| F-14 | Bounded metadata retry (optional) | small | fewer terminal rejections (owner consent) |
 
-## 9. Classification: REMOVE / DEFER
+## 10. Classification: REMOVE / DEFER / OWNER-DECISION
 
-| ID | Item | LOC | Prerequisite |
+| ID | Item | LOC basis | Prerequisite |
 |---|---|---|---|
-| F-05 | Dead exit stubs + unreachable bodies (`_target_qty`, `_compute_available`, `_transition_state`, bodies of `_enter_tp1/_enter_tp2/_do_tp_sale`) | ≈ 300 | P0 tests; re-route legacy-state branches to needs_reconciliation parking |
-| F-06 | Attached-protection engine path + `pending_protection_verification` | ≈ 150 | Confirm no CLI-backend roadmap dependency |
-| F-07 | `TradingNotifier` delivery half (flush/_deliver/claim/recover) | ≈ 150 | F-08 phase 2 |
-| F-10 | `MexcWebSocketFeed` + composite feed | ≈ 230 | Owner ack that 2 s polling is sufficient (spec says it is) |
-| F-12 | Approval-era schema (documentation first, migration later) | n/a (schema) | Archival policy |
-| F-15 | Global-block scope narrowing | n/a | **Owner policy reversal — DEFER** |
-| — | `_legacy_severity` vocabulary (after F-08 phase 2) | ≈ 40 | F-08 phase 2 |
-| — | `cancel_all_account_orders` kill switch | keep | Documented destructive switch; retain (1 call path, engine-external) |
+| F-05 | Tier-1 deletions, itemized | ≈ 275 (exact ranges, §12.1) | P0 characterization tests; test updates for the 4 test-referenced items |
+| F-05 | Tier-2 legacy-state handling | ≈ 27 + re-routing logic | Legacy-state inventory from production DB; written handling decision; parking-behavior characterization tests — **DEFER** |
+| F-06 | Attached-protection path | ≈ 209 by range (config-conditional) | Runtime evidence (§12.3 list) — **DEFER** |
+| F-07 | `TradingNotifier` delivery half | ≈ 111 (`notify.py:225-337`) | F-08 phase-2 decision — **DEFER** |
+| F-08 | Ledger consolidation | n/a (migration design) | Owner approval; full mapping + compat case — **DEFER** |
+| F-09 | Notification coalescing | n/a | Owner consent — **OWNER-DECISION** |
+| F-10 | `MexcWebSocketFeed` | ≈ 233 (`monitor.py:267-499`) | Runtime evidence list (F-10) + updated N-03 — **DEFER** |
+| F-12 | Legacy schema archival/drop | n/a (schema) | Row counts, retention policy, external-consumer check — **DEFER** |
+| F-14 | Metadata bounded retry | small | Owner consent — **OWNER-DECISION** |
+| F-15 | Global-block scope | n/a | **Owner policy decision — no recommendation offered** |
+| — | `_legacy_severity` vocabulary | ≈ 26 (`:1219-1244`) | Only after F-08 phase 2 |
+| — | `cancel_all_account_orders` kill switch | keep | Documented destructive switch; retain |
 
 ---
 
-## 10. Fund-Protection Invariants (must not be weakened by any simplification)
+## 11. Fund-Protection Invariants (must not be weakened by any simplification)
 
 1. Every BUY is preceded by a verified, ordered exit ladder and a working OCO path (`trade_manager.py:595-628`).
-2. Exactly two native OCO legs per fill tranche; both pending rows are persisted atomically before either exchange write (`trade_store.py:create_trade_order_pair`).
+2. **Each fill tranche is protected by exactly two native OCO SELL orders (OCO 1 at TP1, OCO 2 at TP2), each OCO being one exchange order with a TP limit leg and an SL stop-limit leg; both pending order rows are persisted atomically before either exchange write; tranches are independent and their OCOs are never siblings** (`docs/trading.md:455-474`; `trade_store.py:create_trade_order_pair`, `trade_store.py:448+`; `trade_manager.py:_create_oco_tranche`, `trade_manager.py:2228+`, allocation policy `per_entry_fill_tranche` `:2325`). The position-level OCO count is therefore `2 × tranche count`, not a fixed two.
 3. OCO reservation can never exceed sellable inventory; sellable is `None` (unknown) ⇒ no submission (`trade_manager.py:3022-3058`, `:2969-3002`).
-4. Uncertain write outcomes are never followed by automatic resubmission with a different client id (`engine.py:1490-1530`; `trade_manager.py:108-124`).
+4. Uncertain write outcomes are never followed by automatic resubmission with a different client id (`engine.py:1511-1526`; `trade_manager.py:108-124`).
 5. Exchange evidence rows exist before the request (`store.py:begin_exchange_operation`).
 6. Fills are monotonic; an exchange query never reduces recorded fills; a local `filled` is never un-filled (`trade_manager.py:_reconcile_single_order`, engine `_map_exchange_state`).
 7. Entry remainders are cancelled once the acquired position exits (F-05 rule, `trade_manager.py:3139-3181`).
@@ -324,64 +430,143 @@ Each finding: evidence, classification (KEEP / SIMPLIFY-MERGE / REMOVE-DEFER), r
 10. Idempotency: one intent per (channel, message, action, symbol) version; one trade per signal; retry-safe client ids.
 11. Protection submissions are never blocked by the entry-only BUY block (`gate.py:139-144`) — simplifications must preserve this asymmetry.
 12. Notifications never execute orders and never block trading; outbox-before-delivery is preserved (`notify.py`, `notification_dispatcher.py`).
+13. Restart behavior: persisted tranches are reused (never shrunk or re-expanded); no new tranche is created while any submission is unresolved/UNKNOWN (`docs/trading.md:641-667`).
 
 ---
 
-## 11. Notification & Observability Assessment
+## 12. Dead & Legacy Code Register — itemized, auditable (Rev 2)
 
-- **Correctness:** strong. Domain events are written in the business transaction; the dispatcher is independent, fenced against stale claims (`notification_dispatcher.py:912-925`), honors Retry-After, dead-letters after 10 shared attempts, and never auto-retries ambiguous sends. Owner-safety bypass guarantees uncertain/unprotected events reach owners regardless of preferences (`notification_dispatcher.py:117-143`).
-- **Complexity:** the double ledger (F-08) is the main debt; the legacy severity vocabulary (`_legacy_severity`) and the dual relay cursors exist only for the bridge.
-- **Volume:** ≈15–30 messages per trade (F-09) versus the spec's "minimal notifications" — a product-level tuning item, not a bug.
-- **Observability:** audit journal + domain events + `exchange_operations` give complete post-hoc reconstruction; `diagnostics clock/audit/orders/reconcile` and `readiness` cover operations. The readiness report already treats the BUY block as diagnostic context (`readiness.py:356-360`).
+**Method (rev 2):** for every item, the exact line range at the audited commit, the reachability basis (unreachable = no production call site; unreferenced = zero non-definition references; inactive-under-config = live code path gated by a runtime flag that is currently false), and how references were checked (repo-wide grep over `tg_signal_ingest/` + `tests/`, definitions excluded). **Rev 1's aggregate "≈900–1,100 LOC provably dead" is withdrawn** — it mixed reachability classes and was not auditable. No LOC figure in this revision exceeds the sum of its itemized ranges, and no range is counted twice.
+
+### 12.1 Tier 1 — provably production-unreachable (pure deletion; zero runtime behavior change)
+
+| # | Location | Item | Range | Lines | Refs (non-def) | Basis |
+|---|---|---|---|---|---|---|
+| 1 | `trade_manager.py` | `_target_qty` | 2705-2707 | 3 | 0 | unreferenced |
+| 2 | `trade_manager.py` | `_transition_state` | 1130-1176 | 47 | 1 (test) | production-unreachable |
+| 3 | `trade_manager.py` | `_compute_available` | 1193-1204 | 12 | 2 (tests) | production-unreachable |
+| 4 | `trade_manager.py` | `_enter_tp1` | 1101-1113 | 13 | 1 (test) | production-unreachable |
+| 5 | `trade_manager.py` | `_submit_tp_order` | 1237-1245 | 9 | 1 (test) | production-unreachable; raises |
+| 6 | `trade_manager.py` | `_enter_stop_loss` | 2799-2810 | 12 | 0 | unreferenced |
+| 7 | `trade_manager.py` | `_resume_stop_loss` | 2812-2826 | 15 | 0 | unreferenced |
+| 8 | `trade_manager.py` | `_submit_stop_loss_order` | 2828-2844 | 17 | 0 | unreferenced |
+| 9 | `store.py` | `pending_protection_verification` | 1414-1420 | 7 | 0 | unreferenced |
+| 10 | `store.py` | `clock_health_state` (fn only; constants `:35-37` stay) | 40-48 | 9 | 0 | unreferenced |
+| 11 | `engine.py` | `submit_stop_loss_market_sell` | 1902-1919 | 18 | 4 (comments) | production-unreachable; raises |
+| 12 | `notify.py` | delivery half (`flush`/`_report_ambiguous`/`_deliver`/`pending_count`) | 225-337 | 113 | 0 prod / 33 tests | production-unreachable — **removal sequenced behind F-08 (F-07)** |
+
+**Σ itemized: 275 lines** (rows 1–11 = 162; row 12 = 113). Rows 1–11 are immediately deletable after P0; row 12 follows the F-08 decision. LOC arithmetic: 3+47+12+13+9+12+15+17+7+9+18 = 162; +113 = 275.
+
+### 12.2 Tier 2 — live legacy-state handling (deletion = behavior change; NOT pure deletion)
+
+| # | Location | Item | Range | Lines | Live caller |
+|---|---|---|---|---|---|
+| 1 | `trade_manager.py` | `_enter_tp2` | 1115-1128 | 14 | `_advance_trade_after_reconcile` `:3717` (legacy `tp1_active` + TP1 done) |
+| 2 | `trade_manager.py` | `_do_tp_sale` | 1187-1191 | 5 | `_enter_tp1`/`_enter_tp2` |
+| 3 | `trade_manager.py` | `_disable_legacy_exit` | 1178-1185 | 8 | `_do_tp_sale` |
+
+**Σ: 27 lines** — these fail-closed into `needs_reconciliation` for legacy rows; removal or re-routing changes legacy-row reconciliation behavior (F-05 Tier 2 discussion).
+
+### 12.3 Tier 3 — inactive-under-config (live code paths, gated by runtime flag; not provably deletable)
+
+| # | Location | Item | Range (approx.) | Lines | Gate |
+|---|---|---|---|---|---|
+| 1 | `engine.py` | attached-protection region (`_protection_prices`, `_record_protection_intent`, `_verify_protection` + call sites) | 1298-1420 | ≈123 | `supports_attached_protection=False` (`mexc/hybrid.py:20`) |
+| 2 | `store.py` | `order_protection` store methods (writers) | 1335-1420 | ≈86 | same gate via engine callers |
+
+**Σ by range ≈ 209** — qualified, not a deletion claim; DEFER behind F-06's evidence list.
+
+### 12.4 Deferred-range register (other)
+
+| Location | Item | Range | Lines | Status |
+|---|---|---|---|---|
+| `monitor.py` | `MexcWebSocketFeed` | 267-499 | 233 | DEFER (F-10; N-03 documented decision) |
+| `trading/cleanup.py` | cancel-eligibility machinery | 29-140 | ≈112 | SIMPLIFY (F-11, CLI-shape only) |
+| `config.py` | `stop_loss_trigger_offset_ticks` (must be 0) | 573-586 | knob | SIMPLIFY (F-18) |
+| `db.py` | legacy tables (F-12) | migrations 2, 5-17 | schema | DEFER (retention/migration decision) |
+| `mexc/client.py` | `cancel_all_account_orders` | — | — | **KEEP** (documented destructive kill switch) |
+
+### 12.5 Merge-simplification LOC (refactors, net reduction smaller than gross)
+
+| ID | Item | Gross duplicated lines | Note |
+|---|---|---|---|
+| F-02 | `trade_store.py:411-440` duplicate conflict logic | ≈30 | delete duplicate |
+| F-03 | decimal/ISO helper copies | ≈40 | consolidate |
+| F-04 | second backoff codec `trade_manager.py:3621-3650` | ≈30 | one codec; persisted format unchanged |
+
+**Bottom line (Rev 2):** provably production-unreachable, itemized = **275 LOC** (162 immediately, 113 behind F-08). Live-legacy-state = **27 LOC** (not deletable without a behavior decision). Inactive-under-config = **≈209 LOC by range** (deferred). Deferred ranges (WS feed) = **233 LOC**. Rev 1's "500–600 LOC P1" and "900–1,100 LOC provably dead" are **withdrawn as un-auditable**.
 
 ---
 
-## 12. Dead & Legacy Code Register (verified)
+## 13. Change-Category Separation & Prioritized Plan (Rev 2)
 
-| Location | Item | Status |
-|---|---|---|
-| `trade_manager.py:1101-1130` | `_enter_tp1`, `_enter_tp2`, `_transition_state` | Disabled; bodies after `return` unreachable |
-| `trade_manager.py:1178-1236` | `_disable_legacy_exit`, `_do_tp_sale`, `_compute_available`, `_submit_tp_order` | Disabled / unreachable / raise-only |
-| `trade_manager.py` `_target_qty` | zero references | Dead |
-| `trade_manager.py:2799-2845` | `_enter_stop_loss`, `_resume_stop_loss`, `_submit_stop_loss_order` | §7 guards (keep the guarantee, shrink the surface) |
-| `engine.py:1298-1375` | `_protection_prices`, `_record_protection_intent`, `_verify_protection` | Dead in production (`supports_attached_protection=False`) |
-| `store.py` `pending_protection_verification` | zero references | Dead |
-| `store.py` `clock_health_state` | zero function references (constants used in `main.py` diag) | Semi-dead |
-| `notify.py:150-260` | `flush`, `_deliver`, claim/recovery of legacy outbox | Unreachable in production |
-| `config.py:573-586` | `stop_loss_trigger_offset_ticks` (must be 0) | Dead knob |
-| `trading/cleanup.py:29-140` | cancel-eligibility machinery | Disabled by policy |
-| `monitor.py:236-456` | `MexcWebSocketFeed` | Never validated against the exchange |
-| `db.py` migrations 5–17 | approval/learning/mgmt-era tables | Legacy schema, out of hot path |
-| `mexc/client.py:cancel_all_account_orders` | account-wide kill switch | Intentionally retained, documented destructive |
+**Five change categories.** Every action item below belongs to exactly one category; mixing categories in one change is prohibited.
 
----
-
-## 13. Prioritized Remediation Plan
+- **A. Pure deletion / zero behavior change** — reachable proof exists; runtime behavior identical; tests updated only where they called the dead code directly.
+- **B. Behavior-equivalence refactors** — code moves/merges; external behavior identical by construction (pure functions, preserved persisted formats); characterization tests pin equivalence.
+- **C. Compat/data migrations** — schema or persisted-state changes (F-12 archival, F-08 phase 2); require retention policy, rollback path, and owner approval; never "just delete."
+- **D. Production-evidence-required changes** — no change until a specific evidence list is satisfied at runtime (F-06, F-10; F-08 phase 2 soak); static analysis cannot settle them.
+- **E. Owner policy decisions** — behavior/product choices no engineering review can authorize (F-09, F-14, F-15). This audit recommends nothing in this category.
 
 **P0 — Prerequisite (no code changes): characterization-test freeze.**
-Before any P1/P2 deletion, pin the three incident paths with explicit tests (most infrastructure exists in the 72-file offline suite):
-1. market ≥ trigger while < entry ⇒ direct LIMIT at entry (§4.1 path, `trade_manager.py:566-587`);
+Before any A/B change, pin the three incident paths with explicit tests (most infrastructure exists in the 72-file offline suite):
+1. market ≥ trigger while < entry ⇒ direct LIMIT at entry (§4.1 path, `trade_manager.py:540-587`);
 2. transient metadata failure ⇒ terminal reject + owner notification, deterministic symbol error ⇒ identical outcome (§4.2);
 3. canceled-OCO-with-unattributed-child ⇒ trade parked, global block asserted with precise reason, discovery retried under bounded backoff, block clears when the child is attributed (§4.3).
-Also pin §10 invariants 3, 4, 8, 11 with direct assertions. Effort: ~1–2 days. Risk: none.
+Also pin §11 invariants 3, 4, 8, 11, 13 with direct assertions, **plus the OCO tranche model itself: two native OCOs per tranche, TP1/TP2 allocations of the tranche, atomic pair persistence, tranche independence** (invariant 2).
+*Acceptance criteria:* all pinned tests green on the audited code state; each incident path has a named test; §11 invariant assertions exist and fail if the invariant is broken in isolation. Effort ~1–2 days. Risk: none.
 
-**P1 — Low-risk deletions/merges (zero behavior change; ≈ 500–600 LOC).**
-1. F-02 deduplicate conflict logic; 2. F-03 decimal helpers; 3. F-04 backoff codec; 4. F-05 dead stubs + unreachable bodies (re-route the legacy-state branches in `_advance_trade_after_reconcile` to the existing needs_reconciliation parking — keep the §7 no-Market-Sell proof as a test); 5. F-13 log/comment fix; 6. delete `_target_qty`, `pending_protection_verification`, `clock_health_state`, and the dead config knob (F-18b). Each item is independently shippable with the P0 tests green.
+**P1 — Category A + B, zero runtime behavior change.**
+1. F-02 deduplicate conflict logic (A); 2. F-03 decimal helpers (B); 3. F-04 backoff codec, persisted format preserved (B); 4. F-05 Tier-1 rows 1–11 of §12.1 (A), with the Tier-2 rows **explicitly untouched** and Tier-3 presentation decided separately; 5. F-13 log/comment fix (A — log text only); 6. F-18's dead config knob (A) if done ahead of the CLI consolidation.
+*Prerequisites:* P0 green; per-item test updates committed together; §12.1 ranges re-verified at the working-tree HEAD before each deletion (line numbers drift).
+*Acceptance criteria:* full test suite green; grep proof at the new HEAD that each deleted symbol has zero references; diff contains no change outside the listed ranges and their tests; §11 invariants unaffected.
 
-**P2 — Staged structural simplifications (behavior-neutral at the user level, owner-informed).**
-1. F-08 phase 1: stop double-writing legacy outbox rows for domain-event-backed facts; keep `relay_legacy_once` for the drain window; 2. F-06: remove the attached-protection engine path behind the existing flag; keep the table; 3. F-07: remove `TradingNotifier` delivery half after phase 1 soak; 4. F-11: slim `cleanup.py`; 5. F-14 (optional, owner consent): one bounded metadata retry for transient errors only.
+**P2 — Evidence- and decision-gated structural work (categories C/D, owner-informed).**
+1. F-08 phase 1 (category D→B): eliminate the proven duplicate rejection messages by making each rejection flow single-ledger (extend the `emit_rejection_event=False` pattern or route rejections through one ledger), preserving the trade-layer CRITICAL router and owner-safety bypass verbatim. *Prerequisites:* the Ledger-A↔Ledger-B mapping table written and reviewed; owner approval of the message-text changes. *Acceptance criteria:* scripted replay of a rejection produces exactly one owner-visible message per business fact; CRITICAL routing unchanged (asserted by test); no historical row re-sent (cursors respected).
+2. F-06 / F-10 evidence collection (category D, read-only): run the evidence lists in F-06 and F-10 (DB row counts, runtime WS test, latency comparison). *Acceptance criteria:* evidence recorded in the decision registry; no code change in this step.
+3. F-11 `cleanup.py` slimming (category A/B, CLI output change — owner-informed).
+4. F-14 metadata retry (category E→B) **only if** the owner approves the rejection-statistics change.
+*Nothing in P2 removes the WebSocket feed, the attached-protection path, or any table.*
 
-**P3 — Owner-visible / deferred.**
-1. F-09 notification coalescing (requires owner approval; the safety bypass already protects critical events); 2. F-10 remove the WebSocket feed; 3. F-12 legacy-schema documentation now, archival migration later; 4. F-18 CLI consolidation; 5. F-15 global-block scope review (explicit owner policy decision; include an escalation notification when discovery exhausts the 7-day history window).
+**P3 — Owner-visible / deferred (categories C/E).**
+1. F-08 phase 2 ledger consolidation (category C) — only after phase-1 soak and the full compat case (backlog drain, outage recovery, operator requeue, delivery-history retention); completes or retires F-07 with it. 2. F-09 notification coalescing (E). 3. F-12 archival/drop migration per table group (C) after the §F-12 evidence inventory. 4. F-18 CLI consolidation (A/B, ergonomics). 5. F-15 (E) — owner policy review only; the audit offers no recommendation. 6. F-10 removal (D) — only if the F-10 evidence list concludes the feed is redundant; otherwise it stays deferred, documented in N-03.
 
-**Explicitly not recommended:** touching the OCO discovery subsystem, the sellable/invariant math, the uncertain-outcome policy, the evidence chain, or the gate/claim transaction pairing (F-01, F-16, F-17, F-19). Their complexity is load-bearing.
+**Explicitly not recommended for change:** the OCO discovery subsystem, the sellable/invariant math, the uncertain-outcome policy, the evidence chain, the gate/claim transaction pairing, the trade-layer notification router, and the activation/replay boundaries (F-01, F-16, F-17, F-19, F-20). Their complexity is load-bearing.
 
 ---
 
-## 14. Audit Method
+## 14. Unresolved Questions (owner/reviewer input required)
 
-1. **Static read of the full execution path** at HEAD `9ac46c0` on a clean tree: `docs/` (README, AGENTS, trading spec, architecture, data-model), `engine.py` (2,617 LOC, complete), `trade_manager.py` (4,044, complete), `store.py` (2,389, complete), `trade_store.py` (984, complete), `gate.py`, `risk.py`, `monitor.py`, `readiness.py`, `notify.py`, `domain_events.py`, `evidence.py`, `audit.py`, `balance.py`, `cleanup.py`, `parser.py`, `service.py`, `processing.py`, `notification_dispatcher.py`, `main.py`, `config.py`, `repository.py`, `db.py` (migrations 1–25), `mexc/client.py`, `mexc/hybrid.py`, `mexc/symbols.py`, `mexc/clock.py` (structure), `mexc/errors.py` (structure), `mexc/cli.py` (structure), `control/service.py` (structure), `locking.py`, `telemetry.py`, `runtime.py`, `deploy/*`.
-2. **Call-site verification** for every dead-code claim via repo-wide grep (definitions excluded), covering both `tg_signal_ingest` and `tests/`.
-3. **Incident replay against code:** each historical incident was traced to its current enforcement points; where history could not be reconstructed from the tree (the 26 h duration's original trigger), that limitation is stated rather than inferred.
-4. **Spec conformance check:** every finding was evaluated against the authoritative behavior spec; anything that would alter entry/exit correctness or fund protection was excluded from actionable recommendations and routed to owner decisions (F-09, F-15).
-5. **Constraints honored:** read-only audit; no orders placed/cancelled/tested; no `serve`/`auth login`/`trading verify`/`trading reconcile` executed; no secrets, DB contents, or code dumps in this report; exactly one new file committed (this report).
+1. **F-08:** is the legacy formatted outbox a permanent product surface (some messages — e.g. the Persian recovery text at `engine.py:763-773` and decision formats — exist only there), or a bridge to be drained? This determines whether phase 2 is consolidation or cutover, and whether F-07's delivery half is deleted or kept.
+2. **F-08:** which rejection flows' owner-visible text is authoritative — the formatted decision message or the rendered domain event? The proven duplicates (§F-08) cannot be resolved without this choice.
+3. **F-05 Tier 2:** which legacy `trade_state` values actually exist in the production DB (static analysis can only enumerate what *can* reach `_advance_trade_after_reconcile`)? And is the current fail-closed parking the desired permanent handling for those rows?
+4. **F-06:** does any backend roadmap rely on `supports_attached_protection = True`, and is `order_protection` empty in production?
+5. **F-10:** does `MexcWebSocketFeed` connect and receive frames against `wbs.mexc.com/raw` at all (the raw-JSON framing vs MEXC's documented protocol is an unverified claim), and is sub-2 s trigger latency a requirement?
+6. **F-12:** are the residue tables empty in production, and does any external reporting/backup tooling read them? What is the retention policy?
+7. **F-15:** does the owner want to reconfirm the global-block policy at all? (No change is proposed; the question is only whether a review is ever scheduled.)
+8. **F-09:** what message volume per trade is acceptable to the owners under "minimal notifications"?
+
+---
+
+## 15. Audit Method (Rev 2)
+
+1. **Static read of the full execution path** at the audited commit (`9ac46c0`): `docs/` (README, AGENTS, trading spec, architecture, data-model, DECISION_REGISTRY), `engine.py` (2,617 LOC, complete), `trade_manager.py` (4,044, complete), `store.py` (2,389, complete), `trade_store.py` (984, complete), `gate.py`, `risk.py`, `monitor.py`, `readiness.py`, `notify.py`, `domain_events.py`, `evidence.py`, `audit.py`, `balance.py`, `cleanup.py`, `parser.py`, `service.py`, `processing.py`, `notification_dispatcher.py` (1,488), `main.py`, `config.py`, `repository.py`, `db.py` (migrations 1–25), `mexc/client.py`, `mexc/hybrid.py`, `mexc/symbols.py`, `mexc/clock.py` (structure), `mexc/errors.py` (structure), `mexc/cli.py` (structure), `control/service.py` (structure), `control/store.py`, `locking.py`, `telemetry.py`, `runtime.py`, `deploy/*`.
+2. **Call-site verification** for every dead-code/ledger claim via repo-wide grep (definitions excluded), covering both `tg_signal_ingest` and `tests/`; reachability basis stated per item in §12.
+3. **Rev 2 re-verification pass:** every citation in the rewritten sections (F-05, F-06, F-07, F-08, F-10, F-12, F-15, §A.1, §12, dispatcher/notify/monitor ranges, OCO tranche model incl. `docs/trading.md:455-474/641-667/921`, `trade_manager.py` tranche machinery `:2174/:2218/:2228/:2325`, `trade_store.py:448+`) was re-read line-by-line at the audited code state. Citations in carried sections (F-01..F-04, F-09, F-11, F-13, F-14, F-16..F-18, §4-§5) were spot-checked where touched; stale dispatcher citations from Rev 1 (e.g. relay loops at `:947-971`/`:1086-1153`, suppression `:316-324`, owner bypass `:117-143`, query-only `:899-905`) were corrected to the verified locations (`:1197-1218`, `:1245-1316`, `:216-226`, `:138-165`, `:1166`), and the Rev 1 monitor ranges (`:236-456`, `:480-530`) were corrected to `:267-499` / `:583-634`.
+4. **Incident replay against code:** each historical incident was traced to its current enforcement points; where history could not be reconstructed from the tree (the 26 h duration's original trigger), that limitation is stated rather than inferred.
+5. **Spec conformance check:** every finding was evaluated against the authoritative behavior spec; anything that would alter entry/exit correctness or fund protection was excluded from actionable recommendations and routed to owner decisions (F-09, F-14, F-15).
+6. **Constraints honored:** read-only audit; no orders placed/cancelled/tested; no `serve`/`auth login`/`trading verify`/`trading reconcile` executed; no migrations run; no services restarted; no interaction with MEXC or live orders; no secrets, DB contents, or code dumps in this report. **This document is an audit only: it authorizes nothing, changes nothing, and its recommendations all require separate review, tests, and owner approval before any implementation.**
+
+---
+
+## Appendix A.1 — The authoritative OCO model (corrected terminology, Rev 2)
+
+Vocabulary, per `docs/trading.md` (L455-474, L641-667, L921) and the implementation:
+
+- **Position:** one trade's aggregate acquired base quantity.
+- **Fill tranche:** a durable grouping of entry fills (`allocation_policy = "per_entry_fill_tranche"`, `trade_manager.py:2325`; tranche id persisted in `trade_orders.oco_group_id`, `trade_manager.py:2218-2228`). A tranche is created when incremental acquired quantity is confirmed and its fill history is synchronized — including from the acknowledgement callback of an already-partial entry while the entry remainder is still working. Fills discovered together in one fresh reconciliation snapshot may be combined into one tranche (`docs/trading.md:470-472`).
+- **Native OCO order:** one MEXC OCO SELL order (`spot.trade.place-oco`) with **two linked legs**: a TP limit leg and an SL stop-limit leg (trigger and execution price both = configured SL). When one leg activates, the exchange cancels only its own linked sibling.
+- **Per tranche exactly two native OCO orders:** OCO 1 = `tp1_allocation_pct` (default 50%) **of the tranche** at TP1; OCO 2 = the tranche remainder at TP2 (`trade_manager.py:_create_oco_tranche`, `:2228+`; `_place_oco_exits`, `:2265+`; engine `submit_oco_sell`/`_submit_oco_sell_locked`, `engine.py:1816-1900`, which refuses inverted exits and sets SL legs to the configured SL). Both pending order rows are written atomically before either submission (`trade_store.py:create_trade_order_pair`, `:448+`).
+- **Consequences:** a position's native-OCO count is `2 × tranche count`, not a fixed two; OCOs of different tranches are never siblings; the bot never edits or cancels/replaces an active OCO; restarts reuse persisted tranches (never shrink or re-expand) and create no new tranche while a submission is unresolved/UNKNOWN (`docs/trading.md:641-667`); the aggregate `oco_groups` record remains one per trade.
+
+Every statement in this audit that mentions OCO counts uses this per-tranche model. Rev 1's "exactly 2 protective OCOs per position" (exec summary, §2.3, §10.2) was incorrect and is superseded by §11 invariant 2.
