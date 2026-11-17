@@ -155,10 +155,6 @@ class ControlBot:
     async def _send(self, chat_id: int, text: str, kb: dict[str, Any] | None = None) -> dict[str, Any]:
         return await asyncio.to_thread(self.bot.send_message, chat_id, text, reply_markup=kb)
 
-    async def _edit(self, chat_id: int, message_id: int, text: str, kb: dict[str, Any] | None = None) -> None:
-        with contextlib.suppress(BotApiError, Exception):
-            await asyncio.to_thread(self.bot.edit_message_text, chat_id, message_id, text, reply_markup=kb)
-
     async def _answer(self, callback_id: str, text: str | None = None) -> None:
         with contextlib.suppress(Exception):
             await asyncio.to_thread(self.bot.answer_callback_query, callback_id, text)

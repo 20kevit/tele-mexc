@@ -573,13 +573,6 @@ def _install_stop_handlers(stop: asyncio.Event) -> None:
                 loop.add_signal_handler(sig, stop.set)
 
 
-def _read_only_repo(cfg):
-    """Open an existing database without running migrations or creating files."""
-
-    db = Database(cfg.db_path, read_only=True)
-    return db, Repository(db, processing_max_attempts=cfg.processing_max_attempts)
-
-
 def cmd_control_status(_args) -> int:
     from .control.secretbox import SecretBox
     from .control.store import ControlStore
