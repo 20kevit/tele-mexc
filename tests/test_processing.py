@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
-from tg_signal_ingest.processing import InterfaceTestHandler, ProcessingEngine
+from tg_signal_ingest.processing import HandlerFn, ProcessingEngine
 from tg_signal_ingest.repository import QueueItem
+
+
+class InterfaceTestHandler:
+    """Minimal working consumer for the downstream processing interface test."""
+
+    def __init__(self) -> None:
+        self.handled: list[tuple[str, int, int, int]] = []
+
+    def handler(self) -> HandlerFn:
+        async def fn(item: QueueItem, record: dict[str, Any] | None) -> None:
+            self.handled.append(
+                (item.item_type, item.channel_id, item.message_id, item.targets_version)
+            )
+        return fn
 
 
 class TestEngine:
