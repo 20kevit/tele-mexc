@@ -1,10 +1,10 @@
 # Codebase Simplification Audit — Tele-MEXC (Revision 2)
 
-- **Date:** 2026-11-17 (Rev 2 — correction & evidence-validation pass, same day)
+- **Date:** 2026-11-17 (Rev 2 — correction & evidence-validation pass + final consistency pass, same day)
 - **Repo:** `20kevit/tele-mexc`, branch `arena/58c00512-tele-mexc`
-- **Audited code state:** `9ac46c0` (base of this branch). The only commit on top of it, `9f6526f`, adds this document; no code file differs between `9ac46c0` and the current working tree. All `file:line` citations below refer to that code state.
-- **Rev 2 scope:** corrects the OCO terminology and per-position invariant (§2, §3, §10, §A.1), rewrites F-05 / F-06 / F-07 / F-08 / F-10 / F-12 / F-15 on re-verified evidence, replaces the un-auditable LOC claims (≈900–1,100 / 500–600) with an itemized, range-level register, fixes stale dispatcher/monitor line citations, replaces the overlapping "20/8/8/10 = 26" classification totals with a single authoritative table that reconciles to the 20 unique findings, and separates all recommendations into five change categories with prerequisites and acceptance criteria (§13). Sections whose substance did not change are carried from Rev 1 with citations re-spot-checked where touched.
-- **Scope of the audit itself:** read-only. No code, config, DB, service, or deployment changes were made; no migrations were run; no exchange calls were performed; no services were restarted. This document authorizes nothing by itself — every action it describes requires its own review, tests, and owner approval.
+- **Provenance (authoritative revision history):** baseline/source commit `9ac46c0` — the code under audit, **unchanged by any audit revision**. Revision 1 = commit `9f6526f` (audit document only). Revision 2 = commit `c9632f4` (audit document only; **supersedes Revision 1**). The final Rev 2 consistency pass is a further documentation-only commit on this branch. Neither revision modifies any source, test, config, migration, or runtime file: the entire diff from `9ac46c0` to the current head is this Markdown document. All `file:line` citations below refer to the `9ac46c0` code state.
+- **Rev 2 scope (finalized by the consistency pass):** corrects the OCO terminology and the per-tranche protection invariant (§2, §3, §11, §A.1), rewrites F-05 / F-06 / F-07 / F-08 / F-09 / F-10 / F-12 / F-15 on re-verified evidence, replaces the un-auditable LOC claims (≈900–1,100 / 500–600) with an itemized, range-level register (§12), fixes stale dispatcher/monitor line citations, replaces the overlapping "20/8/8/10 = 26" classification totals with a single authoritative table that reconciles to the 20 unique findings (§7), and separates all recommendations into five change categories with prerequisites and acceptance criteria (§13). Sections whose substance did not change are carried from Rev 1 with citations re-spot-checked where touched.
+- **Scope of the audit itself:** read-only. No code, config, DB, service, or deployment changes were made; no migrations were run; no exchange calls were performed; no services were restarted. This document authorizes nothing — no implementation, no deletion, no merge, no production deployment. Every action it describes requires its own review, tests, and owner approval.
 
 ---
 
@@ -18,24 +18,25 @@ Key numbers (Rev 2, itemized in §12):
 
 | Metric | Value |
 |---|---|
-| Findings catalogued | 20 unique (F-01 … F-20), one primary class each — §4 |
+| Findings catalogued | 20 unique (F-01 … F-20), one primary class each — §7 |
 | KEEP (load-bearing complexity) | 5 findings (F-01, F-16, F-17, F-19, F-20) |
-| Pure-deletion / merge candidates (zero runtime behavior change) | 6 findings (F-02, F-03, F-04, F-05 Tier-1, F-13, F-18) — ≈ 275 itemized dead-code LOC + duplicated-helper merges |
+| Pure-deletion / merge candidates (zero runtime behavior change) | 6 findings (F-02, F-03, F-04, F-05 Tier-1 rows 1–11, F-13, F-18) — **162 LOC** pure-deletion candidates + duplicated-helper merges; a further **113 LOC** Tier-1 item follows the F-08 decision (§12.1) |
 | DEFER (evidence-gated, nothing removed/disabled) | 5 findings (F-06, F-07, F-08, F-10, F-12) |
 | Owner policy / consent decisions | 3 findings (F-09, F-14, F-15) |
-| Provably production-unreachable code, itemized by exact ranges | ≈ 275 LOC (§12.1) — **replaces Rev 1's "≈900–1,100"** |
-| Behavior-changing legacy-state/compat handling (not deletion) | ≈ 27 LOC + re-routing logic (§12.2) |
-| Config-conditional code (inactive under current config, not provably deletable) | ≈ 209 LOC by range, deletion deferred (§12.3) |
+| Provably production-unreachable code, itemized by exact ranges | **275 LOC total — of which only 162 LOC (rows 1–11) are pure-deletion candidates; the other 113 LOC (notify delivery half) is conditional on the F-08 decision** (§12.1) — **replaces Rev 1's "≈900–1,100"** |
+| Live legacy-state handlers (deletion = compatibility behavior change, not pure deletion) | 27 LOC (§12.2) |
+| Config-conditional code (inactive under current config, not proven dead) | ≈ 209 LOC by range, DEFER (§12.3) |
+| Deferred ranges (WebSocket implementation, F-10) | 233 LOC, DEFER under documented owner decision N-03 (§12.4) |
 
 **Top findings (Rev 2):**
 
 1. **Notification architecture is a layered dual-ledger design with proven, localized duplicate visibility — not a wholesale "everything is written twice" defect** (F-08, rewritten): trade-layer critical alerts go *only* to the immutable domain ledger, routine trade alerts *only* to the legacy outbox; but specific rejection flows produce both a domain-row message and a decision message for the same business moment, and some flows emit two domain rows for one fact. The consolidation is a staged, owner-approved migration with a full compat case — **DEFER**, not a P2 simplification.
-2. **≈275 LOC of provably production-unreachable code, itemized line-by-line** (F-05 Tier-1): zero- or test-only-referenced methods in `trade_manager.py`, `store.py`, `engine.py`, and the never-called delivery half of `TradingNotifier`. Deletable with zero runtime behavior change after characterization tests — but several adjacent disabled methods are *live legacy-state handlers* and must not be deleted (§12.2).
+2. **275 LOC of provably production-unreachable code, itemized line-by-line** (F-05 Tier-1): zero- or test-only-referenced methods in `trade_manager.py`, `store.py`, `engine.py`, and the never-called delivery half of `TradingNotifier`. **Only 162 LOC of this (rows 1–11) are pure-deletion candidates**, and only after the P0 characterization freeze and per-item verification; the remaining **113 LOC** (the notify delivery half) is **not immediately deletable** — its removal follows the F-08 ledger decision. Several adjacent disabled methods are *live legacy-state handlers* and must not be deleted (§12.2).
 3. **The three historical incidents are correctly encoded in current code** (§4): the entry edge case is *fixed*, the MYX metadata failure remains terminal *by design* (optional bounded retry = owner decision, F-14), and the APE-style global BUY freeze is now coverage-based and instrumented instead of time-based — its global scope is an owner policy question (F-15), on which Rev 2 makes **no recommendation**.
 4. **Duplicated per-symbol conflict logic and decimal/backoff helpers** across `store.py`/`trade_store.py`/`trade_manager.py` (F-02, F-03, F-04) — pure maintenance risk, trivial merges.
 5. **The hand-rolled WebSocket feed is a documented deferred decision (N-03 in `docs/DECISION_REGISTRY.md`), not dead weight to delete** (F-10, rewritten): it has never been exercised against the real exchange, so its removal is **DEFER** until production evidence proves it redundant; Rev 2 lists the exact evidence required.
 
-**Guardrails:** §11 lists the fund-protection invariants that must not be weakened by any simplification. Nothing in the P0–P3 plan touches them; P0 is a test-freeze step, not a code change.
+**Guardrails:** §11 lists the **13** fund-protection invariants that must not be weakened by any simplification. Nothing in the P0–P3 plan touches them; P0 is a test-freeze step, not a code change.
 
 ---
 
@@ -162,7 +163,7 @@ The control bot's pause means "stop trading entirely" (single product, two owner
 
 ## 6. Detailed Findings
 
-Each finding: evidence, one primary classification with secondary tags where applicable (§4), risk of acting, risk of not acting. Confidence: high unless stated. **Rev 2 re-verified every citation in F-05, F-06, F-07, F-08, F-10, F-12, F-15 and the dispatcher/monitor/notify/OCO citations; other sections carry Rev 1 citations over the same code state.**
+Each finding: evidence, one primary classification with secondary tags where applicable (§7), risk of acting, risk of not acting. Confidence: high unless stated. **Rev 2 re-verified every citation in F-05, F-06, F-07, F-08, F-10, F-12, F-15 and the dispatcher/monitor/notify/OCO citations; other sections carry Rev 1 citations over the same code state.**
 
 ### F-01 — Native-OCO stop-child discovery subsystem is forced complexity — **KEEP**
 - **Evidence:** `trade_manager.py:1272-2260` (≈ 1,000 LOC): `_oco_leg_targets`, `_sync_oco_legs`, `_oco_stop_children_settled`, `_discover_oco_stop_children`, `_select_oco_stop_child`, `_query_and_persist_oco_stop_child`. Root cause documented in-code (`trade_manager.py:112-127`): MEXC returns OCO children as separate `allOrders` rows with `orderListId = -1`, null client ids, and no exposed trigger; `mexc/client.py:all_orders` docstring repeats the constraint. Exact-match-only matching with a hard fail-closed path (`trade_manager.py:1705-1758`), bounded backoff (`trade_manager.py:1631-1665`), and a 7-day history window guard (`trade_manager.py:1763-1770`).
@@ -205,7 +206,7 @@ Rev 2 splits this finding into three tiers with different reachability bases. Th
 | `engine.submit_stop_loss_market_sell` | `engine.py:1902-1919` | 4 (comments only) | unreferenced; raises `RuntimeError` |
 | `TradingNotifier` delivery half (`flush`/`_report_ambiguous`/`_deliver`/`pending_count`) | `notify.py:225-337` | production callers **0** (tests only, 28 call sites) | unreferenced in production — but deletion is sequenced behind the F-08 ledger decision, so its *removal class* is DEFER (F-07) |
 
-Tier-1 deletions are behavior-neutral at runtime **because nothing can reach them**; the required work is test-side (update/remove the tests that exercise them directly) plus the P0 characterization freeze.
+Rows 1–11 are behavior-neutral at runtime **because nothing can reach them**; the required work is test-side (update/remove the tests that exercise them directly) plus the P0 characterization freeze — they are pure-deletion **candidates**, subject to per-item verification. Row 12 is equally unreachable but is **not a P1 deletion candidate**: its removal is sequenced behind the F-08 ledger decision (see F-07).
 
 **Tier 2 — live legacy-state handling; deletion = behavior change, not deletion** (§12.2):
 
@@ -266,10 +267,12 @@ Rev 1 claimed "every notification is persisted twice and relayed twice." **That 
 - **Action (staged, owner-approved; nothing executed by this audit):** Phase 0 — map every Ledger-A `event_key` to either a Ledger-B `event_type` or an explicit "Ledger-A-only" marker (the taxonomy exists in `domain_events.py:EVENT_REGISTRY`; the mapping table itself must be written and reviewed). Phase 1 — make rejection flows single-ledger (extend the `emit_rejection_event=False` pattern or route rejections exclusively through one ledger), eliminating the proven duplicates without touching the trade-layer router. Phase 2 — only after a defined soak window and a documented outage-recovery/compat case (backlog drain, `relayed_legacy_notifications`/cursor semantics, operator requeue expectations, retention of delivery history): decide whether the legacy relay and outbox write path retire (which would complete F-07) or remain as the formatted-message ledger. **No path is deleted by this audit, and no phase is authorized without the full migration + compatibility case (backlog behavior, outage recovery, recipient-specific severity/audience behavior, retry/requeue semantics).**
 - **Risk:** medium (notification behavior change; the trade-layer CRITICAL routing and owner-safety bypass must be preserved verbatim — `notification failures must not block trading` is unaffected since both ledgers are already decoupled from trading). **Risk of not acting:** permanent inconsistent rejection messaging (2–3 messages for one fact in some flows), two vocabularies (`_legacy_severity` `:1219-1244`) and two relay cursors maintained forever.
 
-### F-09 — Notification volume vs "minimal notifications" spec — **OWNER DECISION (P3)** *(citations corrected in Rev 2)*
-- **Evidence (from the producer enumeration above):** one full trade emits ≈ 15–30 Telegram messages across recipients: `signal.received`, `intent.created`, every `intent.state_changed`, every `trade.state_changed`, per-leg `trade_order.state_changed`, `oco_group.state_changed`, per-leg `oco_leg.state_changed`, **per fill** `fill.recorded`, **per exchange write** `exchange.write_outcome`, and `reconciliation.outcome` on every change. Exactly one content-suppression rule exists (routine `active↔submitting` group flip, `delivery_decision`, `notification_dispatcher.py:216-226`); threading (`event_thread_key`, `:543-580`) groups replies but does not reduce count.
-- **Action:** none by default. An owner-approved coalescing design (e.g. fold `fill.recorded` into intent summaries; suppress INFO group/leg state flips that carry no safety payload) must preserve the owner-safety bypass (`:138-165`) which guarantees CRITICAL/uncertain events always arrive.
-- **Risk:** owner-visible behavior change → requires explicit consent. **Risk of not acting:** alert fatigue; genuinely critical messages lose signal value in noise (this is the product's stated reason for the spec's "minimal notifications").
+### F-09 — Notification volume reduction: decided by the owner; design questions remain — **OWNER-DECISION (design only)** *(aligned with the recorded owner decision in the Rev 2 final pass)*
+- **Owner decision (recorded in the owner's Notion decision document for the Tele-MEXC notification redesign, last edited 2026-11-17):** notification volume must be significantly reduced; messages must be concise, meaningful, and action-oriented; repetitive status transitions, polling updates, unnecessary technical details, and internal retry noise must not generate needless user-facing messages. Internal event and delivery history may remain complete (filtering affects delivery, not recording). CRITICAL and genuine safety-unknown alerts remain protected. Per-recipient severity settings and the existing maximum of 10 automatic delivery attempts (`MAX_ATTEMPTS`, `notification_dispatcher.py:30`) remain valid unless superseded by a newer explicit decision. **Whether volume should be reduced is therefore settled and is no longer an open question in this audit.**
+- **Evidence (scale, from the producer enumeration above):** one full trade emits ≈ 15–30 Telegram messages across recipients: `signal.received`, `intent.created`, every `intent.state_changed`, every `trade.state_changed`, per-leg `trade_order.state_changed`, `oco_group.state_changed`, per-leg `oco_leg.state_changed`, **per fill** `fill.recorded`, **per exchange write** `exchange.write_outcome`, and `reconciliation.outcome` on every change. Exactly one content-suppression rule exists (routine `active↔submitting` group flip, `delivery_decision`, `notification_dispatcher.py:216-226`); threading (`event_thread_key`, `:543-580`) groups replies but does not reduce count.
+- **Remaining open items (design only; owner-approved before any implementation):** (1) which lifecycle events are combined into per-trade summaries (candidates: per-fill `fill.recorded`, INFO `oco_group`/`oco_leg`/`trade_order` state flips, repeated `reconciliation.outcome` rows); (2) which messages require independent delivery rather than summary folding (e.g. decision messages, first-of-class protection alerts); (3) the exact coalescing and suppression rules that preserve the owner-safety bypass (`notification_dispatcher.py:138-165`), CRITICAL/safety-unknown delivery, and per-recipient severity settings verbatim.
+- **This audit implements nothing and proposes no numerical message target**; the coalescing/suppression design is the owner's to approve.
+- **Risk:** notification behavior change → requires the owner-approved design plus tests. **Risk of not implementing:** the decided volume reduction does not materialize (alert fatigue persists; genuinely critical messages lose signal value in noise).
 
 ### F-10 — Unexercised hand-rolled WebSocket feed — **DEFER until production evidence proves redundancy** *(rewritten in Rev 2)*
 - **Evidence:** `MexcWebSocketFeed` (`monitor.py:267-499`) implements a from-scratch WebSocket client (handshake `:359`, frame parser `:384-392`, subscribe `:479-499` — raw JSON `{"method": "SUBSCRIPTION", …}` frames to `wss://wbs.mexc.com/raw`, `:41`) for which its own docstring says behavior against the real exchange "has not been exercised in this tree." Repo-wide grep: **zero references** to `MexcWebSocketFeed` outside `monitor.py` (production, tests, docs). `_PrimaryWithFallback` (`:583-634`) is referenced only by `tests/test_trading_monitor.py:25,169` and starts the polling fallback immediately, so a working WS would add duplicate ticks, never latency wins. The 2 s polling requirement is spec-compliant (`config.py monitor_poll_interval_s`).
@@ -351,7 +354,7 @@ Corrected inventory at the audited commit (all "unreferenced" claims = repo-wide
 | F-06 | Attached-protection path | **DEFER** | production-evidence-required |
 | F-07 | `TradingNotifier` delivery half | **DEFER** | sequenced behind F-08 |
 | F-08 | Dual notification ledgers | **DEFER** | staged consolidation; compat-data migration in phase 2; behavior change in phase 1 |
-| F-09 | Notification volume | **OWNER-DECISION** | — |
+| F-09 | Notification volume reduction (decided); coalescing design open | **OWNER-DECISION** | design questions only (2026-11-17 owner decision) |
 | F-10 | WebSocket feed | **DEFER** | production-evidence-required; documented owner deferral (N-03) |
 | F-11 | `cleanup.py` inspection-only machinery | **SIMPLIFY** | — |
 | F-12 | Approval/learning-era schema residue | **DEFER** | compat-data migration |
@@ -401,12 +404,12 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 
 | ID | Item | LOC basis | Prerequisite |
 |---|---|---|---|
-| F-05 | Tier-1 deletions, itemized | ≈ 275 (exact ranges, §12.1) | P0 characterization tests; test updates for the 4 test-referenced items |
+| F-05 | Tier-1 deletions, itemized | 162 pure-deletion candidates + 113 F-08-conditional (exact ranges, §12.1) | P0 characterization tests; test updates for the test-referenced items; the 113 LOC row follows the F-08 decision |
 | F-05 | Tier-2 legacy-state handling | ≈ 27 + re-routing logic | Legacy-state inventory from production DB; written handling decision; parking-behavior characterization tests — **DEFER** |
 | F-06 | Attached-protection path | ≈ 209 by range (config-conditional) | Runtime evidence (§12.3 list) — **DEFER** |
 | F-07 | `TradingNotifier` delivery half | ≈ 111 (`notify.py:225-337`) | F-08 phase-2 decision — **DEFER** |
 | F-08 | Ledger consolidation | n/a (migration design) | Owner approval; full mapping + compat case — **DEFER** |
-| F-09 | Notification coalescing | n/a | Owner consent — **OWNER-DECISION** |
+| F-09 | Notification volume reduction (coalescing design) | n/a | Volume reduction decided by owner (2026-11-17); coalescing/suppression design owner-approved before implementation — **OWNER-DECISION** |
 | F-10 | `MexcWebSocketFeed` | ≈ 233 (`monitor.py:267-499`) | Runtime evidence list (F-10) + updated N-03 — **DEFER** |
 | F-12 | Legacy schema archival/drop | n/a (schema) | Row counts, retention policy, external-consumer check — **DEFER** |
 | F-14 | Metadata bounded retry | small | Owner consent — **OWNER-DECISION** |
@@ -416,7 +419,7 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 
 ---
 
-## 11. Fund-Protection Invariants (must not be weakened by any simplification)
+## 11. Fund-Protection Invariants — 13 rules (must not be weakened by any simplification)
 
 1. Every BUY is preceded by a verified, ordered exit ladder and a working OCO path (`trade_manager.py:595-628`).
 2. **Each fill tranche is protected by exactly two native OCO SELL orders (OCO 1 at TP1, OCO 2 at TP2), each OCO being one exchange order with a TP limit leg and an SL stop-limit leg; both pending order rows are persisted atomically before either exchange write; tranches are independent and their OCOs are never siblings** (`docs/trading.md:455-474`; `trade_store.py:create_trade_order_pair`, `trade_store.py:448+`; `trade_manager.py:_create_oco_tranche`, `trade_manager.py:2228+`, allocation policy `per_entry_fill_tranche` `:2325`). The position-level OCO count is therefore `2 × tranche count`, not a fixed two.
@@ -438,7 +441,7 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 
 **Method (rev 2):** for every item, the exact line range at the audited commit, the reachability basis (unreachable = no production call site; unreferenced = zero non-definition references; inactive-under-config = live code path gated by a runtime flag that is currently false), and how references were checked (repo-wide grep over `tg_signal_ingest/` + `tests/`, definitions excluded). **Rev 1's aggregate "≈900–1,100 LOC provably dead" is withdrawn** — it mixed reachability classes and was not auditable. No LOC figure in this revision exceeds the sum of its itemized ranges, and no range is counted twice.
 
-### 12.1 Tier 1 — provably production-unreachable (pure deletion; zero runtime behavior change)
+### 12.1 Tier 1 — provably production-unreachable: 162 LOC pure-deletion candidates + 113 LOC conditional on F-08 (275 itemized total)
 
 | # | Location | Item | Range | Lines | Refs (non-def) | Basis |
 |---|---|---|---|---|---|---|
@@ -455,7 +458,11 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 | 11 | `engine.py` | `submit_stop_loss_market_sell` | 1902-1919 | 18 | 4 (comments) | production-unreachable; raises |
 | 12 | `notify.py` | delivery half (`flush`/`_report_ambiguous`/`_deliver`/`pending_count`) | 225-337 | 113 | 0 prod / 33 tests | production-unreachable — **removal sequenced behind F-08 (F-07)** |
 
-**Σ itemized: 275 lines** (rows 1–11 = 162; row 12 = 113). Rows 1–11 are immediately deletable after P0; row 12 follows the F-08 decision. LOC arithmetic: 3+47+12+13+9+12+15+17+7+9+18 = 162; +113 = 275.
+**Σ itemized: 275 lines, in two groups with different deletion status — the total is NOT an immediately approved deletion amount:**
+- **162 LOC — rows 1–11: pure-deletion candidates.** Deletable with zero runtime behavior change only after the P0 characterization freeze, per-item re-verification of the ranges at the working-tree HEAD, and the listed test updates. A candidate list, not an approval.
+- **113 LOC — row 12 (`notify.py` delivery half): production-unreachable but NOT immediately deletable.** Its removal is conditional on the F-08 ledger decision (F-07) and is sequenced into P2/P3, not P1.
+
+LOC arithmetic: 3+47+12+13+9+12+15+17+7+9+18 = 162; 162 + 113 = 275.
 
 ### 12.2 Tier 2 — live legacy-state handling (deletion = behavior change; NOT pure deletion)
 
@@ -465,9 +472,9 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 | 2 | `trade_manager.py` | `_do_tp_sale` | 1187-1191 | 5 | `_enter_tp1`/`_enter_tp2` |
 | 3 | `trade_manager.py` | `_disable_legacy_exit` | 1178-1185 | 8 | `_do_tp_sale` |
 
-**Σ: 27 lines** — these fail-closed into `needs_reconciliation` for legacy rows; removal or re-routing changes legacy-row reconciliation behavior (F-05 Tier 2 discussion).
+**Σ: 27 lines** — these fail-closed into `needs_reconciliation` for legacy rows; **deletion changes compatibility behavior** for legacy DB rows during reconciliation, so this is not pure deletion (F-05 Tier 2 discussion).
 
-### 12.3 Tier 3 — inactive-under-config (live code paths, gated by runtime flag; not provably deletable)
+### 12.3 Tier 3 — inactive-under-config (live code paths gated by a runtime flag; not proven dead, not provably deletable)
 
 | # | Location | Item | Range (approx.) | Lines | Gate |
 |---|---|---|---|---|---|
@@ -494,7 +501,7 @@ Merge/split notes vs Rev 1: F-05 is split into Tier 1 (REMOVE) / Tier 2 (DEFER) 
 | F-03 | decimal/ISO helper copies | ≈40 | consolidate |
 | F-04 | second backoff codec `trade_manager.py:3621-3650` | ≈30 | one codec; persisted format unchanged |
 
-**Bottom line (Rev 2):** provably production-unreachable, itemized = **275 LOC** (162 immediately, 113 behind F-08). Live-legacy-state = **27 LOC** (not deletable without a behavior decision). Inactive-under-config = **≈209 LOC by range** (deferred). Deferred ranges (WS feed) = **233 LOC**. Rev 1's "500–600 LOC P1" and "900–1,100 LOC provably dead" are **withdrawn as un-auditable**.
+**Bottom line (Rev 2 final):** provably production-unreachable, itemized = **275 LOC total — 162 pure-deletion candidates (after P0 + individual verification) + 113 conditional on the F-08 decision (not immediately deletable)**. Live legacy-state handlers = **27 LOC** (deletion changes compatibility behavior). Inactive-under-config = **≈209 LOC by range** (not proven dead; deferred). Deferred WebSocket implementation = **233 LOC** (F-10). Rev 1's "500–600 LOC P1" and "900–1,100 LOC provably dead" are **withdrawn as un-auditable**.
 
 ---
 
@@ -517,7 +524,7 @@ Also pin §11 invariants 3, 4, 8, 11, 13 with direct assertions, **plus the OCO 
 *Acceptance criteria:* all pinned tests green on the audited code state; each incident path has a named test; §11 invariant assertions exist and fail if the invariant is broken in isolation. Effort ~1–2 days. Risk: none.
 
 **P1 — Category A + B, zero runtime behavior change.**
-1. F-02 deduplicate conflict logic (A); 2. F-03 decimal helpers (B); 3. F-04 backoff codec, persisted format preserved (B); 4. F-05 Tier-1 rows 1–11 of §12.1 (A), with the Tier-2 rows **explicitly untouched** and Tier-3 presentation decided separately; 5. F-13 log/comment fix (A — log text only); 6. F-18's dead config knob (A) if done ahead of the CLI consolidation.
+1. F-02 deduplicate conflict logic (A); 2. F-03 decimal helpers (B); 3. F-04 backoff codec, persisted format preserved (B); 4. F-05 Tier-1 rows 1–11 of §12.1 — the 162 LOC candidate set (A), with row 12 (113 LOC) and the Tier-2 rows **explicitly untouched** and Tier-3 presentation decided separately; 5. F-13 log/comment fix (A — log text only); 6. F-18's dead config knob (A) if done ahead of the CLI consolidation.
 *Prerequisites:* P0 green; per-item test updates committed together; §12.1 ranges re-verified at the working-tree HEAD before each deletion (line numbers drift).
 *Acceptance criteria:* full test suite green; grep proof at the new HEAD that each deleted symbol has zero references; diff contains no change outside the listed ranges and their tests; §11 invariants unaffected.
 
@@ -529,7 +536,7 @@ Also pin §11 invariants 3, 4, 8, 11, 13 with direct assertions, **plus the OCO 
 *Nothing in P2 removes the WebSocket feed, the attached-protection path, or any table.*
 
 **P3 — Owner-visible / deferred (categories C/E).**
-1. F-08 phase 2 ledger consolidation (category C) — only after phase-1 soak and the full compat case (backlog drain, outage recovery, operator requeue, delivery-history retention); completes or retires F-07 with it. 2. F-09 notification coalescing (E). 3. F-12 archival/drop migration per table group (C) after the §F-12 evidence inventory. 4. F-18 CLI consolidation (A/B, ergonomics). 5. F-15 (E) — owner policy review only; the audit offers no recommendation. 6. F-10 removal (D) — only if the F-10 evidence list concludes the feed is redundant; otherwise it stays deferred, documented in N-03.
+1. F-08 phase 2 ledger consolidation (category C) — only after phase-1 soak and the full compat case (backlog drain, outage recovery, operator requeue, delivery-history retention); completes or retires F-07 with it. 2. F-09 notification volume reduction (E): implement only the owner-approved coalescing/suppression design per the 2026-11-17 decision — which lifecycle events fold into summaries, which messages stay independent, exact rules preserving the owner-safety bypass, CRITICAL delivery, and per-recipient severity; no numerical target is set by this audit. 3. F-12 archival/drop migration per table group (C) after the §F-12 evidence inventory. 4. F-18 CLI consolidation (A/B, ergonomics). 5. F-15 (E) — owner policy review only; the audit offers no recommendation. 6. F-10 removal (D) — only if the F-10 evidence list concludes the feed is redundant; otherwise it stays deferred, documented in N-03.
 
 **Explicitly not recommended for change:** the OCO discovery subsystem, the sellable/invariant math, the uncertain-outcome policy, the evidence chain, the gate/claim transaction pairing, the trade-layer notification router, and the activation/replay boundaries (F-01, F-16, F-17, F-19, F-20). Their complexity is load-bearing.
 
@@ -544,7 +551,7 @@ Also pin §11 invariants 3, 4, 8, 11, 13 with direct assertions, **plus the OCO 
 5. **F-10:** does `MexcWebSocketFeed` connect and receive frames against `wbs.mexc.com/raw` at all (the raw-JSON framing vs MEXC's documented protocol is an unverified claim), and is sub-2 s trigger latency a requirement?
 6. **F-12:** are the residue tables empty in production, and does any external reporting/backup tooling read them? What is the retention policy?
 7. **F-15:** does the owner want to reconfirm the global-block policy at all? (No change is proposed; the question is only whether a review is ever scheduled.)
-8. **F-09:** what message volume per trade is acceptable to the owners under "minimal notifications"?
+8. **F-09 (design, post-decision):** which lifecycle events fold into summaries, which messages require independent delivery, and what exact coalescing/suppression rules apply — under the owner's 2026-11-17 volume-reduction decision (whether to reduce volume is no longer open).
 
 ---
 
@@ -555,7 +562,7 @@ Also pin §11 invariants 3, 4, 8, 11, 13 with direct assertions, **plus the OCO 
 3. **Rev 2 re-verification pass:** every citation in the rewritten sections (F-05, F-06, F-07, F-08, F-10, F-12, F-15, §A.1, §12, dispatcher/notify/monitor ranges, OCO tranche model incl. `docs/trading.md:455-474/641-667/921`, `trade_manager.py` tranche machinery `:2174/:2218/:2228/:2325`, `trade_store.py:448+`) was re-read line-by-line at the audited code state. Citations in carried sections (F-01..F-04, F-09, F-11, F-13, F-14, F-16..F-18, §4-§5) were spot-checked where touched; stale dispatcher citations from Rev 1 (e.g. relay loops at `:947-971`/`:1086-1153`, suppression `:316-324`, owner bypass `:117-143`, query-only `:899-905`) were corrected to the verified locations (`:1197-1218`, `:1245-1316`, `:216-226`, `:138-165`, `:1166`), and the Rev 1 monitor ranges (`:236-456`, `:480-530`) were corrected to `:267-499` / `:583-634`.
 4. **Incident replay against code:** each historical incident was traced to its current enforcement points; where history could not be reconstructed from the tree (the 26 h duration's original trigger), that limitation is stated rather than inferred.
 5. **Spec conformance check:** every finding was evaluated against the authoritative behavior spec; anything that would alter entry/exit correctness or fund protection was excluded from actionable recommendations and routed to owner decisions (F-09, F-14, F-15).
-6. **Constraints honored:** read-only audit; no orders placed/cancelled/tested; no `serve`/`auth login`/`trading verify`/`trading reconcile` executed; no migrations run; no services restarted; no interaction with MEXC or live orders; no secrets, DB contents, or code dumps in this report. **This document is an audit only: it authorizes nothing, changes nothing, and its recommendations all require separate review, tests, and owner approval before any implementation.**
+6. **Constraints honored:** read-only audit; no orders placed/cancelled/tested; no `serve`/`auth login`/`trading verify`/`trading reconcile` executed; no migrations run; no services restarted; no interaction with MEXC or live orders; no secrets, DB contents, or code dumps in this report. **This document is an audit only: it authorizes nothing — no implementation, no deletion, no merge, no production deployment. Its recommendations all require separate review, tests, and owner approval before anything is acted upon; passing tests alone authorize nothing.**
 
 ---
 
@@ -569,4 +576,4 @@ Vocabulary, per `docs/trading.md` (L455-474, L641-667, L921) and the implementat
 - **Per tranche exactly two native OCO orders:** OCO 1 = `tp1_allocation_pct` (default 50%) **of the tranche** at TP1; OCO 2 = the tranche remainder at TP2 (`trade_manager.py:_create_oco_tranche`, `:2228+`; `_place_oco_exits`, `:2265+`; engine `submit_oco_sell`/`_submit_oco_sell_locked`, `engine.py:1816-1900`, which refuses inverted exits and sets SL legs to the configured SL). Both pending order rows are written atomically before either submission (`trade_store.py:create_trade_order_pair`, `:448+`).
 - **Consequences:** a position's native-OCO count is `2 × tranche count`, not a fixed two; OCOs of different tranches are never siblings; the bot never edits or cancels/replaces an active OCO; restarts reuse persisted tranches (never shrink or re-expand) and create no new tranche while a submission is unresolved/UNKNOWN (`docs/trading.md:641-667`); the aggregate `oco_groups` record remains one per trade.
 
-Every statement in this audit that mentions OCO counts uses this per-tranche model. Rev 1's "exactly 2 protective OCOs per position" (exec summary, §2.3, §10.2) was incorrect and is superseded by §11 invariant 2.
+Every statement in this audit that mentions OCO counts uses this per-tranche model. Rev 1's "exactly 2 protective OCOs per position" (Rev 1 exec summary, Rev 1 §2.3, Rev 1 §10.2 — Rev 1's own section numbering) was incorrect and is superseded by §11 invariant 2.
