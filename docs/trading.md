@@ -413,27 +413,13 @@ Historical trade states (`needs_reconciliation`, `oco_submitting`,
 global submission gate. They still prevent blind retries of the same uncertain
 order.
 
-## One-time initial open-order cleanup
+## Open-order inspection
 
-The production initialization has one explicitly authorized cleanup operation:
-open orders whose reliably calculated remaining value is strictly below 5 USD
-may be canceled once. The operation:
-
-- snapshots actual open orders first;
-- values remaining quantity × limit price for USDT/USD-quoted symbols;
-- leaves orders at/above 5 USD, filled orders, and orders without reliable
-  valuation untouched;
-- groups a symbol's open orders (including OCO legs) and cancels the symbol only
-  when every open order on it qualifies;
-- verifies the resulting exchange state;
-- never sells balances or closes positions;
-- records completion in `app_state['trading.initial_open_order_cleanup']` so a
-  normal restart does not repeat it;
-- records an in-flight symbol and never blindly repeats an uncertain
-  cancellation.
-
-`tg-ingest trading cleanup-open-orders` is a dry-run by default; `--apply`
-performs the one-time cancellation.
+`tg-ingest trading cleanup-open-orders` inspects and values open orders and
+records an audit event. Small notional does not authorize cancellation; manual
+orders and protective OCO legs are never canceled or modified by this command.
+The legacy `--apply` option is retained for compatibility but cannot enable
+cancellation. An existing historical completion marker causes an early return.
 
 ## Execution
 
@@ -805,7 +791,7 @@ recipient policy (`trading.buy_block` remains the audit marker).
 
 ### Remaining limitations
 
-- `stop_loss_max_retries` caps definitive stop-loss/TP rejection retries;
+- `stop_loss_max_retries` is a compatibility setting, not the OCO retry budget;
   recovery cadence comes from market ticks and the reconciliation worker.
 - The standalone CLI adapter resolves a `clientOrderId` against the first page
   (up to 100 rows) of `current-orders`, then `history-orders`. The live hybrid

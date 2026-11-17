@@ -1,10 +1,7 @@
-"""One-time initial MEXC open-order cleanup.
+"""Inspect MEXC open orders without cancelling or modifying them.
 
-Authorized scope: cancel only OPEN orders whose reliably calculated remaining
-notional is strictly below 5 USD.  This module never sells balances, never
-closes positions, never touches orders at/above the threshold, and never retries
-an uncertain cancellation.  Completion is persisted so a normal restart does
-not repeat the cleanup.
+The legacy cleanup command and ``apply`` argument are retained for compatibility;
+small notional alone never authorizes cancellation. Inspection is audited.
 """
 
 from __future__ import annotations
@@ -246,86 +243,4 @@ def run_initial_open_order_cleanup(
     )
     if apply:
         report.detail += " (apply requested but ignored)"
-    return report
-
-    inflight_raw = store.get_app_state(INFLIGHT_KEY)
-    inflight_symbol: str | None = None
-    if inflight_raw:
-        try:
-            inflight = json.loads(inflight_raw)
-            inflight_symbol = str(inflight.get("symbol") or "") or None
-        except (TypeError, ValueError):
-            inflight_symbol = None
-
-    for symbol in sorted(grouped):
-        group = grouped[symbol]
-        if inflight_symbol == symbol:
-            try:
-                still_open = client.open_orders(symbol=symbol)
-            except Exception as exc:  # noqa: BLE001
-                report.uncertain_symbols.append(symbol)
-                report.detail = f"{symbol}: inflight cancellation cannot be verified ({exc.__class__.__name__})"
-                continue
-            if still_open:
-                report.uncertain_symbols.append(symbol)
-                report.detail = f"{symbol}: previous cancellation is uncertain and will not be repeated"
-            else:
-                report.canceled_symbols.append(symbol)
-                store.set_app_state(INFLIGHT_KEY, "")
-            continue
-        if not all(c.eligible for c in group):
-            report.left_untouched.append(symbol)
-            continue
-        store.set_app_state(
-            INFLIGHT_KEY,
-            json.dumps({"symbol": symbol, "order_ids": [c.order_id for c in group]}, sort_keys=True),
-        )
-        try:
-            client.cancel_all_orders(symbol=symbol)
-        except Exception as exc:  # noqa: BLE001 - uncertain cancellation, never retry blindly
-            report.uncertain_symbols.append(symbol)
-            report.detail = f"{symbol}: cancel outcome uncertain ({exc.__class__.__name__})"
-            continue
-        try:
-            remaining = client.open_orders(symbol=symbol)
-        except Exception as exc:  # noqa: BLE001
-            report.uncertain_symbols.append(symbol)
-            report.detail = f"{symbol}: cancellation verification failed ({exc.__class__.__name__})"
-            continue
-        if remaining:
-            report.uncertain_symbols.append(symbol)
-            report.detail = f"{symbol}: open orders remain after cancellation"
-            continue
-        report.canceled_symbols.append(symbol)
-        store.set_app_state(INFLIGHT_KEY, "")
-
-    if not report.uncertain_symbols:
-        payload = _summary(
-            report.candidates,
-            report.canceled_symbols,
-            report.uncertain_symbols,
-            report.left_untouched,
-            threshold_usd,
-        )
-        store.set_app_state(CLEANUP_KEY, payload)
-        store.audit(
-            "initial-open-order-cleanup",
-            "lifecycle",
-            "open_order_cleanup_completed",
-            payload[:2000],
-            event_type="cleanup.initial_open_orders",
-            outcome="completed",
-            payload={"canceled_symbols": report.canceled_symbols, "left_untouched": report.left_untouched},
-        )
-        report.detail = "cleanup completed and recorded"
-    else:
-        store.audit(
-            "initial-open-order-cleanup",
-            "lifecycle",
-            "open_order_cleanup_uncertain",
-            report.detail[:2000],
-            event_type="cleanup.initial_open_orders",
-            outcome="uncertain",
-            payload={"uncertain_symbols": report.uncertain_symbols},
-        )
     return report

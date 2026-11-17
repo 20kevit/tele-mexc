@@ -37,7 +37,7 @@ Run from the repository root:
 | Per-channel stale-signal boundary, 1/6/24h downtime, delayed delivery, backfill, edits/duplicates | Integration-tested with disposable SQLite and fake Telegram/MEXC | `tests/test_stale_signal_boundary.py`, `tests/test_service_activation_boundary.py` |
 | Planned-intent quarantine after restart; open/uncertain lifecycle recovery | Integration-tested with fakes | `tests/test_stale_signal_boundary.py`, lifecycle/recovery suites |
 | First-startup readiness report (non-trading) | Unit/integration-tested | `tests/test_readiness.py` |
-| Schema/migration compatibility | Integration-tested on disposable DBs | `tests/test_db_migrations.py` (current migration 21) |
+| Schema/migration compatibility | Integration-tested on disposable DBs | `tests/test_db_migrations.py` (current migration 25) |
 | CLI/config validation | Unit-tested | `tests/test_config*.py`, CLI parser tests |
 | Two-owner + programmer notification routing; no severity suppression | Unit/integration-tested | `tests/test_trading_notify.py`, routing tests, `tests/test_control_service.py` |
 | MEXC REST/CLI request shapes | Mocked/contract-tested | `tests/test_mexc_*`; not live exchange proof |
@@ -51,7 +51,7 @@ must be recorded by the operator performing them.
 | Check | Evidence level | Command/procedure |
 | --- | --- | --- |
 | First-startup readiness (prerequisites, blockers) | Offline report tested; live result recorded per deployment | `tg-ingest trading readiness` then `--network`; never places an order |
-| One-time open-order cleanup (<5 USD, no position sales) | Unit-tested; live run recorded in deployment report | `tg-ingest trading cleanup-open-orders --apply` |
+| Open-order inspection (never cancels) | Unit-tested; historical cleanup claims are deployment-specific | `tg-ingest trading cleanup-open-orders`; legacy `--apply` does not enable cancellation |
 | Same-symbol exchange open-order entry rule | Unit/integration-tested with fakes | `tests/test_same_symbol_open_orders.py` |
 | Direct DNS/TCP/TLS to Telegram | Not yet verified in this pass | `tg-ingest diagnostics network` |
 | Telegram session validity | Not yet verified in this pass | `tg-ingest auth check` |

@@ -374,8 +374,8 @@ git pull --ff-only public opencode/tele-mexc-completion
 Start and verify:
 
 ```bash
-.venv/bin/tg-ingest trading cleanup-open-orders          # dry-run snapshot
-.venv/bin/tg-ingest trading cleanup-open-orders --apply  # one-time, <5 USD only
+.venv/bin/tg-ingest trading cleanup-open-orders          # inspection only; audited
+.venv/bin/tg-ingest trading cleanup-open-orders --apply  # legacy flag; no cancellations
 .venv/bin/tg-ingest trading readiness --network          # non-trading checks
 systemctl start tg-ingest
 systemctl is-active tg-ingest

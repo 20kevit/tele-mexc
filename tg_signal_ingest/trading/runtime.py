@@ -180,8 +180,7 @@ def build_trading_engine(
 
     if client is None:
         client = build_mexc_client(cfg, for_live_writes=True)
-    # Owner-selected per-order amount persisted by the Telegram menu.  Env/TOML
-    # values always win; the database only replaces the built-in default.
+    # Apply the owner-selected amount with env > database > TOML precedence.
     apply_persisted_trading_settings(cfg, repo)
     registry = SymbolRegistry(client) if client is not None else None
     trade_store = TradeStore(repo.db, cfg.trading)
