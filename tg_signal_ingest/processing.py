@@ -161,17 +161,3 @@ class ProcessingEngine:
             total.processed, total.retried, total.failed, total.superseded,
         )
         return total
-
-
-class InterfaceTestHandler:
-    """Minimal working consumer for the downstream processing interface test."""
-
-    def __init__(self) -> None:
-        self.handled: list[tuple[str, int, int, int]] = []
-
-    def handler(self) -> HandlerFn:
-        async def fn(item: QueueItem, record: dict[str, Any] | None) -> None:
-            self.handled.append(
-                (item.item_type, item.channel_id, item.message_id, item.targets_version)
-            )
-        return fn
