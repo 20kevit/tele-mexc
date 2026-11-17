@@ -1190,36 +1190,6 @@ class TradeManager:
         self._disable_legacy_exit(trade, target)
         return
 
-    def _tp_price(self, trade: dict[str, Any], target: str) -> Decimal | None:
-        price = _dec(trade.get(f"{target}_price"))
-        if price is not None and price > 0:
-            return price
-        return None
-
-    def _target_remaining(self, trade: dict[str, Any], target: str) -> Decimal:
-        allocated = _dec(trade.get(f"{target}_allocated_qty")) or Decimal("0")
-        if allocated <= 0:
-            return Decimal("0")
-        return max(Decimal("0"), allocated - self._sold_for_kind(trade, target))
-
-    def _tp_never_started(self, trade: dict[str, Any], target: str) -> bool:
-        """True when a reached TP never reached its allocation/order step.
-
-        This is the durable restart case: the trade state says the target was
-        reached, but the process died before ``_do_tp_sale`` persisted the
-        allocation or created an order.  A ``pending`` row was never sent, so
-        retrying it is safe.
-        """
-        if (_dec(trade.get(f"{target}_allocated_qty")) or Decimal("0")) > 0:
-            return False
-        orders = self.store.list_trade_orders(trade["trade_id"], kind=target)
-        return not orders or all(order["state"] == "pending" for order in orders)
-
-    def _has_pending_order(self, trade: dict[str, Any], target: str) -> bool:
-        return any(
-            order["state"] == "pending" for order in self.store.list_trade_orders(trade["trade_id"], kind=target)
-        )
-
     def _compute_available(self, trade: dict[str, Any]) -> Decimal | None:
         """Bot-owned base quantity available to sell right now (fee-aware), or None if unknown."""
         base_sellable = self._sellable_quantity(trade)
@@ -2822,27 +2792,6 @@ class TradeManager:
             "executed_qty": executed,
         }
 
-    def _advance_tp_if_empty(self, trade: dict[str, Any], target: str) -> None:
-        """If the sell quantity is zero, advance the target without inventing fills."""
-        now = self._ts()
-        with self.store.db.transaction() as conn:
-            row = conn.execute("SELECT trade_state FROM trades WHERE trade_id = ?", (trade["trade_id"],)).fetchone()
-            if row is None:
-                return
-            state = row[0]
-            new_state = "tp1_completed" if target == "tp1" else "tp2_completed"
-            if state in (f"{target}_active", "needs_reconciliation"):
-                conn.execute(
-                    "UPDATE trades SET trade_state=?, updated_at=? WHERE trade_id=?",
-                    (new_state, now, trade["trade_id"]),
-                )
-            else:
-                return
-        refreshed = self.store.get_trade(trade["trade_id"])
-        if refreshed is not None:
-            trade = refreshed
-        self._notify_trade(trade, "TP_SKIPPED", f"{target} qty below minimum; marked completed")
-
     # ===================================================================
     # Stop-loss handling
     # ===================================================================
@@ -3927,23 +3876,6 @@ class TradeManager:
             counted_ids.add(leg_id)
             total += _dec(leg.get("filled_qty")) or Decimal("0")
         return total
-
-    def _has_unconfirmed_order(self, trade: dict[str, Any], kind: str) -> bool:
-        return any(
-            order["state"] in UNCONFIRMED_ORDER_STATES
-            for order in self.store.list_trade_orders(trade["trade_id"], kind=kind)
-        )
-
-    def _has_live_order(self, trade: dict[str, Any], kind: str) -> bool:
-        """True for an order that may exist at the exchange.
-
-        ``pending`` means "created locally, never sent"; it must not block the
-        submit path because that path reuses/rebases the row.
-        """
-        return any(
-            order["state"] in UNCONFIRMED_ORDER_STATES and order["state"] != "pending"
-            for order in self.store.list_trade_orders(trade["trade_id"], kind=kind)
-        )
 
     @staticmethod
     def _map_order_state(state: str | None) -> str:

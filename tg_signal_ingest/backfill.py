@@ -50,13 +50,6 @@ class BackfillError(Exception):
     pass
 
 
-class _Page:
-    def __init__(self, messages: list[Any], bottom: bool, oldest_ok: int | None):
-        self.messages = messages
-        self.bottom = bottom
-        self.oldest_ok = oldest_ok
-
-
 async def _fetch_page(
     client: Any, entity_ref: int, offset_id: int, limit: int, min_bound: int
 ) -> list[Any]:

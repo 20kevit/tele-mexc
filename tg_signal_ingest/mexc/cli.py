@@ -104,7 +104,6 @@ _ORDER_TYPE_CODES = {
     104: "TRACK_LIMIT_ORDER",
     105: "TRACK_MARKET_ORDER",
 }
-_SIDE_CODES = {1: "BUY", 2: "SELL"}
 _STATUS_CODES = {
     0: "INACTIVE",
     1: "NEW",
@@ -287,15 +286,6 @@ def _normalize_order_type(value: Any) -> str | None:
     if text.lstrip("-").isdigit():
         return _ORDER_TYPE_CODES.get(int(text))
     return text.upper()
-
-
-def _normalize_side(value: Any) -> str:
-    if isinstance(value, int):
-        return _SIDE_CODES.get(value, "BUY")
-    text = str(value or "").strip()
-    if text.isdigit():
-        return _SIDE_CODES.get(int(text), "BUY")
-    return text.upper() or "BUY"
 
 
 def _extract_rows(data: Any) -> list[dict[str, Any]]:
