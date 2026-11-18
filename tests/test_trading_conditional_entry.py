@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from _trading_fakes import FakeClient, FakeEngine, FakeNotifier
+from _trading_fakes import FakeClient, FakeEngine, FakeMeta, FakeNotifier, FakeRegistry
 
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.repository import Repository
@@ -722,3 +722,82 @@ def test_claimed_but_unacknowledged_conditional_entry_is_parked_without_retry(en
     tm.on_tick(SYMBOL, Decimal("100.00"), received_at=1.0)
     assert attempts == [intent["intent_id"]]
     assert client.place_calls == []
+
+
+# --------------------------------------------------------------------------
+# P0 characterization: entry trigger edge case (historical incident)
+#
+# Incident: signal entry 100, market/reference 99, computed trigger strictly
+# BELOW 99 — i.e. the trigger was already crossed at planning time.  The bot
+# must submit a normal LIMIT BUY at the signal entry price of 100 immediately;
+# it must not wait for another upward crossing and must never submit a market
+# order.  These tests drive the real `_create_trade` decision and the real
+# submission path; they fail if the historical "wait for a fresh crossing"
+# bug is reintroduced.
+# --------------------------------------------------------------------------
+
+
+def _edge_env(cfg: AppConfig, repo: Repository, tick_size: str = "0.5"):
+    """Env with a 0.5 tick so offset 4 gives trigger = 100 - 4*0.5 = 98.00 < market 99."""
+    store = TradeStore(repo.db, cfg.trading)
+    client = FakeClient(FakeRegistry(FakeMeta(tick_size=tick_size)))
+    engine = FakeEngine(cfg, store, client=client)
+    notifier = FakeNotifier()
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    return store, engine, client, notifier, tm
+
+
+def test_p0_market_between_trigger_and_entry_submits_limit_buy_at_entry_immediately(cfg, repo):
+    cfg.trading.entry_trigger_offset_ticks = 4
+    store, engine, client, notifier, tm = _edge_env(cfg, repo)
+    intent = _insert_intent(store)
+    # Market 99 is below Entry 100 but already above trigger 98.00 (already crossed).
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("99"))
+
+    assert decision.deferred is False, "already-crossed trigger must not create a conditional wait"
+    assert decision.trade is not None
+    trade = decision.trade
+    assert trade["entry_mode"] == "direct"
+    assert trade["trigger_price"] is None, "direct entry must not arm a trigger price"
+    assert trade["trade_state"] == "pending_entry"
+    assert client.place_calls == []
+
+    # The submission is a normal LIMIT BUY exactly at the signal entry price.
+    submitted = engine._execute_intent(intent["intent_id"])
+    assert submitted["state"] == "submitted"
+    assert len(client.place_calls) == 1
+    call = client.place_calls[0]
+    assert call["symbol"] == SYMBOL
+    assert call["side"] == "BUY"
+    assert call["order_type"] == "LIMIT", "never a market order"
+    assert Decimal(str(call["price"])) == ENTRY, "limit price must be the signal entry price (100)"
+    assert Decimal(str(call["quantity"])) == Decimal("0.1")
+
+    # Durable-ack hook (same sequence the live on_tick driver performs).
+    tm.on_intent_executed(store.get_intent(intent["intent_id"]))
+    trade = store.get_trade(trade["trade_id"])
+    assert trade["trade_state"] == "entry_active"
+    assert trade["entry_order_id"] == submitted["exchange_order_id"]
+    # No conditional wait exists that could re-submit later.
+    engine._execute_intent(intent["intent_id"])
+    assert len(client.place_calls) == 1
+
+
+def test_p0_market_exactly_at_trigger_is_direct_boundary(cfg, repo):
+    cfg.trading.entry_trigger_offset_ticks = 4
+    store, engine, client, notifier, tm = _edge_env(cfg, repo)
+    intent = _insert_intent(store)
+    # Boundary: market exactly equal to the computed trigger counts as crossed.
+    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("98.00"))
+
+    assert decision.deferred is False
+    assert decision.trade is not None
+    assert decision.trade["entry_mode"] == "direct"
+    assert decision.trade["trigger_price"] is None
+    assert client.place_calls == []
+
+    engine._execute_intent(intent["intent_id"])
+    assert len(client.place_calls) == 1
+    call = client.place_calls[0]
+    assert call["order_type"] == "LIMIT"
+    assert Decimal(str(call["price"])) == ENTRY
