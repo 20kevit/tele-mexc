@@ -1899,24 +1899,6 @@ class TradingEngine:
             "trigger_limit_price": str(stop_price),
         }
 
-    def submit_stop_loss_market_sell(
-        self,
-        trade: dict[str, Any],
-        quantity: Decimal,
-        *,
-        client_order_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Disabled per owner-confirmed §7 — native OCO SL legs are the only authorized SL.
-
-        No automatic Market Sell may be submitted from signal monitoring,
-        startup recovery, or reconciliation.  This method is intentionally
-        unreachable; any call is a defect and must be surfaced immediately.
-        """
-        raise RuntimeError(
-            "Market Sell stop-loss is disabled per owner-confirmed strategy (§7) — "
-            "native OCO SL legs only; no discretionary Market Sell fallback"
-        )
-
     def query_trade_order(self, order: dict[str, Any]) -> dict[str, Any]:
         """Query the exchange status of a TP/SL trade order.
 

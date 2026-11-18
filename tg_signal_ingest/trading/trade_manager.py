@@ -59,7 +59,7 @@ from ..mexc.errors import (
 from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
 from .domain_events import DomainEventConflict, build_domain_event
 from .parser import ParsedSignal
-from .store import TERMINAL_INTENT_STATES, TradingError, submission_acknowledged
+from .store import TERMINAL_INTENT_STATES, submission_acknowledged
 from .trade_store import TradeStore
 
 log = logging.getLogger("ingest.trading.trade_manager")
@@ -1098,20 +1098,6 @@ class TradeManager:
     # Take-profit handling
     # ===================================================================
 
-    def _enter_tp1(self, trade: dict[str, Any]) -> None:
-        """Disabled: standalone take-profit orders are not part of the product."""
-
-        self._disable_legacy_exit(trade, "tp1")
-        return
-        trade = self._refresh(trade)
-        if not self._cancel_entry_remainder(trade):
-            self._record_error(trade, "entry cancel unconfirmed; TP1 held", "exchange")
-            return
-        if not self._reconcile_entry_fills(trade):
-            self._record_error(trade, "entry fills unconfirmed; TP1 held", "reconciliation")
-            return
-        self._do_tp_sale(self._refresh(trade), "tp1")
-
     def _enter_tp2(self, trade: dict[str, Any]) -> None:
         """Disabled: standalone take-profit orders are not part of the product."""
 
@@ -1127,54 +1113,6 @@ class TradeManager:
         self._reconcile_trade_orders(trade)
         self._do_tp_sale(self._refresh(trade), "tp2")
 
-    def _transition_state(self, trade: dict[str, Any], new_state: str, allowed_from: tuple[str, ...]) -> bool:
-        """Atomically move trade state. Returns True if transitioned."""
-        now = self._ts()
-        with self.store.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT trade_state, symbol FROM trades WHERE trade_id = ?", (trade["trade_id"],)
-            ).fetchone()
-            if row is None:
-                return False
-            state = str(row["trade_state"])
-            if state in (
-                "tp2_completed",
-                "closed",
-                "needs_reconciliation",
-                "stop_loss_executing",
-                "exit_pending",
-                UNPROTECTED_CRITICAL,
-            ):
-                return False
-            if state not in allowed_from:
-                return False
-            conn.execute(
-                "UPDATE trades SET trade_state=?, updated_at=? WHERE trade_id=?",
-                (new_state, now, trade["trade_id"]),
-            )
-            if state != new_state:
-                self.store.record_domain_event(
-                    build_domain_event(
-                        "trade.state_changed",
-                        aggregate_id=str(trade["trade_id"]),
-                        correlation_id=str(trade["trade_id"]),
-                        symbol=row["symbol"],
-                        occurred_at=now,
-                        severity=(
-                            "CRITICAL"
-                            if new_state == "unprotected_critical"
-                            else "WARNING"
-                            if new_state == "needs_reconciliation"
-                            else None
-                        ),
-                        payload={"previous_state": state, "new_state": new_state},
-                    ),
-                    conn=conn,
-                )
-        # The transactional domain event replaces the old generic
-        # STATE_TRANSITION outbox notice; do not enqueue a duplicate message.
-        return True
-
     def _disable_legacy_exit(self, trade: dict[str, Any], target: str) -> None:
         """Fail closed instead of submitting a standalone take-profit order."""
 
@@ -1189,19 +1127,6 @@ class TradeManager:
 
         self._disable_legacy_exit(trade, target)
         return
-
-    def _compute_available(self, trade: dict[str, Any]) -> Decimal | None:
-        """Bot-owned base quantity available to sell right now (fee-aware), or None if unknown."""
-        base_sellable = self._sellable_quantity(trade)
-        if base_sellable is None:
-            return None
-        outstanding = Decimal("0")
-        for order in self.store.list_trade_orders(trade["trade_id"]):
-            if order["state"] in UNCONFIRMED_ORDER_STATES:
-                qty = _dec(order.get("quantity")) or Decimal("0")
-                filled = _dec(order.get("sold_qty")) or Decimal("0")
-                outstanding += max(Decimal("0"), qty - filled)
-        return max(Decimal("0"), base_sellable - outstanding)
 
     def _create_trade_order(
         self,
@@ -1234,12 +1159,6 @@ class TradeManager:
             leg_role=kind,
         )
 
-    def _submit_tp_order(
-        self, trade: dict[str, Any], target: str, order: dict[str, Any], qty: Decimal, price: Decimal
-    ) -> None:
-        """Refuse standalone TP submission; exits are native OCO pairs only."""
-
-        raise TradingError("standalone take-profit orders are disabled; exits must be native OCO pairs")
     # ===================================================================
     # Native two-OCO exit placement
     # ===================================================================
@@ -2702,10 +2621,6 @@ class TradeManager:
             return "filled" if sold >= wanted_qty else "uncertain"
         return "failed"
 
-    def _target_qty(self, trade: dict[str, Any], target: str) -> Decimal:
-        """Return the allocated quantity for an OCO target."""
-        return _dec(trade.get(f"{target}_allocated_qty")) or Decimal("0")
-
     def _submit_oco_order(
         self,
         trade: dict[str, Any],
@@ -2795,49 +2710,6 @@ class TradeManager:
     # ===================================================================
     # Stop-loss handling
     # ===================================================================
-
-    def _enter_stop_loss(self, trade: dict[str, Any], trigger_price: Decimal) -> None:
-        """Disabled per §7 — Market Sell stop-loss is *not* an authorized automatic path.
-
-        Native OCO SL legs are the only authorized automatic stop-loss mechanism.
-        This method is retained only to prove no Market Sell is submitted: it
-        delegates to the unprotected handler which persists critical state and
-        never calls the exchange.  Search for `submit_stop_loss_market_sell`
-        must show zero reachable call sites (verified via grep).
-        """
-        self._handle_unprotected_sl(
-            trade, trigger_price, context="_enter_stop_loss disabled — Market Sell not authorized"
-        )
-
-    def _resume_stop_loss(self, trade: dict[str, Any]) -> None:
-        """Disabled per §7 — never resumes a Market Sell. No SELL submitted."""
-        try:
-            self._reconcile_entry_fills(trade)
-            self._reconcile_trade_orders(trade)
-        except Exception:
-            pass
-        sellable = self._sellable_quantity(trade)
-        detail = (
-            f"_resume_stop_loss disabled — Market Sell not authorized; "
-            f"trade {trade.get('trade_id')} {trade.get('symbol')} sellable={sellable} "
-            "requires native OCO SL protection; manual intervention required"
-        )
-        self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-        self._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail)
-
-    def _submit_stop_loss_order(self, trade: dict[str, Any], qty: Decimal) -> None:
-        """Disabled per §7 — Market Sell submission is not authorized.
-
-        This method must never reach engine.submit_stop_loss_market_sell.
-        Search must show zero reachable call sites.
-        """
-        detail = (
-            f"_submit_stop_loss_order disabled — Market Sell not authorized; "
-            f"trade {trade.get('trade_id')} {trade.get('symbol')} qty={qty} "
-            "native OCO SL legs only; persisting critical unprotected state"
-        )
-        self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-        self._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail)
 
     # ----------------------------------------------------------------
     # Sellable inventory — owner-confirmed §5.2 / critical invariant §5.1

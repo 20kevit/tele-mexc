@@ -882,24 +882,6 @@ def test_trade_manager_reconciliation_lock_does_not_block_an_unrelated_signal(en
     assert "trade_lock operation=on_intent_planned" in rendered
 
 
-def test_direct_state_transition_writes_domain_event_and_skips_legacy_duplicate(env):
-    _, store, _, _, notifier, tm = env
-    intent = _insert_intent(store)
-    decision = tm.on_intent_planned(intent, _parsed(), reference_price=ENTRY)
-    trade = decision.trade
-    assert trade is not None and trade["trade_state"] == "pending_entry"
-
-    assert tm._transition_state(trade, "needs_reconciliation", ("pending_entry",)) is True
-    event = store.db.conn.execute(
-        "SELECT event_type,aggregate_id,payload_json FROM audit_events "
-        "WHERE event_class='domain' AND event_type='trade.state_changed' AND aggregate_id=?",
-        (trade["trade_id"],),
-    ).fetchone()
-    assert event is not None
-    assert event["payload_json"] == ('{"new_state":"needs_reconciliation","previous_state":"pending_entry"}')
-    assert not any(key == "STATE_TRANSITION" for key, _, _ in notifier.trade_events)
-
-
 def test_canceled_oco_parent_is_parked_without_rearming(env):
     """A canceled OCO parent may hide either TP or SL child execution."""
     cfg, store, engine, client, notifier, tm = env

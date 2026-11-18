@@ -37,18 +37,6 @@ CLOCK_SKEW_STALE_MS: int = 2000  # 1-2s drift: degraded
 CLOCK_SKEW_UNHEALTHY_MS: int = 5000  # >2s drift: unhealthy (exceeds recvWindow default)
 
 
-def clock_health_state(skew_ms: int) -> str:
-    """Determine clock health state from skew in milliseconds.
-
-    Returns one of: "fresh", "degraded", "unhealthy"
-    """
-    if skew_ms < CLOCK_SKEW_FRESH_MS:
-        return "fresh"
-    if skew_ms < CLOCK_SKEW_STALE_MS:
-        return "degraded"
-    return "unhealthy"
-
-
 def now_iso_utc() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1410,14 +1398,6 @@ class TradingStore:
             )
         self.audit(intent_id, "lifecycle", f"protection_{status}", last_error)
         return self.get_protection(intent_id)
-
-    def pending_protection_verification(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.db.conn.execute(
-            "SELECT * FROM order_protection WHERE status IN ('unverified', 'unknown_requires_reconciliation') "
-            "ORDER BY updated_at LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
 
     def outstanding_balance_usage(self, symbol: str, *, exclude_intent_id: str | None = None) -> dict[str, Decimal]:
         """Sum live non-terminal intents on ``symbol`` for balance reservation.

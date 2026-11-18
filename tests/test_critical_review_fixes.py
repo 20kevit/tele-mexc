@@ -963,12 +963,8 @@ def test_allocation_uses_net_sellable_with_base_fee(cfg, repo):
 
 
 def test_no_market_sell_when_sl_crossed_both_ocos_active(cfg, repo):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    # Track any market sell attempts
-    market_calls = []
-    engine.submit_stop_loss_market_sell = lambda *a, **kw: (
-        market_calls.append(1) or {"exchange_order_id": "ex-sl", "state": "NEW", "executed_qty": Decimal("0")}
-    )  # type: ignore
+    client = SpyMexc()
+    engine, tm, store = _engine_with_tm(cfg, repo, client)
     # Also spy OCO to ensure OCO path is used
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=120, edit_version=0)
@@ -1071,17 +1067,16 @@ def test_no_market_sell_when_sl_crossed_both_ocos_active(cfg, repo):
     store.update_trade_state("tr-sl-both", "oco_active")
     # Price monitor tick crossing SL
     tm.on_tick("BTCUSDT", Decimal("89"), received_at=time.time())
-    assert market_calls == [], "Market Sell must never be submitted when OCOs active"
-    # Direct call to disabled method raises — verify on fresh engine without override
-    fresh_engine, _, _ = _engine_with_tm(cfg, repo, SpyMexc())
-    with pytest.raises(RuntimeError, match="disabled"):
-        fresh_engine.submit_stop_loss_market_sell(store.get_trade("tr-sl-both"), Decimal("0.1"))
+    # submit_stop_loss_market_sell no longer exists on the engine; guard the
+    # no-automatic-Market-Sell invariant at the exchange-client boundary.
+    assert not any(
+        call.get("side") == "SELL" and call.get("order_type") == "MARKET" for call in client.place_order_calls
+    ), "Market Sell must never be submitted when OCOs active"
 
 
 def _assert_no_market_sell_on_missing_oco(cfg, repo, missing_kind):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    market_calls = []
-    engine.submit_stop_loss_market_sell = lambda *a, **kw: market_calls.append(1)  # type: ignore
+    client = SpyMexc()
+    engine, tm, store = _engine_with_tm(cfg, repo, client)
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=121, edit_version=0)
     store.create_intent(
@@ -1199,7 +1194,9 @@ def _assert_no_market_sell_on_missing_oco(cfg, repo, missing_kind):
             "to-miss-tp2-unc", "unknown_requires_reconciliation", exchange_order_id="ex-miss-tp2-unc"
         )
         tm.on_tick("BTCUSDT", Decimal("89"), received_at=time.time())
-        assert market_calls == [], f"Market Sell must never be submitted when {missing_kind}"
+        assert not any(
+            call.get("side") == "SELL" and call.get("order_type") == "MARKET" for call in client.place_order_calls
+        ), f"Market Sell must never be submitted when {missing_kind}"
         # State may remain protected via remaining OCO leg; key is no Market Sell
         assert store.get_trade(f"tr-sl-missing-{missing_kind}")["trade_state"] not in ("closed", "failed")
 
@@ -1213,9 +1210,8 @@ def test_no_market_sell_oco2_uncertain(cfg, repo):
 
 
 def test_no_market_sell_oco_rejection(cfg, repo):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    market_calls = []
-    engine.submit_stop_loss_market_sell = lambda *a, **kw: market_calls.append(1)  # type: ignore
+    client = SpyMexc()
+    engine, tm, store = _engine_with_tm(cfg, repo, client)
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=122, edit_version=0)
     store.create_intent(
@@ -1302,13 +1298,14 @@ def test_no_market_sell_oco_rejection(cfg, repo):
     )
     store.transition_trade_order("to-reject-tp1", "rejected", exchange_order_id=None)
     tm.on_tick("BTCUSDT", Decimal("89"), received_at=time.time())
-    assert market_calls == []
+    assert not any(
+        call.get("side") == "SELL" and call.get("order_type") == "MARKET" for call in client.place_order_calls
+    )
 
 
 def test_no_market_sell_oco_cancellation(cfg, repo):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    market_calls = []
-    engine.submit_stop_loss_market_sell = lambda *a, **kw: market_calls.append(1)  # type: ignore
+    client = SpyMexc()
+    engine, tm, store = _engine_with_tm(cfg, repo, client)
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=123, edit_version=0)
     store.create_intent(
@@ -1395,13 +1392,14 @@ def test_no_market_sell_oco_cancellation(cfg, repo):
     )
     store.transition_trade_order("to-cancel-tp1", "canceled")
     tm.on_tick("BTCUSDT", Decimal("89"), received_at=time.time())
-    assert market_calls == []
+    assert not any(
+        call.get("side") == "SELL" and call.get("order_type") == "MARKET" for call in client.place_order_calls
+    )
 
 
 def test_no_market_sell_restart_missing_protection(cfg, repo):
-    engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
-    market_calls = []
-    engine.submit_stop_loss_market_sell = lambda *a, **kw: market_calls.append(1)  # type: ignore
+    client = SpyMexc()
+    engine, tm, store = _engine_with_tm(cfg, repo, client)
     parsed = SignalParser().parse(COMPLETE)
     sid, _ = store.record_signal(parsed, channel_id=100, message_id=124, edit_version=0)
     store.create_intent(
@@ -1477,7 +1475,9 @@ def test_no_market_sell_restart_missing_protection(cfg, repo):
     # No OCO orders at all → restart should attempt OCO placement (not market sell)
     store.update_trade_state("tr-sl-restart", "position_open")
     tm.reconcile_all_open()
-    assert market_calls == [], "restart must not submit Market Sell"
+    assert not any(
+        call.get("side") == "SELL" and call.get("order_type") == "MARKET" for call in client.place_order_calls
+    ), "restart must not submit Market Sell"
     assert store.get_trade("tr-sl-restart")["trade_state"] in (
         "needs_reconciliation",
         "position_open",

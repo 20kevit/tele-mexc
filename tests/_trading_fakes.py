@@ -352,27 +352,6 @@ class FakeEngine:
         self.tp_orders.append({"kind": kind, "client_order_id": client_order_id, **order})
         return order
 
-    def submit_stop_loss_market_sell(self, trade, quantity, client_order_id=None):
-        cid = client_order_id or f"tsisl-{trade['trade_id']}"
-        resp = self.client.place_order(
-            symbol=trade["symbol"],
-            side="SELL",
-            order_type="MARKET",
-            quantity=quantity,
-            price=None,
-            client_order_id=cid,
-        )
-        self.client.fill_order(resp["orderId"], quantity, quantity, Decimal("1"))
-        order = {
-            "exchange_order_id": resp["orderId"],
-            "state": "FILLED",
-            "executed_qty": quantity,
-            "cumulative_quote": quantity,
-        }
-        self.sl_calls.append(quantity)
-        self.sl_client_ids.append(cid)
-        return order
-
     def submit_oco_sell(
         self, trade, client_order_id, price, quantity, stop_price, kind=None,
         trade_order_id=None,

@@ -9,8 +9,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-import pytest
-
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import TradingEngine
@@ -206,19 +204,6 @@ def test_standalone_tp_path_is_disabled():
     tm.engine = None
     trade = {"trade_id": "t1", "symbol": "BTCUSDT", "tp1_price": "110", "sl_price": "95"}
 
-    tm._enter_tp1(trade)
     tm._enter_tp2(trade)
 
-    assert tm.store.states == [("t1", "needs_reconciliation"), ("t1", "needs_reconciliation")]
-
-
-def test_submit_tp_order_refuses_to_submit():
-    tm = object.__new__(TradeManager)
-    with pytest.raises(Exception, match="OCO"):
-        tm._submit_tp_order(
-            {"trade_id": "t1", "symbol": "BTCUSDT"},
-            "tp1",
-            {"trade_order_id": "x", "client_order_id": "c"},
-            Decimal("1"),
-            Decimal("1"),
-        )
+    assert tm.store.states == [("t1", "needs_reconciliation")]
