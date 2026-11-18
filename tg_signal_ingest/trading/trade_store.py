@@ -8,22 +8,13 @@ referenced by ``trades.entry_intent_id``.
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from .audit import redact_payload
 from .domain_events import build_domain_event
+from .parsing import parse_decimal as _optional_decimal
 from .store import TradingStore, _row, dec_str
-
-
-def _optional_decimal(value: Any) -> Decimal | None:
-    if value in (None, ""):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
 
 # Only semantic OCO leg fields create a domain event. Poll bookkeeping fields
 # (evidence id, last observed time, not-observed reason) do not.
@@ -556,42 +547,6 @@ class TradeStore(TradingStore):
         sql += " ORDER BY created_at DESC"
         rows = self.db.conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
-
-    # ── Per-symbol concurrency (owner-confirmed §3.2) ──────────────
-
-    CONFLICTING_TRADE_STATES: tuple[str, ...] = (
-        "pending_entry",
-        "entry_active",
-        "position_open",
-        "oco_submitting",
-        "oco_active",
-        "oco_partial",
-        "tp1_active",
-        "tp1_completed",
-        "tp2_active",
-        "stop_loss_executing",
-        "exit_pending",
-        "needs_reconciliation",
-    )
-    """Any non-terminal bot-owned trade for the same symbol blocks a new BUY.
-
-    Terminal states ``closed`` and ``tp2_completed`` do not conflict.
-    ``needs_reconciliation`` is treated as conflicting because protection is
-    unverified — a new overlapping trade could oversell or confuse
-    reconciliation.
-    """
-
-    def has_active_trade_for_symbol(self, symbol: str) -> dict[str, Any] | None:
-        """Return the first conflicting trade for *symbol*, or None."""
-        if not symbol:
-            return None
-        placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
-        rows = self.db.conn.execute(
-            "SELECT * FROM trades WHERE symbol = ? AND trade_state IN "
-            f"({placeholders}) ORDER BY updated_at DESC LIMIT 1",
-            (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
-        ).fetchall()
-        return dict(rows[0]) if rows else None
 
     def transition_trade_order(
         self,

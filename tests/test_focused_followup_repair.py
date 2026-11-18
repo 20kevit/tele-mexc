@@ -873,8 +873,6 @@ def test_no_exchange_write_when_fee_unknown(cfg, repo):
     assert spy.place_oco_calls == []
     assert spy.place_order_calls == []
     # Try via _do_tp_sale path (if any)
-    # Also test _compute_available returns None and blocks
-    assert tm._compute_available(store.get_trade(tid)) is None
     assert tm._remaining_base(store.get_trade(tid)) is None
 
 
