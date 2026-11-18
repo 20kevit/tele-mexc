@@ -337,7 +337,9 @@ class IngestService:
             log.error("MEXC readiness verification failed (%s)", exc.__class__.__name__)
             return
         if not verified:
-            log.error("MEXC account readiness could not be verified; new entries will be blocked")
+            # Owner policy: the startup account check is diagnostics only — it
+            # is not a per-order gate; pause/emergency/BUY-block still apply.
+            log.error("MEXC account readiness could not be verified; recorded for diagnostics (not an order gate)")
 
     async def _startup_boundary_snapshot(self) -> int | None:
         """Return the newest message identity visible before handlers start.
@@ -378,8 +380,10 @@ class IngestService:
         """Persist the forward-only per-channel boundary and set readiness.
 
         A ``None`` snapshot means the latest Telegram identity could not be
-        established reliably.  The process keeps ingesting for observation but
-        the submission gate stays closed for new entries.
+        established reliably.  The process keeps ingesting for observation, but
+        new-entry protection stays fail-closed: the boundary is enforced
+        per-message in ``TradingEngine.process_item`` (an unset boundary
+        refuses historical signals), not by the submission gate.
         """
 
         store = getattr(self.trading, "store", None)
