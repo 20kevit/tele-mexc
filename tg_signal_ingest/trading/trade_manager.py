@@ -124,6 +124,10 @@ OCO_CHILD_DISCOVERY_HISTORY_MS = 7 * 24 * 60 * 60 * 1000
 OCO_CHILD_DISCOVERY_BACKOFF_PREFIX = "OCO_STOP_CHILD_DISCOVERY:"
 OCO_CHILD_DISCOVERY_BACKOFF_MAX_S = 900.0
 OCO_CHILD_DISCOVERY_QUERY_LIMIT = 1000
+# Same bounded exponential backoff codec, second persisted prefix: MEXC
+# trade-order queries parked after repeated order-not-found results.
+TRADE_ORDER_NOT_FOUND_BACKOFF_PREFIX = "MEXC_ORDER_NOT_FOUND:"
+TRADE_ORDER_NOT_FOUND_BACKOFF_MAX_S = 900.0
 
 # Deterministic exchange validations that can never succeed by resubmitting
 # the same payload.  They are terminal for the leg (no retry, no replacement).
@@ -1540,8 +1544,7 @@ class TradeManager:
                     claimed[discovered_id] = str(order.get("trade_order_id") or "")
 
     @staticmethod
-    def _oco_discovery_streak(reason: str) -> int:
-        prefix = OCO_CHILD_DISCOVERY_BACKOFF_PREFIX
+    def _oco_discovery_streak(reason: str, prefix: str = OCO_CHILD_DISCOVERY_BACKOFF_PREFIX) -> int:
         if not reason.startswith(prefix):
             return 0
         for part in reason[len(prefix) :].split(":"):
@@ -1552,16 +1555,28 @@ class TradeManager:
                     return 0
         return 0
 
-    def _oco_discovery_backoff_remaining(self, leg: dict[str, Any]) -> float:
-        """Reuse the bounded exponential backoff policy for discovery retries."""
+    def _oco_discovery_backoff_remaining(
+        self,
+        leg: dict[str, Any],
+        *,
+        prefix: str = OCO_CHILD_DISCOVERY_BACKOFF_PREFIX,
+        max_s: float = OCO_CHILD_DISCOVERY_BACKOFF_MAX_S,
+    ) -> float:
+        """Bounded exponential backoff (60s doubling, capped) before re-query.
 
-        streak = self._oco_discovery_streak(str(leg.get("not_observed_reason") or ""))
+        Shared by OCO stop-child discovery (default prefix) and by MEXC
+        trade-order not-found parking via TRADE_ORDER_NOT_FOUND_BACKOFF_*;
+        both park on the same persisted ``count=N`` codec in
+        ``not_observed_reason`` keyed off ``last_observed_at``.
+        """
+
+        streak = self._oco_discovery_streak(str(leg.get("not_observed_reason") or ""), prefix)
         if streak <= 0:
             return 0.0
         last = _dec_ts(leg.get("last_observed_at"))
         if last is None:
             return 0.0
-        delay = min(60.0 * (2 ** (streak - 1)), OCO_CHILD_DISCOVERY_BACKOFF_MAX_S)
+        delay = min(60.0 * (2 ** (streak - 1)), max_s)
         elapsed = max(0.0, (self._now() - last).total_seconds())
         return max(0.0, delay - elapsed)
 
@@ -3483,30 +3498,6 @@ class TradeManager:
                 self._settle_entry_state(refreshed)
         return synced
 
-    @staticmethod
-    def _trade_order_not_found_streak(reason: str) -> int:
-        prefix = "MEXC_ORDER_NOT_FOUND:"
-        if not reason.startswith(prefix):
-            return 0
-        for part in reason[len(prefix) :].split(":"):
-            if part.startswith("count="):
-                try:
-                    return max(0, int(part.split("=", 1)[1]))
-                except ValueError:
-                    return 0
-        return 0
-
-    def _trade_order_not_found_backoff_remaining(self, order: dict[str, Any]) -> float:
-        streak = self._trade_order_not_found_streak(str(order.get("not_observed_reason") or ""))
-        if streak <= 0:
-            return 0.0
-        last = _dec_ts(order.get("last_observed_at"))
-        if last is None:
-            return 0.0
-        delay = min(60.0 * (2 ** (streak - 1)), 900.0)
-        elapsed = max(0.0, (self._now() - last).total_seconds())
-        return max(0.0, delay - elapsed)
-
     def _reconcile_trade_orders(self, trade: dict[str, Any], *, advance: bool = True) -> None:
         """Query TP/SL order status and recompute sold totals across ALL orders."""
         if not self.engine:
@@ -3516,7 +3507,9 @@ class TradeManager:
                 continue
             if order["state"] == "pending":
                 continue  # never sent; the submit path will send it
-            remaining = self._trade_order_not_found_backoff_remaining(order)
+            remaining = self._oco_discovery_backoff_remaining(
+                order, prefix=TRADE_ORDER_NOT_FOUND_BACKOFF_PREFIX, max_s=TRADE_ORDER_NOT_FOUND_BACKOFF_MAX_S
+            )
             if remaining > 0:
                 log.debug(
                     "trade-order reconciliation parked for %s after MEXC order-not-found; retry in %.1fs",
@@ -3624,9 +3617,11 @@ class TradeManager:
             error_code = fresh.get("error_code")
             if error_code in (-2011, -2013):
                 previous = str(order.get("not_observed_reason") or "")
-                streak = self._trade_order_not_found_streak(previous) + 1
+                streak = self._oco_discovery_streak(previous, TRADE_ORDER_NOT_FOUND_BACKOFF_PREFIX) + 1
                 fresh = dict(fresh)
-                fresh["not_observed_reason"] = f"MEXC_ORDER_NOT_FOUND:count={streak}:code={error_code}"
+                fresh["not_observed_reason"] = (
+                    f"{TRADE_ORDER_NOT_FOUND_BACKOFF_PREFIX}count={streak}:code={error_code}"
+                )
             mapped = "unknown_requires_reconciliation"
             raw_state = "NOT_FOUND"
         # FILLED with no executed quantity is not trustworthy enough to size a
