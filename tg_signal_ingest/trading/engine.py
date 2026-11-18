@@ -51,12 +51,13 @@ from .balance import BalanceError, parse_account, validate_balance
 from .evidence import ExchangeEvidence
 from .gate import ENTRY, PROTECTION, SubmissionBlocked, SubmissionGate
 from .parser import ParsedSignal, SignalParser
+from .parsing import parse_decimal as _optional_decimal
+from .parsing import parse_iso_utc as _parse_signal_time
 from .risk import RiskDecision, RiskManager
 from .store import (
     TERMINAL_INTENT_STATES,
     RiskLimitExceeded,
     TradingError,
-    dec_str,
     submission_acknowledged,
 )
 
@@ -2573,26 +2574,3 @@ class TradingEngine:
                 stats.ambiguous += 1
             del result
         return stats
-
-
-def _parse_signal_time(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
-def _optional_decimal(value: Any) -> Decimal | None:
-    if value is None or value == "":
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def string_or_none(value: Decimal | None) -> str | None:
-    return dec_str(value)

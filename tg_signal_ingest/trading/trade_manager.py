@@ -59,6 +59,8 @@ from ..mexc.errors import (
 from ..telemetry import SLOW_LOCK_HOLD_MS, SLOW_LOCK_WAIT_MS, level_for
 from .domain_events import DomainEventConflict, build_domain_event
 from .parser import ParsedSignal
+from .parsing import parse_decimal as _dec
+from .parsing import parse_iso_utc as _dec_ts
 from .store import TERMINAL_INTENT_STATES, submission_acknowledged
 from .trade_store import TradeStore
 
@@ -180,16 +182,6 @@ def oco_retry_delay_s(attempt: int) -> int | None:
     return OCO_RETRY_DELAYS_S[attempt]
 
 
-def _dec_ts(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-
-
 def _int_ms(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -217,26 +209,6 @@ def _is_retryable_oco_error(exc: BaseException) -> bool:
         return False
     text = str(exc).lower()
     return not any(token in text for token in _NON_RETRYABLE_TOKENS)
-
-
-def _dec(value: Any) -> Decimal | None:
-    if value in (None, ""):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-
-def _optional_decimal(value: Any) -> Decimal | None:
-    """Return a Decimal or None, without converting empty/invalid to zero."""
-    if value in (None, ""):
-        return None
-    try:
-        d = Decimal(str(value))
-        return d if d.is_finite() else None
-    except (InvalidOperation, TypeError, ValueError):
-        return None
 
 
 def _first(values: list[Decimal | str] | tuple[Decimal, ...] | None) -> Decimal | None:

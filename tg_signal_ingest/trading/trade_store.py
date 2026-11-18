@@ -8,22 +8,13 @@ referenced by ``trades.entry_intent_id``.
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from .audit import redact_payload
 from .domain_events import build_domain_event
+from .parsing import parse_decimal as _optional_decimal
 from .store import TradingStore, _row, dec_str
-
-
-def _optional_decimal(value: Any) -> Decimal | None:
-    if value in (None, ""):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
 
 # Only semantic OCO leg fields create a domain event. Poll bookkeeping fields
 # (evidence id, last observed time, not-observed reason) do not.

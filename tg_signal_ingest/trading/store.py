@@ -28,6 +28,7 @@ from .domain_events import (
     validate_domain_event,
 )
 from .parser import PARSER_VERSION, ParsedSignal
+from .parsing import parse_iso_utc as _parse_iso
 
 _APPLICATION_VERSION = "0.1.0"
 
@@ -95,16 +96,6 @@ def severity_rank(value: str | None) -> int:
         return SEVERITY_LEVELS.index(str(value or DEFAULT_MIN_SEVERITY).upper())
     except ValueError:
         return SEVERITY_LEVELS.index(DEFAULT_MIN_SEVERITY)
-
-
-def _parse_iso(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class TradingError(Exception):
