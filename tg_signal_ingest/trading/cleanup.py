@@ -12,7 +12,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 CLEANUP_KEY = "trading.initial_open_order_cleanup"
-INFLIGHT_KEY = "trading.initial_open_order_cleanup_inflight"
 DEFAULT_THRESHOLD_USD = Decimal("5")
 STABLE_QUOTE_ASSETS = {"USDT", "USD"}
 
