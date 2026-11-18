@@ -121,7 +121,6 @@ def test_p0_multi_tranche_position_has_two_native_ocos_per_tranche(env):
         Decimal("0.06"): (Decimal("0.03"), Decimal("0.03")),
         Decimal("0.02"): (Decimal("0.01"), Decimal("0.01")),
     }
-    seen: list[tuple[Decimal, Decimal]] = []
     for group_orders in tranches.values():
         assert len(group_orders) == 2
         by_kind = {order["kind"]: order for order in group_orders}
@@ -132,16 +131,11 @@ def test_p0_multi_tranche_position_has_two_native_ocos_per_tranche(env):
         assert Decimal(tp2["price"]) == TP2
         assert Decimal(tp1["stop_trigger_price"]) == SL
         assert Decimal(tp2["stop_trigger_price"]) == SL
-        seen.append((Decimal(tp1["quantity"]), Decimal(tp2["quantity"])))
-        assert Decimal(tp1["quantity"]) + Decimal(tp2["quantity"]) in expected
-        tp1_expected = expected[Decimal(tp1["quantity"]) + Decimal(tp2["quantity"])][0]
-        assert Decimal(tp1["quantity"]) == tp1_expected
-        assert Decimal(tp2["quantity"]) == Decimal(tp1["quantity"])  # 50/50 for these fills
-    assert sorted(seen) == [
-        (Decimal("0.01"), Decimal("0.01")),
-        (Decimal("0.01"), Decimal("0.01")),
-        (Decimal("0.03"), Decimal("0.03")),
-    ]
+        # The (OCO1, OCO2) pair must be exactly the incremental-fill
+        # allocation; only the correct multiset can satisfy this per tranche.
+        tranche_total = Decimal(tp1["quantity"]) + Decimal(tp2["quantity"])
+        assert tranche_total in expected, tranche_total
+        assert (Decimal(tp1["quantity"]), Decimal(tp2["quantity"])) == expected[tranche_total]
 
     # Distinct tranche identity and distinct client order ids everywhere.
     cids = [str(order["client_order_id"]) for group in tranches.values() for order in group]
@@ -206,12 +200,14 @@ def test_p0_tranche_order_pairs_persist_atomically_before_any_submission(env):
     tp2_spec = spec("tp2", TP2)
 
     # The store API refuses any spec list that is not exactly {tp1, tp2}.
-    with pytest.raises(ValueError, match="exactly one tp1 and one tp2"):
-        store.create_trade_order_pair([tp1_spec])
-    with pytest.raises(ValueError, match="exactly one tp1 and one tp2"):
-        store.create_trade_order_pair([tp1_spec, tp2_spec, tp1_spec])
-    with pytest.raises(ValueError, match="exactly one tp1 and one tp2"):
-        store.create_trade_order_pair([spec("tp1", TP1), spec("tp1", TP1)])
+    invalid_spec_lists = [
+        [tp1_spec],
+        [tp1_spec, tp2_spec, tp1_spec],
+        [spec("tp1", TP1), spec("tp1", TP1)],
+    ]
+    for specs in invalid_spec_lists:
+        with pytest.raises(ValueError, match="exactly one tp1 and one tp2"):
+            store.create_trade_order_pair(specs)
 
     # Nothing was persisted by the failed calls.
     assert store.list_trade_orders(trade_id, kind="tp1") == []

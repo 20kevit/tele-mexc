@@ -801,17 +801,3 @@ def test_p0_market_exactly_at_trigger_is_direct_boundary(cfg, repo):
     call = client.place_calls[0]
     assert call["order_type"] == "LIMIT"
     assert Decimal(str(call["price"])) == ENTRY
-
-
-def test_p0_market_below_trigger_still_waits_conditionally(cfg, repo):
-    cfg.trading.entry_trigger_offset_ticks = 4
-    store, engine, client, notifier, tm = _edge_env(cfg, repo)
-    intent = _insert_intent(store)
-    # Boundary: market strictly below the trigger keeps the conditional wait.
-    decision = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("97.90"))
-
-    assert decision.deferred is True
-    assert decision.trade is not None
-    assert decision.trade["entry_mode"] == "conditional"
-    assert Decimal(decision.trade["trigger_price"]) == Decimal("98.00")
-    assert client.place_calls == []

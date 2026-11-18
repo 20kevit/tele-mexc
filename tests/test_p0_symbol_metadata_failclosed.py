@@ -80,7 +80,10 @@ class _BrokenValidateMeta(FakeMeta):
 
 
 class _EngineFakeClient(FakeClient):
-    """FakeClient with the read-only account/ticker views the engine reads."""
+    """FakeClient plus the read-only account/ticker views the engine reads.
+
+    ``query_order``/``open_orders`` are inherited from ``FakeClient``.
+    """
 
     def ticker_price(self, symbol=None):
         return {"symbol": symbol, "price": str(_REFERENCE_PRICE)}
@@ -94,18 +97,6 @@ class _EngineFakeClient(FakeClient):
                 {"asset": "USDT", "free": "1000", "locked": "0", "available": "1000"},
             ],
         }
-
-    def query_order(self, **kwargs):
-        return {
-            "orderId": kwargs.get("order_id") or "ex-1",
-            "symbol": kwargs.get("symbol") or SYMBOL,
-            "status": "NEW",
-            "executedQty": "0",
-            "cumulativeQuoteQty": "0",
-        }
-
-    def open_orders(self, symbol=None):
-        return []
 
 
 # ---------------------------------------------------------------------------
