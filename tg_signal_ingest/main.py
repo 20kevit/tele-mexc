@@ -1524,6 +1524,76 @@ def cmd_notifications_requeue(args) -> int:
     return 0 if result == "requeued" else 1
 
 
+def cmd_notifications_parity(args) -> int:
+    """Read-only parity report: expected domain events vs delivery rows.
+
+    Compares both notification ledgers without modifying either and without
+    any Telegram activity (F-08 Phase 1 verification aid).  Exit code: 0
+    when parity holds, 1 when gaps/orphans/anomalies exist, 2 on errors.
+    """
+    cfg = _load_or_exit(require_credentials=False)
+    from .notification_parity import build_parity_report
+
+    recipients = {
+        "owner": cfg.control.owner_user_id,
+        "owner_b": cfg.control.owner_b_user_id,
+        "developer": cfg.control.developer_user_id,
+    }
+    recipients = {role: int(chat_id) for role, chat_id in recipients.items() if chat_id}
+    report = build_parity_report(
+        cfg.db_path,
+        cfg.data_dir / "notification-delivery.sqlite3",
+        recipients,
+        since_audit_id=args.since_audit_id,
+        gap_limit=args.limit,
+    )
+    if "error" in report:
+        print(report["error"], file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if report["parity_ok"] else 1
+    if not report["delivery_db_present"]:
+        print("notification dispatcher has not initialized its delivery database; nothing to compare yet")
+        print(f"source_max_audit_id={report['source_max_audit_id']}")
+        return 0
+    print("notification parity report (read-only, no delivery triggered):")
+    print(
+        f"  source_max_audit_id={report['source_max_audit_id']} source_cursor={report['source_cursor']} "
+        f"cursor_lag={report['cursor_lag']} relay_caught_up={report['relay_caught_up']}"
+    )
+    print(
+        f"  domain_events_considered={report['domain_events_considered']} "
+        f"relayed={report['relayed_events_considered']} unrelayed_within_cursor={report['unrelayed_within_cursor']}"
+    )
+    print(
+        f"  expected_deliveries={report['expected_deliveries']} "
+        f"(pending={report['expected_pending']} suppressed={report['expected_suppressed']}) "
+        f"delivery_rows={report['delivery_rows']}"
+    )
+    print(
+        f"  gaps_total={report['gaps_total']} orphans_total={report['orphans_total']} parity_ok={report['parity_ok']}"
+    )
+    for role, counts in sorted(report["status_counts_by_role"].items()):
+        joined = "  ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        print(f"  role={role}: {joined}")
+    if report["gaps"]:
+        print(f"gaps ({report['gaps_total']} total, showing {len(report['gaps'])}):")
+        for gap in report["gaps"]:
+            print(
+                f"  audit_id={gap['audit_id']} event={gap['event_id']} type={gap['event_type']} "
+                f"severity={gap['severity']} role={gap['recipient_role']}"
+            )
+    if report["orphans"]:
+        print(f"orphan deliveries ({report['orphans_total']} total, showing {len(report['orphans'])}):")
+        for orphan in report["orphans"]:
+            print(
+                f"  delivery_id={orphan['delivery_id']} event={orphan['event_id']} "
+                f"role={orphan['recipient_role']} status={orphan['status']}"
+            )
+    return 0 if report["parity_ok"] else 1
+
+
 _NOTIFICATION_SOURCE_REQUIRED_COLUMNS = frozenset(
     {
         "audit_id", "event_id", "event_type", "schema_version", "occurred_at_utc",
@@ -1688,6 +1758,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     notification_requeue.add_argument("delivery_id", help="exact delivery_id from notifications list")
     notification_requeue.set_defaults(func=cmd_notifications_requeue)
+    notification_parity = notifications_sub.add_parser(
+        "parity",
+        help="read-only parity report: expected domain events vs per-recipient delivery rows (no writes, no Telegram)",
+    )
+    notification_parity.add_argument(
+        "--since-audit-id", type=int, default=0, help="only consider domain events above this audit id"
+    )
+    notification_parity.add_argument("--limit", type=int, default=20, help="maximum gaps/orphans listed in detail")
+    notification_parity.add_argument("--json", action="store_true")
+    notification_parity.set_defaults(func=cmd_notifications_parity)
 
     status = sub.add_parser("status", help="offline health/sync overview")
     status.set_defaults(func=cmd_status)
