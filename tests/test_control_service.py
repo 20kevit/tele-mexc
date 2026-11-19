@@ -224,7 +224,7 @@ async def test_owner_signal_history_latest_ten_details_and_back_are_read_only(cf
     await control.handle_update(_callback(1, "s:menu"))
     menu = fake.edited[-1]
     options = [button["callback_data"] for row in menu["reply_markup"]["inline_keyboard"] for button in row]
-    assert options == ["s:last", "s:48", "m:status"]
+    assert options == ["s:last", "s:48"]
 
     await control.handle_update(_callback(2, "s:last"))
     listing = fake.edited[-1]
@@ -246,9 +246,9 @@ async def test_owner_signal_history_latest_ten_details_and_back_are_read_only(cf
     assert "حد ضرر: 95" in details["text"]
     assert "TP1: 110" in details["text"] and "TP2: 120" in details["text"]
     assert "منبع: Signals" in details["text"]
-    assert details["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "s:back:last:0"
+    assert details["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "s:back:l:0"
 
-    await control.handle_update(_callback(4, "s:back:last:0"))
+    await control.handle_update(_callback(4, "s:back:l:0"))
     assert "۱۰ سیگنال LONG اخیر" in fake.edited[-1]["text"]
     assert engine.executed == []
 
@@ -269,6 +269,47 @@ async def test_owner_signal_history_last_48_hours_uses_stored_utc_timestamps(cfg
     assert engine.executed == []
 
 
+async def test_48_hour_signal_pages_return_to_the_same_page_after_details(cfg, repo):
+    _add_channel(repo)
+    control, fake, engine = _bot(cfg, repo)
+    now = datetime.now(UTC)
+    for n in range(1, 22):
+        _add_history_signal(
+            repo,
+            n,
+            symbol=f"COIN{n}USDT",
+            created_at=(now - timedelta(minutes=n)).isoformat(),
+        )
+
+    await control.handle_update(_callback(1, "s:48"))
+    first_page = fake.edited[-1]
+    assert "COIN1USDT" in first_page["text"]
+    assert "COIN11USDT" not in first_page["text"]
+    next_button = next(
+        button
+        for row in first_page["reply_markup"]["inline_keyboard"]
+        for button in row
+        if button["callback_data"] == "s:page:48:1"
+    )
+    await control.handle_update(_callback(2, next_button["callback_data"]))
+    second_page = fake.edited[-1]
+    assert "COIN11USDT" in second_page["text"]
+    assert "COIN1USDT" not in second_page["text"]
+    detail_button = next(
+        button
+        for row in second_page["reply_markup"]["inline_keyboard"]
+        for button in row
+        if button["callback_data"].startswith("s:d:")
+    )
+    await control.handle_update(_callback(3, detail_button["callback_data"]))
+    details = fake.edited[-1]
+    assert details["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "s:back:h:1"
+    await control.handle_update(_callback(4, "s:back:h:1"))
+    assert "COIN11USDT" in fake.edited[-1]["text"]
+    assert "COIN1USDT" not in fake.edited[-1]["text"]
+    assert engine.executed == []
+
+
 async def test_signal_callbacks_require_owner_and_reject_invalid_or_stale_ids(cfg, repo):
     _add_channel(repo)
     _full_setup(ControlStore(repo.db))
@@ -278,12 +319,12 @@ async def test_signal_callbacks_require_owner_and_reject_invalid_or_stale_ids(cf
     await control.handle_update(_callback(1, "s:menu", user=DEVELOPER))
     assert not fake.edited
     assert fake.answered[-1] == "cb-1"
-    await control.handle_update(_callback(2, "s:d:not-valid!"))
+    await control.handle_update(_callback(2, "s:d:not-valid!:l"))
     assert "نامعتبر یا منقضی" in fake.edited[-1]["text"]
 
     encoded = control._signal_callback_id(signal_id).split(":", 2)[2]
     repo.db.conn.execute("UPDATE signals SET status='rejected' WHERE signal_id=?", (signal_id,))
-    await control.handle_update(_callback(3, f"s:d:{encoded}"))
+    await control.handle_update(_callback(3, f"s:d:{encoded}:l"))
     assert "دیگر واجد شرایط" in fake.edited[-1]["text"]
     assert engine.executed == []
 

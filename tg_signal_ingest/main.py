@@ -597,7 +597,7 @@ def cmd_control_status(_args) -> int:
         print(f"  channel: {setup['selected_channel_title'] or 'not selected'}")
         print(f"  execution paused: {bool(int(setup['paused'] or 0))}")
         print(
-            f"  notification minimum (default): {store.notification_min_severity()} "
+            f"  notification minimum (default): {store.notification_min_severity('owner')} "
             "(owners' CRITICAL/safety alerts bypass it; per-role overrides "
             "notification_min_severity.<role> are read by the dispatcher)"
         )
@@ -1209,34 +1209,6 @@ def cmd_trading_reconcile(args) -> int:
     return 0 if stats.errors == 0 else 1
 
 
-def cmd_trading_notifications(args) -> int:
-    cfg = _load_or_exit(require_credentials=False)
-    db, repo = _new_repo(cfg)
-    from .trading.store import TradingStore
-
-    store = TradingStore(repo.db, cfg.trading)
-    rows = store.pending_notifications(limit=args.limit)
-    if args.status:
-        rows = [r for r in rows if r["status"] == args.status]
-    print(f"trading notifications ({len(rows)} pending/failed):")
-    for r in rows:
-        attempts = store.notification_attempts(int(r["notification_id"]))
-        last = attempts[-1] if attempts else None
-        print(
-            f"  id={r['notification_id']} status={r['status']} role={r['role']} "
-            f"category={r['category']} event_type={r['event_type']} "
-            f"attempts={r['attempts']} next={r['next_attempt_at'] or '-'} "
-            f"last={last['outcome'] if last else '-'} {last['error'] or '' if last else ''}"
-        )
-        if last:
-            print(
-                f"        attempt={last['attempt_no']} at={last['attempted_at']} "
-                f"ambiguous={last['ambiguous']} retry_after={last['retry_after_s']}"
-            )
-    db.close()
-    return 0
-
-
 def cmd_trading_verify(args) -> int:
     """Read-only MEXC API key verification command.
 
@@ -1257,9 +1229,11 @@ def cmd_trading_readiness(args) -> int:
     ``--network`` it performs ordinary read-only Telegram/MEXC checks.
     """
 
-    import hashlib
+    import uuid
 
+    from .trading.domain_events import build_domain_event
     from .trading.readiness import build_readiness_report, report_as_json
+    from .trading.store import TradingStore
 
     cfg = _load_or_exit(require_credentials=False)
     db, repo = _new_repo(cfg)
@@ -1269,35 +1243,25 @@ def cmd_trading_readiness(args) -> int:
     else:
         print(report.render())
 
-    if report.blockers and cfg.control.bot_token and (
-        cfg.control.owner_user_id or cfg.control.owner_b_user_id
-    ):
+    if report.blockers:
         try:
-            from .control.bot_api import BotApiClient
-            from .trading.notify import TradingNotifier
-            from .trading.store import TradingStore
-
-            notifier = TradingNotifier(
-                TradingStore(repo.db, cfg.trading),
-                BotApiClient(cfg.control.bot_token, api_base=cfg.control.api_base),
-                owner_id=cfg.control.owner_user_id,
-                owner_b_id=cfg.control.owner_b_user_id,
-                developer_id=cfg.control.developer_user_id,
+            summary = "|".join(f"{check.name}:{check.detail}" for check in report.blockers)
+            event_id = uuid.uuid5(uuid.NAMESPACE_URL, f"readiness:{summary}").hex
+            message = "⚠️ گزارش آمادگی اولین استارت: NOT READY\n" + "\n".join(
+                f"- {check.name}: {check.detail}" for check in report.blockers[:12]
             )
-            summary = hashlib.sha256(
-                "|".join(f"{check.name}:{check.detail}" for check in report.blockers).encode("utf-8")
-            ).hexdigest()[:12]
-            notifier.notify(
-                event_key=f"readiness:blockers:{summary}",
-                text=(
-                    "⚠️ گزارش آمادگی اولین استارت: NOT READY\n"
-                    + "\n".join(f"- {check.name}: {check.detail}" for check in report.blockers[:12])
-                ),
-                category="critical",
-                event_type="readiness.not_ready",
+            TradingStore(repo.db, cfg.trading).record_domain_event(
+                build_domain_event(
+                    "system.service_event",
+                    aggregate_id="readiness",
+                    correlation_id="readiness",
+                    event_id=event_id,
+                    severity="WARNING",
+                    payload={"event_key": "readiness.not_ready", "message": message[:1800]},
+                )
             )
         except Exception as exc:  # noqa: BLE001 - reporting must not hide the local report
-            print(f"owner notification enqueue failed ({exc.__class__.__name__})", file=sys.stderr)
+            print(f"readiness event recording failed ({exc.__class__.__name__})", file=sys.stderr)
     db.close()
     return 0 if report.ready else 1
 
@@ -1532,7 +1496,7 @@ _NOTIFICATION_SOURCE_REQUIRED_COLUMNS = frozenset(
     }
 )
 _NOTIFICATION_SOURCE_REQUIRED_TABLES = frozenset(
-    {"audit_events", "control_settings", "notification_preferences", "trading_notifications"}
+    {"audit_events", "control_settings", "notification_preferences"}
 )
 
 
@@ -1766,11 +1730,6 @@ def build_parser() -> argparse.ArgumentParser:
     ts_recon = ts_sub.add_parser("reconcile", help="reconcile non-terminal intents")
     ts_recon.add_argument("--limit", type=int, default=50)
     ts_recon.set_defaults(func=cmd_trading_reconcile)
-    ts_notify = ts_sub.add_parser("notifications", help="list trading notification outbox state")
-    ts_notify.add_argument("--status", default=None, help="filter by status (pending, failed, ambiguous, sent)")
-    ts_notify.add_argument("--limit", type=int, default=50)
-    ts_notify.set_defaults(func=cmd_trading_notifications)
-
     ts_verify = ts_sub.add_parser("verify", help="read-only MEXC API key verification (no order placed)")
     ts_verify.set_defaults(func=cmd_trading_verify)
 

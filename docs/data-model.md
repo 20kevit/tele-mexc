@@ -95,11 +95,11 @@ signals 1 ── * order_intents 1 ── * order_fills
 | Table | Purpose |
 | --- | --- |
 | `trading_budget_ledger` | one row per executable intent: reserved/spent/fee quote, active flag, state (`reserved`, `uncertain`, `settled`, `released`) |
-| `trading_notifications` | compatibility producer outbox; unique `(event_key, role)`, formatted text, recipient, category/event type. New rows are relayed by the independent dispatcher; its old delivery status columns are not authoritative after the dispatcher cutover |
+| `trading_notifications` | legacy table retained by historical migrations for upgrade/data compatibility; current producers no longer write it and the dispatcher does not relay it |
 
-The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. Notification roles are `owner`, `owner_b`, and `developer`. `notification_min_severity` in `control_settings` is the shared default; `notification_min_severity.<role>` overrides it per recipient. Per-category `notification_preferences` are applied per recipient; `owner_b` inherits `owner` preferences until its own rows exist. CRITICAL and owner-safety alerts bypass both filters for owners.
+The ledger is a technical per-intent reservation/idempotency tracker. It is not a portfolio budget and is never reset by restart. Notification roles are `owner`, `owner_b`, and `developer`. `notification_min_severity` in `control_settings` is the shared default; `notification_min_severity.<role>` overrides it per recipient. Per-category `notification_preferences` are applied per recipient; `owner_b` inherits `owner` preferences until its own rows exist. Critical safety events remain durable and are not suppressed by routine owner filters.
 
-`TradingNotifier.notify()` is enqueue-only: trading producers never perform Telegram I/O or call `flush()`. The independent `tg-ingest notifications worker` relays domain events and new formatted rows from `trading_notifications` into a separate `notification-delivery.sqlite3` ledger. That delivery DB owns `deliveries` (one row per event/recipient/fragment with `part_no`, `thread_key`, `reply_to_message_id`, attempts, claim token, message id), `delivery_attempts`, `delivery_threads` (per-recipient root message for trade/intent replies), `relayed_events`, `relayed_legacy_notifications`, and `dispatcher_state` (cursors + heartbeat). It establishes independent no-replay boundaries for both the domain journal and legacy outbox at first startup. The trading DB is read-only to the dispatcher; legacy outbox status fields therefore remain compatibility metadata, not the source of truth for delivery outcomes.
+The independent `tg-ingest notifications worker` reads domain events from `audit_events` using a read-only trading-database connection and writes delivery state to `notification-delivery.sqlite3`. The ledger holds per-recipient deliveries, ordered message fragments, attempt history, relay checkpoints, and heartbeat. Current messages are standalone; reply threading and the formatted `trading_notifications` bridge have been removed. Historical migrations and delivery databases may retain unused compatibility tables/columns; no migration or cleanup of production data is implied by this description.
 
 ### Exchange evidence and OCO lifecycle
 
@@ -109,8 +109,8 @@ The ledger is a technical per-intent reservation/idempotency tracker. It is not 
 | `oco_groups` | one row per trade (`oco_group_id` PK, `trade_id` unique); `state` mirrors trade state, `intended_config`, `protection_status`, `closed_at` |
 | `oco_legs` | one row per OCO target (`leg_id` PK, unique per group+target); `kind`, `target`, prices/qtys, state, exchange status, fills/fees, `cancel_reason`, `canceled_by_target` |
 | `notification_preferences` | per-role/per-category enablement, read by the independent dispatcher; `owner_b` falls back to `owner` defaults/preferences |
-| `notification-delivery.sqlite3` (separate file) | independent relay cursors, per-recipient delivery state, message fragments/threads, attempts, message IDs, suppression decisions, and worker heartbeat; no schema migration in the trading DB |
-| `notification_callbacks` | opaque, role-bound, expiring, atomically single-use tokens for `expand`/`signal_source`/`ack`; not currently emitted by the dispatcher |
+| `notification-delivery.sqlite3` (separate file) | independent domain-event cursor, per-recipient delivery state, message fragments, attempts, message IDs, suppression decisions, and worker heartbeat; no schema migration in the trading DB |
+| `notification_callbacks` | legacy table retained by historical migrations; current notification delivery does not use it |
 | `notification_delivery_attempts` | legacy per-notification attempt history: outcome, error, message id, retry-after, `ambiguous` flag |
 
 `exchange_operations.uncertainty`: `none`, `uncertain`, `reconciled`,

@@ -16,7 +16,6 @@ import pytest
 
 from tg_signal_ingest.control.bot_api import (
     BotApiClient,
-    BotApiError,
     BotApiNotSentError,
     BotApiRateLimitError,
     BotApiTransportError,
@@ -27,7 +26,6 @@ from tg_signal_ingest.notification_dispatcher import (
     NOTIFICATION_CATEGORY_BY_EVENT,
     NotificationDispatcher,
     delivery_decision,
-    event_thread_key,
     notification_category,
     recipient_minimum_severity,
     render_domain_event,
@@ -70,13 +68,6 @@ def _source(path: Path) -> sqlite3.Connection:
         "PRIMARY KEY(role,category))"
     )
     conn.execute("CREATE TABLE control_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
-    conn.execute(
-        """CREATE TABLE trading_notifications (
-            notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_key TEXT, category TEXT, event_type TEXT, role TEXT,
-            chat_id INTEGER, text TEXT, status TEXT
-        )"""
-    )
     conn.commit()
     return conn
 
@@ -107,9 +98,9 @@ class RecordingBot:
         self.markups: list[dict | None] = []
 
     def send_message(
-        self, chat_id: int, text: str, *, reply_to_message_id: int | None = None, reply_markup=None
+        self, chat_id: int, text: str, *, reply_markup=None
     ):
-        self.calls.append((chat_id, text, reply_to_message_id))
+        self.calls.append((chat_id, text, None))
         self.markups.append(reply_markup)
         error = self.fail.get(chat_id)
         if error is not None:
@@ -523,14 +514,7 @@ def test_routing_helpers_are_deterministic():
         "owner", "DEBUG", "order_lifecycle", "trade.state_changed", {}, {}, {}, "INFO"
     )
     assert (status, reason) == ("suppressed", "DEBUG is internal-log only")
-    assert event_thread_key(
-        "trade.state_changed", aggregate_type="trade", aggregate_id="t1",
-        correlation_id="t1", payload={}, severity="INFO",
-    ) == "trade:t1"
-    assert event_thread_key(
-        "trade.protection_critical", aggregate_type="trade", aggregate_id="t1",
-        correlation_id="t1", payload={}, severity="CRITICAL",
-    ) is None
+
 
 
 def severity_enabled_for_test(severity: str, minimum: str) -> bool:
@@ -593,107 +577,14 @@ def test_only_identical_event_id_is_deduplicated(tmp_path):
         source.close()
 
 
-# --------------------------------------------------------------- threading
+def test_long_message_chunks_preserve_order_and_content():
+    from tg_signal_ingest.notification_dispatcher import message_chunks
 
-
-def test_root_and_replies_are_per_recipient(tmp_path):
-    bot = RecordingBot()
-    source, worker = _worker(tmp_path, bot)
-    try:
-        _insert(source, 1, "intent.state_changed",
-                {"previous_state": "submitting", "new_state": "submitted"},
-                aggregate_type="intent", aggregate_id="intent-1", correlation_id="signal-1")
-        _insert(source, 2, "trade.state_changed",
-                {"previous_state": "entry_active", "new_state": "oco_active"},
-                aggregate_type="intent", aggregate_id="intent-1", correlation_id="signal-1")
-        _insert(source, 3, "trade.protection_critical",
-                {"event_key": "SL_UNPROTECTED_CRITICAL", "detail": "unprotected"},
-                severity="CRITICAL", aggregate_type="trade", aggregate_id="trade-1",
-                correlation_id="trade-1")
-        worker.run_once()
-
-        by_owner = [call for call in bot.calls if call[0] == OWNER]
-        assert by_owner[0][2] is None  # root
-        owner_root = worker.store.thread_root("owner", "intent:intent-1")
-        assert owner_root is not None
-        assert by_owner[1][2] == owner_root  # replies to owner's own root
-        assert by_owner[2][2] is None  # critical is standalone
-
-        roots = worker.store.conn.execute(
-            "SELECT recipient_role,thread_key,root_message_id FROM delivery_threads "
-            "ORDER BY recipient_role"
-        ).fetchall()
-        assert {(row["recipient_role"], row["thread_key"]) for row in roots} == {
-            ("developer", "intent:intent-1"),
-            ("owner", "intent:intent-1"),
-            ("owner_b", "intent:intent-1"),
-        }
-    finally:
-        worker.close()
-        source.close()
-
-
-def test_deleted_root_falls_back_to_standalone_not_dead_letter(tmp_path):
-    bot = RecordingBot()
-    source, worker = _worker(tmp_path, bot)
-    try:
-        _insert(source, 1, "intent.state_changed",
-                {"previous_state": "submitting", "new_state": "submitted"}, aggregate_type="intent",
-                aggregate_id="intent-1")
-        worker.run_once()
-        root_id = worker.store.thread_root("owner", "intent:intent-1")
-        assert root_id is not None
-
-        _insert(source, 2, "intent.state_changed",
-                {"previous_state": "submitting", "new_state": "submitted",
-                 "exchange_order_id": "999"},
-                aggregate_type="intent", aggregate_id="intent-1")
-        bot.fail[OWNER] = BotApiError("Bad Request: message to be replied not found")
-        # The first owner send (reply) fails; the fallback standalone send must
-        # succeed because the fake only fails once per chat in this dict.
-        def send(chat_id, text, *, reply_to_message_id=None):
-            bot.calls.append((chat_id, text, reply_to_message_id))
-            if chat_id == OWNER and reply_to_message_id is not None:
-                raise BotApiError("Bad Request: message to be replied not found")
-            bot.next_id += 1
-            return {"message_id": bot.next_id}
-
-        bot.send_message = send
-        worker._supports_reply = True
-        worker.run_once()
-        status = worker.store.conn.execute(
-            "SELECT status FROM deliveries WHERE event_id='evt-2' AND recipient_role='owner'"
-        ).fetchone()["status"]
-        assert status == "sent"
-    finally:
-        worker.close()
-        source.close()
-
-
-def test_long_legacy_message_is_chunked_in_order(tmp_path):
-    bot = RecordingBot()
-    source, worker = _worker(tmp_path, bot, prefs={("owner", "order_lifecycle"): 1})
-    try:
-        text = "line-0000\n" + "\n".join(f"line-{i:04d}" for i in range(1, 900))
-        assert len(text) > 2 * 3900
-        source.execute(
-            "INSERT INTO trading_notifications(event_key,category,event_type,role,chat_id,text,status) "
-            "VALUES('long','order_lifecycle','trade.protection_critical','owner',?,?,'pending')",
-            (OWNER, text),
-        )
-        source.commit()
-        worker.run_once()
-        calls = [call for call in bot.calls if call[0] == OWNER]
-        assert len(calls) == 3
-        assert "".join(call[1] for call in calls) == text
-        parts = worker.store.conn.execute(
-            "SELECT part_no,part_count,status FROM deliveries ORDER BY part_no"
-        ).fetchall()
-        assert [row["part_no"] for row in parts] == [1, 2, 3]
-        assert all(row["part_count"] == 3 and row["status"] == "sent" for row in parts)
-    finally:
-        worker.close()
-        source.close()
+    text = "line-0000\n" + "\n".join(f"line-{i:04d}" for i in range(1, 900))
+    chunks = message_chunks(text)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 3900 for chunk in chunks)
+    assert "".join(chunks) == text
 
 
 # ------------------------------------------------------- delivery failures
@@ -998,24 +889,6 @@ def test_operator_requeue_preserves_history_and_grants_one_attempt(tmp_path):
         source.close()
 
 
-def test_notification_callbacks_are_single_use_role_bound_and_expiring(cfg, repo):
-    from tg_signal_ingest.trading.store import TradingStore
-
-    store = TradingStore(repo.db, cfg.trading)
-    token = store.create_notification_callback(
-        notification_id=1, role="owner", action="ack", ttl_s=60
-    )
-    assert store.consume_notification_callback(token, "developer") is None
-    consumed = store.consume_notification_callback(token, "owner")
-    assert consumed is not None and consumed["role"] == "owner"
-    assert store.consume_notification_callback(token, "owner") is None
-
-    expired = store.create_notification_callback(
-        notification_id=2, role="owner", action="expand", ttl_s=-1
-    )
-    assert store.consume_notification_callback(expired, "owner") is None
-
-
 # ------------------------------------------------ trading-path independence
 
 
@@ -1041,31 +914,14 @@ def _calls_in(tree: ast.AST) -> set[str]:
 
 
 def test_trading_path_has_no_telegram_network_or_flush_calls():
-    """Static call-graph guard over the trading critical path.
-
-    ``trading/notify.py`` retains the dormant legacy flush/delivery helpers for
-    compatibility, but the producer entry points ``notify``/``enqueue`` must not
-    reach them.  Every other trading module (and the serve orchestration) must
-    contain no Telegram/network/flush call at all.
-    """
-
+    """Trading producers only append audit state; the independent worker owns I/O."""
     forbidden_calls = {"send_message", "flush", "urlopen", "getresponse", "request"}
     offenders: list[str] = []
     for path in _trading_modules():
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        if path.name == "notify.py":
-            for node in tree.body:
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
-                    "notify",
-                    "enqueue",
-                }:
-                    reached = _calls_in(node) & forbidden_calls
-                    if reached:
-                        offenders.append(f"{path.name}:{node.name}:{sorted(reached)}")
-            continue
-        for name in _calls_in(tree) & forbidden_calls:
-            offenders.append(f"{path.name}:{name}")
+        offenders.extend(f"{path.name}:{name}" for name in _calls_in(tree) & forbidden_calls)
     assert offenders == []
+    assert not (Path(__file__).resolve().parents[1] / "tg_signal_ingest/trading/notify.py").exists()
 
 
 def test_systemd_worker_dependency_is_one_directional():
@@ -1084,22 +940,3 @@ def test_systemd_worker_dependency_is_one_directional():
     assert "PartOf=tg-ingest.service" in worker
     assert "After=network-online.target tg-ingest.service" in worker
     assert "tg-ingest notifications worker" in worker
-
-
-def test_notifier_enqueue_never_calls_the_telegram_bot(cfg, repo):
-    from tg_signal_ingest.trading.notify import TradingNotifier
-    from tg_signal_ingest.trading.store import TradingStore
-
-    class ExplodingBot:
-        def send_message(self, *args, **kwargs):
-            raise AssertionError("trading path must never call Telegram")
-
-    store = TradingStore(repo.db, cfg.trading)
-    notifier = TradingNotifier(store, ExplodingBot(), owner_id=OWNER, developer_id=DEVELOPER)
-    # Enqueue is local-only; if this ever called send_message the exploding bot
-    # would fail the test.
-    notifier.notify(event_key="test:local-only", text="local only", category="order_lifecycle")
-    rows = store.db.conn.execute(
-        "SELECT COUNT(*) AS n FROM trading_notifications"
-    ).fetchone()["n"]
-    assert rows == 2

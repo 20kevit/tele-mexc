@@ -14,7 +14,7 @@ import contextlib
 import logging
 import math
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -434,7 +434,10 @@ class ControlBot:
             else:
                 rows.append([_btn("⏸ توقف اجرای سفارش", "m:pause")])
             if s.get("selected_channel_id"):
-                rows.append([_btn("📈 تاریخچه سیگنال‌های LONG", "s:menu")])
+                rows.append([
+                    _btn("📈 ۱۰ سیگنال اخیر", "s:last"),
+                    _btn("🕒 ۴۸ ساعت اخیر", "s:48"),
+                ])
         rows.append([_btn("📊 وضعیت", "m:status"), _btn("❓ راهنما", "m:help")])
         return _kb(rows)
 
@@ -1036,25 +1039,52 @@ class ControlBot:
         ).fetchone()
         return dict(row) if row is not None else None
 
-    def _signal_history_rows(self, view: str) -> list[dict[str, Any]]:
+    def _signal_history_rows(
+        self, view: str, page: int = 0, page_size: int = 10
+    ) -> tuple[list[dict[str, Any]], int]:
+        eligibility = (
+            "s.signal_kind IN ('alert','update') AND LOWER(COALESCE(s.action,''))='buy' "
+            "AND s.market_type='spot' AND s.status IN ('validated','planned')"
+        )
+        params: list[Any] = []
+        if view == "48":
+            cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+            eligibility += " AND julianday(s.created_at)>=julianday(?)"
+            params.append(cutoff)
+            count = int(self.repo.db.conn.execute(
+                f"SELECT COUNT(*) FROM signals s WHERE {eligibility}", params
+            ).fetchone()[0])
+        else:
+            count = 10
         rows = self.repo.db.conn.execute(
-            """SELECT s.signal_id,s.symbol,s.created_at,s.edit_version
-               FROM signals s
+            f"""SELECT s.signal_id,s.symbol,s.created_at,s.edit_version FROM signals s
+                WHERE {eligibility}
+                ORDER BY s.created_at DESC,s.channel_id DESC,s.message_id DESC,s.edit_version DESC
+                LIMIT ? OFFSET ?""",
+            (*params, page_size, page * page_size),
+        ).fetchall()
+        return [dict(row) for row in rows], count
+
+    def _signal_page_for_id(self, signal_id: str, view: str) -> int:
+        if view == "last":
+            return 0
+        signal = self._eligible_signal(signal_id)
+        if signal is None:
+            return 0
+        cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        newer = self.repo.db.conn.execute(
+            """SELECT COUNT(*) FROM signals s
                WHERE s.signal_kind IN ('alert','update')
                  AND LOWER(COALESCE(s.action,''))='buy' AND s.market_type='spot'
                  AND s.status IN ('validated','planned')
-               ORDER BY s.created_at DESC,s.channel_id DESC,s.message_id DESC,s.edit_version DESC"""
-        ).fetchall()
-        signals = [dict(row) for row in rows]
-        if view == "last":
-            return signals[:10]
-        cutoff = datetime.now(UTC).timestamp() - 48 * 60 * 60
-        result: list[dict[str, Any]] = []
-        for row in signals:
-            parsed = self._signal_time(row.get("created_at"))
-            if parsed is not None and parsed.timestamp() >= cutoff:
-                result.append(row)
-        return result
+                 AND julianday(s.created_at)>=julianday(?)
+                 AND (s.created_at>? OR (s.created_at=? AND
+                      (s.channel_id>? OR (s.channel_id=? AND
+                       (s.message_id>? OR (s.message_id=? AND s.edit_version>?))))))""",
+            (cutoff, signal["created_at"], signal["created_at"], signal["channel_id"], signal["channel_id"],
+             signal["message_id"], signal["message_id"], signal["edit_version"]),
+        ).fetchone()[0]
+        return int(newer) // 10
 
     async def _edit_signal_screen(self, chat_id: int, text: str, keyboard: dict[str, Any]) -> None:
         message_id = self._active_callback_message_id
@@ -1070,40 +1100,22 @@ class ControlBot:
 
     async def _signal_history_action(self, chat_id: int, parts: list[str]) -> None:
         action = parts[1] if len(parts) > 1 else ""
-        if action == "menu" and len(parts) == 2:
-            await self._edit_signal_screen(
-                chat_id,
-                "📈 تاریخچه سیگنال‌های LONG\nیکی از دو بازه را انتخاب کنید:",
-                _kb([
-                    [_btn("۱۰ سیگنال اخیر", "s:last")],
-                    [_btn("۴۸ ساعت گذشته", "s:48")],
-                    [_btn("بازگشت", "m:status")],
-                ]),
-            )
-            return
         if action in {"last", "48"} and len(parts) == 2:
             await self._show_signal_list(chat_id, action, 0)
             return
-        if action == "page" and len(parts) == 4:
-            view = parts[2]
+        if action == "page" and len(parts) == 4 and parts[2] == "48":
             try:
                 page = int(parts[3])
             except ValueError:
                 page = -1
-            if view in {"last", "48"} and 0 <= page <= 10000:
-                await self._show_signal_list(chat_id, view, page)
+            if 0 <= page <= 10000:
+                await self._show_signal_list(chat_id, "48", page)
                 return
-        if action == "d" and len(parts) in {3, 5}:
+        if action == "d" and len(parts) == 4:
             signal_id = self._decode_signal_callback(parts[2])
-            back_view, back_page = "menu", 0
-            if len(parts) == 5:
-                back_view = parts[3]
-                try:
-                    back_page = int(parts[4])
-                except ValueError:
-                    back_page = -1
-            if signal_id and back_view in {"menu", "last", "48"} and 0 <= back_page <= 10000:
-                await self._show_signal_details(chat_id, signal_id, back_view, back_page)
+            view = {"l": "last", "h": "48"}.get(parts[3])
+            if signal_id and view:
+                await self._show_signal_details(chat_id, signal_id, view)
                 return
         if action == "event" and len(parts) == 3:
             event_id = parts[2]
@@ -1114,32 +1126,28 @@ class ControlBot:
                     (event_id,),
                 ).fetchone()
                 if event is not None:
-                    await self._show_signal_details(chat_id, str(event["aggregate_id"]), "menu", 0)
+                    await self._show_signal_details(chat_id, str(event["aggregate_id"]), "last")
                     return
         if action == "back" and len(parts) == 4:
-            view = parts[2]
+            view = {"l": "last", "h": "48"}.get(parts[2])
             try:
                 page = int(parts[3])
             except ValueError:
                 page = -1
-            if view == "menu" and page == 0:
-                await self._signal_history_action(chat_id, ["s", "menu"])
-                return
-            if view in {"last", "48"} and 0 <= page <= 10000:
+            if view and 0 <= page <= 10000:
                 await self._show_signal_list(chat_id, view, page)
                 return
         await self._edit_signal_screen(
             chat_id,
-            "این دکمه نامعتبر یا منقضی شده است. از تاریخچه سیگنال‌ها دوباره وارد شوید.",
-            _kb([[_btn("تاریخچه سیگنال‌ها", "s:menu")]]),
+            "این دکمه نامعتبر یا منقضی شده است. فهرست سیگنال‌ها را دوباره باز کنید.",
+            _kb([[_btn("۱۰ اخیر", "s:last"), _btn("۴۸ ساعت اخیر", "s:48")]]),
         )
 
     async def _show_signal_list(self, chat_id: int, view: str, page: int) -> None:
-        signals = self._signal_history_rows(view)
         page_size = 10
-        pages = max(1, (len(signals) + page_size - 1) // page_size)
+        signals, total = self._signal_history_rows(view, page, page_size)
+        pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, pages - 1)
-        visible = signals[page * page_size : (page + 1) * page_size]
         if not signals:
             message = (
                 "در میان ۱۰ سیگنال اخیر، LONG BUY واجد شرایطی ثبت نشده است."
@@ -1152,11 +1160,12 @@ class ControlBot:
             if pages > 1:
                 message += f" · صفحه {page + 1} از {pages}"
         rows: list[list[dict[str, str]]] = []
-        for row in visible:
+        for row in signals:
             symbol = self._signal_safe(row.get("symbol"), 24)
             stamp = self._signal_local_time(row.get("created_at"))
             message += f"\n#{symbol} · {stamp}"
-            callback = f"{self._signal_callback_id(str(row['signal_id']))}:{view}:{page}"
+            view_code = "h" if view == "48" else "l"
+            callback = f"{self._signal_callback_id(str(row['signal_id']))}:{view_code}"
             if len(callback.encode("utf-8")) <= 64:
                 rows.append([_btn(f"جزئیات #{symbol}", callback)])
         if view == "48" and pages > 1:
@@ -1166,18 +1175,16 @@ class ControlBot:
             if page + 1 < pages:
                 nav.append(_btn("بعدی", f"s:page:48:{page + 1}"))
             rows.append(nav)
-        rows.append([_btn("انتخاب بازه", "s:menu")])
+        rows.append([_btn("بازگشت به انتخاب بازه", "m:status")])
         await self._edit_signal_screen(chat_id, message, _kb(rows))
 
-    async def _show_signal_details(
-        self, chat_id: int, signal_id: str, back_view: str, page: int
-    ) -> None:
+    async def _show_signal_details(self, chat_id: int, signal_id: str, back_view: str) -> None:
         signal = self._eligible_signal(signal_id)
         if signal is None:
             await self._edit_signal_screen(
                 chat_id,
                 "این سیگنال دیگر واجد شرایط نمایش نیست یا در پایگاه داده پیدا نشد.",
-                _kb([[_btn("تاریخچه سیگنال‌ها", "s:menu")]]),
+                _kb([[_btn("۱۰ اخیر", "s:last"), _btn("۴۸ ساعت اخیر", "s:48")]]),
             )
             return
         targets = str(signal.get("target_prices") or "").split(",")
@@ -1198,10 +1205,12 @@ class ControlBot:
             lines.append(f"وضعیت سفارش: {self._signal_safe(signal.get('intent_state'))}")
         if source:
             lines.append(f"منبع: {self._signal_safe(source)}")
+        back_code = "h" if back_view == "48" else "l"
+        back_page = self._signal_page_for_id(signal_id, back_view)
         await self._edit_signal_screen(
             chat_id,
             "\n".join(lines),
-            _kb([[_btn("بازگشت", f"s:back:{back_view}:{page}")]]),
+            _kb([[_btn("بازگشت به فهرست", f"s:back:{back_code}:{back_page}")]]),
         )
 
     # -------------------------------------------------- notification settings

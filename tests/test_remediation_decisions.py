@@ -7,7 +7,6 @@ exchange or Telegram traffic.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -17,7 +16,6 @@ from tg_signal_ingest.db import MIGRATIONS, Database
 from tg_signal_ingest.mexc.client import SharedWeightedRateGate, WeightedRateGate
 from tg_signal_ingest.mexc.errors import MexcNetworkError, MexcPrecisionError, MexcServerError
 from tg_signal_ingest.trading.gate import SubmissionGate
-from tg_signal_ingest.trading.notify import TradingNotifier
 from tg_signal_ingest.trading.store import TradingStore
 from tg_signal_ingest.trading.trade_manager import (
     MAX_OCO_ATTEMPTS,
@@ -127,75 +125,6 @@ def test_definitive_validation_errors_are_not_retryable() -> None:
     assert _is_retryable_oco_error(MexcServerError("limit price needs to be greater than the latest price")) is False
     # Ambiguous transport failures are handled as UNKNOWN, never as a retry.
     assert isinstance(MexcNetworkError("timeout"), MexcNetworkError)
-
-
-# --------------------------------------------------------------------------
-# F-10 — notification isolation and ambiguous delivery reporting
-# --------------------------------------------------------------------------
-
-
-class _Bot:
-    def __init__(self, fail_for: int | None = None):
-        self.fail_for = fail_for
-        self.sent: list[int] = []
-
-    def send_message(self, chat_id: int, text: str) -> dict:
-        if self.fail_for is not None and int(chat_id) == self.fail_for:
-            raise RuntimeError("telegram unavailable")
-        self.sent.append(int(chat_id))
-        return {"ok": True}
-
-
-def _notifier(repo, cfg, bot, owner_b=333):
-    store = TradingStore(repo.db, cfg.trading)
-    return TradingNotifier(store, bot, owner_id=111, owner_b_id=owner_b, developer_id=222), store
-
-
-def test_each_recipient_gets_its_own_row(cfg, repo) -> None:
-    notifier, store = _notifier(repo, cfg, _Bot())
-    notifier.notify(event_key="evt-1", text="hello", category="order_lifecycle")
-    notifier.flush()
-
-    rows = repo.db.conn.execute(
-        "SELECT role, chat_id, status FROM trading_notifications ORDER BY role"
-    ).fetchall()
-    assert [r["role"] for r in rows] == ["developer", "owner", "owner_b"]
-    assert {r["status"] for r in rows} == {"sent"}
-
-
-def test_failure_for_one_recipient_does_not_mask_the_other(cfg, repo) -> None:
-    bot = _Bot(fail_for=333)
-    notifier, store = _notifier(repo, cfg, bot)
-    notifier.notify(event_key="evt-2", text="hello", category="order_lifecycle")
-    notifier.flush()
-
-    rows = {
-        r["role"]: r["status"]
-        for r in repo.db.conn.execute("SELECT role, status FROM trading_notifications")
-    }
-    assert rows["owner"] == "sent"
-    assert rows["developer"] == "sent"
-    # A generic transport exception cannot prove non-delivery: preserve it as
-    # ambiguous (never blindly retried) rather than marking it failed.
-    assert rows["owner_b"] == "ambiguous"
-
-
-def test_ambiguous_delivery_is_reported_to_both_recipients(cfg, repo) -> None:
-    notifier, store = _notifier(repo, cfg, _Bot())
-    notifier.enqueue(event_key="evt-3", text="important", category="critical")
-    # Simulate a crash mid-delivery: the row is stuck in 'sending'.
-    old = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-    with repo.db.transaction() as conn:
-        conn.execute("UPDATE trading_notifications SET status='sending', claim_token='t', claimed_at=? ", (old,))
-
-    recovered = store.recover_ambiguous_sending(older_than_s=60)
-    assert recovered >= 1
-    notifier._report_ambiguous(recovered)
-
-    alerts = repo.db.conn.execute(
-        "SELECT role FROM trading_notifications WHERE event_type = 'notification.ambiguous'"
-    ).fetchall()
-    assert {r["role"] for r in alerts} == {"owner", "owner_b", "developer"}
 
 
 # --------------------------------------------------------------------------

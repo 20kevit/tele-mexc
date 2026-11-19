@@ -7,7 +7,6 @@ All exchange/Telegram clients are fakes; no test can reach MEXC or Telegram.
 
 from __future__ import annotations
 
-import contextlib
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -24,7 +23,6 @@ from tests.test_trading_engine import (
 from tg_signal_ingest.mexc.errors import MexcNetworkError
 from tg_signal_ingest.notification_dispatcher import NotificationDispatcher
 from tg_signal_ingest.trading import SignalParser, TradingStore
-from tg_signal_ingest.trading.notify import TradingNotifier
 from tg_signal_ingest.trading.store import RiskLimitExceeded
 
 OWNER = 100000001
@@ -41,11 +39,9 @@ class FlakyBot:
 
 
 class _NotificationHarness:
-    """Exercise the independent dispatcher while preserving producer wiring."""
+    """Exercise the independent dispatcher after events have been journaled."""
 
     def __init__(self, engine, bot):
-        self.legacy = TradingNotifier(engine.store, bot, owner_id=OWNER, developer_id=DEVELOPER)
-        engine.notifier = self.legacy
         self._tempdir = tempfile.TemporaryDirectory(prefix="tele-mexc-notify-test-")
         self.dispatcher = NotificationDispatcher(
             engine.store.db.path,
@@ -54,23 +50,12 @@ class _NotificationHarness:
             {"owner": OWNER, "developer": DEVELOPER},
         )
 
-    def flush(self, limit: int = 100) -> int:
-        return int(self.dispatcher.run_once(delivery_limit=limit)["attempted"])
+    def flush(self):
+        return self.dispatcher.run_once()
 
-    def pending_count(self) -> int:
-        counts = self.dispatcher.store.counts()
-        return counts.get("pending", 0) + counts.get("retry", 0)
-
-    def close(self) -> None:
+    def close(self):
         self.dispatcher.close()
         self._tempdir.cleanup()
-
-    def __getattr__(self, name):
-        return getattr(self.legacy, name)
-
-    def __del__(self):
-        with contextlib.suppress(Exception):
-            self.close()
 
 
 def _notifier(engine, bot):

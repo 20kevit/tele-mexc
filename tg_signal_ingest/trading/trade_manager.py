@@ -249,7 +249,6 @@ class TradeManager:
         *,
         engine: Any | None = None,
         client: Any | None = None,
-        notifier: Any | None = None,
         price_provider: Any | None = None,
         now: Any | None = None,
         clock: Any | None = None,
@@ -258,7 +257,6 @@ class TradeManager:
         self.store = store
         self.engine = engine
         self.client = client
-        self._notifier = notifier
         self._price_provider = price_provider
         self._now = now or (lambda: datetime.now(UTC))
         self._clock = clock or time.monotonic
@@ -290,15 +288,6 @@ class TradeManager:
                     hold_ms,
                     outcome,
                 )
-
-    @property
-    def notifier(self) -> Any:
-        """Notifier attached to the engine after construction (lazy)."""
-        if self._notifier is not None:
-            return self._notifier
-        if self.engine is not None:
-            return getattr(self.engine, "notifier", None)
-        return None
 
     # ===================================================================
     # Public entry points
@@ -762,10 +751,9 @@ class TradeManager:
                 outcome="blocked",
                 dedupe_key=f"buy-block:{reason}",
             )
-            # The reason is part of the event key so a *different* block (a new
-            # unprotected position) is reported instead of being swallowed by
-            # the outbox uniqueness constraint.
-            self._notify_trade(
+            # The reason participates in the stable event identity so a
+            # different block (a new unprotected position) is not deduplicated.
+            self._record_alert(
                 None,
                 f"BUY_BLOCK_ACTIVE_{hashlib.sha1(reason.encode('utf-8')).hexdigest()[:8]}",
                 f"new BUYs blocked (enforced by the submission gate): {reason}",
@@ -780,7 +768,7 @@ class TradeManager:
                 outcome="unblocked",
                 dedupe_key="buy-block:cleared",
             )
-            self._notify_trade(
+            self._record_alert(
                 None,
                 "BUY_BLOCK_CLEARED",
                 "new BUYs allowed: every open position has verified exit protection",
@@ -795,7 +783,6 @@ class TradeManager:
             category="risk",
         )
         self.store.update_signal(intent["signal_id"], "rejected", reason)
-        self._notify_intent(intent, "REJECTED_TRADE", reason)
 
     # ===================================================================
     # Price monitoring (called by the MarketMonitor feed callback)
@@ -909,7 +896,7 @@ class TradeManager:
             last_error_category="protection",
         )
         self.store.audit(trade["trade_id"], "risk", "sl_unprotected_critical", detail[:2000])
-        self._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail)
+        self._record_alert(trade, "SL_UNPROTECTED_CRITICAL", detail)
         # Narrowest restriction: per-symbol (trade already in needs_reconciliation
         # is treated as conflicting for that symbol via CONFLICTING_TRADE_STATES)
 
@@ -951,7 +938,7 @@ class TradeManager:
             self.engine._execute_intent(intent["intent_id"])
         except Exception as exc:  # noqa: BLE001
             self._record_error(trade, f"entry submission failed: {exc}", "exchange")
-            self._notify_trade(trade, "ENTRY_SUBMISSION_FAILED", str(exc)[:500])
+            self._record_alert(trade, "ENTRY_SUBMISSION_FAILED", str(exc)[:500])
             current = store.get_intent(intent["intent_id"])
             if current is not None and submission_acknowledged(current):
                 self.on_intent_executed(current)
@@ -2185,7 +2172,7 @@ class TradeManager:
                     "cannot be treated as complete until MEXC fills are reconciled"
                 )
                 self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                 self._sync_oco_group_state(trade, note=detail)
                 self._refresh_buy_block()
                 return
@@ -2211,7 +2198,7 @@ class TradeManager:
                 f"OCO tranche sizing unknown for {trade.get('trade_id')} {trade.get('symbol')}; fill/fee sync required"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
             self._refresh_buy_block()
             return
         if sellable <= 0:
@@ -2243,7 +2230,7 @@ class TradeManager:
                 "attributed; no new tranche may be submitted"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
             self._sync_oco_group_state(trade, note=detail)
             return
 
@@ -2255,7 +2242,7 @@ class TradeManager:
                 "order that may still fill — no new OCO submitted"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
             self._sync_oco_group_state(trade, note=detail)
             return
 
@@ -2275,7 +2262,7 @@ class TradeManager:
                     f"quantity {sold} is below allocation {allocated}; tranche sizing is ambiguous"
                 )
                 self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                 self._sync_oco_group_state(trade, note=detail)
                 return
 
@@ -2303,7 +2290,7 @@ class TradeManager:
                         "outcome; missing target cannot be inferred"
                     )
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                     self._sync_oco_group_state(trade, note=detail)
                     return
                 tp1_pct = _dec(trade.get("tp1_allocation_pct")) or Decimal("50")
@@ -2322,7 +2309,7 @@ class TradeManager:
                     )
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
                     self.store.audit(trade["trade_id"], "risk", "oco_invariant_would_violate", detail)
-                    self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+                    self._record_alert(trade, "OCO_INVARIANT_VIOLATED", detail)
                     self._sync_oco_group_state(trade, note=detail)
                     return
                 missing_price = tp1_price if missing_kind == "tp1" else tp2_price
@@ -2337,7 +2324,7 @@ class TradeManager:
                 if reason:
                     detail = f"legacy OCO tranche missing {missing_kind} cannot be completed: {reason}"
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                    self._notify_trade(trade, "OCO_MINIMUM_NOT_MET", detail)
+                    self._record_alert(trade, "OCO_MINIMUM_NOT_MET", detail)
                     self._sync_oco_group_state(trade, note=detail)
                     return
                 self._create_trade_order(
@@ -2362,7 +2349,7 @@ class TradeManager:
                 f"sellable inventory {sellable}; no further OCO writes"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-            self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+            self._record_alert(trade, "OCO_INVARIANT_VIOLATED", detail)
             self._sync_oco_group_state(trade, note=detail)
             return
 
@@ -2386,7 +2373,7 @@ class TradeManager:
                     detail = f"new OCO tranche cannot be fully allocated ({kind}={qty}): {reason}"
                     self._record_residual(trade, kind, uncovered, detail)
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-                    self._notify_trade(trade, "OCO_MINIMUM_NOT_MET", detail)
+                    self._record_alert(trade, "OCO_MINIMUM_NOT_MET", detail)
                     self._sync_oco_group_state(trade, note=detail)
                     return
             tranche_id = self._next_oco_tranche_id(trade, group_id)
@@ -2395,7 +2382,7 @@ class TradeManager:
             except Exception as exc:
                 detail = f"could not durably create both OCO rows for tranche {tranche_id}: {exc}"
                 self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                 self._sync_oco_group_state(trade, note=detail)
                 return
             self.store.update_trade_fields(
@@ -2419,7 +2406,7 @@ class TradeManager:
                         f"OCO tranche {tranche_id} is missing required {kind} order row; refusing inferred replacement"
                     )
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                     self._sync_oco_group_state(trade, note=detail)
                     return
                 initial = min(
@@ -2456,7 +2443,7 @@ class TradeManager:
         if remaining_cov is None:
             detail = "sellable quantity became unknown after OCO tranche submission"
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
             self._sync_oco_group_state(trade, note=detail)
             return
         if remaining_cov <= 0:
@@ -2491,7 +2478,7 @@ class TradeManager:
             )
             self.store.update_trade_state(trade["trade_id"], "oco_partial", note=detail[:2000])
             self._sync_oco_group_state(trade, note=detail)
-            self._notify_trade(trade, "OCO_PROTECTION_PARTIAL", detail)
+            self._record_alert(trade, "OCO_PROTECTION_PARTIAL", detail)
         else:
             detail = (
                 f"no OCO tranche is fully confirmed; uncertain={','.join(uncertain) or '-'}; "
@@ -2499,7 +2486,7 @@ class TradeManager:
             )
             self.store.update_trade_state(trade["trade_id"], UNPROTECTED_CRITICAL, note=detail[:2000])
             self._sync_oco_group_state(trade, note=detail)
-            self._notify_trade(trade, "OCO_PROTECTION_UNVERIFIED", detail)
+            self._record_alert(trade, "OCO_PROTECTION_UNVERIFIED", detail)
         self._refresh_buy_block()
 
     def _ensure_oco_leg(
@@ -2580,7 +2567,7 @@ class TradeManager:
                         f"{existing_qty}@{existing_price} != {wanted_qty}@{price}"
                     )
                     self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail)
-                    self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                    self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                     return "failed"
             else:
                 next_order = self._create_trade_order(
@@ -2895,7 +2882,7 @@ class TradeManager:
                 "reconciliation required before (re)submitting OCO legs"
             )
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-            self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+            self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
             self.store.audit(trade["trade_id"], "risk", "oco_invariant_unknown", detail[:2000])
             return False, detail
         reserved = self._combined_oco_reserved(trade)
@@ -2912,7 +2899,7 @@ class TradeManager:
             "reconciliation required before (re)submitting OCO legs"
         )
         self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-        self._notify_trade(trade, "OCO_INVARIANT_VIOLATED", detail)
+        self._record_alert(trade, "OCO_INVARIANT_VIOLATED", detail)
         self.store.audit(trade["trade_id"], "risk", "oco_invariant_violated", detail[:2000])
         return False, detail
 
@@ -2934,7 +2921,7 @@ class TradeManager:
             # Unknown inventory → cannot prove fully exited; fail closed
             detail = f"close refused: sellable unknown for {trade.get('trade_id')} — fee or fill data unprovable"
             self.store.update_trade_state(trade["trade_id"], "needs_reconciliation", note=detail[:2000])
-            self._notify_trade(trade, "TRADE_CLOSE_REFUSED_UNKNOWN", detail)
+            self._record_alert(trade, "TRADE_CLOSE_REFUSED_UNKNOWN", detail)
             self.store.audit(trade["trade_id"], "risk", "close_refused_unknown", detail[:2000])
             return
         if remaining > 0 and residual <= 0:
@@ -2972,7 +2959,7 @@ class TradeManager:
                 dedupe_key=f"trade-close-refused-oco:{trade['trade_id']}",
             )
             if previous_state != "needs_reconciliation":
-                self._notify_trade(trade, "OCO_PROTECTION_UNVERIFIED", detail)
+                self._record_alert(trade, "OCO_PROTECTION_UNVERIFIED", detail)
             self._refresh_buy_block()
             return
         self.store.update_trade_state(trade["trade_id"], "closed", note="position fully exited", sl_state="completed")
@@ -3036,7 +3023,7 @@ class TradeManager:
             "remainder; the remainder was cancelled so it cannot open a new position"
         )
         self.store.audit(trade["trade_id"], "lifecycle", "entry_remainder_cancelled", detail)
-        self._notify_trade(trade, "ENTRY_REMAINDER_CANCELLED", detail)
+        self._record_alert(trade, "ENTRY_REMAINDER_CANCELLED", detail)
         self._refresh_buy_block()
 
     def _cancel_entry_remainder(self, trade: dict[str, Any]) -> bool:
@@ -3186,7 +3173,7 @@ class TradeManager:
                     "Market Sell disabled; manual reconciliation required"
                 ),
             )
-            self._notify_trade(
+            self._record_alert(
                 trade,
                 "SL_UNPROTECTED_CRITICAL",
                 "legacy Market Sell state encountered after disablement — no Market Sell submitted",
@@ -3394,7 +3381,7 @@ class TradeManager:
                     "confirmable and OCO re-arming is blocked"
                 )
                 self.store.update_trade_state(trade_id, "needs_reconciliation", note=detail)
-                self._notify_trade(trade, "OCO_INVARIANT_UNKNOWN", detail)
+                self._record_alert(trade, "OCO_INVARIANT_UNKNOWN", detail)
                 self._sync_oco_group_state(trade, note=detail)
                 self.store.audit(trade_id, "reconcile", "oco_parent_child_unresolved", detail)
                 return
@@ -3825,14 +3812,14 @@ class TradeManager:
             last_error=message[:500],
             last_error_category=category,
         )
-        self._notify_trade(trade, "TRADE_ERROR", message[:500])
+        self._record_alert(trade, "TRADE_ERROR", message[:500])
 
     # ===================================================================
-    # Notifications
+    # Critical alert journal
     # ===================================================================
 
-    def _notify_trade(self, trade: dict[str, Any] | None, event_key: str, text: str, **extra: Any) -> None:
-        """Persist critical protection alerts as domain events; never blocks trading."""
+    def _record_alert(self, trade: dict[str, Any] | None, event_key: str, text: str) -> None:
+        """Persist deduplicated protection alerts; other diagnostics stay local."""
         critical_keys = {
             "SL_UNPROTECTED_CRITICAL",
             "OCO_INVARIANT_UNKNOWN",
@@ -3863,21 +3850,12 @@ class TradeManager:
                         )
                     )
                 return
-            if self.notifier is not None:
-                self.notifier.notify_trade(trade, event_key, text, **extra)
+            log.debug("internal trade diagnostic %s: %s", event_key, str(text)[:300])
         except Exception as exc:  # noqa: BLE001 - notifications never block trading
-            log.warning("notify_trade failed (%s); trading continues", exc)
-
-    def _notify_intent(self, intent: dict[str, Any], event_key: str, text: str) -> None:
-        if self.notifier is None:
-            return
-        try:
-            self.notifier.notify_intent(intent, event_key, text)
-        except Exception as exc:  # noqa: BLE001 - notifications never block trading
-            log.warning("notify_intent failed (%s)", exc)
+            log.warning("critical alert journal write failed (%s); trading continues", exc.__class__.__name__)
 
     def _notify_stale_config(self, symbol: str, reason: str) -> None:
-        self._notify_trade(None, "STALE_CONFIG", f"{symbol}: {reason}")
+        self._record_alert(None, "STALE_CONFIG", f"{symbol}: {reason}")
 
     def _ts(self) -> str:
         return self._now().isoformat()

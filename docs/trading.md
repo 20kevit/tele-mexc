@@ -821,33 +821,19 @@ recipient policy (`trading.buy_block` remains the audit marker).
 
 ## Notifications
 
-Trading producers never send Telegram messages. They append a bounded local
-domain event (or, on legacy paths, a `trading_notifications` row) and continue.
-The independent `tg-ingest notifications worker` reads the trading database
-read-only, relays events into `data/notification-delivery.sqlite3`, and performs
-all Bot API I/O there. A notification delay or failure can therefore never block,
-retry, or resubmit an order.
+Trading producers never send Telegram messages or write the retired formatted
+notification outbox. They append typed domain events to the durable audit
+journal. The independent `tg-ingest notifications worker` reads that journal
+read-only and performs Bot API I/O using its separate delivery database. A
+notification delay or failure cannot block, retry, or resubmit an order.
 
-The authoritative severity/routing/delivery policy and the F-01…F-20 audit
-matrix are in [notification-readiness.md](notification-readiness.md). Summary:
-
-| Recipient | Receives |
-| --- | --- |
-| Owner A (`CONTROL_OWNER_USER_ID`) | INFO and above, plus all owner-safety WARNING/ERROR/CRITICAL events; never DEBUG |
-| Owner B (`CONTROL_OWNER_B_USER_ID`) | Same owner policy with independent preferences and minimum severity |
-| Programmer (`CONTROL_DEVELOPER_USER_ID`) | The same event stream plus DEBUG diagnostics; read-only control access |
-
-- CRITICAL always reaches every configured recipient regardless of category or
-  minimum severity.
-- Genuine rejected/ambiguous signals are WARNING and owner-visible.
-- DEBUG (chatter, not-a-signal, parser diagnostics) is programmer-only.
-- Suppressed events remain in history with their rendered text and reason.
-- Only the exact `event_id` is idempotent; distinct lifecycle events are never
-  collapsed.
-- Per-recipient attempt budget is 10 including the initial attempt. Ambiguous
-  outcomes are never retried automatically; permanent 4xx is dead-letter.
-- The first lifecycle message per recipient/thread is the root; later lifecycle
-  messages reply to that recipient's own root. CRITICAL is standalone.
+The current severity/routing/delivery policy is summarized in
+[notification-readiness.md](notification-readiness.md). Recipient category
+preferences and minimum severity are applied by the worker; critical safety and
+uncertain exchange outcomes remain durably recorded and must not be hidden by
+routine filtering. Delivery is per recipient, deduplicated by immutable event
+ID, and capped at 10 automatic attempts. Ambiguous outcomes are not retried
+automatically. Messages are standalone; lifecycle threading has been removed.
 
 The programmer is not a third owner: it cannot pause/resume, change the quote
 amount, change MEXC credentials, select a channel, or alter notification
@@ -885,7 +871,6 @@ opaque, role-bound, expiring, and atomically single-use.
 .venv/bin/tg-ingest trading intents --limit 20
 .venv/bin/tg-ingest trading parse <message_id>
 .venv/bin/tg-ingest trading reconcile
-.venv/bin/tg-ingest trading notifications [--status pending] [--limit 50]
 .venv/bin/tg-ingest notifications status
 .venv/bin/tg-ingest notifications list --status dead_letter --limit 50
 .venv/bin/tg-ingest notifications requeue <delivery_id>

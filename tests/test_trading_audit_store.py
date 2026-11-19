@@ -67,25 +67,6 @@ def test_audit_event_type_and_redaction(store):
     assert row["secrets_redacted"] == 1
 
 
-def test_notification_minimum_severity_is_the_only_filter(store):
-    assert store.notification_min_severity() == "INFO"
-    assert store.notification_allowed("DEBUG") is False
-    assert store.notification_allowed("INFO") is True
-    assert store.notification_allowed("CRITICAL") is True
-
-    store.set_notification_min_severity("WARNING")
-    assert store.notification_min_severity() == "WARNING"
-    assert store.notification_allowed("INFO") is False
-    assert store.notification_allowed("WARNING") is True
-
-    store.set_notification_min_severity("CRITICAL")
-    assert store.notification_allowed("ERROR") is False
-    assert store.notification_allowed("CRITICAL") is True
-
-    with pytest.raises(ValueError):
-        store.set_notification_min_severity("LOUD")
-
-
 def test_oco_group_and_leg_lifecycle(store):
     now = store._ts()
     with store.db.transaction() as conn:

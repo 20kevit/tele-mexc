@@ -258,7 +258,7 @@ def build_readiness_report(
     if control.owner_user_id and control.developer_user_id and control.owner_user_id == control.developer_user_id:
         report.add("programmer role separation", FAIL, "the programmer must not be an owner")
     if control.configured:
-        report.add("owner notification routing", PASS, "durable outbox configured for owners + programmer")
+        report.add("owner notification routing", PASS, "durable domain-event delivery configured")
     else:
         report.add("owner notification routing", FAIL, "control bot/owner configuration is incomplete")
 
@@ -363,31 +363,6 @@ def build_readiness_report(
         report.add("OCO groups", PASS, ", ".join(f"{row['state']}={row['n']}" for row in oco_rows))
     else:
         report.add("OCO groups", PASS, "none")
-
-    # --------------------------------------------------------- notification
-    notif = conn.execute(
-        "SELECT status, COUNT(*) AS n FROM trading_notifications GROUP BY status ORDER BY status"
-    ).fetchall()
-    notif_counts = {str(row["status"]): int(row["n"]) for row in notif}
-    pending = notif_counts.get("pending", 0) + notif_counts.get("retry", 0)
-    ambiguous = notif_counts.get("ambiguous", 0)
-    failed = notif_counts.get("failed", 0)
-    if ambiguous:
-        report.add(
-            "notification outbox",
-            WARN,
-            f"{ambiguous} ambiguous delivery(ies); delivery certainty is unresolved",
-        )
-    elif failed:
-        report.add("notification outbox", WARN, f"{failed} definitively failed delivery(ies); inspect the outbox")
-    elif pending:
-        report.add(
-            "notification outbox",
-            PASS,
-            f"{pending} pending/retry compatibility row(s); the independent dispatcher relays them",
-        )
-    else:
-        report.add("notification outbox", PASS, "no pending/failed deliveries")
 
     # Delivery health lives in the dispatcher-owned database, never in the
     # trading transaction path.  A missing ledger means the worker has not run

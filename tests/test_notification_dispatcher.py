@@ -48,13 +48,6 @@ def _source(path: Path) -> sqlite3.Connection:
         "PRIMARY KEY(role,category))"
     )
     conn.execute("CREATE TABLE control_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")
-    conn.execute(
-        """CREATE TABLE trading_notifications (
-            notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_key TEXT, category TEXT, event_type TEXT, role TEXT,
-            chat_id INTEGER, text TEXT, status TEXT
-        )"""
-    )
     conn.commit()
     return conn
 
@@ -483,7 +476,6 @@ def test_notification_source_schema_readiness_waits_for_migration_columns(tmp_pa
         CREATE TABLE notification_preferences (
             role TEXT, category TEXT, enabled INTEGER, updated_at TEXT
         );
-        CREATE TABLE trading_notifications (notification_id INTEGER PRIMARY KEY, recipient_role TEXT);
         """
     )
     conn.commit()
@@ -628,71 +620,6 @@ def test_owner_unknown_state_alert_bypasses_minimum_severity(tmp_path):
     finally:
         worker.close()
         source.close()
-
-
-def _legacy_notification(conn: sqlite3.Connection, event_key: str = "TRADE_ERROR") -> None:
-    conn.execute(
-        "INSERT INTO trading_notifications(event_key,category,event_type,role,chat_id,text,status) "
-        "VALUES(?,?,?,?,?,?, 'pending')",
-        (event_key, "order_lifecycle", "trade.error", "owner", 101, "legacy formatted message"),
-    )
-    conn.commit()
-
-
-def test_legacy_severity_keeps_local_rejection_warning_and_buy_block_critical():
-    classify = NotificationDispatcher._legacy_severity
-    assert classify("signal_decision", "intent:REJECTED_LOCALLY", "signal.rejected_locally") == "WARNING"
-    assert classify("order_lifecycle", "BUY_BLOCK_ACTIVE_deadbeef", "trade.alert") == "CRITICAL"
-    assert classify("order_lifecycle", "BUY_BLOCK_CLEARED", "trade.alert") == "INFO"
-    assert classify("order_lifecycle", "exchange rejected", "order.rejected") == "ERROR"
-    assert classify("order_lifecycle", "exchange rejected", "signal.rejected_by_exchange") == "ERROR"
-
-
-def test_legacy_outbox_bridge_skips_preexisting_rows_and_delivers_new_rows(tmp_path):
-    source_path = tmp_path / "trading.sqlite3"
-    source = _source(source_path)
-    _legacy_notification(source, "old-before-install")
-    bot = FakeBot()
-    worker = NotificationDispatcher(source_path, tmp_path / "delivery.sqlite3", bot, {"owner": 101})
-    try:
-        assert worker.run_once()["attempted"] == 0
-        assert bot.calls == []
-        _legacy_notification(source, "new-after-install")
-        result = worker.run_once()
-        assert result["attempted"] == 1
-        assert bot.calls == [(101, "legacy formatted message")]
-        row = worker.store.conn.execute(
-            "SELECT event_id,status,notification_category FROM deliveries"
-        ).fetchone()
-        assert (row["event_id"], row["status"], row["notification_category"]) == (
-            "legacy-notification-2", "sent", "order_lifecycle"
-        )
-    finally:
-        worker.close()
-        source.close()
-
-
-def test_legacy_outbox_bridge_respects_recipient_category_preferences(tmp_path):
-    source_path = tmp_path / "trading.sqlite3"
-    source = _source(source_path)
-    source.execute(
-        "INSERT INTO notification_preferences(role,category,enabled,updated_at) "
-        "VALUES('owner','order_lifecycle',0,'now')"
-    )
-    source.commit()
-    bot = FakeBot()
-    worker = NotificationDispatcher(source_path, tmp_path / "delivery.sqlite3", bot, {"owner": 101})
-    try:
-        _legacy_notification(source)
-        result = worker.run_once()
-        assert result["relayed"] == 1 and result["attempted"] == 0
-        row = worker.store.conn.execute("SELECT status,last_error FROM deliveries").fetchone()
-        assert (row["status"], row["last_error"]) == ("suppressed", "category disabled")
-        assert bot.calls == []
-    finally:
-        worker.close()
-        source.close()
-
 
 
 def test_status_inspection_is_read_only_and_exposes_heartbeat(tmp_path):

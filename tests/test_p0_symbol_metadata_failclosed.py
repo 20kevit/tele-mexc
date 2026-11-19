@@ -109,7 +109,7 @@ def _planning_env(cfg: AppConfig, repo: Repository, registry: Any):
     client = FakeClient(registry)
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     return store, engine, client, notifier, tm
 
 
@@ -192,10 +192,15 @@ def test_p0_transient_metadata_failure_at_planning_rejects_fail_closed(cfg, repo
     assert signal is not None
     assert signal["status"] == "rejected"
 
-    # The owner-notification event is recorded for the rejected intent with
-    # the precise metadata reason (not a generic message).
-    assert [event[0] for event in notifier.intent_events] == ["REJECTED_TRADE"]
-    assert [event[2] for event in notifier.intent_events] == ["symbol metadata unavailable for exit-ladder validation"]
+    # The rejection is durably journaled with its precise reason; delivery is
+    # handled independently by the domain-event worker.
+    rejection = store.db.conn.execute(
+        "SELECT payload_json,severity FROM audit_events WHERE event_class='domain' "
+        "AND event_type='intent.state_changed' AND aggregate_id=?",
+        (intent["intent_id"],),
+    ).fetchone()
+    assert rejection is not None and rejection["severity"] == "ERROR"
+    assert "symbol metadata unavailable for exit-ladder validation" in rejection["payload_json"]
 
     # No order reached the fake exchange.
     assert client.place_calls == []
@@ -252,8 +257,13 @@ def test_p0_deterministic_symbol_error_keeps_every_attempt_fail_closed(cfg, repo
     assert client.place_calls == []
     assert store.list_trades() == []
 
-    # Both rejections notified the owner; no retries bypassed the gate.
-    assert [event[0] for event in notifier.intent_events] == ["REJECTED_TRADE", "REJECTED_TRADE"]
+    # Both rejections are durably recorded; no retry bypasses the gate.
+    recorded = store.db.conn.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE event_class='domain' "
+        "AND event_type='intent.state_changed' AND severity='ERROR' "
+        "AND json_extract(payload_json, '$.new_state')='rejected'"
+    ).fetchone()[0]
+    assert recorded == 2
 
 
 def test_p0_metadata_unavailable_at_engine_planning_rejects_signal_without_intent(cfg, repo):

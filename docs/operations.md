@@ -272,7 +272,6 @@ Repeat after network recovery. Do not cancel or resubmit based only on a local
 guess; inspect the exchange order id/status.
 
 ```bash
-.venv/bin/tg-ingest trading notifications       # legacy compatibility outbox rows
 .venv/bin/tg-ingest notifications status        # queue depth, heartbeat, dead-letter, oldest age
 .venv/bin/tg-ingest notifications list --status ambiguous --limit 50
 .venv/bin/tg-ingest notifications requeue <delivery_id>

@@ -46,7 +46,6 @@ from ..telemetry import (
     SLOW_SIGNAL_STAGE_MS,
     level_for,
 )
-from .audit import normalize_event_type
 from .balance import BalanceError, parse_account, validate_balance
 from .evidence import ExchangeEvidence
 from .gate import ENTRY, PROTECTION, SubmissionBlocked, SubmissionGate
@@ -64,16 +63,6 @@ from .store import (
 log = logging.getLogger("ingest.trading")
 
 EXCHANGE_TERMINAL = {"FILLED", "CANCELED", "PARTIALLY_CANCELED"}
-
-# Central notification routing.  Every owner-level event (including ordinary
-# local rejections and "not a signal" parser results) goes to both owners and
-# the programmer.  Technical diagnostics are an additional stream, never a
-# replacement for the owners' event stream.
-NOTIFY_ALL: tuple[str, ...] | None = None
-# Retained for backwards-compatible imports in integrations; it is intentionally
-# not used to hide events from the owners.
-NOTIFY_DEVELOPER = ("developer",)
-
 
 @dataclass
 class ReconcileStats:
@@ -98,7 +87,6 @@ class TradingEngine:
         parser: SignalParser | None = None,
         now: Any | None = None,
         monotonic: Any | None = None,
-        notifier: Any | None = None,
         trade_manager: Any | None = None,
         submission_gate: SubmissionGate | None = None,
     ):
@@ -136,8 +124,6 @@ class TradingEngine:
         # has verified the Telegram session and resolved the selected channel.
         self._runtime_ready: dict[str, Any] = {}
         self._mexc_verified = False
-        # Durable owner/developer reporting; never a prerequisite for an order.
-        self.notifier = notifier
         # Trade lifecycle coordinator (conditional entry, TP1/TP2, SL).  It
         # owns entry submission for every intent.
         self.trade_manager = trade_manager
@@ -340,20 +326,14 @@ class TradingEngine:
         version = int(record.get("processing_version") or 0)
         with self._measure_signal_stage(item, "parse"):
             parsed = self.parser.parse(text, is_edit=item.item_type == "edit" or version > 0)
-        # Determine the startup/backfill boundary before creating the domain
-        # event: historical messages must remain silent even when the new
-        # notification dispatcher is running.
+        # Historical/backfill messages are stored locally but never become
+        # eligible notification or trading events.
         historical = self._is_historical(item, record)
         signal_id, inserted = self.store.record_signal(
             parsed,
             channel_id=item.channel_id,
             message_id=item.message_id,
             edit_version=version,
-            # Only candidate trade signals produce the INFO "signal received"
-            # event.  Ambiguous input becomes a WARNING rejection (never a
-            # misleading INFO receipt), and chatter/cancel/result messages stay
-            # on the legacy diagnostic path.
-            emit_event=(not historical and parsed.kind in ("alert", "update")),
         )
 
         # Historical backfill and any message at/below the startup boundary
@@ -383,12 +363,9 @@ class TradingEngine:
                 self.store.audit(signal_id, "parse", parsed.kind, parsed.reason_text)
             return None
 
-        # Classify once, after the historical/replay guard.  Genuine trading
-        # signals always go to both recipients; ordinary channel messages are
-        # developer-only NOT_A_SIGNAL diagnostics.
+        # Parser chatter and rejections remain in the local audit log only.
         genuine = self._is_genuine_signal(parsed)
         if not genuine:
-            self._notify_non_signal(signal_id, parsed, record=record)
             if parsed.kind in ("info", "result"):
                 self.store.audit(signal_id, "parse", parsed.kind, parsed.reason_text)
                 return None
@@ -465,13 +442,6 @@ class TradingEngine:
             )
             self.store.update_signal(signal_id, "superseded", reason)
             self.store.audit(signal_id, "lifecycle", "conflicting_edit", reason)
-            self._notify_intent_decision(
-                existing_intent,
-                status="DUPLICATE_IGNORED",
-                reason=reason,
-                record=record,
-                signal_id=signal_id,
-            )
             return existing_intent
 
         # Spot BUY-only policy is decidable locally. Reject SHORT/SELL before
@@ -545,11 +515,6 @@ class TradingEngine:
             reason = f"intent admission failed safely: {exc}"
             self.store.update_signal(signal_id, "rejected", reason)
             self.store.audit(signal_id, "lifecycle", "rejected_symbol_check_failed", reason)
-            try:
-                if self.notifier:
-                    self.notifier.notify_trade(None, "SYMBOL_CHECK_FAILED", reason)
-            except Exception:
-                pass
             return None
         except RiskLimitExceeded as exc:
             reason = str(exc)
@@ -586,17 +551,7 @@ class TradingEngine:
                     f"trade {trade_decision.trade['trade_id']} waiting for upward trigger "
                     f"at {trade_decision.trade['trigger_price']}",
                 )
-                self._notify(
-                    event_key=f"{intent['intent_id']}:conditional_entry_waiting",
-                    signal_id=signal_id,
-                    intent_id=intent["intent_id"],
-                    text=(
-                        f"{intent['symbol']}: entry {intent['limit_price']} above the market "
-                        f"({reference}); waiting for upward trigger "
-                        f"{trade_decision.trade['trigger_price']} before submitting a Limit Buy "
-                        f"(max price = entry)."
-                    ),
-                )
+        self.store.record_signal_received(signal_id)
         if defer:
             return intent
         with self._measure_signal_stage(item, "order_execution"):
@@ -761,17 +716,6 @@ class TradingEngine:
                 outcome="canceled_local",
                 dedupe_key=f"stale-plan:{intent_id}",
             )
-            self._notify(
-                event_key=f"{intent_id}:recovery:stale_plan_canceled",
-                signal_id=signal_id,
-                intent_id=intent_id,
-                text=(
-                    f"{intent.get('symbol')}: سفارش برنامه‌ریزی‌شده پیش از توقف/ری‌استارت "
-                    f"اجرا نشد (مرز فعال‌سازی {boundary}). هیچ سفارش واقعی ارسال نشد."
-                ),
-                category="recovery",
-                event_type="recovery.stale_planned_canceled",
-            )
         except Exception as exc:  # noqa: BLE001 - recovery must continue
             log.error("failed to cancel stale planned intent %s: %s", intent_id, exc)
 
@@ -891,55 +835,6 @@ class TradingEngine:
             base_quantity=qty,
         )
 
-    # --------------------------------------------------------- notifications
-
-    def _notify(
-        self,
-        *,
-        event_key: str,
-        text: str,
-        signal_id: str | None = None,
-        intent_id: str | None = None,
-        roles: Iterable[str] | None = None,
-        category: str = "order_lifecycle",
-        event_type: str | None = None,
-    ) -> None:
-        """Best-effort durable notification; never affects order handling."""
-
-        started = self._monotonic()
-        outcome = "skipped" if self.notifier is None else "ok"
-        if category == "signal_decision" or event_type in {
-            "signal.rejected", "signal.rejected_locally", "signal.not_a_signal",
-        }:
-            log.debug(
-                "signal decision kept internal signal_id=%s event_type=%s",
-                signal_id or "none",
-                event_type or "none",
-            )
-            return
-        try:
-            if self.notifier is None:
-                return
-            self.notifier.notify(
-                event_key=event_key,
-                text=text,
-                signal_id=signal_id,
-                intent_id=intent_id,
-                roles=roles,
-                category=category,
-                event_type=event_type or normalize_event_type("order_lifecycle", event_key),
-            )
-        except Exception as exc:  # noqa: BLE001 - reporting must not break execution
-            outcome = "error"
-            log.warning("notification enqueue failed (%s)", exc.__class__.__name__)
-        finally:
-            duration_ms = int(round(max(0.0, self._monotonic() - started) * 1000))
-            log.log(
-                level_for((duration_ms, SLOW_SIGNAL_STAGE_MS)),
-                "signal_stage signal_id=%s intent_id=%s stage=notification_enqueue duration_ms=%s outcome=%s",
-                signal_id or "none", intent_id or "none", duration_ms, outcome,
-            )
-
     @staticmethod
     def _is_genuine_signal(parsed: ParsedSignal) -> bool:
         """A genuine trading signal has a recognizable BUY or SELL direction.
@@ -976,163 +871,6 @@ class TradingEngine:
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=UTC)
         return self._now() > deadline
-
-    def _source_ref(
-        self,
-        *,
-        record: dict[str, Any] | None = None,
-        signal_id: str | None = None,
-        intent: dict[str, Any] | None = None,
-    ) -> str:
-        if record is not None:
-            return (
-                f"channel {record.get('channel_id')} / message {record.get('message_id')} "
-                f"(v{record.get('processing_version')})"
-            )
-        if intent is not None:
-            return (
-                f"channel {intent.get('create_channel_id')} / "
-                f"message {intent.get('create_msg_id')} (signal {intent.get('signal_id')})"
-            )
-        if signal_id:
-            parts = signal_id.split(":")
-            if len(parts) >= 2:
-                return f"channel {parts[0]} / message {parts[1]}"
-        return signal_id or "unknown source"
-
-    def _original_text(
-        self,
-        *,
-        record: dict[str, Any] | None = None,
-        signal_id: str | None = None,
-        intent: dict[str, Any] | None = None,
-    ) -> str:
-        """Return the exact source text, never normalized or rewritten."""
-
-        if record is None:
-            if intent is not None:
-                try:
-                    record = self.store.get_message(int(intent["create_channel_id"]), int(intent["create_msg_id"]))
-                except (KeyError, TypeError, ValueError):
-                    record = None
-            elif signal_id:
-                parts = signal_id.split(":")
-                if len(parts) >= 2:
-                    try:
-                        record = self.store.get_message(int(parts[0]), int(parts[1]))
-                    except (TypeError, ValueError):
-                        record = None
-        if record is not None:
-            text = record.get("text")
-            caption = record.get("caption")
-            if text:
-                return str(text)
-            if caption:
-                return str(caption)
-            return f"[no text content; media={record.get('media_type') or 'unknown'}]"
-        return "[original message text unavailable]"
-
-    def _notify_decision(
-        self,
-        *,
-        event_key: str,
-        status: str,
-        symbol: str | None,
-        direction: str | None,
-        reason: str,
-        classification: str | None = None,
-        record: dict[str, Any] | None = None,
-        signal_id: str | None = None,
-        intent: dict[str, Any] | None = None,
-        submission_attempted: bool = False,
-        diagnostics: str | None = None,
-        roles: Iterable[str] | None = NOTIFY_ALL,
-        category: str = "signal_decision",
-        event_type: str | None = None,
-    ) -> None:
-        """Central formatter for signal decisions and diagnostics."""
-
-        lines = [
-            f"status: {status}",
-            f"source: {self._source_ref(record=record, signal_id=signal_id, intent=intent)}",
-            f"symbol: {symbol or '—'}",
-            f"direction: {str(direction or '').upper() or '—'}",
-        ]
-        if classification:
-            lines.append(f"classification: {classification}")
-        lines.append(f"decision: {reason}")
-        lines.append(f"exchange submission attempted: {'yes' if submission_attempted else 'no'}")
-        if diagnostics:
-            lines.append(f"diagnostics: {diagnostics}")
-        lines.append("original message:")
-        lines.append(self._original_text(record=record, signal_id=signal_id, intent=intent))
-        self._notify(
-            event_key=event_key,
-            signal_id=signal_id or (intent.get("signal_id") if intent else None),
-            intent_id=intent.get("intent_id") if intent else None,
-            text="\n".join(lines),
-            roles=roles,
-            category=category,
-            event_type=event_type,
-        )
-
-    def _notify_non_signal(
-        self,
-        signal_id: str,
-        parsed: ParsedSignal,
-        *,
-        record: dict[str, Any] | None = None,
-    ) -> None:
-        """Report a parser result / non-signal to both owners and the programmer."""
-
-        if parsed.kind == "result":
-            reason = "result/take-profit follow-up, not a new trading signal"
-        elif parsed.kind == "cancel":
-            reason = "cancel/control message, not a new trading signal"
-        elif parsed.kind == "info":
-            reason = parsed.reason_text or "ordinary channel message, not an actionable trading signal"
-        else:
-            reason = parsed.reason_text or "not an actionable trading signal"
-        self._notify_decision(
-            event_key=f"{signal_id}:not_a_signal",
-            status="NOT_A_SIGNAL",
-            symbol=parsed.symbol,
-            direction=parsed.action,
-            reason=reason,
-            classification=parsed.kind,
-            record=record,
-            signal_id=signal_id,
-            diagnostics=parsed.reason_text or None,
-            roles=NOTIFY_ALL,
-            category="signal_decision",
-            event_type="signal.not_a_signal",
-        )
-
-    def _notify_intent_decision(
-        self,
-        intent: dict[str, Any],
-        *,
-        status: str,
-        reason: str,
-        record: dict[str, Any] | None = None,
-        signal_id: str | None = None,
-    ) -> None:
-        """Report a local intent decision (no exchange submission) to both."""
-
-        self._notify_decision(
-            event_key=f"{intent['intent_id']}:decision:{status}",
-            status=status,
-            symbol=intent.get("symbol"),
-            direction=intent.get("side"),
-            reason=f"no exchange order was submitted. {reason}",
-            classification="ORDER_INTENT",
-            record=record,
-            signal_id=signal_id or intent.get("signal_id"),
-            intent=intent,
-            submission_attempted=False,
-            category="signal_decision",
-            event_type="signal.rejected_locally",
-        )
 
     def execute_intent(self, intent_id: str) -> dict[str, Any]:
         """Revalidate a planned intent immediately before exchange submission.
@@ -1250,11 +988,6 @@ class TradingEngine:
                             event_type="exchange.submission_blocked",
                             outcome="blocked",
                         )
-                        self._notify_intent_decision(
-                            result,
-                            status="SUBMISSION_BLOCKED",
-                            reason=f"submission blocked: {blocked}",
-                        )
                     return result
                 try:
                     with self._symbol_lock(str(intent.get("symbol") or "")):
@@ -1278,11 +1011,6 @@ class TradingEngine:
                 exc.reason,
                 event_type="exchange.submission_blocked",
                 outcome="blocked",
-            )
-            self._notify_intent_decision(
-                result,
-                status="SUBMISSION_BLOCKED",
-                reason=f"submission blocked: {exc.reason}",
             )
             return result
 

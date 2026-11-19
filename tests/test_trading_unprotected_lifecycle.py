@@ -42,7 +42,7 @@ def env(cfg: AppConfig, repo: Repository):
     client = FakeClient()
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     tm._clock = lambda: 5000.0
     return cfg, store, engine, client, notifier, tm
 
@@ -219,7 +219,10 @@ def test_buy_block_clears_only_when_no_unsold_quantity_remains(env, monkeypatch)
     tm._refresh_buy_block()
 
     assert store.buy_block_reason() is None
-    assert any(event[0] == "BUY_BLOCK_CLEARED" for event in notifier.trade_events)
+    assert store.db.conn.execute(
+        "SELECT 1 FROM audit_events WHERE event_type='trading.buy_block' "
+        "AND outcome='unblocked'"
+    ).fetchone() is not None
 
 
 def test_restart_rebuilds_block_then_restores_protection(env, monkeypatch):
@@ -236,7 +239,7 @@ def test_restart_rebuilds_block_then_restores_protection(env, monkeypatch):
     # Simulate a stale cleared flag: restart must rebuild the block from
     # durable trade state before/after reconciliation.
     store.set_buy_block(None)
-    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client)
     tm2.recover_on_startup()
     assert store.get_trade(trade["trade_id"])["trade_state"] == UNPROTECTED_CRITICAL
     assert store.buy_block_reason() is not None

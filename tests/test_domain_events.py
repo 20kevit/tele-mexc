@@ -172,20 +172,16 @@ def test_signal_received_and_rejected_events_are_atomic_and_deduplicated(store):
     from tg_signal_ingest.trading.parser import SignalParser
 
     parsed = SignalParser().parse(ALERT)
-    signal_id, inserted = store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0, emit_event=True
-    )
+    signal_id, inserted = store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
     assert inserted is True
-    # Parsing is not eligibility: no owner-facing signal event exists yet.
-    events = _domain_events(store)
-    assert events == []
-    duplicate_id, inserted = store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0, emit_event=True
-    )
+    assert _domain_events(store) == []
+    duplicate_id, inserted = store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
     assert duplicate_id == signal_id and inserted is False
     assert _domain_events(store) == []
 
     store.update_signal(signal_id, "validated")
+    assert _domain_events(store) == []  # local validation alone does not announce a signal
+    assert store.record_signal_received(signal_id) is True
     events = _domain_events(store)
     assert [row["event_type"] for row in events] == ["signal.received"]
     received = json.loads(events[0]["payload_json"])
@@ -194,10 +190,7 @@ def test_signal_received_and_rejected_events_are_atomic_and_deduplicated(store):
     assert received["tp2_price"] == "120"
     assert received["stop_loss_price"] == "95"
 
-    duplicate_id, inserted = store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0, emit_event=True
-    )
-    assert duplicate_id == signal_id and inserted is False
+    assert store.record_signal_received(signal_id) is False
     assert len(_domain_events(store)) == 1
 
     store.update_signal(signal_id, "rejected", "risk check failed")
@@ -278,9 +271,7 @@ def test_historical_signal_can_be_stored_without_notification_events(store):
     from tg_signal_ingest.trading.parser import SignalParser
 
     parsed = SignalParser().parse(ALERT)
-    signal_id, inserted = store.record_signal(
-        parsed, channel_id=100, message_id=1, edit_version=0, emit_event=False
-    )
+    signal_id, inserted = store.record_signal(parsed, channel_id=100, message_id=1, edit_version=0)
     assert inserted is True
     store.update_signal(signal_id, "rejected", "historical replay", emit_rejection_event=False)
     assert _domain_events(store) == []
@@ -787,38 +778,14 @@ def test_engine_emits_accepted_event_immediately_before_reconciliation(cfg, repo
     assert "executed_qty" not in accepted and "cumulative_quote" not in accepted
 
 
-def test_notifier_persists_only_and_producer_never_calls_telegram(cfg, repo):
-    class ExplodingBot:
-        def __init__(self):
-            self.calls = 0
-
-        def send_message(self, chat_id: int, text: str):
-            self.calls += 1
-            raise AssertionError("producer path must not call Telegram")
-
-    from tg_signal_ingest.trading.notify import TradingNotifier
-
+def test_engine_records_one_signal_receipt_after_eligibility(cfg, repo):
     engine = _engine(cfg, repo, FakeMexc())
-    bot = ExplodingBot()
-    notifier = TradingNotifier(engine.store, bot, owner_id=100000001, developer_id=100000002)
-    engine.notifier = notifier
-
-    def _unexpected_flush(*args, **kwargs):
-        raise AssertionError("producer path must not flush the notification outbox")
-
-    notifier.flush = _unexpected_flush  # type: ignore[method-assign]
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, ALERT))
-
     assert result is not None
-    assert bot.calls == 0
-    # The execution result is now delivered from the domain-event journal;
-    # the removed legacy summary must not be re-enqueued in the old outbox.
-    assert notifier.pending_count() == 0
-    assert engine.store.db.conn.execute(
-        "SELECT COUNT(*) FROM audit_events WHERE event_class='domain'"
-    ).fetchone()[0] > 0
-    domain_types = {row["event_type"] for row in _domain_events(engine.store)}
-    assert "intent.created" in domain_types
+    receipts = [row for row in _domain_events(engine.store) if row["event_type"] == "signal.received"]
+    assert len(receipts) == 1
+    assert json.loads(receipts[0]["payload_json"])["side"] == "buy"
+
 
 
 def test_legacy_audit_rows_stay_compatible_but_domain_rows_are_immutable(store):
@@ -850,20 +817,12 @@ def test_legacy_audit_rows_stay_compatible_but_domain_rows_are_immutable(store):
 def test_critical_trade_protection_alert_is_persisted_as_domain_event(store, cfg):
     from tg_signal_ingest.trading.trade_manager import TradeManager
 
-    class Notifier:
-        def __init__(self):
-            self.calls = []
-
-        def notify_trade(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-
-    notifier = Notifier()
     trade = _trade(store)
-    manager = TradeManager(cfg.trading, store, notifier=notifier)
+    manager = TradeManager(cfg.trading, store)
     detail = "CRITICAL UNPROTECTED: BTCUSDT quantity=0.1; OCO protection missing"
 
-    manager._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail)
-    manager._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail)
+    manager._record_alert(trade, "SL_UNPROTECTED_CRITICAL", detail)
+    manager._record_alert(trade, "SL_UNPROTECTED_CRITICAL", detail)
 
     events = [
         row for row in _domain_events(store)
@@ -874,9 +833,8 @@ def test_critical_trade_protection_alert_is_persisted_as_domain_event(store, cfg
     assert events[0]["symbol"] == "BTCUSDT"
     payload = json.loads(events[0]["payload_json"])
     assert payload == {"detail": detail, "event_key": "SL_UNPROTECTED_CRITICAL"}
-    assert notifier.calls == []
 
-    manager._notify_trade(trade, "SL_UNPROTECTED_CRITICAL", detail + "; new evidence")
+    manager._record_alert(trade, "SL_UNPROTECTED_CRITICAL", detail + "; new evidence")
     assert len([
         row for row in _domain_events(store)
         if row["event_type"] == "trade.protection_critical"
@@ -886,12 +844,8 @@ def test_critical_trade_protection_alert_is_persisted_as_domain_event(store, cfg
 def test_new_buy_block_is_persisted_as_critical_protection_event(store, cfg):
     from tg_signal_ingest.trading.trade_manager import TradeManager
 
-    class Notifier:
-        def notify_trade(self, *args, **kwargs):
-            raise AssertionError("critical buy-block alerts must use the domain-event path")
-
-    manager = TradeManager(cfg.trading, store, notifier=Notifier())
-    manager._notify_trade(
+    manager = TradeManager(cfg.trading, store)
+    manager._record_alert(
         None,
         "BUY_BLOCK_ACTIVE_deadbeef",
         "new BUYs blocked: an open position has no verified exit protection",

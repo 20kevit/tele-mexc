@@ -38,7 +38,7 @@ def env(cfg: AppConfig, repo: Repository):
     client = FakeClient()
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     return cfg, store, engine, client, notifier, tm
 
 
@@ -375,7 +375,7 @@ def test_oco_position_recovers_after_restart(env):
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active"
     # New manager over the same DB (simulated restart).
-    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client)
     tm2.recover_on_startup()
     t = store.get_trade(trade["trade_id"])
     assert t["trade_state"] == "oco_active", t
@@ -534,7 +534,7 @@ def test_restart_recovers_partial_oco_protection(env):
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_partial"
 
-    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=FakeNotifier())
+    tm2 = TradeManager(cfg.trading, store, engine=engine, client=client)
     tm2.recover_on_startup()
     trade = store.get_trade(trade["trade_id"])
     assert trade["trade_state"] == "oco_active", trade

@@ -11,7 +11,6 @@ from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
 from ..repository import Repository
 from .engine import TradingEngine
 from .gate import SubmissionGate
-from .store import TradingStore
 from .trade_manager import TradeManager
 from .trade_store import TradeStore
 
@@ -81,29 +80,6 @@ def _apply_persisted_signal_validity(cfg: AppConfig, repo: Repository) -> bool:
     cfg.trading.signal_validity_s = hours * 3600.0
     log.info("applied persisted signal validity %.3g hours from the control database", hours)
     return True
-
-
-def _build_notifier(cfg: AppConfig, store: TradingStore) -> Any | None:
-    """Build the durable owner/developer notifier when Bot API is configured."""
-
-    control = cfg.control
-    if not control.bot_token or not (control.owner_user_id or control.owner_b_user_id or control.developer_user_id):
-        return None
-    try:
-        from ..control.bot_api import BotApiClient
-        from .notify import TradingNotifier
-
-        bot = BotApiClient(control.bot_token, api_base=control.api_base)
-        return TradingNotifier(
-            store,
-            bot,
-            owner_id=control.owner_user_id,
-            owner_b_id=control.owner_b_user_id,
-            developer_id=control.developer_user_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - notifications must never block trading
-        log.warning("trading notifier unavailable (%s); trading continues", exc.__class__.__name__)
-        return None
 
 
 def build_mexc_client(cfg: AppConfig, *, for_live_writes: bool = False) -> Any:
@@ -191,13 +167,8 @@ def build_trading_engine(
         client=client,
         registry=registry,
         price_provider=price_provider,
-        notifier=None,
         submission_gate=gate,
     )
-    # Durable owner/developer reporting.  The notifier is attached to both the
-    # engine and the trade manager so lifecycle events are never dropped.
-    notifier = _build_notifier(cfg, engine.store)
-    engine.notifier = notifier
     # Trade lifecycle coordinator wires into the engine.  It owns conditional
     # entry, TP1/TP2 and stop-loss for every intent.
     trade_manager = TradeManager(
@@ -205,7 +176,6 @@ def build_trading_engine(
         trade_store,
         engine=engine,
         client=client,
-        notifier=notifier,
         price_provider=price_provider,
     )
     engine.trade_manager = trade_manager

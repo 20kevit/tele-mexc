@@ -189,7 +189,6 @@ def event_suppression_reason(
     severity: str,
     payload: dict[str, Any] | None,
     *,
-    legacy_key: str = "",
     category: str = "",
 ) -> str | None:
     """Apply the small owner-notification policy before recipient routing.
@@ -201,13 +200,10 @@ def event_suppression_reason(
     kind = str(event_type or "").lower()
     level = str(severity or "INFO").upper()
     data = payload or {}
-    key = f"{legacy_key} {category} {kind}".lower()
-    if level == "DEBUG" or "debug" in key:
+    if level == "DEBUG":
         return "DEBUG is internal-log only"
     if (
         kind in {"signal.rejected", "signal.rejected_locally", "signal.not_a_signal"}
-        or "signal.rejected" in key
-        or "rejected_locally" in key
     ):
         return "rejected signals are never delivered"
     if category == "signal_decision":
@@ -301,7 +297,7 @@ def delivery_decision(
     if severity_value == "DEBUG":
         return "suppressed", "DEBUG is internal-log only"
 
-    suppression = event_suppression_reason(event_type, severity_value, payload)
+    suppression = event_suppression_reason(event_type, severity_value, payload, category=category)
     if suppression:
         return "suppressed", suppression
 
@@ -331,18 +327,6 @@ def delivery_decision(
     if not severity_enabled(severity_value, minimum):
         return "suppressed", f"below minimum severity {minimum}"
     return "pending", None
-
-
-def _is_missing_reply_error(exc: BotApiError) -> bool:
-    text = str(exc).lower()
-    return "repl" in text and ("not found" in text or "message to be replied" in text)
-
-
-def _supports_reply_to(bot: Any) -> bool:
-    try:
-        return "reply_to_message_id" in inspect.signature(bot.send_message).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -647,45 +631,6 @@ def message_chunks(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
     return chunks
 
 
-def event_thread_key(
-    event_type: str,
-    *,
-    aggregate_type: str | None,
-    aggregate_id: str | None,
-    correlation_id: str | None,
-    payload: dict[str, Any] | None,
-    severity: str,
-) -> str | None:
-    """Return the per-trade/per-intent threading scope for one event.
-
-    The first successfully delivered lifecycle message for a ``(recipient,
-    thread_key)`` pair becomes that recipient's root; later lifecycle events
-    reply to it.  CRITICAL alerts and signal/system events are standalone.
-    """
-
-    if str(severity).upper() == "CRITICAL":
-        return None
-    if event_type in ("trade.protection_critical",) or event_type.startswith("signal."):
-        return None
-    if event_type.startswith("system.") or event_type in (
-        "exchange.write_outcome",
-        "reconciliation.outcome",
-    ):
-        return None
-    payload = payload or {}
-    aggregate = str(aggregate_type or "")
-    if aggregate == "trade" and aggregate_id:
-        return f"trade:{aggregate_id}"
-    if aggregate in ("trade_order", "oco_group", "oco_leg") and correlation_id:
-        return f"trade:{correlation_id}"
-    if aggregate == "intent" and aggregate_id:
-        return f"intent:{aggregate_id}"
-    if aggregate == "exchange_order":
-        intent_id = payload.get("intent_id") or correlation_id
-        return f"intent:{intent_id}" if intent_id else None
-    return None
-
-
 class DeliveryStore:
     """SQLite ledger owned exclusively by the notification dispatcher."""
 
@@ -710,10 +655,6 @@ class DeliveryStore:
                 event_type TEXT NOT NULL,
                 relayed_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS relayed_legacy_notifications (
-                notification_id INTEGER PRIMARY KEY,
-                relayed_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS deliveries (
                 delivery_id TEXT PRIMARY KEY,
                 event_id TEXT NOT NULL,
@@ -725,8 +666,6 @@ class DeliveryStore:
                 message_text TEXT NOT NULL,
                 part_no INTEGER NOT NULL DEFAULT 1,
                 part_count INTEGER NOT NULL DEFAULT 1,
-                thread_key TEXT,
-                reply_to_message_id INTEGER,
                 status TEXT NOT NULL CHECK (status IN
                     ('pending','sending','retry','sent','ambiguous','suppressed','dead_letter')),
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -750,15 +689,6 @@ class DeliveryStore:
                 telegram_message_id INTEGER,
                 retry_after_s INTEGER,
                 PRIMARY KEY(delivery_id, attempt_no)
-            );
-            CREATE TABLE IF NOT EXISTS delivery_threads (
-                recipient_role TEXT NOT NULL,
-                thread_key TEXT NOT NULL,
-                root_message_id INTEGER NOT NULL,
-                root_delivery_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(recipient_role, thread_key)
             );
             """
         )
@@ -794,8 +724,6 @@ class DeliveryStore:
                         message_text TEXT NOT NULL,
                         part_no INTEGER NOT NULL DEFAULT 1,
                         part_count INTEGER NOT NULL DEFAULT 1,
-                        thread_key TEXT,
-                        reply_to_message_id INTEGER,
                         status TEXT NOT NULL CHECK (status IN
                             ('pending','sending','retry','sent','ambiguous','suppressed','dead_letter')),
                         attempts INTEGER NOT NULL DEFAULT 0,
@@ -811,12 +739,12 @@ class DeliveryStore:
                     INSERT INTO deliveries_v2 (
                         delivery_id,event_id,recipient_role,chat_id,event_type,
                         notification_category,severity,message_text,part_no,part_count,
-                        thread_key,reply_to_message_id,status,attempts,next_attempt_at,
-                        claim_token,claimed_at,telegram_message_id,last_error,created_at,updated_at
+                        status,attempts,next_attempt_at,claim_token,claimed_at,
+                        telegram_message_id,last_error,created_at,updated_at
                     )
                     SELECT delivery_id,event_id,recipient_role,chat_id,event_type,
                         notification_category,severity,message_text,1,1,
-                        NULL,NULL,status,attempts,next_attempt_at,
+                        status,attempts,next_attempt_at,
                         claim_token,claimed_at,telegram_message_id,last_error,created_at,updated_at
                     FROM deliveries;
                     DROP TABLE deliveries;
@@ -832,11 +760,7 @@ class DeliveryStore:
                 self.conn.execute(
                     "ALTER TABLE deliveries ADD COLUMN notification_category TEXT NOT NULL DEFAULT 'diagnostic'"
                 )
-            for name, ddl in (
-                ("part_count", "INTEGER NOT NULL DEFAULT 1"),
-                ("thread_key", "TEXT"),
-                ("reply_to_message_id", "INTEGER"),
-            ):
+            for name, ddl in (("part_count", "INTEGER NOT NULL DEFAULT 1"),):
                 if name not in columns:
                     self.conn.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {ddl}")
 
@@ -863,20 +787,6 @@ class DeliveryStore:
         self.conn.execute(
             "INSERT OR IGNORE INTO dispatcher_state(key,value,updated_at) VALUES('source_cursor',?,?)",
             (str(max(0, int(source_max_audit_id))), _stamp()),
-        )
-
-    def legacy_cursor(self) -> int:
-        row = self.conn.execute(
-            "SELECT value FROM dispatcher_state WHERE key='legacy_notification_cursor'"
-        ).fetchone()
-        return int(row["value"]) if row else 0
-
-    def initialize_legacy_cursor(self, source_max_notification_id: int) -> None:
-        """Establish an independent no-replay boundary for the compatibility outbox."""
-        self.conn.execute(
-            "INSERT OR IGNORE INTO dispatcher_state(key,value,updated_at) "
-            "VALUES('legacy_notification_cursor',?,?)",
-            (str(max(0, int(source_max_notification_id))), _stamp()),
         )
 
     def relay_batch(
@@ -940,14 +850,6 @@ class DeliveryStore:
                 else:
                     roles = [str(role) for role in audience]
                 chunks = message_chunks(body)
-                thread_key = event_thread_key(
-                    event_type,
-                    aggregate_type=event.get("aggregate_type"),
-                    aggregate_id=event.get("aggregate_id"),
-                    correlation_id=event.get("correlation_id"),
-                    payload=payload,
-                    severity=severity,
-                )
                 for role in roles:
                     chat_id = recipients.get(role)
                     if not chat_id:
@@ -967,9 +869,8 @@ class DeliveryStore:
                             """
                             INSERT OR IGNORE INTO deliveries
                             (delivery_id,event_id,recipient_role,chat_id,event_type,notification_category,
-                             severity,message_text,part_no,part_count,thread_key,status,last_error,
-                             created_at,updated_at)
-                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                             severity,message_text,part_no,part_count,status,last_error,created_at,updated_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
                                 uuid.uuid4().hex,
@@ -982,7 +883,6 @@ class DeliveryStore:
                                 chunk,
                                 part_no,
                                 len(chunks),
-                                thread_key,
                                 delivery_status,
                                 reason,
                                 now,
@@ -1093,8 +993,6 @@ class DeliveryStore:
         error: str | None = None,
         message_id: int | None = None,
         retry_after_s: int | None = None,
-        reply_to_message_id: int | None = None,
-        establish_thread: bool = False,
     ) -> None:
         now_dt = _now()
         now = _stamp(now_dt)
@@ -1144,60 +1042,22 @@ class DeliveryStore:
             )
             self.conn.execute(
                 "UPDATE deliveries SET status=?,attempts=?,next_attempt_at=?,telegram_message_id=?,"
-                "reply_to_message_id=?,claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=? "
+                "claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=? "
                 "WHERE delivery_id=?",
                 (
                     "sent" if outcome == "sent" else outcome,
                     attempt,
                     next_at,
                     message_id,
-                    reply_to_message_id,
                     (error or "")[:500] or None,
                     now,
                     delivery["delivery_id"],
                 ),
             )
-            thread_key = delivery.get("thread_key")
-            if (
-                outcome == "sent"
-                and establish_thread
-                and message_id is not None
-                and thread_key
-            ):
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO delivery_threads "
-                    "(recipient_role,thread_key,root_message_id,root_delivery_id,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (
-                        delivery["recipient_role"],
-                        thread_key,
-                        int(message_id),
-                        delivery["delivery_id"],
-                        now,
-                        now,
-                    ),
-                )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
-
-    def thread_root(self, recipient_role: str, thread_key: str | None) -> int | None:
-        if not thread_key:
-            return None
-        row = self.conn.execute(
-            "SELECT root_message_id FROM delivery_threads WHERE recipient_role=? AND thread_key=?",
-            (recipient_role, thread_key),
-        ).fetchone()
-        return int(row["root_message_id"]) if row is not None else None
-
-    def clear_thread(self, recipient_role: str, thread_key: str | None) -> None:
-        if not thread_key:
-            return
-        self.conn.execute(
-            "DELETE FROM delivery_threads WHERE recipient_role=? AND thread_key=?",
-            (recipient_role, thread_key),
-        )
 
     def requeue(self, delivery_id: str) -> str:
         """Explicit operator requeue; never automatic.
@@ -1273,7 +1133,6 @@ class NotificationDispatcher:
         self.store = DeliveryStore(delivery_db_path)
         self.bot = bot
         self.recipients = {str(k): int(v) for k, v in recipients.items() if v}
-        self._supports_reply = _supports_reply_to(bot)
         self.batch_size = max(1, int(batch_size))
         self._source = sqlite3.connect(f"file:{self.source_path}?mode=ro", uri=True, timeout=10)
         self._source.row_factory = sqlite3.Row
@@ -1281,10 +1140,6 @@ class NotificationDispatcher:
         self._source.execute("PRAGMA busy_timeout=10000")
         max_row = self._source.execute("SELECT COALESCE(MAX(audit_id),0) AS max_id FROM audit_events").fetchone()
         self.store.initialize_cursor(int(max_row["max_id"] or 0))
-        legacy_max = self._source.execute(
-            "SELECT COALESCE(MAX(notification_id),0) AS max_id FROM trading_notifications"
-        ).fetchone()
-        self.store.initialize_legacy_cursor(int(legacy_max["max_id"] or 0))
 
     def close(self) -> None:
         self._source.close()
@@ -1348,133 +1203,12 @@ class NotificationDispatcher:
             settings,
         )
 
-    @staticmethod
-    def _legacy_severity(category: str, event_key: str, event_type: str = "") -> str:
-        key = f"{category}:{event_key}:{event_type}".upper()
-        if any(token in key for token in ("NOT_A_SIGNAL", "NOT A SIGNAL")):
-            return "DEBUG"
-        if "BUY_BLOCK_ACTIVE" in key:
-            return "CRITICAL"
-        if "BUY_BLOCK_CLEARED" in key:
-            return "INFO"
-        # A genuine signal rejected locally is actionable but not an exchange
-        # failure. Keep it WARNING; definitive exchange/order rejections remain ERROR.
-        if "REJECTED_LOCALLY" in key:
-            return "WARNING"
-        if "CRITICAL" in key or "EMERGENCY" in key or "UNPROTECTED" in key:
-            return "CRITICAL"
-        if category == "notification_delivery" or any(
-            token in key for token in ("FAILED", "REJECTED", "ERROR", "MISMATCH")
-        ):
-            return "ERROR"
-        if category in ("reconciliation", "recovery") or any(
-            token in key for token in ("WARNING", "RECONCIL", "BLOCK", "STALE")
-        ):
-            return "WARNING"
-        if category == "diagnostic":
-            return "DEBUG"
-        return "INFO"
-
-    def relay_legacy_once(self) -> int:
-        """Bridge new rows from the old formatted outbox without replaying history."""
-        cursor = self.store.legacy_cursor()
-        rows = self._source.execute(
-            """
-            SELECT notification_id,event_key,category,event_type,role,chat_id,text
-            FROM trading_notifications
-            WHERE notification_id > ? AND status='pending'
-            ORDER BY notification_id LIMIT ?
-            """,
-            (cursor, self.batch_size),
-        ).fetchall()
-        if not rows:
-            return 0
-        preferences, minimum_severity, settings = self._routing_preferences()
-        now = _stamp()
-        inserted = 0
-        self.store.conn.execute("BEGIN IMMEDIATE")
+    def _send(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
-            current = self.store.legacy_cursor()
-            for row in rows:
-                notification_id = int(row["notification_id"])
-                if notification_id <= current:
-                    continue
-                event_id = f"legacy-notification-{notification_id}"
-                role = str(row["role"])
-                category = str(row["category"] or "diagnostic")
-                event_type = str(row["event_type"] or "legacy")
-                severity = self._legacy_severity(
-                    category, str(row["event_key"] or ""), event_type
-                )
-                status, reason = delivery_decision(
-                    role,
-                    severity,
-                    category,
-                    event_type,
-                    {},
-                    preferences,
-                    settings,
-                    minimum_severity,
-                )
-                suppression = event_suppression_reason(
-                    event_type,
-                    severity,
-                    {},
-                    legacy_key=str(row["event_key"] or ""),
-                    category=category,
-                )
-                chunks = [] if severity == "DEBUG" else message_chunks(_safe_text(row["text"], limit=20000))
-                if suppression:
-                    status, reason = "suppressed", suppression
-                for part_no, chunk in enumerate(chunks, 1):
-                    cur = self.store.conn.execute(
-                        """
-                        INSERT OR IGNORE INTO deliveries
-                        (delivery_id,event_id,recipient_role,chat_id,event_type,notification_category,
-                         severity,message_text,part_no,part_count,status,last_error,created_at,updated_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (
-                            uuid.uuid4().hex, event_id, role, int(row["chat_id"]),
-                            event_type, category, severity, chunk, part_no, len(chunks),
-                            status, reason, now, now,
-                        ),
-                    )
-                    inserted += max(0, cur.rowcount)
-                self.store.conn.execute(
-                    "INSERT OR IGNORE INTO relayed_legacy_notifications(notification_id,relayed_at) "
-                    "VALUES(?,?)",
-                    (notification_id, now),
-                )
-                current = notification_id
-            self.store.conn.execute(
-                "INSERT INTO dispatcher_state(key,value,updated_at) VALUES('legacy_notification_cursor',?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                (str(current), now),
-            )
-            self.store.conn.execute("COMMIT")
-        except Exception:
-            self.store.conn.execute("ROLLBACK")
-            raise
-        return inserted
-
-    def _send(
-        self,
-        chat_id: int,
-        text: str,
-        reply_to_message_id: int | None,
-        reply_markup: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        if reply_to_message_id is not None and self._supports_reply:
-            kwargs["reply_to_message_id"] = reply_to_message_id
-        try:
-            parameters = inspect.signature(self.bot.send_message).parameters
-            supports_markup = "reply_markup" in parameters
+            supports_markup = "reply_markup" in inspect.signature(self.bot.send_message).parameters
         except (TypeError, ValueError):
             supports_markup = False
-        if reply_markup is not None and supports_markup:
-            kwargs["reply_markup"] = reply_markup
+        kwargs = {"reply_markup": reply_markup} if reply_markup is not None and supports_markup else {}
         return self.bot.send_message(chat_id, text, **kwargs) or {}
 
     def deliver_one(self) -> bool:
@@ -1483,73 +1217,34 @@ class NotificationDispatcher:
             return False
         chat_id = int(delivery["chat_id"])
         text = str(delivery["message_text"])
-        thread_key = delivery.get("thread_key")
-        reply_to = self.store.thread_root(str(delivery["recipient_role"]), thread_key)
-        thread_missing = bool(thread_key) and reply_to is None and int(delivery.get("part_no") or 1) == 1
         try:
             markup = None
             event_id = str(delivery.get("event_id") or "")
             if delivery.get("event_type") == "signal.received" and len(event_id) <= 48:
-                markup = {
-                    "inline_keyboard": [[{
-                        "text": "جزئیات سیگنال",
-                        "callback_data": f"s:event:{event_id}",
-                    }]]
-                }
-            result = self._send(chat_id, text, reply_to, markup)
+                markup = {"inline_keyboard": [[{
+                    "text": "جزئیات سیگنال",
+                    "callback_data": f"s:event:{event_id}",
+                }]]}
+            result = self._send(chat_id, text, markup)
             message_id = int(result["message_id"]) if isinstance(result, dict) and result.get("message_id") else None
-            self.store.finish(
-                delivery,
-                "sent",
-                message_id=message_id,
-                reply_to_message_id=reply_to,
-                establish_thread=thread_missing,
-            )
+            self.store.finish(delivery, "sent", message_id=message_id)
         except BotApiNotSentError as exc:
-            # DNS/connect failure: no request byte was written, safe to retry.
             self.store.finish(delivery, "retry", error=str(exc))
         except BotApiRateLimitError as exc:
-            self.store.finish(
-                delivery, "retry", error="telegram rate limited",
-                retry_after_s=exc.retry_after or 30,
-            )
+            self.store.finish(delivery, "retry", error="telegram rate limited", retry_after_s=exc.retry_after or 30)
         except BotApiForbiddenError as exc:
             self.store.finish(delivery, "suppressed", error=str(exc))
         except BotApiTransportError as exc:
-            # The request may have been applied; never retry automatically.
             self.store.finish(delivery, "ambiguous", error=str(exc))
         except BotApiError as exc:
-            if reply_to is not None and _is_missing_reply_error(exc):
-                # A deleted root must not dead-letter a lifecycle update.  The
-                # failed reply was definitively rejected, so one standalone
-                # resend is safe; a new root is created for later events.
-                self.store.clear_thread(str(delivery["recipient_role"]), thread_key)
-                try:
-                    result = self._send(chat_id, text, None)
-                    message_id = (
-                        int(result["message_id"])
-                        if isinstance(result, dict) and result.get("message_id")
-                        else None
-                    )
-                    self.store.finish(
-                        delivery,
-                        "sent",
-                        message_id=message_id,
-                        establish_thread=thread_missing,
-                    )
-                except BotApiTransportError as retry_exc:
-                    self.store.finish(delivery, "ambiguous", error=str(retry_exc))
-                except BotApiError as retry_exc:
-                    self.store.finish(delivery, "dead_letter", error=str(retry_exc))
-            else:
-                self.store.finish(delivery, "dead_letter", error=str(exc))
-        except Exception as exc:  # transport boundary: acceptance cannot be excluded
+            self.store.finish(delivery, "dead_letter", error=str(exc))
+        except Exception as exc:  # acceptance cannot be excluded
             self.store.finish(delivery, "ambiguous", error=type(exc).__name__)
         return True
 
     def run_once(self, *, delivery_limit: int = 100) -> dict[str, int]:
         self.store.set_state("last_cycle_at", _stamp())
-        relayed = self.relay_once() + self.relay_legacy_once()
+        relayed = self.relay_once()
         recovered = self.store.recover_stale_claims()
         delivered = 0
         for _ in range(max(1, delivery_limit)):
@@ -1626,7 +1321,7 @@ def inspect_delivery_db(
                 oldest_age_s = None
         query = (
             "SELECT delivery_id,event_id,recipient_role,event_type,notification_category,severity,"
-            "status,attempts,part_no,part_count,thread_key,reply_to_message_id,telegram_message_id,"
+            "status,attempts,part_no,part_count,telegram_message_id,"
             "last_error,created_at,updated_at FROM deliveries"
         )
         params: list[Any] = []

@@ -31,7 +31,7 @@ def env(cfg, repo):
     client = FakeClient()
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     return cfg, store, engine, client, notifier, tm
 
 

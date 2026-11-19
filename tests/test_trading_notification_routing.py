@@ -1,8 +1,6 @@
-"""Notification routing policy: owner gets every genuine signal; developer
-also gets NOT_A_SIGNAL diagnostics.
+"""End-to-end notification policy over the durable audit-event worker.
 
-All exchange/Telegram clients are deterministic fakes.  No test can reach
-MEXC or Telegram, and no test places a real order.
+All exchange/Telegram clients are deterministic fakes; there is no live I/O.
 """
 
 from __future__ import annotations
@@ -42,26 +40,16 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
     assert "سیگنال جدید دریافت شد" not in joined
 
 
-def test_signal_decision_producer_never_calls_any_notifier_route(cfg, repo):
-    class SpyNotifier:
-        def __init__(self):
-            self.calls = []
-
-        def notify(self, **kwargs):
-            self.calls.append(kwargs)
-
-        def notify_trade(self, *args, **kwargs):
-            self.calls.append({"trade": args, **kwargs})
-
+def test_signal_decisions_are_only_local_audit_events(cfg, repo):
     engine = _engine(cfg, repo, FakeMexc())
-    spy = SpyNotifier()
-    engine.notifier = spy
     engine.process_item(
         _item(100, 1),
         _store_message(repo, 1, "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"),
     )
-    engine.process_item(_item(100, 2), _store_message(repo, 2, "BUY BTCUSDT\\nTP1: 110"))
-    assert spy.calls == []
+    assert not hasattr(engine, "notifier")
+    assert not any(row["event_type"] == "signal.received" for row in engine.store.db.conn.execute(
+        "SELECT event_type FROM audit_events WHERE event_class='domain'"
+    ).fetchall())
 
 
 def test_sell_signal_is_internal_only_and_never_notified(cfg, repo):

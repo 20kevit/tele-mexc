@@ -13,7 +13,7 @@ from decimal import Decimal
 
 import pytest
 
-from tests._trading_fakes import FakeClient, FakeMeta, FakeNotifier, FakeRegistry
+from tests._trading_fakes import FakeClient, FakeMeta, FakeRegistry
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem, Repository
@@ -288,7 +288,7 @@ def test_protection_and_entry_routes_share_the_pause_boundary(cfg, repo):
     client = GatedClient()
     cfg.trading.order_quote_amount = 10.0
     store = TradeStore(repo.db, cfg.trading, now=lambda: NOW)
-    tm = TradeManager(cfg.trading, store, engine=None, client=client, notifier=FakeNotifier())
+    tm = TradeManager(cfg.trading, store, engine=None, client=client)
     engine = TradingEngine(cfg, repo, client=client, now=lambda: NOW, trade_manager=tm)
     tm.engine = engine
     engine.store = store

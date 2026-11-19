@@ -211,7 +211,7 @@ visible until reconciliation resolves it. See `docs/data-model.md`.
 - `control run` builds the same bot without ingestion/backfill/queue/trading
   workers and acquires only the control lock.
 - If control is disabled, the service still reuses only
-  `control.bot_api.BotApiClient` for durable trading notifications.
+  `control.bot_api.BotApiClient` only through the independent domain-event notification worker.
 
 ## Trade-lifecycle wiring
 

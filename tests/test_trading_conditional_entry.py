@@ -34,7 +34,7 @@ def env(cfg: AppConfig, repo: Repository):
     client = FakeClient()
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     return cfg, store, engine, client, notifier, tm
 
 
@@ -326,7 +326,7 @@ def test_pending_entry_survives_restart(env):
     intent = _insert_intent(store)
     trade = tm.on_intent_planned(intent, _parsed(), reference_price=Decimal("90")).trade
     # Simulate crash/restart: build a fresh manager over the same DB.
-    tm2 = TradeManager(cfg, store, engine=engine, client=client, notifier=FakeNotifier())
+    tm2 = TradeManager(cfg, store, engine=engine, client=client)
     tm2.recover_on_startup()
     t = store.get_trade(trade["trade_id"])
     assert t["trade_state"] == "pending_entry"
@@ -349,7 +349,7 @@ def test_trigger_state_recomputed_after_restart(env):
     assert store.get_trade(trade["trade_id"])["trade_state"] == "entry_active"
     # After restart, trigger re-evaluation does not double-submit.
     fake_clock_now[0] = 5.0
-    tm2 = TradeManager(cfg, store, engine=engine, client=client, notifier=FakeNotifier())
+    tm2 = TradeManager(cfg, store, engine=engine, client=client)
     tm2._clock = lambda: fake_clock_now[0]
     tm2.recover_on_startup()
     assert store.get_trade(trade["trade_id"])["trade_state"] == "entry_active"
@@ -743,7 +743,7 @@ def _edge_env(cfg: AppConfig, repo: Repository, tick_size: str = "0.5"):
     client = FakeClient(FakeRegistry(FakeMeta(tick_size=tick_size)))
     engine = FakeEngine(cfg, store, client=client)
     notifier = FakeNotifier()
-    tm = TradeManager(cfg.trading, store, engine=engine, client=client, notifier=notifier)
+    tm = TradeManager(cfg.trading, store, engine=engine, client=client)
     return store, engine, client, notifier, tm
 
 
