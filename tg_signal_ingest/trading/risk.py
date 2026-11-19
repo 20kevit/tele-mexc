@@ -56,7 +56,7 @@ class RiskManager:
 
         if cfg.emergency_stop:
             reasons.append("emergency stop is active")
-        if signal.kind not in ("alert", "update"):
+        if signal.kind != "signal":
             reasons.append(f"signal kind {signal.kind!r} is not executable")
         if signal.action is None:
             reasons.append("signal direction is missing or ambiguous")

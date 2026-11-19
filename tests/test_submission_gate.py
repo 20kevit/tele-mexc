@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 
 from tests._trading_fakes import FakeClient, FakeMeta, FakeNotifier, FakeRegistry
+from tests.channel_template import channel_signal
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem, Repository
@@ -27,7 +28,7 @@ from tg_signal_ingest.trading.trade_manager import TradeManager
 from tg_signal_ingest.trading.trade_store import TradeStore
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+ALERT = channel_signal(stop="90")
 
 
 class GatedClient(FakeClient):
@@ -80,7 +81,7 @@ def _engine(cfg: AppConfig, repo: Repository, client: GatedClient) -> TradingEng
 
 
 def _planned_intent(engine: TradingEngine, message_id: int, symbol: str = "BTCUSDT") -> dict:
-    text = ALERT if symbol == "BTCUSDT" else f"BUY {symbol}\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+    text = channel_signal(symbol=symbol, stop="90")
     parsed = SignalParser().parse(text)
     sid, _ = engine.store.record_signal(parsed, channel_id=100, message_id=message_id, edit_version=0)
     intent, _ = engine.store.create_intent(

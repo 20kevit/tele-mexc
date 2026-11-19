@@ -44,7 +44,7 @@ def env(cfg: AppConfig, repo: Repository):
 
 def _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL) -> ParsedSignal:
     return ParsedSignal(
-        kind="alert",
+        kind="signal",
         action="buy",
         symbol=SYMBOL,
         entry_price=entry,
@@ -52,8 +52,6 @@ def _parsed(entry=ENTRY, tp1=TP1, tp2=TP2, sl=SL) -> ParsedSignal:
         entry_high_price=None,
         target_prices=(tp1, tp2),
         stop_loss=sl,
-        order_type="limit",
-        amount_text=None,
         raw_text="buy",
         normalized_text="buy",
         fingerprint_sha256="abc",

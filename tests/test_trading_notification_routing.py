@@ -7,6 +7,7 @@ MEXC or Telegram, and no test places a real order.
 
 from __future__ import annotations
 
+from tests.channel_template import channel_signal
 from tests.test_trading_budget import DEVELOPER, OWNER, FlakyBot, _notifier
 from tests.test_trading_engine import ALERT, FakeMexc, _engine, _item, _store_message
 from tg_signal_ingest.mexc.errors import MexcNetworkError, MexcOrderRejected
@@ -46,7 +47,7 @@ def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
-    text = "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"
+    text = channel_signal(direction="SHORT", stop="105", tp1="90", tp2="80")
 
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, text))
     notifier.flush()
@@ -68,7 +69,7 @@ def test_locally_rejected_genuine_buy_notifies_both_owners_with_reason(cfg, repo
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
-    text = "BUY BTCUSDT\nTP1: 110"
+    text = channel_signal(stop="101")
 
     result = engine.process_item(_item(100, 1), _store_message(repo, 1, text))
     notifier.flush()
@@ -78,7 +79,7 @@ def test_locally_rejected_genuine_buy_notifies_both_owners_with_reason(cfg, repo
     assert len(bot.sent) >= 2
     _assert_both(bot)
     joined = _joined(bot)
-    assert "no entry price" in joined
+    assert "SL" in joined
     assert "سیگنال رد شد" in joined
     assert "SUBMISSION_REJECTED" not in joined and "REJECTED_BY_EXCHANGE" not in joined
 
@@ -89,7 +90,7 @@ def test_rejection_is_delivered_once_not_duplicated_by_legacy_path(cfg, repo):
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
-    text = "BUY BTCUSDT\nTP1: 110"  # missing entry -> rejected locally
+    text = channel_signal(stop="101")  # invalid stop -> rejected locally
 
     engine.process_item(_item(100, 1), _store_message(repo, 1, text))
     notifier.flush()
@@ -343,8 +344,8 @@ def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
     assert not any(chat == OWNER and "original message:" in sent_text for chat, sent_text in bot.sent)
     joined = _joined(bot)
     assert "classification: info" in joined
-    assert "classification: result" in joined
-    assert "classification: ambiguous" in joined
+    assert "classification: result" not in joined
+    assert "classification: ambiguous" not in joined
     assert engine.store.list_intents(limit=10) == []
     assert client.place_calls == 0
 

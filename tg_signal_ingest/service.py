@@ -455,7 +455,7 @@ class IngestService:
             chat_id = getattr(event, "chat_id", None)
             if not _is_target(chat_id):
                 return
-            await self._store_event_message(event.message, "live")
+            await self._store_event_message(event.message, "live", is_edit=True)
 
         @self._client.on(events.Raw(UpdateDeleteChannelMessages))
         async def _on_deleted(update: UpdateDeleteChannelMessages) -> None:
@@ -465,11 +465,11 @@ class IngestService:
             changed = self.repo.mark_deleted(self._selected_channel_id or 0, update.messages)
             log.info("deletion event: %s message(s) newly marked deleted", changed)
 
-    async def _store_event_message(self, message: Any, source: str) -> None:
+    async def _store_event_message(self, message: Any, source: str, *, is_edit: bool = False) -> None:
         assert self._selected_channel_id is not None
         try:
             rec = message_to_record(self._selected_channel_id, message, source)
-            result = self.repo.upsert_message(rec)
+            result = self.repo.upsert_message(rec, is_edit=is_edit)
             self.repo.record_live_event(self._selected_channel_id, int(message.id))
             if result.outcome.value == "inserted":
                 log.info("live message %s stored (media=%s)", message.id, rec.media_type or "text-only")
@@ -598,8 +598,7 @@ class IngestService:
         async def _handle(item, record):
             await asyncio.to_thread(self.trading.process_item, item, record)
 
-        for item_type in ("message", "edit", "delete"):
-            self.proc_engine.register_handler(item_type, _handle)
+        self.proc_engine.register_handler("message", _handle)
 
     async def _control_worker(self) -> None:
         """Keep the controller alive independently of Telegram reconnects."""

@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import pytest
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.config import AppConfig, ConfigError, load_config
 from tg_signal_ingest.db import Database
 from tg_signal_ingest.normalize import message_to_record
@@ -23,7 +24,7 @@ from tg_signal_ingest.trading.trade_manager import TradeManager
 from tg_signal_ingest.trading.trade_store import TradeStore
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-COMPLETE = "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+COMPLETE = channel_signal(stop="90")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -1543,7 +1544,7 @@ def test_two_engines_same_symbol_are_both_admitted_without_exchange_open_orders(
 def test_per_symbol_different_symbols_proceed_independently(cfg, repo):
     engine, tm, store = _engine_with_tm(cfg, repo, SpyMexc())
     for mid, sym in [(210, "ETHUSDT"), (211, "SOLUSDT")]:
-        txt = f"BUY {sym}\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+        txt = channel_signal(symbol=sym, stop="90")
         rec = _store(repo, mid, txt)
         res = engine.process_item(_item(100, mid), rec)
         assert res is not None, f"{sym} should not be blocked by other symbol"
@@ -1567,7 +1568,7 @@ def test_same_symbol_exchange_query_failure_blocks_only_that_symbol(cfg, repo):
     assert sig["status"] == "rejected"
     assert "open-order query failed" in sig["rejection_reason"].lower()
 
-    other = _store(repo, 213, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120")
+    other = _store(repo, 213, channel_signal(symbol="ETHUSDT", stop="90"))
     assert engine.process_item(_item(100, 213), other) is not None
 
 
@@ -1683,7 +1684,7 @@ def test_entry_range_rejected_with_clear_reason(cfg, repo):
     from tg_signal_ingest.trading.parser import ParsedSignal
 
     ps = ParsedSignal(
-        kind="alert",
+        kind="signal",
         action="buy",
         symbol="BTCUSDT",
         entry_price=None,
@@ -1691,12 +1692,9 @@ def test_entry_range_rejected_with_clear_reason(cfg, repo):
         entry_high_price=Decimal("102"),
         target_prices=(Decimal("110"), Decimal("120")),
         stop_loss=Decimal("90"),
-        order_type=None,
-        amount_text=None,
         raw_text="BUY BTCUSDT ENTRY 100-102 SL 90 TP1 110 TP2 120",
         normalized_text="BUY BTCUSDT ENTRY 100-102",
         fingerprint_sha256="x",
-        reasons=(),
     )
     rm = engine.risk
     dec = rm.evaluate(ps, message_datetime=None, reference_price=None, base_asset="BTC", now=NOW, symbol_meta=None)

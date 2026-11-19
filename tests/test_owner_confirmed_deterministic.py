@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem, Repository
@@ -71,11 +72,11 @@ def _fake_mexc_with_registry():
 
 # ── §4 Mandatory validation at execution boundary ────────────────────────
 
-COMPLETE_LONG = "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+COMPLETE_LONG = channel_signal(stop="90")
 
 
 def test_missing_symbol_rejects(cfg, repo):
-    # Parser will produce kind=ambiguous for missing symbol, engine rejects before risk
+    # An incomplete post is not a signal candidate.
     engine = _engine(cfg, repo)
     rec = _store(repo, 1, "BUY \nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120")
     assert (
@@ -96,7 +97,7 @@ def test_missing_symbol_rejects(cfg, repo):
         is None
     )
     sig = repo.db.conn.execute("SELECT status FROM signals WHERE channel_id=100 AND message_id=1").fetchone()
-    assert sig["status"] == "rejected"
+    assert sig["status"] == "parsed"
 
 
 def test_missing_entry_rejects(cfg, repo):
@@ -141,9 +142,8 @@ def test_missing_sl_rejects(cfg, repo):
         )
         is None
     )
-    # distinct reason contains SL
-    row = repo.db.conn.execute("SELECT rejection_reason FROM signals WHERE channel_id=100 AND message_id=3").fetchone()
-    assert "SL" in row["rejection_reason"] or "stop" in row["rejection_reason"].lower()
+    row = repo.db.conn.execute("SELECT signal_kind FROM signals WHERE channel_id=100 AND message_id=3").fetchone()
+    assert row["signal_kind"] == "info"
 
 
 def test_missing_tp1_rejects(cfg, repo):
@@ -193,7 +193,7 @@ def test_missing_tp2_rejects(cfg, repo):
 def test_invalid_price_relationship_rejects(cfg, repo):
     engine = _engine(cfg, repo)
     # SL >= Entry
-    rec = _store(repo, 6, "BUY BTCUSDT\nENTRY: 100\nSL: 100\nTP1: 110\nTP2: 120")
+    rec = _store(repo, 6, channel_signal(stop="100"))
     assert (
         engine.process_item(
             QueueItem(
@@ -212,7 +212,7 @@ def test_invalid_price_relationship_rejects(cfg, repo):
         is None
     )
     # Entry >= TP1
-    rec2 = _store(repo, 7, "BUY BTCUSDT\nENTRY: 110\nSL: 90\nTP1: 110\nTP2: 120")
+    rec2 = _store(repo, 7, channel_signal(entry="110", stop="90"))
     assert (
         engine.process_item(
             QueueItem(
@@ -231,7 +231,7 @@ def test_invalid_price_relationship_rejects(cfg, repo):
         is None
     )
     # TP1 > TP2
-    rec3 = _store(repo, 8, "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 130\nTP2: 120")
+    rec3 = _store(repo, 8, channel_signal(stop="90", tp1="130"))
     assert (
         engine.process_item(
             QueueItem(
@@ -300,8 +300,8 @@ def test_per_signal_idempotency_no_duplicate_buy(cfg, repo):
 
 def test_per_symbol_concurrency_allows_different_symbol(cfg, repo):
     engine = _engine(cfg, repo)
-    rec1 = _store(repo, 11, "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120")
-    rec2 = _store(repo, 12, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120")
+    rec1 = _store(repo, 11, channel_signal(stop="90"))
+    rec2 = _store(repo, 12, channel_signal(symbol="ETHUSDT", stop="90"))
     a = engine.process_item(
         QueueItem(
             queue_id=0,

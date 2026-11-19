@@ -25,6 +25,7 @@ from typing import Any
 from _trading_fakes import FakeClient, FakeEngine, FakeMeta, FakeNotifier, FakeRegistry
 from conftest import FakeMsg
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.mexc.errors import MexcSymbolError
 from tg_signal_ingest.normalize import message_to_record
@@ -36,7 +37,7 @@ from tg_signal_ingest.trading.trade_store import TradeStore
 
 SYMBOL = "BTCUSDT"
 ENTRY = Decimal("100")
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+ALERT = channel_signal()
 NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 # Market reference used to defer entry into the conditional wait: 90 is below
 # trigger 98.5 (entry 100 - 3 ticks * 0.5) and below the 100 entry.
@@ -154,7 +155,7 @@ def _insert_planned_intent(store: TradeStore, *, signal_id: str = "sig-1", clien
 
 def _parsed() -> ParsedSignal:
     return ParsedSignal(
-        kind="alert",
+        kind="signal",
         action="buy",
         symbol=SYMBOL,
         entry_price=ENTRY,
@@ -162,8 +163,6 @@ def _parsed() -> ParsedSignal:
         entry_high_price=None,
         target_prices=(Decimal("110"), Decimal("120")),
         stop_loss=Decimal("95"),
-        order_type="limit",
-        amount_text=None,
         raw_text="buy",
         normalized_text="buy",
         fingerprint_sha256="abc",

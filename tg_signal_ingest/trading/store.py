@@ -626,6 +626,8 @@ class TradingStore:
         are superseded atomically. Returns (signal_id, inserted)."""
 
         signal_id = f"{channel_id}:{message_id}:{edit_version}"
+        # Keep the existing SQLite CHECK constraint and domain-event vocabulary.
+        stored_kind = {"signal": "alert", "additional": "info"}[parsed.kind]
         now = self._ts()
         with self.db.transaction() as conn:
             conn.execute(
@@ -649,7 +651,7 @@ class TradingStore:
                     message_id,
                     edit_version,
                     PARSER_VERSION,
-                    parsed.kind,
+                    stored_kind,
                     parsed.symbol,
                     parsed.action,
                     dec_str(parsed.entry_price),
@@ -657,8 +659,8 @@ class TradingStore:
                     dec_str(parsed.entry_high_price),
                     ",".join(format(p, "f") for p in parsed.target_prices) or None,
                     dec_str(parsed.stop_loss),
-                    parsed.order_type,
-                    parsed.amount_text,
+                    None,  # legacy order_type
+                    None,  # legacy amount_text
                     parsed.fingerprint_sha256,
                     status,
                     rejection_reason,
@@ -677,13 +679,13 @@ class TradingStore:
                         occurred_at=now,
                         payload={
                             "state": status,
-                            "signal_kind": parsed.kind,
+                            "signal_kind": stored_kind,
                             "side": parsed.action,
                             "entry_price": dec_str(parsed.entry_price),
                             "tp1_price": dec_str(parsed.target_prices[0]) if parsed.target_prices else None,
                             "tp2_price": dec_str(parsed.target_prices[1]) if len(parsed.target_prices) > 1 else None,
                             "stop_loss_price": dec_str(parsed.stop_loss),
-                            "order_type": parsed.order_type,
+                            "order_type": None,
                         },
                     ),
                     conn=conn,
@@ -815,24 +817,6 @@ class TradingStore:
             ).fetchone()
         )
 
-    def has_later_cancel(self, channel_id: int, symbol: str | None, message_id: int) -> bool:
-        """True if a cancel for this symbol/ALL was posted after ``message_id``.
-
-        Telegram message ids are monotonic per channel. This prevents a queued
-        (possibly retried) old alert from creating an order after a cancel that
-        was already processed.
-        """
-
-        if not symbol:
-            return False
-        row = self.db.conn.execute(
-            "SELECT 1 FROM signals WHERE channel_id = ? AND signal_kind = 'cancel' "
-            "AND message_id > ? AND status NOT IN ('rejected', 'superseded', 'deleted') "
-            "AND (symbol = ? OR symbol IS NULL) LIMIT 1",
-            (channel_id, message_id, symbol.upper()),
-        ).fetchone()
-        return row is not None
-
     def active_signals(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if symbol:
             rows = self.db.conn.execute(
@@ -851,79 +835,6 @@ class TradingStore:
             "SELECT * FROM signals WHERE channel_id = ? AND message_id = ?", (channel_id, message_id)
         ).fetchall()
         return [dict(r) for r in rows]
-
-    def cancel_signals(
-        self,
-        symbol: str | None,
-        reason: str,
-        *,
-        channel_id: int | None = None,
-        before_message_id: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Mark active signals canceled and return all non-terminal intents.
-
-        Intents are selected independently of signal status: an edit marks the
-        previous signal version ``superseded``, but its live order still has to
-        be canceled.
-        """
-
-        now = self._ts()
-        placeholders = ",".join("?" for _ in TERMINAL_INTENT_STATES)
-        with self.db.transaction() as conn:
-            signal_where = ["status IN ('validated', 'planned')"]
-            signal_params: list[Any] = []
-            if symbol:
-                signal_where.append("symbol = ?")
-                signal_params.append(symbol.upper())
-            if channel_id is not None:
-                signal_where.append("channel_id = ?")
-                signal_params.append(channel_id)
-            if before_message_id is not None:
-                signal_where.append("message_id < ?")
-                signal_params.append(before_message_id)
-            rows = conn.execute(
-                f"SELECT signal_id FROM signals WHERE {' AND '.join(signal_where)}",
-                signal_params,
-            ).fetchall()
-            for row in rows:
-                conn.execute(
-                    "UPDATE signals SET status = 'canceled', rejection_reason = ?, updated_at = ? WHERE signal_id = ?",
-                    (reason, now, row["signal_id"]),
-                )
-
-            intent_where = [f"state NOT IN ({placeholders})"]
-            intent_params: list[Any] = list(TERMINAL_INTENT_STATES)
-            if symbol:
-                intent_where.append("symbol = ?")
-                intent_params.append(symbol.upper())
-            if channel_id is not None:
-                intent_where.append("create_channel_id = ?")
-                intent_params.append(channel_id)
-            if before_message_id is not None:
-                intent_where.append("create_msg_id < ?")
-                intent_params.append(before_message_id)
-            intents = conn.execute(
-                f"SELECT * FROM order_intents WHERE {' AND '.join(intent_where)}",
-                intent_params,
-            ).fetchall()
-        return [dict(row) for row in intents]
-
-    def cancel_signals_for_message(self, channel_id: int, message_id: int, reason: str) -> list[dict[str, Any]]:
-        now = self._ts()
-        placeholders = ",".join("?" for _ in TERMINAL_INTENT_STATES)
-        with self.db.transaction() as conn:
-            conn.execute(
-                "UPDATE signals SET status = 'deleted', rejection_reason = ?, updated_at = ? "
-                "WHERE channel_id = ? AND message_id = ? "
-                "AND status NOT IN ('deleted', 'canceled')",
-                (reason, now, channel_id, message_id),
-            )
-            intents = conn.execute(
-                "SELECT * FROM order_intents WHERE create_channel_id = ? AND create_msg_id = ? "
-                f"AND state NOT IN ({placeholders})",
-                (channel_id, message_id, *TERMINAL_INTENT_STATES),
-            ).fetchall()
-        return [dict(row) for row in intents]
 
     # ------------------------------------------------------------ intents
 

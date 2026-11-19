@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.trading.runtime import (
     apply_persisted_trading_settings,
     build_trading_engine,
@@ -139,7 +140,7 @@ def test_persisted_buy_amount_reaches_a_real_spot_intent(cfg, repo):
 
     intent = engine.process_item(
         _item(100, 900),
-        _store_message(repo, 900, "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"),
+        _store_message(repo, 900, channel_signal()),
     )
     assert intent is not None
     assert Decimal(intent["quote_amount"]) == Decimal("6.5")
