@@ -1287,7 +1287,7 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
             "SELECT event_type FROM audit_events WHERE event_class='domain' ORDER BY audit_id"
         ).fetchall()
     ]
-    assert events == ["signal.received", "signal.rejected"]
+    assert events == ["signal.rejected"]
 
 
 def test_balance_api_failure_rejects_without_submitting(cfg, repo):

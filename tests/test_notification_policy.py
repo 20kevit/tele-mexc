@@ -104,9 +104,13 @@ class RecordingBot:
         self.calls: list[tuple[int, str, int | None]] = []
         self.fail = fail or {}
         self.next_id = 1000
+        self.markups: list[dict | None] = []
 
-    def send_message(self, chat_id: int, text: str, *, reply_to_message_id: int | None = None):
+    def send_message(
+        self, chat_id: int, text: str, *, reply_to_message_id: int | None = None, reply_markup=None
+    ):
         self.calls.append((chat_id, text, reply_to_message_id))
+        self.markups.append(reply_markup)
         error = self.fail.get(chat_id)
         if error is not None:
             raise error
@@ -151,6 +155,11 @@ def _insert(
     aggregate_id: str = "intent-1",
     correlation_id: str = "signal-1",
 ) -> None:
+    if event_type == "trade.state_changed" and payload.get("new_state") in {"b", "c"}:
+        # Generic event used by transport/routing mechanics tests: model a
+        # meaningful, verified protection activation rather than a routine
+        # state transition, which production policy correctly suppresses.
+        payload = {**payload, "new_state": "oco_active"}
     conn.execute(
         "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
@@ -241,9 +250,7 @@ def test_all_five_severities_follow_the_policy(tmp_path):
         _insert(source, 4, "trade.state_changed", {"previous_state": "a", "new_state": "b"}, severity="ERROR")
         _insert(source, 5, "trade.state_changed", {"previous_state": "a", "new_state": "b"}, severity="CRITICAL")
         worker.run_once()
-        assert _statuses(worker, "evt-1") == {
-            "developer": "sent", "owner": "suppressed", "owner_b": "suppressed"
-        }
+        assert _statuses(worker, "evt-1") == {}
         for event_id in ("evt-2", "evt-3", "evt-4"):
             assert _statuses(worker, event_id) == {
                 "developer": "sent", "owner": "sent", "owner_b": "sent"
@@ -267,13 +274,10 @@ def test_debug_never_reaches_owners_even_when_category_is_enabled(tmp_path):
         _insert(source, 1, "signal.received", {"state": "parsed", "signal_kind": "alert"},
                 severity="DEBUG")
         worker.run_once()
-        assert _statuses(worker, "evt-1") == {
-            "developer": "sent", "owner": "suppressed", "owner_b": "suppressed"
-        }
-        row = worker.store.conn.execute(
-            "SELECT last_error FROM deliveries WHERE recipient_role='owner'"
-        ).fetchone()
-        assert row["last_error"] == "DEBUG is developer-only"
+        assert _statuses(worker, "evt-1") == {}
+        assert worker.store.conn.execute(
+            "SELECT COUNT(*) FROM deliveries WHERE event_id='evt-1'"
+        ).fetchone()[0] == 0
     finally:
         worker.close()
         source.close()
@@ -288,7 +292,70 @@ def test_debug_cannot_bypass_disabled_diagnostic_preference(tmp_path):
     try:
         _insert(source, 1, "future.event", {}, severity="DEBUG")
         worker.run_once()
-        assert _statuses(worker, "evt-1")["developer"] == "suppressed"
+        assert _statuses(worker, "evt-1") == {}
+    finally:
+        worker.close()
+        source.close()
+
+
+def test_notification_policy_sends_only_eligible_buy_and_one_verified_protection_event(tmp_path):
+    bot = RecordingBot()
+    source, worker = _worker(tmp_path, bot)
+    try:
+        _insert(
+            source, 1, "signal.received",
+            {"state": "validated", "signal_kind": "alert", "side": "buy", "entry_price": "100",
+             "tp1_price": "110", "tp2_price": "120", "stop_loss_price": "95"},
+            event_id="eligible-long", aggregate_type="signal", aggregate_id="-100:1:0",
+            audience=["owner", "owner_b"],
+        )
+        _insert(
+            source, 2, "signal.rejected",
+            {"reason": "bad entry", "previous_state": "parsed", "new_state": "rejected"},
+            event_id="rejected",
+        )
+        _insert(
+            source, 3, "signal.received",
+            {"state": "validated", "signal_kind": "alert", "side": "sell"}, event_id="sell",
+        )
+        _insert(
+            source, 4, "signal.received",
+            {"state": "validated", "signal_kind": "alert", "side": "short"}, event_id="short",
+        )
+        _insert(source, 5, "trade.state_changed", {"previous_state": "entry_active", "new_state": "oco_active"},
+                event_id="protection-active", aggregate_type="trade", aggregate_id="trade-1")
+        _insert(source, 6, "oco_group.state_changed",
+                {"previous_state": "open", "new_state": "open", "protection_status": "oco_active"},
+                event_id="oco-poll", aggregate_type="oco_group", aggregate_id="oco-1")
+        _insert(source, 7, "oco_leg.state_changed",
+                {"kind": "take_profit", "target": "tranche-1:tp1", "previous_state": "open",
+                 "new_state": "open", "filled_qty": "0", "previous_filled_qty": "0"},
+                event_id="oco-leg-poll", aggregate_type="oco_leg", aggregate_id="leg-1")
+        _insert(source, 8, "exchange.write_outcome",
+                {"operation_type": "place_oco", "outcome": "success"}, event_id="oco-api-ok")
+        _insert(source, 9, "oco_leg.state_changed",
+                {"kind": "take_profit", "target": "tranche-1:tp1", "previous_state": "open",
+                 "new_state": "filled", "filled_qty": "0.05", "previous_filled_qty": "0"},
+                event_id="tp1-fill", aggregate_type="oco_leg", aggregate_id="leg-2")
+        _insert(source, 10, "future.event", {}, severity="DEBUG", event_id="debug-event")
+        worker.run_once()
+
+        sent_ids = {
+            row["event_id"]
+            for row in worker.store.conn.execute("SELECT event_id FROM deliveries WHERE status='sent'")
+        }
+        assert "eligible-long" in sent_ids and "protection-active" in sent_ids and "tp1-fill" in sent_ids
+        assert not ({"rejected", "sell", "short", "oco-poll", "oco-leg-poll", "oco-api-ok"} & sent_ids)
+        assert _statuses(worker, "debug-event") == {}
+        signal_calls = [call for call in bot.calls if "سیگنال خرید معتبر" in call[1]]
+        assert {call[0] for call in signal_calls} == {OWNER, OWNER_B}
+        assert all("TP1" not in call[1] and "حد ضرر" not in call[1] for call in signal_calls)
+        assert all(markup and markup["inline_keyboard"][0][0]["text"] == "جزئیات سیگنال"
+                   for markup in bot.markups if markup is not None)
+        protection_calls = [call for call in bot.calls if "حفاظت معامله فعال و تأیید شد" in call[1]]
+        assert {call[0] for call in protection_calls} == {OWNER, OWNER_B, DEVELOPER}
+        tp_calls = [call for call in bot.calls if "TP1" in call[1]]
+        assert len(tp_calls) == 3
     finally:
         worker.close()
         source.close()
@@ -403,7 +470,7 @@ def test_per_recipient_minimum_severity_is_independent(tmp_path):
         source.close()
 
 
-def test_genuine_rejection_is_warning_and_owner_visible(tmp_path):
+def test_rejected_signal_is_retained_but_never_delivered(tmp_path):
     assert build_domain_event(
         "signal.rejected",
         aggregate_id="signal-1",
@@ -423,13 +490,13 @@ def test_genuine_rejection_is_warning_and_owner_visible(tmp_path):
                 severity="WARNING")
         worker.run_once()
         assert _statuses(worker, "evt-1") == {
-            "developer": "suppressed", "owner": "sent", "owner_b": "sent"
+            "developer": "suppressed", "owner": "suppressed", "owner_b": "suppressed"
         }
-        text = worker.store.conn.execute(
-            "SELECT message_text FROM deliveries WHERE recipient_role='owner'"
-        ).fetchone()["message_text"]
-        assert "سیگنال رد شد" in text
-        assert "✅" not in text
+        assert not worker.bot.calls
+        row = worker.store.conn.execute(
+            "SELECT last_error FROM deliveries WHERE recipient_role='owner'"
+        ).fetchone()
+        assert row["last_error"] == "rejected signals are never delivered"
     finally:
         worker.close()
         source.close()
@@ -455,7 +522,7 @@ def test_routing_helpers_are_deterministic():
     status, reason = delivery_decision(
         "owner", "DEBUG", "order_lifecycle", "trade.state_changed", {}, {}, {}, "INFO"
     )
-    assert (status, reason) == ("suppressed", "DEBUG is developer-only")
+    assert (status, reason) == ("suppressed", "DEBUG is internal-log only")
     assert event_thread_key(
         "trade.state_changed", aggregate_type="trade", aggregate_id="t1",
         correlation_id="t1", payload={}, severity="INFO",
@@ -533,11 +600,11 @@ def test_root_and_replies_are_per_recipient(tmp_path):
     bot = RecordingBot()
     source, worker = _worker(tmp_path, bot)
     try:
-        _insert(source, 1, "intent.created", {"state": "planned"}, aggregate_type="intent",
-                aggregate_id="intent-1", correlation_id="signal-1")
-        _insert(source, 2, "intent.state_changed",
-                {"previous_state": "submitting", "new_state": "submitted",
-                 "exchange_order_id": "999"},
+        _insert(source, 1, "intent.state_changed",
+                {"previous_state": "submitting", "new_state": "submitted"},
+                aggregate_type="intent", aggregate_id="intent-1", correlation_id="signal-1")
+        _insert(source, 2, "trade.state_changed",
+                {"previous_state": "entry_active", "new_state": "oco_active"},
                 aggregate_type="intent", aggregate_id="intent-1", correlation_id="signal-1")
         _insert(source, 3, "trade.protection_critical",
                 {"event_key": "SL_UNPROTECTED_CRITICAL", "detail": "unprotected"},
@@ -570,7 +637,8 @@ def test_deleted_root_falls_back_to_standalone_not_dead_letter(tmp_path):
     bot = RecordingBot()
     source, worker = _worker(tmp_path, bot)
     try:
-        _insert(source, 1, "intent.created", {"state": "planned"}, aggregate_type="intent",
+        _insert(source, 1, "intent.state_changed",
+                {"previous_state": "submitting", "new_state": "submitted"}, aggregate_type="intent",
                 aggregate_id="intent-1")
         worker.run_once()
         root_id = worker.store.thread_root("owner", "intent:intent-1")
@@ -610,7 +678,7 @@ def test_long_legacy_message_is_chunked_in_order(tmp_path):
         assert len(text) > 2 * 3900
         source.execute(
             "INSERT INTO trading_notifications(event_key,category,event_type,role,chat_id,text,status) "
-            "VALUES('long','order_lifecycle','trade.state_changed','owner',?,?,'pending')",
+            "VALUES('long','order_lifecycle','trade.protection_critical','owner',?,?,'pending')",
             (OWNER, text),
         )
         source.commit()

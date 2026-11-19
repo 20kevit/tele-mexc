@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -160,6 +160,30 @@ def _add_channel(repo) -> None:
     repo.select_channel(CHANNEL)
 
 
+def _add_history_signal(
+    repo,
+    message_id: int,
+    *,
+    symbol: str = "BTCUSDT",
+    created_at: str | None = None,
+    status: str = "validated",
+    action: str = "buy",
+    signal_kind: str = "alert",
+):
+    now = created_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    signal_id = f"{CHANNEL}:{message_id}:0"
+    with repo.db.transaction() as conn:
+        conn.execute(
+            """INSERT INTO signals
+                (signal_id,channel_id,message_id,edit_version,parser_version,signal_kind,symbol,
+                 action,market_type,entry_price,target_prices,stop_loss,order_type,
+                 fingerprint_sha256,status,created_at,updated_at)
+               VALUES(?,?,?,?,1,?,?,?,'spot','100','110,120','95','limit',?,?,?,?)""",
+            (signal_id, CHANNEL, message_id, 0, signal_kind, symbol, action, f"fp-{message_id}", status, now, now),
+        )
+    return signal_id
+
+
 def _add_intent(repo, *, intent_id="intent-1", signal_id="sig-1") -> None:
     now = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     with repo.db.transaction() as conn:
@@ -185,6 +209,83 @@ def _add_intent(repo, *, intent_id="intent-1", signal_id="sig-1") -> None:
             """,
             (intent_id, signal_id, f"idem-{intent_id}", f"client-{intent_id}", CHANNEL, now, now),
         )
+
+
+async def test_owner_signal_history_latest_ten_details_and_back_are_read_only(cfg, repo):
+    _add_channel(repo)
+    store = ControlStore(repo.db)
+    _full_setup(store)
+    control, fake, engine = _bot(cfg, repo)
+    for n in range(1, 13):
+        _add_history_signal(repo, n, symbol=f"COIN{n}USDT")
+    _add_history_signal(repo, 13, status="rejected")
+    _add_history_signal(repo, 14, action="sell")
+
+    await control.handle_update(_callback(1, "s:menu"))
+    menu = fake.edited[-1]
+    options = [button["callback_data"] for row in menu["reply_markup"]["inline_keyboard"] for button in row]
+    assert options == ["s:last", "s:48", "m:status"]
+
+    await control.handle_update(_callback(2, "s:last"))
+    listing = fake.edited[-1]
+    assert "۱۰ سیگنال LONG اخیر" in listing["text"]
+    assert "COIN13USDT" not in listing["text"] and "COIN14USDT" not in listing["text"]
+    assert "ورود: 100" not in listing["text"]
+    detail_button = listing["reply_markup"]["inline_keyboard"][0][0]
+    assert detail_button["callback_data"].startswith("s:d:")
+    detail_rows = [
+        row for row in listing["reply_markup"]["inline_keyboard"]
+        if row[0]["callback_data"].startswith("s:d:")
+    ]
+    assert len(detail_rows) == 10
+
+    await control.handle_update(_callback(3, detail_button["callback_data"]))
+    details = fake.edited[-1]
+    assert "COIN12USDT" in details["text"]
+    assert "ورود: 100" in details["text"]
+    assert "حد ضرر: 95" in details["text"]
+    assert "TP1: 110" in details["text"] and "TP2: 120" in details["text"]
+    assert "منبع: Signals" in details["text"]
+    assert details["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "s:back:last:0"
+
+    await control.handle_update(_callback(4, "s:back:last:0"))
+    assert "۱۰ سیگنال LONG اخیر" in fake.edited[-1]["text"]
+    assert engine.executed == []
+
+
+async def test_owner_signal_history_last_48_hours_uses_stored_utc_timestamps(cfg, repo):
+    _add_channel(repo)
+    control, fake, engine = _bot(cfg, repo)
+    now = datetime.now(UTC)
+    _add_history_signal(repo, 21, symbol="RECENTUSDT", created_at=now.isoformat())
+    _add_history_signal(repo, 22, symbol="OLD47USDT", created_at=(now - timedelta(hours=47)).isoformat())
+    _add_history_signal(repo, 23, symbol="OLD49USDT", created_at=(now - timedelta(hours=49)).isoformat())
+    _add_history_signal(repo, 24, symbol="NOPEUSDT", status="rejected", created_at=now.isoformat())
+
+    await control.handle_update(_callback(1, "s:48"))
+    text = fake.edited[-1]["text"]
+    assert "RECENTUSDT" in text and "OLD47USDT" in text
+    assert "OLD49USDT" not in text and "NOPEUSDT" not in text
+    assert engine.executed == []
+
+
+async def test_signal_callbacks_require_owner_and_reject_invalid_or_stale_ids(cfg, repo):
+    _add_channel(repo)
+    _full_setup(ControlStore(repo.db))
+    control, fake, engine = _bot_with_developer(cfg, repo)
+    signal_id = _add_history_signal(repo, 31)
+
+    await control.handle_update(_callback(1, "s:menu", user=DEVELOPER))
+    assert not fake.edited
+    assert fake.answered[-1] == "cb-1"
+    await control.handle_update(_callback(2, "s:d:not-valid!"))
+    assert "نامعتبر یا منقضی" in fake.edited[-1]["text"]
+
+    encoded = control._signal_callback_id(signal_id).split(":", 2)[2]
+    repo.db.conn.execute("UPDATE signals SET status='rejected' WHERE signal_id=?", (signal_id,))
+    await control.handle_update(_callback(3, f"s:d:{encoded}"))
+    assert "دیگر واجد شرایط" in fake.edited[-1]["text"]
+    assert engine.executed == []
 
 
 async def test_start_requires_owner_and_resumes_persisted_setup(cfg, repo):

@@ -8,12 +8,15 @@ intent, risk, balance-preflight, execution, and reconciliation pipeline.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import logging
 import math
 import time
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ..config import AppConfig
 from ..mexc import MexcSpotClient, SharedWeightedRateGate, SymbolRegistry
@@ -93,6 +96,7 @@ class ControlBot:
         self._pending_mexc_secret: str | None = None
         self._pending_mexc_started = 0.0
         self._last_tick = 0.0
+        self._active_callback_message_id: int | None = None
         self._load_stored_mexc()
 
     def _load_stored_mexc(self) -> None:
@@ -379,11 +383,16 @@ class ControlBot:
             await self._answer(callback_id, "این عملیات فقط برای مالکان مجاز است")
             return
         await self._answer(callback_id)
+        previous_message_id = self._active_callback_message_id
         try:
+            message_id = message.get("message_id")
+            self._active_callback_message_id = int(message_id) if message_id is not None else None
             await self._route_callback(chat_id, data)
         except Exception as exc:  # noqa: BLE001 - callbacks must never crash polling
             log.warning("control callback failed (%s)", exc.__class__.__name__)
-            await self._send(chat_id, "انجام این عملیات ممکن نشد. جزئیات حساس در لاگ ثبت نمی‌شود.")
+            await self._send(chat_id, "انجام این عملیات ممکن نشد. لطفاً دوباره تلاش کنید.")
+        finally:
+            self._active_callback_message_id = previous_message_id
 
     async def _route_callback(self, chat_id: int, data: str) -> None:
         parts = data.split(":")
@@ -398,6 +407,8 @@ class ControlBot:
             await self._mexc_action(chat_id, parts)
         elif head == "n":
             await self._notification_action(chat_id, parts)
+        elif head == "s":
+            await self._signal_history_action(chat_id, parts)
         else:
             await self._send(chat_id, "دکمه نامعتبر است. /start")
 
@@ -422,6 +433,8 @@ class ControlBot:
                 rows.append([_btn("▶️ ادامه اجرا", "m:resume")])
             else:
                 rows.append([_btn("⏸ توقف اجرای سفارش", "m:pause")])
+            if s.get("selected_channel_id"):
+                rows.append([_btn("📈 تاریخچه سیگنال‌های LONG", "s:menu")])
         rows.append([_btn("📊 وضعیت", "m:status"), _btn("❓ راهنما", "m:help")])
         return _kb(rows)
 
@@ -969,6 +982,227 @@ class ControlBot:
         self.store.audit("sizing_changed", f"order_quote_amount={value:g}")
         await self._send(chat_id, "مبلغ خرید ذخیره شد و در اجرای بعدی استفاده می‌شود.")
         await self._show_sizing(chat_id)
+
+    # ----------------------------------------------------- LONG signal history
+
+    @staticmethod
+    def _signal_callback_id(signal_id: str) -> str:
+        encoded = base64.urlsafe_b64encode(signal_id.encode("utf-8")).decode("ascii").rstrip("=")
+        return f"s:d:{encoded}"
+
+    @staticmethod
+    def _decode_signal_callback(value: str) -> str | None:
+        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        if not value or len(value) > 60 or any(ch not in alphabet for ch in value):
+            return None
+        try:
+            padded = value + "=" * (-len(value) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            return None
+        if not decoded or len(decoded) > 120:
+            return None
+        return decoded
+
+    @staticmethod
+    def _signal_time(value: Any) -> datetime | None:
+        return _parse_ts(str(value)) if value not in (None, "") else None
+
+    @staticmethod
+    def _signal_local_time(value: Any) -> str:
+        parsed = ControlBot._signal_time(value)
+        if parsed is None:
+            return "زمان نامشخص"
+        return parsed.astimezone(ZoneInfo("Europe/Brussels")).strftime("%d/%m %H:%M %Z")
+
+    @staticmethod
+    def _signal_safe(value: Any, limit: int = 160) -> str:
+        text = str(value or "").replace("\r", " ").replace("\n", " ")
+        text = "".join(ch for ch in text if ord(ch) >= 32 and ord(ch) != 127)
+        return text[:limit].strip() or "—"
+
+    def _eligible_signal(self, signal_id: str) -> dict[str, Any] | None:
+        row = self.repo.db.conn.execute(
+            """SELECT s.*, c.title AS source_title, c.username AS source_username,
+                      i.state AS intent_state
+               FROM signals s
+               LEFT JOIN channels c ON c.channel_id=s.channel_id
+               LEFT JOIN order_intents i ON i.signal_id=s.signal_id
+               WHERE s.signal_id=? AND s.signal_kind IN ('alert','update')
+                 AND LOWER(COALESCE(s.action,''))='buy' AND s.market_type='spot'
+                 AND s.status IN ('validated','planned')
+               LIMIT 1""",
+            (signal_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _signal_history_rows(self, view: str) -> list[dict[str, Any]]:
+        rows = self.repo.db.conn.execute(
+            """SELECT s.signal_id,s.symbol,s.created_at,s.edit_version
+               FROM signals s
+               WHERE s.signal_kind IN ('alert','update')
+                 AND LOWER(COALESCE(s.action,''))='buy' AND s.market_type='spot'
+                 AND s.status IN ('validated','planned')
+               ORDER BY s.created_at DESC,s.channel_id DESC,s.message_id DESC,s.edit_version DESC"""
+        ).fetchall()
+        signals = [dict(row) for row in rows]
+        if view == "last":
+            return signals[:10]
+        cutoff = datetime.now(UTC).timestamp() - 48 * 60 * 60
+        result: list[dict[str, Any]] = []
+        for row in signals:
+            parsed = self._signal_time(row.get("created_at"))
+            if parsed is not None and parsed.timestamp() >= cutoff:
+                result.append(row)
+        return result
+
+    async def _edit_signal_screen(self, chat_id: int, text: str, keyboard: dict[str, Any]) -> None:
+        message_id = self._active_callback_message_id
+        edit = getattr(self.bot, "edit_message_text", None)
+        if message_id is not None and callable(edit):
+            try:
+                await asyncio.to_thread(edit, chat_id, message_id, text, reply_markup=keyboard)
+                return
+            except Exception as exc:  # do not send a duplicate after an ambiguous edit
+                log.info("signal history message edit failed (%s)", exc.__class__.__name__)
+                return
+        await self._send(chat_id, text, keyboard)
+
+    async def _signal_history_action(self, chat_id: int, parts: list[str]) -> None:
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "menu" and len(parts) == 2:
+            await self._edit_signal_screen(
+                chat_id,
+                "📈 تاریخچه سیگنال‌های LONG\nیکی از دو بازه را انتخاب کنید:",
+                _kb([
+                    [_btn("۱۰ سیگنال اخیر", "s:last")],
+                    [_btn("۴۸ ساعت گذشته", "s:48")],
+                    [_btn("بازگشت", "m:status")],
+                ]),
+            )
+            return
+        if action in {"last", "48"} and len(parts) == 2:
+            await self._show_signal_list(chat_id, action, 0)
+            return
+        if action == "page" and len(parts) == 4:
+            view = parts[2]
+            try:
+                page = int(parts[3])
+            except ValueError:
+                page = -1
+            if view in {"last", "48"} and 0 <= page <= 10000:
+                await self._show_signal_list(chat_id, view, page)
+                return
+        if action == "d" and len(parts) in {3, 5}:
+            signal_id = self._decode_signal_callback(parts[2])
+            back_view, back_page = "menu", 0
+            if len(parts) == 5:
+                back_view = parts[3]
+                try:
+                    back_page = int(parts[4])
+                except ValueError:
+                    back_page = -1
+            if signal_id and back_view in {"menu", "last", "48"} and 0 <= back_page <= 10000:
+                await self._show_signal_details(chat_id, signal_id, back_view, back_page)
+                return
+        if action == "event" and len(parts) == 3:
+            event_id = parts[2]
+            if 1 <= len(event_id) <= 48 and all(ch.isalnum() or ch in "-_" for ch in event_id):
+                event = self.repo.db.conn.execute(
+                    "SELECT aggregate_id FROM audit_events WHERE event_id=? "
+                    "AND event_class='domain' AND event_type='signal.received' LIMIT 1",
+                    (event_id,),
+                ).fetchone()
+                if event is not None:
+                    await self._show_signal_details(chat_id, str(event["aggregate_id"]), "menu", 0)
+                    return
+        if action == "back" and len(parts) == 4:
+            view = parts[2]
+            try:
+                page = int(parts[3])
+            except ValueError:
+                page = -1
+            if view == "menu" and page == 0:
+                await self._signal_history_action(chat_id, ["s", "menu"])
+                return
+            if view in {"last", "48"} and 0 <= page <= 10000:
+                await self._show_signal_list(chat_id, view, page)
+                return
+        await self._edit_signal_screen(
+            chat_id,
+            "این دکمه نامعتبر یا منقضی شده است. از تاریخچه سیگنال‌ها دوباره وارد شوید.",
+            _kb([[_btn("تاریخچه سیگنال‌ها", "s:menu")]]),
+        )
+
+    async def _show_signal_list(self, chat_id: int, view: str, page: int) -> None:
+        signals = self._signal_history_rows(view)
+        page_size = 10
+        pages = max(1, (len(signals) + page_size - 1) // page_size)
+        page = min(page, pages - 1)
+        visible = signals[page * page_size : (page + 1) * page_size]
+        if not signals:
+            message = (
+                "در میان ۱۰ سیگنال اخیر، LONG BUY واجد شرایطی ثبت نشده است."
+                if view == "last"
+                else "در ۴۸ ساعت گذشته LONG BUY واجد شرایطی ثبت نشده است."
+            )
+        else:
+            title = "۱۰ سیگنال LONG اخیر" if view == "last" else "سیگنال‌های LONG در ۴۸ ساعت گذشته"
+            message = f"📈 {title}"
+            if pages > 1:
+                message += f" · صفحه {page + 1} از {pages}"
+        rows: list[list[dict[str, str]]] = []
+        for row in visible:
+            symbol = self._signal_safe(row.get("symbol"), 24)
+            stamp = self._signal_local_time(row.get("created_at"))
+            message += f"\n#{symbol} · {stamp}"
+            callback = f"{self._signal_callback_id(str(row['signal_id']))}:{view}:{page}"
+            if len(callback.encode("utf-8")) <= 64:
+                rows.append([_btn(f"جزئیات #{symbol}", callback)])
+        if view == "48" and pages > 1:
+            nav: list[dict[str, str]] = []
+            if page > 0:
+                nav.append(_btn("قبلی", f"s:page:48:{page - 1}"))
+            if page + 1 < pages:
+                nav.append(_btn("بعدی", f"s:page:48:{page + 1}"))
+            rows.append(nav)
+        rows.append([_btn("انتخاب بازه", "s:menu")])
+        await self._edit_signal_screen(chat_id, message, _kb(rows))
+
+    async def _show_signal_details(
+        self, chat_id: int, signal_id: str, back_view: str, page: int
+    ) -> None:
+        signal = self._eligible_signal(signal_id)
+        if signal is None:
+            await self._edit_signal_screen(
+                chat_id,
+                "این سیگنال دیگر واجد شرایط نمایش نیست یا در پایگاه داده پیدا نشد.",
+                _kb([[_btn("تاریخچه سیگنال‌ها", "s:menu")]]),
+            )
+            return
+        targets = str(signal.get("target_prices") or "").split(",")
+        entry = signal.get("entry_price")
+        if entry is None and (signal.get("entry_low_price") or signal.get("entry_high_price")):
+            entry = f"{signal.get('entry_low_price') or '—'} تا {signal.get('entry_high_price') or '—'}"
+        source = signal.get("source_title") or signal.get("source_username")
+        lines = [
+            f"📈 سیگنال LONG BUY · #{self._signal_safe(signal.get('symbol'), 32)}",
+            f"دریافت: {self._signal_local_time(signal.get('created_at'))}",
+            f"ورود: {self._signal_safe(entry)}",
+            f"حد ضرر: {self._signal_safe(signal.get('stop_loss'))}",
+            f"TP1: {self._signal_safe(targets[0] if targets else None)}",
+            f"TP2: {self._signal_safe(targets[1] if len(targets) > 1 else None)}",
+            f"وضعیت پردازش: {self._signal_safe(signal.get('status'))}",
+        ]
+        if signal.get("intent_state"):
+            lines.append(f"وضعیت سفارش: {self._signal_safe(signal.get('intent_state'))}")
+        if source:
+            lines.append(f"منبع: {self._signal_safe(source)}")
+        await self._edit_signal_screen(
+            chat_id,
+            "\n".join(lines),
+            _kb([[_btn("بازگشت", f"s:back:{back_view}:{page}")]]),
+        )
 
     # -------------------------------------------------- notification settings
 

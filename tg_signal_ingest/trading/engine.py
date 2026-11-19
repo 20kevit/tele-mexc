@@ -908,6 +908,15 @@ class TradingEngine:
 
         started = self._monotonic()
         outcome = "skipped" if self.notifier is None else "ok"
+        if category == "signal_decision" or event_type in {
+            "signal.rejected", "signal.rejected_locally", "signal.not_a_signal",
+        }:
+            log.debug(
+                "signal decision kept internal signal_id=%s event_type=%s",
+                signal_id or "none",
+                event_type or "none",
+            )
+            return
         try:
             if self.notifier is None:
                 return

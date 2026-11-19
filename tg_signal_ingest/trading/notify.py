@@ -127,6 +127,17 @@ class TradingNotifier:
         duplicate an event.
         """
 
+        # Parser decisions, rejected/unsupported signals, and DEBUG are local
+        # diagnostics only. They are retained by the signal/audit ledger, but
+        # never enter even the legacy Telegram outbox.
+        severity_value = classify_severity(category, event_key, severity)
+        event_name = str(event_type or "").lower()
+        if (
+            severity_value == "DEBUG"
+            or category == "signal_decision"
+            or event_name in {"signal.rejected", "signal.rejected_locally", "signal.not_a_signal"}
+        ):
+            return 0
         targets = self._targets(roles)
         if not targets:
             return 0

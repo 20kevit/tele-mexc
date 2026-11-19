@@ -176,6 +176,16 @@ def test_signal_received_and_rejected_events_are_atomic_and_deduplicated(store):
         parsed, channel_id=100, message_id=1, edit_version=0, emit_event=True
     )
     assert inserted is True
+    # Parsing is not eligibility: no owner-facing signal event exists yet.
+    events = _domain_events(store)
+    assert events == []
+    duplicate_id, inserted = store.record_signal(
+        parsed, channel_id=100, message_id=1, edit_version=0, emit_event=True
+    )
+    assert duplicate_id == signal_id and inserted is False
+    assert _domain_events(store) == []
+
+    store.update_signal(signal_id, "validated")
     events = _domain_events(store)
     assert [row["event_type"] for row in events] == ["signal.received"]
     received = json.loads(events[0]["payload_json"])
@@ -194,7 +204,7 @@ def test_signal_received_and_rejected_events_are_atomic_and_deduplicated(store):
     events = _domain_events(store)
     assert [row["event_type"] for row in events] == ["signal.received", "signal.rejected"]
     rejected = json.loads(events[1]["payload_json"])
-    assert rejected["previous_state"] == "parsed"
+    assert rejected["previous_state"] == "validated"
     assert rejected["new_state"] == "rejected"
     assert rejected["reason"] == "risk check failed"
 

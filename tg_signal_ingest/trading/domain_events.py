@@ -62,6 +62,7 @@ def _spec(
     category: str,
     aggregate_type: str,
     severity: str = "INFO",
+    audience: tuple[str, ...] = DEFAULT_AUDIENCE,
     required: tuple[str, ...] = (),
     allowed: tuple[str, ...] = (),
 ) -> EventSpec:
@@ -72,6 +73,7 @@ def _spec(
         category=category,
         aggregate_type=aggregate_type,
         default_severity=severity,
+        audience=audience,
         required_payload=required,
         allowed_payload=frozenset(allowed),
     )
@@ -85,6 +87,7 @@ EVENT_REGISTRY: dict[str, EventSpec] = {
         category="parse",
         aggregate_type="signal",
         severity="INFO",
+        audience=("owner", "owner_b"),
         required=("state", "signal_kind"),
         allowed=(
             "state", "signal_kind", "side", "entry_price", "tp1_price", "tp2_price",
@@ -200,6 +203,7 @@ EVENT_REGISTRY: dict[str, EventSpec] = {
             "new_state",
             "exchange_status",
             "filled_qty",
+            "previous_filled_qty",
             "filled_quote",
             "fee_amount",
             "fee_asset",

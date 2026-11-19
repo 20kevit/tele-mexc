@@ -145,23 +145,28 @@ def owner_safety_alert_bypasses_preferences(
     """Return True when an owner alert is safety-critical.
 
     Safety alerts bypass both the routine minimum-severity threshold and the
-    category preference.  They are never suppressible by ordinary owner
-    tuning; a genuine rejected/ambiguous trading signal is owner-visible by
-    policy.  CRITICAL events additionally go to *every configured recipient*.
+    category preference. Rejected signals are explicitly excluded before this
+    policy is evaluated. CRITICAL events additionally go to every configured
+    recipient.
     """
 
     if role not in OWNER_ROLES:
         return False
     if str(severity).upper() == "CRITICAL":
         return True
-    if event_type in ("signal.rejected", "trade.protection_critical") or event_type.endswith(
-        "rejected_locally"
-    ):
+    if event_type == "trade.protection_critical":
         return True
     payload = payload or {}
+    state = str(payload.get("new_state") or "").lower()
     unknown_state = (
         event_type in ("intent.state_changed", "trade_order.state_changed", "trade.state_changed")
-        and payload.get("new_state") in _OWNER_SAFETY_UNKNOWN_STATES
+        and state in _OWNER_SAFETY_UNKNOWN_STATES
+    )
+    genuine_failure = (
+        event_type in ("intent.state_changed", "trade_order.state_changed", "oco_leg.state_changed")
+        and state in {"failed", "rejected", "unknown_requires_reconciliation"}
+    ) or (
+        event_type == "trade.state_changed" and state == "oco_partial"
     )
     uncertain_outcome = (
         event_type in ("exchange.write_outcome", "reconciliation.outcome")
@@ -169,13 +174,108 @@ def owner_safety_alert_bypasses_preferences(
     )
     unprotected_group = (
         event_type == "oco_group.state_changed"
-        and payload.get("protection_status") in ("unprotected", "unprotected_critical", "failed")
+        and str(payload.get("protection_status") or "").lower()
+        in ("partial", "oco_partial", "unprotected", "unprotected_critical", "failed", "unknown")
     )
-    return unknown_state or uncertain_outcome or unprotected_group
+    return unknown_state or genuine_failure or uncertain_outcome or unprotected_group
 
 
 # Backwards-compatible name used by earlier callers/tests.
 owner_safety_alert_bypasses_min_severity = owner_safety_alert_bypasses_preferences
+
+
+def event_suppression_reason(
+    event_type: str,
+    severity: str,
+    payload: dict[str, Any] | None,
+    *,
+    legacy_key: str = "",
+    category: str = "",
+) -> str | None:
+    """Apply the small owner-notification policy before recipient routing.
+
+    Events remain in the immutable audit journal.  This function only decides
+    whether an event belongs in a Telegram delivery queue.
+    """
+
+    kind = str(event_type or "").lower()
+    level = str(severity or "INFO").upper()
+    data = payload or {}
+    key = f"{legacy_key} {category} {kind}".lower()
+    if level == "DEBUG" or "debug" in key:
+        return "DEBUG is internal-log only"
+    if (
+        kind in {"signal.rejected", "signal.rejected_locally", "signal.not_a_signal"}
+        or "signal.rejected" in key
+        or "rejected_locally" in key
+    ):
+        return "rejected signals are never delivered"
+    if category == "signal_decision":
+        return "signal parsing and decision diagnostics are internal only"
+    if kind == "signal.received":
+        if str(data.get("side") or "").lower() != "buy":
+            return "only LONG BUY signals are eligible"
+        if str(data.get("signal_kind") or "").lower() not in {"alert", "update"}:
+            return "non-trade signal is not owner-notifiable"
+        if str(data.get("state") or "").lower() not in {"validated", "planned"}:
+            return "signal has not passed eligibility checks"
+    if kind == "intent.created" or kind == "intent.submission_accepted":
+        return "covered by the verified entry-order lifecycle event"
+    if kind == "intent.state_changed":
+        state = str(data.get("new_state") or "").lower()
+        if state not in {
+            "submitted", "partially_filled", "filled", "failed", "rejected",
+            "unknown_requires_reconciliation",
+        }:
+            return "routine entry-intent transition"
+    if (
+        kind == "fill.recorded"
+        and str(data.get("_intent_state") or "").lower() in {
+            "partially_filled", "filled", "unknown_requires_reconciliation",
+        }
+    ):
+        return "entry fill is represented by the verified cumulative order state"
+    if kind == "trade.state_changed":
+        state = str(data.get("new_state") or "").lower()
+        if state not in {
+            "oco_active", "oco_partial", "unprotected_critical", "needs_reconciliation", "closed",
+        }:
+            return "routine trade lifecycle transition"
+    if kind == "oco_group.state_changed":
+        protection = str(data.get("protection_status") or "").lower()
+        state = str(data.get("new_state") or "").lower()
+        if level not in {"ERROR", "CRITICAL"} and protection not in {
+            "partial", "oco_partial", "unprotected", "unprotected_critical", "failed", "unknown",
+        } and state not in {"failed", "unknown_requires_reconciliation", "needs_reconciliation"}:
+            return "routine OCO group transition; protection activation is reported once"
+    if kind == "oco_leg.state_changed":
+        state = str(data.get("new_state") or "").lower()
+        try:
+            current_qty = float(data.get("filled_qty") or 0)
+            previous_qty = float(data.get("previous_filled_qty") or 0)
+        except (TypeError, ValueError):
+            current_qty, previous_qty = 0.0, 0.0
+        actual_fill = current_qty > previous_qty
+        safety_failure = (
+            state in {"rejected", "failed", "unknown_requires_reconciliation"}
+            or level in {"ERROR", "CRITICAL"}
+        )
+        if not actual_fill and not safety_failure:
+            return "routine OCO leg transition"
+    if kind == "trade_order.state_changed":
+        state = str(data.get("new_state") or "").lower()
+        if state == "open" and level not in {"ERROR", "CRITICAL"}:
+            return "low-level OCO order acceptance is reported with verified protection"
+    if kind == "exchange.write_outcome":
+        outcome = str(data.get("outcome") or "").lower()
+        operation = str(data.get("operation_type") or "").lower()
+        if outcome == "success":
+            return "successful low-level exchange response is not a business outcome"
+        if outcome == "error" and operation in {"place_order", "place_oco"}:
+            return "definitive submission failure is reported by the order lifecycle"
+    if kind == "reconciliation.outcome" and str(data.get("outcome") or "").lower() in {"consistent", "resolved"}:
+        return "routine reconciliation confirmation"
+    return None
 
 
 def delivery_decision(
@@ -197,17 +297,13 @@ def delivery_decision(
     severity_value = str(severity).upper()
     minimum = recipient_minimum_severity(role, settings, global_minimum)
 
-    # DEBUG is developer diagnostics only, even if a legacy category row or a
-    # stale preference would otherwise enable it for an owner.
+    # DEBUG is local/internal only, including for the developer recipient.
     if severity_value == "DEBUG":
-        if role in OWNER_ROLES:
-            return "suppressed", "DEBUG is developer-only"
-        # DEBUG is the developer diagnostic stream.  It is gated by the
-        # developer's category preference but not by the routine owner-noise
-        # severity threshold; it can never reach an owner.
-        if not recipient_preference_enabled(role, category, preferences):
-            return "suppressed", "category disabled"
-        return "pending", None
+        return "suppressed", "DEBUG is internal-log only"
+
+    suppression = event_suppression_reason(event_type, severity_value, payload)
+    if suppression:
+        return "suppressed", suppression
 
     # CRITICAL always reaches every configured recipient, independent of
     # category enablement and minimum severity.
@@ -336,14 +432,7 @@ def render_domain_event(row: dict[str, Any]) -> str:
     symbol = _symbol_tag(row.get("symbol") or payload.get("symbol"))
     prefix = f"{symbol}\n" if symbol else ""
     if event_type == "signal.received":
-        return (
-            f"📨 سیگنال جدید دریافت شد\n{prefix}"
-            f"جهت: {payload.get('side') or '—'}\n"
-            f"ورود: {payload.get('entry_price') or '—'}\n"
-            f"هدف اول (TP1): {payload.get('tp1_price') or '—'}\n"
-            f"هدف دوم (TP2): {payload.get('tp2_price') or '—'}\n"
-            f"حد ضرر: {payload.get('stop_loss_price') or '—'}"
-        )
+        return f"📈 سیگنال خرید معتبر\n{prefix}ورود: {payload.get('entry_price') or '—'}"
     if event_type in ("system.service_event", "system.control_event"):
         heading = "رویداد سامانه" if event_type == "system.service_event" else "رویداد کنترل ربات"
         return f"ℹ️ {heading}\n{payload.get('message') or payload.get('event_key') or '—'}"
@@ -369,6 +458,27 @@ def render_domain_event(row: dict[str, Any]) -> str:
         if payload.get("exchange_status"):
             details.append(f"وضعیت صرافی: {payload['exchange_status']}")
         return f"✅ پذیرش ارسال سفارش ورود در صرافی تأیید شد\n{prefix}" + "\n".join(details)
+    if event_type == "oco_leg.state_changed":
+        target = str(payload.get("target") or "").lower()
+        kind = str(payload.get("kind") or "").lower()
+        if kind == "stop_loss" or target.endswith("_sl") or "_sl:" in target:
+            target = "stop_loss"
+        elif "tp1" in target:
+            target = "tp1"
+        elif "tp2" in target:
+            target = "tp2"
+        else:
+            target = kind
+        labels = {
+            "tp1": "هدف سود اول (TP1) اجرا شد",
+            "tp2": "هدف سود دوم (TP2) اجرا شد",
+            "sl": "حد ضرر (SL) اجرا شد",
+            "stop_loss": "حد ضرر (SL) اجرا شد",
+        }
+        heading = labels.get(target, "سفارش حفاظتی اجرا شد")
+        amount = payload.get("filled_qty")
+        detail = f"\nمقدار اجراشده: {amount}" if amount not in (None, "", "0", "0.0") else ""
+        return f"{'🛑' if target in ('sl', 'stop_loss') else '🎯'} {heading}\n{prefix}{detail}".rstrip()
     if event_type.endswith(".state_changed"):
         previous = payload.get("previous_state") or "—"
         current = payload.get("new_state") or "—"
@@ -382,37 +492,49 @@ def render_domain_event(row: dict[str, Any]) -> str:
         if event_type == "intent.state_changed":
             state_labels = {
                 "submitting": "ارسال سفارش ورود آغاز شد",
-                "submitted": "سفارش ورود در صرافی پذیرفته شد",
-                "open": "سفارش ورود باز است",
-                "partially_filled": "سفارش ورود بخشی پر شده است",
-                "filled": "سفارش ورود کامل پر شد",
-                "rejected": "سفارش ورود رد شد؛ سفارشی اجرا نشد یا ادامه نیافت",
-                "failed": "اجرای سفارش ورود ناموفق بود",
-                "unknown_requires_reconciliation": "نتیجهٔ ارسال سفارش ورود نامشخص است؛ تطبیق لازم است",
+                "submitted": "سفارش خرید در صرافی پذیرفته شد",
+                "open": "سفارش خرید در صرافی باز است",
+                "partially_filled": "سفارش خرید بخشی اجرا شد",
+                "filled": "سفارش خرید کامل اجرا شد",
+                "rejected": "سفارش خرید ناموفق بود",
+                "failed": "اجرای سفارش خرید ناموفق بود",
+                "unknown_requires_reconciliation": "نتیجهٔ ارسال سفارش خرید نامشخص است؛ بررسی لازم است",
                 "canceled_local": "سفارش ورود محلی لغو شد و به صرافی ارسال نشد",
                 "canceled": "سفارش ورود لغو شد",
             }
-            details = [f"از: {previous}", f"به: {current}"]
-            for key, label in (
-                ("exchange_order_id", "شناسه سفارش صرافی"),
-                ("exchange_status", "وضعیت صرافی"),
-                ("executed_qty", "مقدار پرشده"),
-                ("cumulative_quote", "ارزش تجمعی اجرا"),
-            ):
-                if payload.get(key) is not None:
-                    details.append(f"{label}: {payload[key]}")
+            details: list[str] = []
+            if payload.get("executed_qty") is not None:
+                details.append(f"مقدار اجراشده: {payload['executed_qty']}")
+            if payload.get("cumulative_quote") is not None:
+                details.append(f"ارزش اجرا: {payload['cumulative_quote']}")
             if payload.get("fill_sync_required"):
-                details.append("تاریخچهٔ Fill هنوز کامل همگام نشده است")
-            if payload.get("reason"):
-                details.append(f"توضیح: {payload['reason']}")
+                details.append("همگام‌سازی سوابق اجرا هنوز کامل نشده است.")
+            if current == "unknown_requires_reconciliation":
+                details.append("اقدام: نتیجه در صرافی بررسی شود؛ سفارش مجدد خودکار ارسال نمی‌شود.")
+            elif current in ("failed", "rejected") and payload.get("reason"):
+                details.append(f"اقدام: بررسی لازم است — {_safe_text(payload['reason'], limit=240)}")
             icon = "⚠️" if current == "unknown_requires_reconciliation" else (
-                "🚫" if current in ("rejected", "failed") else "📥"
+                "🚨" if current in ("rejected", "failed") else "✅" if current in ("submitted", "open") else "📥"
             )
             heading = state_labels.get(current, labels.get(event_type, "تغییر وضعیت سفارش ورود"))
             return f"{icon} {heading}\n{prefix}" + "\n".join(details)
         if event_type == "trade_order.state_changed":
             kind = str(payload.get("kind") or "سفارش")
             state = str(current)
+            if state in ("rejected", "failed", "unknown_requires_reconciliation"):
+                target = "حد ضرر" if "sl" in kind.lower() or "stop" in kind.lower() else "هدف سود"
+                if state == "unknown_requires_reconciliation":
+                    return f"🚨 نتیجهٔ سفارش حفاظتی نامشخص است\n{prefix}{target} نیازمند بررسی در MEXC است."
+                if payload.get("retryable"):
+                    details = [target, "تلاش مجدد زمان‌بندی شده است."]
+                    if payload.get("attempt") is not None:
+                        details.append(f"تلاش: {int(payload['attempt']) + 1}")
+                    if payload.get("next_attempt_at"):
+                        details.append(f"زمان تلاش بعدی (UTC): {payload['next_attempt_at']}")
+                    if payload.get("reason"):
+                        details.append(_safe_text(payload["reason"], limit=160))
+                    return f"⚠️ تلاش سفارش حفاظتی رد شد\n{prefix}" + "\n".join(details)
+                return f"🚨 سفارش حفاظتی ناموفق بود\n{prefix}{target} نیازمند بررسی مالک است."
             if state == "open":
                 heading = "سفارش حفاظتی در صرافی پذیرفته شد"
             elif state == "rejected" and payload.get("retryable") and payload.get("next_attempt_at"):
@@ -462,35 +584,27 @@ def render_domain_event(row: dict[str, Any]) -> str:
             }
             heading = state_labels.get(current, labels.get(event_type, "تغییر وضعیت معامله"))
             reason = payload.get("reason")
-            if current == "closed" and reason:
-                if "no position opened" in str(reason):
-                    heading = "ورود پر نشد؛ معامله بدون ایجاد موقعیت بسته شد"
-                elif "reconciliation:" in str(reason):
-                    heading = "معامله پس از تطبیق قطعی بسته شد"
-            details = [f"از: {previous}", f"به: {current}"]
-            if reason:
-                details.append(f"توضیح: {reason}")
-            return f"🔄 {heading}\n{prefix}" + "\n".join(details)
+            if current == "oco_active":
+                return f"🛡 حفاظت معامله فعال و تأیید شد\n{prefix}حد ضرر و اهداف سود در صرافی بررسی شدند."
+            if current == "closed":
+                return f"🏁 معامله بسته شد\n{prefix}وضعیت نهایی در دفتر محلی تأیید شد."
+            if current in ("oco_partial", "unprotected_critical", "needs_reconciliation"):
+                detail = _safe_text(reason or "برای حفظ حفاظت، بررسی لازم است.", limit=280)
+                return f"🚨 {heading}\n{prefix}اقدام: بررسی لازم است.\n{detail}"
+            return f"🔄 {heading}\n{prefix}"
         return f"🔄 {labels.get(event_type, 'تغییر وضعیت')}\n{prefix}از: {previous}\nبه: {current}"
+    if event_type == "fill.recorded":
+        return (
+            f"💹 اجرای خرید در صرافی تأیید شد\n{prefix}"
+            f"مقدار: {payload.get('quantity') or '—'} · قیمت: {payload.get('price') or '—'}"
+        )
     if event_type == "exchange.write_outcome":
         outcome = str(payload.get("outcome") or "unknown")
-        labels = {
-            "success": "پاسخ موفق از صرافی دریافت شد",
-            "error": "درخواست تغییر‌دهنده با خطا مواجه شد",
-            "uncertain": "نتیجهٔ درخواست تغییر‌دهنده نامشخص است؛ ارسال مجدد کور انجام نمی‌شود",
-        }
-        details = [f"عملیات: {payload.get('operation_type') or '—'}"]
-        if payload.get("response_status"):
-            details.append(f"وضعیت صرافی: {payload['response_status']}")
-        if payload.get("error_class"):
-            details.append(f"نوع خطا: {payload['error_class']}")
-        if payload.get("exchange_code"):
-            details.append(f"کد صرافی: {payload['exchange_code']}")
-        heading = "⚠️" if outcome != "success" else "✅"
-        return (
-            f"{heading} نتیجهٔ درخواست صرافی\n{prefix}"
-            f"{labels.get(outcome, outcome)}\n" + "\n".join(details)
-        )
+        if outcome == "uncertain":
+            return f"🚨 نتیجهٔ درخواست صرافی نامشخص است\n{prefix}اقدام: بررسی لازم است؛ ارسال مجدد خودکار انجام نمی‌شود."
+        if outcome == "error":
+            return f"⚠️ درخواست صرافی ناموفق بود\n{prefix}اقدام: وضعیت سفارش بررسی شود."
+        return f"ℹ️ رویداد صرافی ثبت شد\n{prefix}"
     if event_type == "reconciliation.outcome":
         outcome = str(payload.get("outcome") or "unknown")
         labels = {
@@ -504,13 +618,6 @@ def render_domain_event(row: dict[str, Any]) -> str:
             f"🔎 نتیجهٔ تطبیق سفارش\n{prefix}{labels.get(outcome, outcome)}\n"
             f"وضعیت محلی: {payload.get('local_state') or '—'}\n"
             f"وضعیت صرافی: {payload.get('exchange_state') or '—'}"
-        )
-    if event_type == "fill.recorded":
-        return (
-            f"💹 اجرای معامله در صرافی ثبت شد\n{prefix}"
-            f"مقدار: {payload.get('quantity') or '—'}\n"
-            f"قیمت: {payload.get('price') or '—'}\n"
-            f"مبلغ: {payload.get('quote_amount') or '—'}"
         )
     event_id = _safe_text(row.get("event_id") or "—", limit=80)
     return f"ℹ️ رخداد جدید: {event_type}\n{prefix}شناسه: {event_id}"
@@ -798,6 +905,8 @@ class DeliveryStore:
                 category = notification_category(event_type)
                 severity = str(event.get("severity") or "INFO").upper()
                 payload = _event_payload(event)
+                if event.get("linked_intent_state"):
+                    payload["_intent_state"] = str(event["linked_intent_state"])
                 try:
                     body = render_domain_event(event)
                 except Exception:  # noqa: BLE001 - one malformed event must not stall the relay
@@ -811,6 +920,11 @@ class DeliveryStore:
                     "VALUES(?,?,?,?)",
                     (event_id, audit_id, event_type, now),
                 )
+                # Keep DEBUG solely in audit_events/local logs; do not create
+                # Telegram delivery-queue rows even with a permissive preference.
+                if severity == "DEBUG":
+                    cursor = audit_id
+                    continue
                 try:
                     audience = json.loads(
                         str(event.get("audience_json") or '["owner","owner_b","developer"]')
@@ -1207,8 +1321,27 @@ class NotificationDispatcher:
             (cursor, self.batch_size),
         ).fetchall()
         preferences, minimum_severity, settings = self._routing_preferences()
+        events = [dict(row) for row in rows]
+        # Link fill facts to the current durable intent state. If exchange fill
+        # rows and a cumulative partial/full transition were committed together
+        # (or the worker caught up later), send one verified lifecycle outcome.
+        for event in events:
+            if event.get("event_type") != "fill.recorded":
+                continue
+            payload = _event_payload(event)
+            intent_id = payload.get("intent_id")
+            if not intent_id:
+                continue
+            try:
+                linked = self._source.execute(
+                    "SELECT state FROM order_intents WHERE intent_id=?", (str(intent_id),)
+                ).fetchone()
+            except sqlite3.Error:
+                linked = None
+            if linked is not None:
+                event["linked_intent_state"] = str(linked["state"])
         return self.store.relay_batch(
-            [dict(row) for row in rows],
+            events,
             self.recipients,
             preferences,
             minimum_severity,
@@ -1283,7 +1416,16 @@ class NotificationDispatcher:
                     settings,
                     minimum_severity,
                 )
-                chunks = message_chunks(_safe_text(row["text"], limit=20000))
+                suppression = event_suppression_reason(
+                    event_type,
+                    severity,
+                    {},
+                    legacy_key=str(row["event_key"] or ""),
+                    category=category,
+                )
+                chunks = [] if severity == "DEBUG" else message_chunks(_safe_text(row["text"], limit=20000))
+                if suppression:
+                    status, reason = "suppressed", suppression
                 for part_no, chunk in enumerate(chunks, 1):
                     cur = self.store.conn.execute(
                         """
@@ -1316,12 +1458,24 @@ class NotificationDispatcher:
             raise
         return inserted
 
-    def _send(self, chat_id: int, text: str, reply_to_message_id: int | None) -> dict[str, Any]:
+    def _send(
+        self,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
         if reply_to_message_id is not None and self._supports_reply:
-            return self.bot.send_message(
-                chat_id, text, reply_to_message_id=reply_to_message_id
-            ) or {}
-        return self.bot.send_message(chat_id, text) or {}
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        try:
+            parameters = inspect.signature(self.bot.send_message).parameters
+            supports_markup = "reply_markup" in parameters
+        except (TypeError, ValueError):
+            supports_markup = False
+        if reply_markup is not None and supports_markup:
+            kwargs["reply_markup"] = reply_markup
+        return self.bot.send_message(chat_id, text, **kwargs) or {}
 
     def deliver_one(self) -> bool:
         delivery = self.store.claim_next()
@@ -1333,7 +1487,16 @@ class NotificationDispatcher:
         reply_to = self.store.thread_root(str(delivery["recipient_role"]), thread_key)
         thread_missing = bool(thread_key) and reply_to is None and int(delivery.get("part_no") or 1) == 1
         try:
-            result = self._send(chat_id, text, reply_to)
+            markup = None
+            event_id = str(delivery.get("event_id") or "")
+            if delivery.get("event_type") == "signal.received" and len(event_id) <= 48:
+                markup = {
+                    "inline_keyboard": [[{
+                        "text": "جزئیات سیگنال",
+                        "callback_data": f"s:event:{event_id}",
+                    }]]
+                }
+            result = self._send(chat_id, text, reply_to, markup)
             message_id = int(result["message_id"]) if isinstance(result, dict) and result.get("message_id") else None
             self.store.finish(
                 delivery,

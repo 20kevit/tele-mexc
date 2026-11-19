@@ -64,8 +64,9 @@ def _event(
     audit_id: int,
     event_id: str = "evt-1",
     *,
-    event_type: str = "intent.created",
+    event_type: str = "trade.state_changed",
     severity: str = "INFO",
+    payload: dict | None = None,
 ) -> None:
     conn.execute(
         """
@@ -83,15 +84,14 @@ def _event(
             "signal-1",
             "BTCUSDT",
             severity,
-            json.dumps(
-                {
-                    "state": "planned",
-                    "entry_price": "100",
-                    "tp1_price": "110",
-                    "tp2_price": "120",
-                    "stop_loss_price": "95",
-                }
-            ),
+            json.dumps(payload or {
+                "previous_state": "entry_active",
+                "new_state": "oco_active",
+                "entry_price": "100",
+                "tp1_price": "110",
+                "tp2_price": "120",
+                "stop_loss_price": "95",
+            }),
             '["owner","owner_b","developer"]',
         ),
     )
@@ -164,13 +164,16 @@ def test_first_startup_establishes_no_replay_boundary(tmp_path):
     try:
         # Old events are not replayed when the dispatcher is first installed.
         assert worker.run_once()["relayed"] == 0
-        _event(source, 2, "new-event")
+        _event(
+            source, 2, "new-event", event_type="signal.received",
+            payload={"state": "validated", "signal_kind": "alert", "side": "buy", "entry_price": "100"},
+        )
         assert worker.run_once()["relayed"] == 1
         assert len(bot.calls) == 1
         assert "#BTCUSDT" in bot.calls[0][1]
-        assert "هدف اول (TP1): 110" in bot.calls[0][1]
-        assert "هدف دوم (TP2): 120" in bot.calls[0][1]
-        assert "حد ضرر: 95" in bot.calls[0][1]
+        assert "سیگنال خرید معتبر" in bot.calls[0][1]
+        assert "ورود: 100" in bot.calls[0][1]
+        assert "حد ضرر" not in bot.calls[0][1]
     finally:
         worker.close()
         source.close()
@@ -523,12 +526,8 @@ def test_owner_b_category_override_takes_precedence_over_owner_fallback(tmp_path
         source.close()
 
 
-def test_genuine_rejection_is_owner_visible_despite_category_preference(tmp_path):
-    """A genuine rejected/ambiguous signal is WARNING and owner-visible.
-
-    Routine category preferences may silence order chatter, but they must never
-    hide an owner-actionable rejection.
-    """
+def test_genuine_rejection_is_suppressed_for_every_recipient(tmp_path):
+    """Rejected signal facts remain internal and never become Telegram deliveries."""
 
     source_path = tmp_path / "trading.sqlite3"
     source = _source(source_path)
@@ -552,10 +551,10 @@ def test_genuine_rejection_is_owner_visible_despite_category_preference(tmp_path
         ).fetchall()
         assert [(r["recipient_role"], r["status"]) for r in rows] == [
             ("developer", "suppressed"),
-            ("owner", "sent"),
-            ("owner_b", "sent"),
+            ("owner", "suppressed"),
+            ("owner_b", "suppressed"),
         ]
-        assert {chat for chat, _ in bot.calls} == {101, 202}
+        assert bot.calls == []
     finally:
         worker.close()
         source.close()
@@ -789,13 +788,10 @@ def test_retry_scheduled_domain_event_has_explicit_persian_message():
     )
     assert "تلاش سفارش حفاظتی رد شد" in message
     assert "تلاش: 3" in message
-    assert "تلاش بعدی: 4" in message
-    assert "دلیل: temporary exchange rejection" in message
-    assert "قیمت: 110" in message
-    assert "مقدار: 0.05" in message
-    assert "قیمت فعال‌سازی SL: 98" in message
-    assert "شناسه سفارش صرافی: 98765" in message
     assert "2026-11-12T12:00:05+00:00" in message
+    assert "temporary exchange rejection" in message
+    assert "قیمت: 110" not in message
+    assert "شناسه سفارش صرافی: 98765" not in message
 
 
 def test_trade_state_renderer_uses_human_readable_persian_state_label():
@@ -812,10 +808,10 @@ def test_trade_state_renderer_uses_human_readable_persian_state_label():
             ),
         }
     )
-    assert "ورود پر نشد؛ معامله بدون ایجاد موقعیت بسته شد" in message
-    assert "توضیح: entry intent rejected with no fills" in message
-    assert "از: oco_partial" in message
-    assert "به: closed" in message
+    assert "معامله بسته شد" in message
+    assert "وضعیت نهایی در دفتر محلی تأیید شد" in message
+    assert "entry intent rejected" not in message
+    assert "از: oco_partial" not in message
 
 
 
@@ -867,12 +863,11 @@ def test_intent_state_event_renders_exchange_acknowledgement_details():
             ),
         }
     )
-    assert "سفارش ورود در صرافی پذیرفته شد" in message
-    assert "شناسه سفارش صرافی: 987654" in message
-    assert "وضعیت صرافی: NEW" in message
-    assert "مقدار پرشده: 0.025" in message
-    assert "ارزش تجمعی اجرا: 2.5" in message
-    assert "توضیح: exchange accepted order 987654" in message
+    assert "سفارش خرید در صرافی پذیرفته شد" in message
+    assert "مقدار اجراشده: 0.025" in message
+    assert "ارزش اجرا: 2.5" in message
+    assert "987654" not in message
+    assert "NEW" not in message
 
 
 def test_submission_accepted_renders_acceptance_only_without_fill_amounts():

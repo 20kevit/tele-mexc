@@ -258,7 +258,7 @@ def test_three_usdt_signal_below_symbol_minimum_is_skipped(cfg, repo):
     assert signal is not None and "below the exchange minimum" in signal["rejection_reason"]
 
 
-def test_genuine_signal_result_notifies_both_with_original_text(cfg, repo):
+def test_valid_signal_notification_is_short_and_does_not_expose_source_text(cfg, repo):
     engine = _engine(cfg, repo)
     bot = FlakyBot()
     notifier = _notifier(engine, bot)
@@ -268,13 +268,15 @@ def test_genuine_signal_result_notifies_both_with_original_text(cfg, repo):
     texts = [text for _, text in bot.sent]
     joined = "\n".join(texts)
     assert len(bot.sent) >= 2
-    assert any("سیگنال جدید دریافت شد" in text for text in texts)
-    assert any("ورود: 100" in text for text in texts)
+    initial = [text for text in texts if "سیگنال خرید معتبر" in text]
+    assert len(initial) == 1  # signal notifications are owner-only
+    assert "ورود: 100" in initial[0]
+    assert "TP1" not in initial[0] and "حد ضرر" not in initial[0]
     assert "exchange submission attempted: yes" not in joined
     assert {chat for chat, _ in bot.sent} == {OWNER, DEVELOPER}
 
 
-def test_sell_signal_is_reported_ignored_and_never_ordered(cfg, repo):
+def test_sell_signal_is_silent_and_never_ordered(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -287,13 +289,12 @@ def test_sell_signal_is_reported_ignored_and_never_ordered(cfg, repo):
     notifier.flush()
     assert result is None
     assert client.place_calls == 0
-    joined = "\n".join(text for _, text in bot.sent)
-    assert "Spot BUY only" in joined
-    assert "سیگنال رد شد" in joined
-    assert "سفارش واقعی" not in joined
+    assert bot.sent == []
+    signal = engine.store.get_signal("100:1:0")
+    assert signal is not None and "Spot BUY only" in signal["rejection_reason"]
 
 
-def test_live_result_notification_contains_exchange_identity(cfg, repo):
+def test_exchange_confirmed_filled_status_is_reported_with_ledger_sync_warning(cfg, repo):
     filled = {
         "orderId": "ex-notify",
         "symbol": "BTCUSDT",
@@ -318,8 +319,12 @@ def test_live_result_notification_contains_exchange_identity(cfg, repo):
     notifier.flush()
     assert result is not None and result["state"] == "filled"
     joined = "\n".join(text for _, text in bot.sent)
-    assert "سفارش ورود کامل پر شد" in joined
-    assert "ex-notify" in joined
+    # The MEXC order state is reported, but incomplete local fill synchronization
+    # is made explicit rather than presented as a fully reconciled ledger.
+    assert "سفارش خرید کامل اجرا شد" in joined
+    assert "همگام‌سازی سوابق اجرا هنوز کامل نشده است" in joined
+    assert "نامشخص" in joined
+    assert "ex-notify" not in joined
     assert "cumulative tracked spend" not in joined
 
 

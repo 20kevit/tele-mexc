@@ -36,12 +36,36 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
     assert len(bot.sent) >= 2
     _assert_both(bot)
     assert "ورود: 100" in _joined(bot)
-    assert "سفارش ورود در صرافی پذیرفته شد" in _joined(bot)
-    assert "سیگنال جدید دریافت شد" in _joined(bot)
+    joined = _joined(bot)
+    assert "سفارش خرید در صرافی پذیرفته شد" in joined
+    assert joined.count("سیگنال خرید معتبر") == 1  # owners only; developer is not an owner
+    assert "سیگنال جدید دریافت شد" not in joined
 
 
-def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
-    """Every genuine signal decision reaches both owners and the programmer."""
+def test_signal_decision_producer_never_calls_any_notifier_route(cfg, repo):
+    class SpyNotifier:
+        def __init__(self):
+            self.calls = []
+
+        def notify(self, **kwargs):
+            self.calls.append(kwargs)
+
+        def notify_trade(self, *args, **kwargs):
+            self.calls.append({"trade": args, **kwargs})
+
+    engine = _engine(cfg, repo, FakeMexc())
+    spy = SpyNotifier()
+    engine.notifier = spy
+    engine.process_item(
+        _item(100, 1),
+        _store_message(repo, 1, "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"),
+    )
+    engine.process_item(_item(100, 2), _store_message(repo, 2, "BUY BTCUSDT\\nTP1: 110"))
+    assert spy.calls == []
+
+
+def test_sell_signal_is_internal_only_and_never_notified(cfg, repo):
+    """Spot SELL/SHORT diagnostics stay local; no Telegram route is allowed."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -53,17 +77,13 @@ def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
 
     assert result is None
     assert client.place_calls == 0
-    assert len(bot.sent) >= 2
-    _assert_both(bot)
-    joined = _joined(bot)
-    assert "Spot BUY only" in joined
-    assert "سیگنال رد شد" in joined
-    assert "سیگنال جدید دریافت شد" in joined
-    assert "ACCEPTED_OPEN" not in joined and "SUBMISSION_REJECTED" not in joined
+    assert bot.sent == []
+    signal = engine.store.get_signal("100:1:0")
+    assert signal is not None and "Spot BUY only" in signal["rejection_reason"]
 
 
-def test_locally_rejected_genuine_buy_notifies_both_owners_with_reason(cfg, repo):
-    """A genuine signal rejected locally is reported to both owners."""
+def test_locally_rejected_genuine_buy_is_internal_only(cfg, repo):
+    """A locally rejected signal is recorded but never exposed in Telegram."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -75,16 +95,13 @@ def test_locally_rejected_genuine_buy_notifies_both_owners_with_reason(cfg, repo
 
     assert result is None
     assert client.place_calls == 0
-    assert len(bot.sent) >= 2
-    _assert_both(bot)
-    joined = _joined(bot)
-    assert "no entry price" in joined
-    assert "سیگنال رد شد" in joined
-    assert "SUBMISSION_REJECTED" not in joined and "REJECTED_BY_EXCHANGE" not in joined
+    assert bot.sent == []
+    signal = engine.store.get_signal("100:1:0")
+    assert signal is not None and "no entry price" in signal["rejection_reason"]
 
 
-def test_rejection_is_delivered_once_not_duplicated_by_legacy_path(cfg, repo):
-    """F2: a local rejection is one domain event, never a legacy/domain pair."""
+def test_rejection_is_recorded_once_and_has_no_legacy_delivery(cfg, repo):
+    """The immutable diagnostic event is retained without a Telegram delivery."""
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -94,14 +111,12 @@ def test_rejection_is_delivered_once_not_duplicated_by_legacy_path(cfg, repo):
     engine.process_item(_item(100, 1), _store_message(repo, 1, text))
     notifier.flush()
 
-    # One canonical rejection rendering per recipient (owner + developer); it
-    # must still never be duplicated for the same recipient.
-    per_recipient: dict[int, int] = {}
-    for chat, text in bot.sent:
-        if "سیگنال رد شد" in text:
-            per_recipient[chat] = per_recipient.get(chat, 0) + 1
-    assert per_recipient == {OWNER: 1, DEVELOPER: 1}
-    assert "status: REJECTED_LOCALLY" not in "\n".join(t for _, t in bot.sent)
+    assert bot.sent == []
+    events = engine.store.db.conn.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE event_class='domain' AND event_type='signal.rejected'"
+    ).fetchone()[0]
+    assert events == 1
+    assert engine.store.get_signal("100:1:0")["status"] == "rejected"
 
 
 def test_fixed_per_order_amount_is_submitted_without_a_budget_cap(cfg, repo):
@@ -135,7 +150,7 @@ def test_fixed_per_order_amount_is_submitted_without_a_budget_cap(cfg, repo):
     _assert_both(bot)
     joined = _joined(bot)
     assert "aggregate test budget" not in joined
-    assert "سفارش ورود در صرافی پذیرفته شد" in joined
+    assert "سفارش خرید در صرافی پذیرفته شد" in joined
 
 
 def test_exchange_accepted_open_is_not_reported_as_filled(cfg, repo):
@@ -167,9 +182,9 @@ def test_exchange_accepted_open_is_not_reported_as_filled(cfg, repo):
     assert len(bot.sent) >= 2
     _assert_both(bot)
     joined = _joined(bot)
-    assert "سفارش ورود در صرافی پذیرفته شد" in joined
-    assert "ex-open" in joined
-    assert "وضعیت صرافی: NEW" in joined
+    assert "سفارش خرید در صرافی پذیرفته شد" in joined
+    assert "ex-open" not in joined
+    assert "NEW" not in joined
     assert "FILLED" not in joined
 
 
@@ -187,8 +202,9 @@ def test_exchange_rejection_notifies_both_as_submission_rejected(cfg, repo):
     assert len(bot.sent) >= 2
     _assert_both(bot)
     joined = _joined(bot)
-    assert "سفارش ورود رد شد" in joined
+    assert "سفارش خرید ناموفق بود" in joined
     assert "insufficient balance" in joined
+    assert "نتیجهٔ درخواست صرافی" not in joined
     assert "REJECTED_LOCALLY" not in joined
 
 
@@ -231,7 +247,7 @@ def test_uncertain_submission_and_reconciliation_update_are_truthful(cfg, repo):
     _assert_both(bot)
     joined = _joined(bot)
     assert "نامشخص" in joined
-    assert "MexcNetworkError" in joined
+    assert "MexcNetworkError" not in joined
 
     intent_id = result["intent_id"]
     sent_before_reconcile = len(bot.sent)
@@ -242,8 +258,9 @@ def test_uncertain_submission_and_reconciliation_update_are_truthful(cfg, repo):
     assert len(bot.sent) > sent_before_reconcile
     _assert_both(bot)
     update = "\n".join(_texts(bot)[sent_before_reconcile:])
-    assert "سفارش ورود کامل پر شد" in update or "وضعیت سفارش" in update
-    assert "ex-uncertain" in _joined(bot)
+    assert "سفارش خرید کامل اجرا شد" in update
+    assert "مقدار اجراشده: 0.1" in update
+    assert "ex-uncertain" not in _joined(bot)
 
     # Repeating the same reconciliation must not duplicate the notification.
     sent_after_reconcile = len(bot.sent)
@@ -306,9 +323,10 @@ def test_partial_fill_then_full_fill_sends_meaningful_updates(cfg, repo):
     assert result is not None and result["state"] == "open"
     assert len(bot.sent) >= 2
     first = _joined(bot)
-    assert "PARTIALLY_FILLED" in first
-    assert "تاریخچهٔ Fill هنوز کامل همگام نشده است" in first
-    assert "سفارش ورود کامل پر شد" not in first
+    assert "اجرای خرید در صرافی تأیید شد" in first
+    assert "مقدار: 0.05 · قیمت: 100" in first
+    assert "PARTIALLY_FILLED" not in first
+    assert "تاریخچهٔ Fill" not in first
 
     client.query_results.append(filled)
     client.trades = [first_trade, second_trade]
@@ -317,12 +335,12 @@ def test_partial_fill_then_full_fill_sends_meaningful_updates(cfg, repo):
     assert reconciled["state"] == "filled"
     assert len(bot.sent) > 2
     update = _joined(bot)
-    assert "سفارش ورود کامل پر شد" in update
-    assert "مقدار پرشده: 0.1" in update
+    assert "اجرای خرید در صرافی تأیید شد" in update
+    assert "مقدار: 0.05 · قیمت: 100" in update
     assert client.place_calls == 1
 
 
-def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
+def test_not_a_signal_diagnostics_never_reach_telegram(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -337,15 +355,11 @@ def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
         engine.process_item(_item(100, message_id), _store_message(repo, message_id, text))
     notifier.flush()
 
-    assert len(bot.sent) >= len(cases)
-    for original in cases:
-        assert any(original in sent_text for chat, sent_text in bot.sent if chat == DEVELOPER)
-    assert not any(chat == OWNER and "original message:" in sent_text for chat, sent_text in bot.sent)
-    joined = _joined(bot)
-    assert "classification: info" in joined
-    assert "classification: result" in joined
-    assert "classification: ambiguous" in joined
+    assert bot.sent == []
     assert engine.store.list_intents(limit=10) == []
+    assert engine.store.db.conn.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE category='parse'"
+    ).fetchone()[0] >= len(cases)
     assert client.place_calls == 0
 
 

@@ -883,6 +883,7 @@ class TradeStore(TradingStore):
                             "new_state": str(current["state"]),
                             "exchange_status": current["exchange_status"],
                             "filled_qty": current["filled_qty"],
+                            "previous_filled_qty": previous["filled_qty"] if previous is not None else "0",
                             "filled_quote": current["filled_quote"],
                             "fee_amount": current["fee_amount"],
                             "fee_asset": current["fee_asset"],

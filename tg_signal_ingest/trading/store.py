@@ -667,27 +667,9 @@ class TradingStore:
                 ),
             )
             inserted = cur.rowcount > 0
-            if inserted and emit_event:
-                self.record_domain_event(
-                    build_domain_event(
-                        "signal.received",
-                        aggregate_id=signal_id,
-                        correlation_id=signal_id,
-                        symbol=parsed.symbol,
-                        occurred_at=now,
-                        payload={
-                            "state": status,
-                            "signal_kind": parsed.kind,
-                            "side": parsed.action,
-                            "entry_price": dec_str(parsed.entry_price),
-                            "tp1_price": dec_str(parsed.target_prices[0]) if parsed.target_prices else None,
-                            "tp2_price": dec_str(parsed.target_prices[1]) if len(parsed.target_prices) > 1 else None,
-                            "stop_loss_price": dec_str(parsed.stop_loss),
-                            "order_type": parsed.order_type,
-                        },
-                    ),
-                    conn=conn,
-                )
+            # Signal-received events are emitted when validation succeeds in
+            # update_signal(), not at parse time. This prevents invalid or
+            # unsupported input from racing the independent dispatcher.
         return signal_id, inserted
 
     def update_signal(
@@ -701,7 +683,7 @@ class TradingStore:
         now = self._ts()
         with self.db.transaction() as conn:
             previous = conn.execute(
-                "SELECT status, symbol, signal_kind FROM signals WHERE signal_id = ?",
+                "SELECT * FROM signals WHERE signal_id = ?",
                 (signal_id,),
             ).fetchone()
             if previous is None:
@@ -728,6 +710,40 @@ class TradingStore:
                     ),
                     conn=conn,
                 )
+            elif (
+                status == "validated"
+                and str(previous["status"]) != "validated"
+                and str(previous["signal_kind"]) in {"alert", "update"}
+                and str(previous["action"] or "").lower() == "buy"
+                and previous["symbol"]
+            ):
+                already_notified = conn.execute(
+                    "SELECT 1 FROM audit_events WHERE event_class='domain' "
+                    "AND event_type='signal.received' AND aggregate_id=? LIMIT 1",
+                    (signal_id,),
+                ).fetchone()
+                if already_notified is None:
+                    targets = str(previous["target_prices"] or "").split(",")
+                    self.record_domain_event(
+                        build_domain_event(
+                            "signal.received",
+                            aggregate_id=signal_id,
+                            correlation_id=signal_id,
+                            symbol=str(previous["symbol"]),
+                            occurred_at=now,
+                            payload={
+                                "state": "validated",
+                                "signal_kind": str(previous["signal_kind"]),
+                                "side": "buy",
+                                "entry_price": previous["entry_price"],
+                                "tp1_price": targets[0] if targets and targets[0] else None,
+                                "tp2_price": targets[1] if len(targets) > 1 and targets[1] else None,
+                                "stop_loss_price": previous["stop_loss"],
+                                "order_type": previous["order_type"],
+                            },
+                        ),
+                        conn=conn,
+                    )
 
     def get_signal(self, signal_id: str) -> dict[str, Any] | None:
         return _row(self.db.conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone())
