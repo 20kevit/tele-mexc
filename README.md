@@ -121,8 +121,11 @@ dead-letter/ambiguous counts, and heartbeat staleness.
   The configured programmer has read-only technical/diagnostic access and is
   never an owner. Trading producers only append local events; an independent
   `tg-ingest notifications worker` delivers them. CRITICAL and owner-safety
-  alerts always reach both owners, while routine DEBUG chatter stays
-  programmer-only. See `docs/notification-readiness.md`. Its `/pause` and `/resume`
+  alerts always reach both owners. Only a valid LONG/BUY channel signal
+  produces the signal-received receipt; SHORT/SELL and locally rejected
+  genuine signals produce an explicit rejection notice, while ordinary
+  channel messages are stored and audited without any Telegram notification.
+  See `docs/notification-readiness.md`. Its `/pause` and `/resume`
   controls are enforced at the order-submission boundary with a kernel file lock
   and a transactional readiness check. See `docs/CONTROL_BOT_FA.md`.
 - Before the first controlled start, run the non-trading readiness report.

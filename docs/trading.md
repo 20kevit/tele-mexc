@@ -826,8 +826,13 @@ matrix are in [notification-readiness.md](notification-readiness.md). Summary:
 
 - CRITICAL always reaches every configured recipient regardless of category or
   minimum severity.
+- Only a valid LONG/BUY channel signal produces the `signal.received` receipt
+  ("سیگنال جدید دریافت شد"). SHORT/SELL signals, additional messages, and
+  ordinary channel chatter never produce the receipt; SHORT/SELL keeps its
+  explicit `signal.rejected` decision notice.
+- Ordinary channel messages (chatter, result posts, follow-ups) are stored and
+  audited but never delivered to Telegram for any recipient.
 - Genuine rejected/ambiguous signals are WARNING and owner-visible.
-- DEBUG (chatter, not-a-signal, parser diagnostics) is programmer-only.
 - Suppressed events remain in history with their rendered text and reason.
 - Only the exact `event_id` is idempotent; distinct lifecycle events are never
   collapsed.
