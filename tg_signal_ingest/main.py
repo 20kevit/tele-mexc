@@ -1088,7 +1088,8 @@ def cmd_trading_status(_args) -> int:
     print("  risk gates: Spot BUY only; fixed owner quote; no symbol allowlist or order caps")
     print(f"  emergency_stop: {t.emergency_stop}")
     print(f"  MEXC credentials: {'set' if cfg.mexc.api_key and cfg.mexc.api_secret else 'missing'}")
-    print(f"  intents by state: {counts or 'none'}")
+    print(f"  actionable intents by state: {counts or 'none'}")
+    print(f"  legacy-ignored intents: {store.count_legacy_ignored_intents()}")
     print(f"  reconciliation outcomes: {recon or 'none'}")
     print(f"  recorded fills: {store.fills_count()}")
     block_reason = store.buy_block_reason()
@@ -1145,7 +1146,7 @@ def cmd_trading_intents(args) -> int:
     db, repo = _new_repo(cfg)
     for row in TradingStore(repo.db, cfg.trading).list_intents(limit=args.limit):
         print(
-            f"{row['intent_id']:<34} {row['state']:<30} {row['symbol']:<12} "
+            f"{row['intent_id']:<34} {row.get('display_state', row['state']):<30} {row['symbol']:<12} "
             f"{row['side']:<4} qty={row['base_quantity'] or '-'} quote={row['quote_amount'] or '-'} "
             f"ex={row['exchange_order_id'] or '-'} {row['reject_reason'] or ''}"
         )
