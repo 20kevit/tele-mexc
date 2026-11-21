@@ -153,6 +153,48 @@ def test_uncertain_outcome_freezes_reservation_without_blocking_next_signal(cfg,
     assert _reserved_total(engine.store) == Decimal("20.04")
 
 
+def test_legacy_ignored_intents_are_excluded_from_reservation_and_admission(cfg, repo):
+    store = TradingStore(repo.db, cfg.trading)
+    ignored = _create_intent(store, 1)
+    active = _create_intent(store, 2)
+    store.transition_intent(ignored["intent_id"], "unknown_requires_reconciliation", note="legacy")
+    store.transition_intent(active["intent_id"], "unknown_requires_reconciliation", note="active")
+    with store.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO legacy_ignored_intents (intent_id, reason, ignored_at) VALUES (?, ?, ?)",
+            (ignored["intent_id"], "test legacy exclusion", "2026-11-21T00:00:00Z"),
+        )
+    assert store.outstanding_balance_usage(ignored["symbol"]) == {"quote": Decimal("10"), "base": Decimal("0")}
+    assert store.count_open_intents() == 1
+    assert store.count_intents_by_state() == {"unknown_requires_reconciliation": 1}
+    assert store.count_legacy_ignored_intents() == 1
+    assert store.has_active_intent_for_symbol(ignored["symbol"])["intent_id"] == active["intent_id"]
+    rows = {row["intent_id"]: row for row in store.list_intents(limit=10)}
+    assert rows[ignored["intent_id"]]["display_state"] == "ignored_legacy"
+    with store.db.transaction() as conn:
+        conn.execute("DELETE FROM trading_budget_ledger WHERE intent_id = ?", (ignored["intent_id"],))
+    store.ensure_budget_reservation(ignored["intent_id"])
+    assert store.db.conn.execute(
+        "SELECT 1 FROM trading_budget_ledger WHERE intent_id = ?", (ignored["intent_id"],)
+    ).fetchone() is None
+
+
+def test_legacy_ignored_intent_blocks_direct_engine_reconciliation(cfg, repo):
+    client = FakeMexc()
+    engine = _engine(cfg, repo, client)
+    intent = _create_intent(engine.store, 1)
+    engine.store.transition_intent(intent["intent_id"], "unknown_requires_reconciliation", note="legacy")
+    with engine.store.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO legacy_ignored_intents (intent_id, reason, ignored_at) VALUES (?, ?, ?)",
+            (intent["intent_id"], "test legacy exclusion", "2026-11-21T00:00:00Z"),
+        )
+    before = len(client.query_calls)
+    result = engine.reconcile_intent(intent["intent_id"], notify=False)
+    assert result["state"] == "unknown_requires_reconciliation"
+    assert len(client.query_calls) == before
+
+
 def test_reservations_survive_engine_restart(cfg, repo):
     client = FakeMexc(place_error=MexcNetworkError("timeout"))
     engine = _engine(cfg, repo, client)
