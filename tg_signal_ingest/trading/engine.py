@@ -348,12 +348,16 @@ class TradingEngine:
         # event: historical messages must remain silent even when the new
         # notification dispatcher is running.
         historical = self._is_historical(item, record)
+        # Owner policy: only a valid LONG/BUY channel signal may produce the
+        # "signal received" receipt. SHORT/SELL, additional, and ordinary
+        # channel messages are stored and audited but never announced.
+        buy_signal = parsed.kind == "signal" and parsed.action == "buy"
         signal_id, inserted = self.store.record_signal(
             parsed,
             channel_id=item.channel_id,
             message_id=item.message_id,
             edit_version=version,
-            emit_event=(not historical and parsed.kind == "signal"),
+            emit_event=(not historical and buy_signal),
         )
 
         # Historical backfill and any message at/below the startup boundary
@@ -384,7 +388,10 @@ class TradingEngine:
             return None
 
         if parsed.kind == "additional":
-            self._notify_non_signal(signal_id, parsed, record=record)
+            # Owner policy: ordinary channel messages (chatter, result posts,
+            # follow-ups) are stored and audited but never generate a Telegram
+            # notification. Only valid LONG/BUY signals produce a receipt, and
+            # genuine rejected signals keep their signal.rejected notice.
             self.store.audit(signal_id, "parse", parsed.kind)
             return None
 
@@ -1021,30 +1028,6 @@ class TradingEngine:
             roles=roles,
             category=category,
             event_type=event_type,
-        )
-
-    def _notify_non_signal(
-        self,
-        signal_id: str,
-        parsed: ParsedSignal,
-        *,
-        record: dict[str, Any] | None = None,
-    ) -> None:
-        """Report a parser result / non-signal to both owners and the programmer."""
-
-        self._notify_decision(
-            event_key=f"{signal_id}:not_a_signal",
-            status="NOT_A_SIGNAL",
-            symbol=parsed.symbol,
-            direction=parsed.action,
-            reason="not an actionable signal",
-            classification="info",
-            record=record,
-            signal_id=signal_id,
-            diagnostics="not an actionable signal",
-            roles=NOTIFY_ALL,
-            category="signal_decision",
-            event_type="signal.not_a_signal",
         )
 
     def _notify_intent_decision(

@@ -1,5 +1,7 @@
-"""Notification routing policy: owner gets every genuine signal; developer
-also gets NOT_A_SIGNAL diagnostics.
+"""Notification routing policy: only valid LONG/BUY signals produce the
+"signal received" receipt; SHORT/SELL and locally rejected genuine signals
+still reach owner and developer as explicit rejection decisions, while
+ordinary channel messages stay silent (stored and audited only).
 
 All exchange/Telegram clients are deterministic fakes.  No test can reach
 MEXC or Telegram, and no test places a real order.
@@ -41,8 +43,12 @@ def test_genuine_buy_notifies_owner_and_developer_once(cfg, repo):
     assert "سیگنال جدید دریافت شد" in _joined(bot)
 
 
-def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
-    """Every genuine signal decision reaches both owners and the programmer."""
+def test_genuine_sell_rejects_without_signal_receipt(cfg, repo):
+    """Only valid LONG/BUY signals produce the signal-received receipt.
+
+    A SHORT/SELL signal is refused locally and reported as an explicit
+    rejection decision to both owners and the programmer — never as a receipt.
+    """
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -59,7 +65,8 @@ def test_genuine_sell_notifies_both_owners_and_is_explicitly_ignored(cfg, repo):
     joined = _joined(bot)
     assert "Spot BUY only" in joined
     assert "سیگنال رد شد" in joined
-    assert "سیگنال جدید دریافت شد" in joined
+    # Owner policy: SHORT/SELL never produces the signal-received receipt.
+    assert "سیگنال جدید دریافت شد" not in joined
     assert "ACCEPTED_OPEN" not in joined and "SUBMISSION_REJECTED" not in joined
 
 
@@ -323,7 +330,12 @@ def test_partial_fill_then_full_fill_sends_meaningful_updates(cfg, repo):
     assert client.place_calls == 1
 
 
-def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
+def test_ordinary_channel_messages_stay_silent_and_non_tradeable(cfg, repo):
+    """Ordinary channel messages are stored and audited but never announced.
+
+    Additional/chatter/result messages must not produce a Telegram
+    notification for any recipient and must never create an order.
+    """
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
     bot = FlakyBot()
@@ -335,19 +347,15 @@ def test_not_a_signal_reaches_both_owners_with_exact_text(cfg, repo):
     ]
 
     for message_id, text in enumerate(cases, 1):
-        engine.process_item(_item(100, message_id), _store_message(repo, message_id, text))
+        assert engine.process_item(_item(100, message_id), _store_message(repo, message_id, text)) is None
     notifier.flush()
 
-    assert len(bot.sent) >= len(cases)
-    for original in cases:
-        assert any(original in sent_text for chat, sent_text in bot.sent if chat == DEVELOPER)
-    assert not any(chat == OWNER and "original message:" in sent_text for chat, sent_text in bot.sent)
-    joined = _joined(bot)
-    assert "classification: info" in joined
-    assert "classification: result" not in joined
-    assert "classification: ambiguous" not in joined
+    assert bot.sent == []
     assert engine.store.list_intents(limit=10) == []
     assert client.place_calls == 0
+    # Every ordinary message is still durably recorded and audited.
+    statuses = {engine.store.get_signal(f"100:{mid}:0")["status"] for mid in range(1, len(cases) + 1)}
+    assert statuses == {"parsed"}
 
 
 def test_historical_backfill_and_replay_are_silent_and_non_tradeable(cfg, repo):
