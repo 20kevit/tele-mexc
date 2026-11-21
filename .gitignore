@@ -13,7 +13,7 @@ coverage.xml
 htmlcov/
 
 # Virtual environments
-.venv/
+.venv
 venv/
 
 # Environment / secrets
