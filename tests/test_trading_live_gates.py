@@ -21,12 +21,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import TradingEngine
 
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+ALERT = channel_signal()
 LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
 
 
@@ -279,9 +280,8 @@ def test_signal_expiry_does_not_cancel_an_accepted_order(cfg, repo):
 def test_no_manual_allowlist_blocks_dynamic_symbol(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
-    result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, text="BUY ETHUSDT\nENTRY: 2000\nSL: 1900\nTP1: 2100\nTP2: 2200")
-    )
+    text = channel_signal(symbol="ETHUSDT", entry="2000", stop="1900", tp1="2100", tp2="2200")
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, text=text))
     assert result is not None
     assert fake.place_calls == 1
 
@@ -292,7 +292,8 @@ def test_unknown_exchange_symbol_fails_closed(cfg, repo):
     cfg.trading.order_quote_amount = 10.0
     engine.store.set_app_state_once("trading.activation_boundary_message_id", "0")
     result = engine.process_item(
-        _item(100, 1), _store_message(repo, 1, text="BUY NOPEUSDT\nENTRY: 1\nSL: 0.9\nTP1: 2\nTP2: 3")
+        _item(100, 1),
+        _store_message(repo, 1, text=channel_signal(symbol="NOPEUSDT", entry="1", stop="0.9", tp1="2", tp2="3"))
     )
     assert result is None
     assert fake.place_calls == 0
@@ -312,7 +313,7 @@ def test_missing_acknowledgement_does_not_block_submission(cfg, repo):
 def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
-    text = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120\nAMOUNT: $5000 USDT\nDEPOSIT 25%"
+    text = channel_signal() + "\n💰Deposit 25%\n💬 : amount $5000 USDT"
     intent = engine.process_item(_item(100, 1), _store_message(repo, 1, text=text))
     assert intent is not None
     assert Decimal(str(intent["quote_amount"])) == Decimal("10")
@@ -322,7 +323,7 @@ def test_signal_supplied_amount_never_changes_fixed_owner_amount(cfg, repo):
 def test_short_signal_is_parsed_but_never_sold(cfg, repo):
     fake = FakeMexc()
     engine = _engine(cfg, repo, fake, mode="spot")
-    result = engine.process_item(_item(100, 1), _store_message(repo, 1, text="SHORT BTCUSDT\nENTRY: 100\nTP1: 90"))
+    result = engine.process_item(_item(100, 1), _store_message(repo, 1, text=channel_signal(direction="SHORT")))
     assert result is None
     assert fake.place_calls == 0
     signal = engine.store.get_signal("100:1:0")

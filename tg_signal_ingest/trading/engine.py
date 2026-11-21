@@ -332,28 +332,32 @@ class TradingEngine:
             )
 
     def _process_item(self, item: QueueItem, record: dict[str, Any]) -> dict[str, Any] | None:
-        if item.item_type == "delete" or int(record.get("deleted") or 0):
-            self.handle_delete(item.channel_id, item.message_id)
+        # The queue loads the *current* archive row. An old new-message item
+        # may therefore see edited content, even when the item itself is v0.
+        version = int(record.get("processing_version") or 0)
+        if (
+            item.item_type != "message" or item.targets_version != 0 or version != 0
+            or record.get("edit_datetime") or int(record.get("deleted") or 0)
+        ):
             return None
 
         text = record.get("text") or record.get("caption")
-        version = int(record.get("processing_version") or 0)
         with self._measure_signal_stage(item, "parse"):
-            parsed = self.parser.parse(text, is_edit=item.item_type == "edit" or version > 0)
+            parsed = self.parser.parse(text)
         # Determine the startup/backfill boundary before creating the domain
         # event: historical messages must remain silent even when the new
         # notification dispatcher is running.
         historical = self._is_historical(item, record)
+        # Owner policy: only a valid LONG/BUY channel signal may produce the
+        # "signal received" receipt. SHORT/SELL, additional, and ordinary
+        # channel messages are stored and audited but never announced.
+        buy_signal = parsed.kind == "signal" and parsed.action == "buy"
         signal_id, inserted = self.store.record_signal(
             parsed,
             channel_id=item.channel_id,
             message_id=item.message_id,
             edit_version=version,
-            # Only candidate trade signals produce the INFO "signal received"
-            # event.  Ambiguous input becomes a WARNING rejection (never a
-            # misleading INFO receipt), and chatter/cancel/result messages stay
-            # on the legacy diagnostic path.
-            emit_event=(not historical and parsed.kind in ("alert", "update")),
+            emit_event=(not historical and buy_signal),
         )
 
         # Historical backfill and any message at/below the startup boundary
@@ -361,7 +365,7 @@ class TradingEngine:
         # This check runs before every notification/order path so a downtime
         # backlog can never flood recipients or become fresh orders.
         if historical:
-            if parsed.kind in ("alert", "update", "ambiguous", "cancel"):
+            if parsed.kind == "signal":
                 boundary = self.store.activation_boundary(item.channel_id)
                 if record.get("source") == "backfill":
                     reason = "historical backfill message; only new Telegram messages can trade"
@@ -380,39 +384,15 @@ class TradingEngine:
                 self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
                 self.store.audit(signal_id, "lifecycle", "rejected_replay", reason)
             else:
-                self.store.audit(signal_id, "parse", parsed.kind, parsed.reason_text)
+                self.store.audit(signal_id, "parse", parsed.kind)
             return None
 
-        # Classify once, after the historical/replay guard.  Genuine trading
-        # signals always go to both recipients; ordinary channel messages are
-        # developer-only NOT_A_SIGNAL diagnostics.
-        genuine = self._is_genuine_signal(parsed)
-        if not genuine:
-            self._notify_non_signal(signal_id, parsed, record=record)
-            if parsed.kind in ("info", "result"):
-                self.store.audit(signal_id, "parse", parsed.kind, parsed.reason_text)
-                return None
-            if parsed.kind == "cancel":
-                self.store.update_signal(signal_id, "parsed", "cancel signal")
-                if record.get("source") == "backfill":
-                    reason = "historical cancel imported by backfill; not applied to live orders"
-                    self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
-                    self.store.audit(signal_id, "lifecycle", "cancel_ignored_backfill", reason)
-                    return None
-                self._handle_cancel(parsed, signal_id, item.channel_id, item.message_id)
-                return None
-            reason = "; ".join(parsed.reasons) or "not an actionable trading signal"
-            self.store.update_signal(signal_id, "rejected", reason, emit_rejection_event=False)
-            self.store.audit(signal_id, "parse", "not_a_signal", reason)
-            return None
-
-        # A genuine BUY/SELL candidate that the parser could not turn into an
-        # executable alert (missing entry/symbol or another invalid field) is
-        # a local rejection and is reported to both recipients.
-        if parsed.kind == "ambiguous":
-            reason = "; ".join(parsed.reasons) or "ambiguous signal"
-            self.store.update_signal(signal_id, "rejected", reason)
-            self.store.audit(signal_id, "parse", "rejected_ambiguous", reason)
+        if parsed.kind == "additional":
+            # Owner policy: ordinary channel messages (chatter, result posts,
+            # follow-ups) are stored and audited but never generate a Telegram
+            # notification. Only valid LONG/BUY signals produce a receipt, and
+            # genuine rejected signals keep their signal.rejected notice.
+            self.store.audit(signal_id, "parse", parsed.kind)
             return None
 
         # Historical/backfill traffic and anything at or below the one-time
@@ -437,12 +417,6 @@ class TradingEngine:
         if replay_reason is not None:
             self.store.update_signal(signal_id, "rejected", replay_reason)
             self.store.audit(signal_id, "lifecycle", "rejected_replay", replay_reason)
-            return None
-
-        if self.store.has_later_cancel(item.channel_id, parsed.symbol, item.message_id):
-            reason = "a later cancel signal for this symbol was already processed"
-            self.store.update_signal(signal_id, "rejected", reason)
-            self.store.audit(signal_id, "lifecycle", "rejected_after_cancel", reason)
             return None
 
         deadline = self._signal_deadline(record)
@@ -931,17 +905,6 @@ class TradingEngine:
                 signal_id or "none", intent_id or "none", duration_ms, outcome,
             )
 
-    @staticmethod
-    def _is_genuine_signal(parsed: ParsedSignal) -> bool:
-        """A genuine trading signal has a recognizable BUY or SELL direction.
-
-        ``ambiguous`` is included when the parser detected a direction: those
-        are real signals that failed local validation (missing entry/symbol,
-        missing/invalid fields, ...), not ordinary chatter.  Futures/leverage wording alone is not a rejection reason.
-        """
-
-        return parsed.kind in ("alert", "update", "ambiguous") and parsed.action in ("buy", "sell")
-
     def _signal_deadline(self, record: dict[str, Any]) -> datetime | None:
         """Return the absolute deadline of a signal, or None when unprovable."""
 
@@ -1065,38 +1028,6 @@ class TradingEngine:
             roles=roles,
             category=category,
             event_type=event_type,
-        )
-
-    def _notify_non_signal(
-        self,
-        signal_id: str,
-        parsed: ParsedSignal,
-        *,
-        record: dict[str, Any] | None = None,
-    ) -> None:
-        """Report a parser result / non-signal to both owners and the programmer."""
-
-        if parsed.kind == "result":
-            reason = "result/take-profit follow-up, not a new trading signal"
-        elif parsed.kind == "cancel":
-            reason = "cancel/control message, not a new trading signal"
-        elif parsed.kind == "info":
-            reason = parsed.reason_text or "ordinary channel message, not an actionable trading signal"
-        else:
-            reason = parsed.reason_text or "not an actionable trading signal"
-        self._notify_decision(
-            event_key=f"{signal_id}:not_a_signal",
-            status="NOT_A_SIGNAL",
-            symbol=parsed.symbol,
-            direction=parsed.action,
-            reason=reason,
-            classification=parsed.kind,
-            record=record,
-            signal_id=signal_id,
-            diagnostics=parsed.reason_text or None,
-            roles=NOTIFY_ALL,
-            category="signal_decision",
-            event_type="signal.not_a_signal",
         )
 
     def _notify_intent_decision(
@@ -2026,30 +1957,6 @@ class TradingEngine:
             rows = my_trades(symbol=symbol, order_id=exchange_order_id, limit=int(limit))
             op.succeed(rows)
         return list(rows) if isinstance(rows, list) else []
-
-    def _handle_cancel(self, parsed: ParsedSignal, signal_id: str, channel_id: int, message_id: int) -> None:
-        symbol = parsed.symbol
-        reason = f"cancel signal {signal_id}"
-        if symbol is None and "ALL" not in parsed.normalized_text:
-            self.store.audit(
-                signal_id,
-                "lifecycle",
-                "cancel_ignored",
-                "cancel signal has no symbol and did not explicitly say ALL",
-            )
-            return
-        # A queued/retried old cancel must never cancel an order created by a
-        # newer Telegram message (message ids are monotonic per channel).
-        intents = self.store.cancel_signals(symbol, reason, channel_id=channel_id, before_message_id=message_id)
-        self.store.audit(signal_id, "lifecycle", "cancel_received", f"symbol={symbol} intents={len(intents)}")
-        for intent in intents:
-            self._cancel_intent(intent, reason)
-
-    def handle_delete(self, channel_id: int, message_id: int) -> None:
-        reason = f"Telegram message {channel_id}/{message_id} deleted"
-        intents = self.store.cancel_signals_for_message(channel_id, message_id, reason)
-        for intent in intents:
-            self._cancel_intent(intent, reason)
 
     def _cancel_intent(self, intent: dict[str, Any], reason: str) -> None:
         intent_id = intent["intent_id"]

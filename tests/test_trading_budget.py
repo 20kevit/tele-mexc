@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 
+from tests.channel_template import channel_signal
 from tests.test_trading_engine import (
     ALERT,
     FakeMeta,
@@ -146,7 +147,7 @@ def test_uncertain_outcome_freezes_reservation_without_blocking_next_signal(cfg,
 
     second = engine.process_item(
         _item(100, 2),
-        _store_message(repo, 2, "BUY ETHUSDT\nENTRY: 100\nSL: 90\nTP1: 111\nTP2: 120"),
+        _store_message(repo, 2, channel_signal(symbol="ETHUSDT", stop="90", tp1="111")),
     )
     assert second is not None and second["state"] == "unknown_requires_reconciliation"
     assert client.place_calls == 2
@@ -282,7 +283,7 @@ def test_sell_signal_is_reported_ignored_and_never_ordered(cfg, repo):
 
     result = engine.process_item(
         _item(100, 1),
-        _store_message(repo, 1, "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"),
+        _store_message(repo, 1, channel_signal(direction="SHORT", stop="105", tp1="90", tp2="80")),
     )
     notifier.flush()
     assert result is None

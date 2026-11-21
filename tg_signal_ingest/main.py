@@ -1167,10 +1167,7 @@ def cmd_trading_parse(args) -> int:
     if record is None:
         print("message not found", file=sys.stderr)
         return 1
-    parsed = SignalParser().parse(
-        record.get("text") or record.get("caption"),
-        is_edit=bool(record.get("edit_datetime")),
-    )
+    parsed = SignalParser().parse(record.get("text") or record.get("caption"))
     payload = {
         "kind": parsed.kind,
         "action": parsed.action,
@@ -1180,9 +1177,9 @@ def cmd_trading_parse(args) -> int:
         "entry_high_price": str(parsed.entry_high_price) if parsed.entry_high_price is not None else None,
         "targets": [str(p) for p in parsed.target_prices],
         "stop_loss": str(parsed.stop_loss) if parsed.stop_loss is not None else None,
-        "order_type": parsed.order_type,
-        "amount_text": parsed.amount_text,
-        "reasons": list(parsed.reasons),
+        "signal_id": parsed.signal_id,
+        "date": parsed.date,
+        "time": parsed.time,
         "fingerprint": parsed.fingerprint_sha256,
     }
     print(json.dumps(payload, indent=2))

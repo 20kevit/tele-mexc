@@ -360,3 +360,49 @@ def test_notification_settings_are_per_recipient_and_owner_a_can_manage_others()
 
     asyncio.run(service._notification_action(202, ["n", "set", "owner_b", "ERROR"]))
     assert store.calls[-1] == ("ERROR", "owner_b")
+
+
+async def test_channel_edits_cannot_become_entries_even_on_replay(cfg, selected_repo):
+    from types import SimpleNamespace
+
+    from tests.channel_template import channel_signal
+    from tests.test_trading_engine import Msg, _engine
+
+    client = FakeClient()
+    engine = _engine(cfg, selected_repo)
+    svc = IngestService(cfg, selected_repo, client=client, trading_engine=engine)
+    svc._selected_channel_id = 100
+    svc._selected_marked_id = -1000000000100
+    svc._register_handlers()
+    svc._register_trading_handlers()
+    on_new, on_edit, on_delete = client.handlers
+
+    def event(mid, text):
+        return SimpleNamespace(chat_id=svc._selected_marked_id, message=Msg(mid, text))
+
+    # No edit timestamp: event provenance must survive a first-seen edit and replay.
+    await on_edit(event(901, channel_signal()))
+    selected_repo.reprocess_message(100, 901)
+    # The original queue item will see the archive row written by the later edit.
+    await on_new(event(902, "ordinary channel post"))
+    await on_edit(event(902, channel_signal()))
+    # A genuine new post in the same batch remains tradeable.
+    await on_new(event(903, channel_signal()))
+    stats = await svc.proc_engine.run_once()
+    assert stats.failed == 0
+    assert engine.store.intent_for_message(100, 901) is None
+    assert engine.store.intent_for_message(100, 902) is None
+    assert engine.store.intent_for_message(100, 903) is not None
+    assert engine.client.place_calls == 1
+
+    # Delete an accepted entry and another post still waiting in the queue.
+    accepted = engine.store.intent_for_message(100, 903)
+    original = engine.store.get_signal("100:903:0")
+    await on_new(event(904, channel_signal()))
+    await on_delete(SimpleNamespace(channel_id=100, messages=[903, 904]))
+    assert (await svc.proc_engine.run_once()).failed == 0
+    assert selected_repo.get_message_raw(100, 903)["deleted"]
+    assert engine.store.intent_for_message(100, 903) == accepted
+    assert engine.store.get_signal("100:903:0") == original
+    assert engine.store.intent_for_message(100, 904) is None
+    assert engine.client.cancel_calls == 0

@@ -86,7 +86,7 @@ class TradeSim:
         decision = self.tm.on_intent_planned(
             self.intent,
             ParsedSignal(
-                kind="alert",
+                kind="signal",
                 action="buy",
                 symbol=self.cfg.symbol,
                 entry_price=self.cfg.entry,
@@ -94,8 +94,6 @@ class TradeSim:
                 entry_high_price=None,
                 target_prices=(self.cfg.tp1, self.cfg.tp2),
                 stop_loss=self.cfg.sl,
-                order_type="limit",
-                amount_text=None,
                 raw_text="buy",
                 normalized_text="buy",
                 fingerprint_sha256="sim",

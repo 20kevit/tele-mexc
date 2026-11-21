@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import pytest
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.config import AppConfig
 from tg_signal_ingest.control.service import ControlBot
 from tg_signal_ingest.control.store import ControlStore
@@ -19,7 +20,7 @@ from tg_signal_ingest.trading.store import TradingStore
 
 OWNER = 100000001
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+ALERT = channel_signal(stop="90")
 
 
 class FakeBot:

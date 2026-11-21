@@ -13,6 +13,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading.engine import TradingEngine
@@ -22,7 +23,7 @@ from tg_signal_ingest.trading.trade_manager import RECONCILIATION_REQUIRED_STATE
 from tg_signal_ingest.trading.trade_store import TradeStore
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-COMPLETE = "BUY BTCUSDT\nENTRY: 100\nSL: 90\nTP1: 110\nTP2: 120"
+COMPLETE = channel_signal(stop="90")
 
 
 class FakeMsg:

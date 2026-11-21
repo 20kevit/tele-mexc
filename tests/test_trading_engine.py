@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.mexc.errors import (
     AccidentalOrderRiskError,
     MexcCliConfirmationRequired,
@@ -216,7 +217,7 @@ class FakeMexc:
         return list(self.all_orders_rows)
 
 
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+ALERT = channel_signal()
 
 
 def test_fetch_market_prices_uses_one_all_symbol_call(cfg, repo):
@@ -261,15 +262,14 @@ def test_edit_reuses_message_identity_and_never_places_second_order(cfg, repo):
     first = engine.process_item(_item(100, 2), record)
     assert first is not None
 
-    edited = _store_message(repo, 2, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5))
+    edited = _store_message(repo, 2, channel_signal(entry="101"), edit_date=NOW - timedelta(seconds=5))
     assert int(edited["processing_version"]) == 1
     second = engine.process_item(_item(100, 2, "edit"), edited)
 
-    assert second is not None
-    assert second["intent_id"] == first["intent_id"]
+    assert second is None
     assert engine.store.list_intents(limit=10).__len__() == 1
     statuses = {row["signal_id"]: row["status"] for row in engine.store.list_signals(limit=10)}
-    assert statuses["100:2:1"] == "superseded"
+    assert "100:2:1" not in statuses
 
 
 def test_repeated_identical_content_on_a_new_message_is_a_new_signal(cfg, repo):
@@ -304,10 +304,8 @@ def test_no_arbitrary_daily_or_open_order_caps(cfg, repo):
     engine = _engine(cfg, repo)
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     for mid, sym in zip((6, 7, 8), symbols, strict=False):
-        intent = engine.process_item(
-            _item(100, mid),
-            _store_message(repo, mid, f"BUY {sym}\nENTRY {100 + mid}\nSL 90\nTP1 120\nTP2 130"),
-        )
+        text = channel_signal(symbol=sym, entry=str(100 + mid), stop="90", tp1="120", tp2="130")
+        intent = engine.process_item(_item(100, mid), _store_message(repo, mid, text))
         assert intent is not None, f"{sym} should not be capped"
     assert len(engine.store.list_intents(limit=10)) == 3
 
@@ -325,10 +323,9 @@ def test_network_uncertainty_never_retries_and_reconciles_to_filled(cfg, repo):
     assert intent["state"] == "unknown_requires_reconciliation"
     assert client.place_calls == 1
 
-    edited = _store_message(repo, 8, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5))
+    edited = _store_message(repo, 8, channel_signal(entry="101"), edit_date=NOW - timedelta(seconds=5))
     again = engine.process_item(_item(100, 8, "edit"), edited)
-    assert again is not None
-    assert again["state"] == "unknown_requires_reconciliation"
+    assert again is None
     assert client.place_calls == 1  # no blind retry
 
     client.query_error = MexcOrderNotFound("no order")
@@ -934,19 +931,18 @@ def test_edit_changing_action_cannot_create_second_order(cfg, repo):
     edited = _store_message(
         repo,
         20,
-        "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105",
+        channel_signal(direction="SHORT", stop="105", tp1="90", tp2="80"),
         edit_date=NOW - timedelta(seconds=5),
     )
     second = engine.process_item(_item(100, 20, "edit"), edited)
 
-    assert second is not None and second["intent_id"] == first["intent_id"]
+    assert second is None
     assert len(engine.store.list_intents(limit=10)) == 1
     signal = engine.store.get_signal("100:20:1")
-    assert signal is not None and signal["status"] == "superseded"
-    assert "different action/symbol" in signal["rejection_reason"]
+    assert signal is None
 
 
-def test_cancel_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
+def test_channel_cancel_is_ignored_but_direct_operator_cancel_still_reconciles(cfg, repo):
     open_order = {
         "orderId": "ex-edit",
         "symbol": "BTCUSDT",
@@ -968,23 +964,28 @@ def test_cancel_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     intent = engine.process_item(_item(100, 21), _store_message(repo, 21, ALERT))
     assert intent is not None and intent["state"] == "open"
 
+    original = engine.store.get_signal("100:21:0")
     edited = _store_message(
         repo,
         21,
-        ALERT + "\nTP2: 120",
+        channel_signal(entry="101"),
         edit_date=NOW - timedelta(seconds=5),
     )
     engine.process_item(_item(100, 21, "edit"), edited)
     old_signal = engine.store.get_signal("100:21:0")
-    assert old_signal is not None and old_signal["status"] == "superseded"
+    assert old_signal == original
 
     engine.process_item(_item(100, 22), _store_message(repo, 22, "CANCEL BTCUSDT"))
+    assert client.cancel_calls == 0
+    assert engine.store.get_intent(intent["intent_id"]) == intent
+    assert engine.store.get_signal("100:21:0") == original
+    engine._cancel_intent(intent, "operator request")
     final = engine.store.get_intent(intent["intent_id"])
     assert client.cancel_calls == 1
     assert final is not None and final["state"] == "canceled"
 
 
-def test_delete_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
+def test_delete_after_edit_does_not_change_signal_or_order(cfg, repo):
     open_order = {
         "orderId": "ex-del",
         "symbol": "BTCUSDT",
@@ -1009,15 +1010,19 @@ def test_delete_after_edit_still_cancels_superseded_signal_intent(cfg, repo):
     edited = _store_message(
         repo,
         23,
-        ALERT + "\nTP2: 120",
+        channel_signal(entry="101"),
         edit_date=NOW - timedelta(seconds=5),
     )
     engine.process_item(_item(100, 23, "edit"), edited)
-    engine.handle_delete(100, 23)
+    original = engine.store.get_signal("100:23:0")
+    repo.mark_deleted(100, [23])
+    record = repo.get_message_raw(100, 23)
+    assert record["deleted"]
+    engine.process_item(_item(100, 23, "delete"), record)
+    assert engine.store.get_signal("100:23:0") == original
 
-    final = engine.store.get_intent(intent["intent_id"])
-    assert client.cancel_calls == 1
-    assert final is not None and final["state"] == "canceled"
+    assert client.cancel_calls == 0
+    assert engine.store.get_intent(intent["intent_id"]) == intent
 
 
 def test_rate_limited_submit_is_unknown_and_reconciled_not_resubmitted(cfg, repo):
@@ -1051,7 +1056,7 @@ def test_rate_limited_submit_is_unknown_and_reconciled_not_resubmitted(cfg, repo
     assert client.place_calls == 1
 
 
-def test_later_cancel_processed_first_blocks_older_queued_alert(cfg, repo):
+def test_later_cancel_processed_first_does_not_block_older_queued_alert(cfg, repo):
     client = FakeMexc()
     engine = _engine(cfg, repo, client)
 
@@ -1059,12 +1064,8 @@ def test_later_cancel_processed_first_blocks_older_queued_alert(cfg, repo):
     assert cancel is None
 
     result = engine.process_item(_item(100, 30), _store_message(repo, 30, ALERT))
-    assert result is None
-    assert client.place_calls == 0
-    assert engine.store.list_intents(limit=10) == []
-    signal = engine.store.get_signal("100:30:0")
-    assert signal is not None and signal["status"] == "rejected"
-    assert "later cancel" in signal["rejection_reason"]
+    assert result is not None
+    assert client.place_calls == 1
 
 
 def test_not_found_for_open_intent_never_becomes_terminal_failed(cfg, repo):
@@ -1195,12 +1196,12 @@ def test_terminal_rejected_intent_synchronizes_signal_status(cfg, repo):
     assert signal is not None and signal["status"] == "rejected"
 
     # A later edit also cannot create or resubmit an order.
-    edited = _store_message(repo, 60, ALERT + "\nTP2: 120", edit_date=NOW - timedelta(seconds=5))
-    assert engine.process_item(_item(100, 60, "edit"), edited) is not None
+    edited = _store_message(repo, 60, channel_signal(entry="101"), edit_date=NOW - timedelta(seconds=5))
+    assert engine.process_item(_item(100, 60, "edit"), edited) is None
     assert client.place_calls == 1
     assert len(engine.store.list_intents(limit=10)) == 1
     newer = engine.store.get_signal("100:60:1")
-    assert newer is not None and newer["status"] == "superseded"
+    assert newer is None
 
 
 def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
@@ -1231,7 +1232,7 @@ def test_backfill_sourced_cancel_does_not_touch_live_orders(cfg, repo):
     assert final is not None and final["state"] == "open"
 
     # The ignored historical cancel must not block an older live message either.
-    older = engine.process_item(_item(100, 49), _store_message(repo, 49, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120"))
+    older = engine.process_item(_item(100, 49), _store_message(repo, 49, channel_signal(stop="90")))
     assert older is not None
 
 
@@ -1269,7 +1270,7 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
 
     monkeypatch.setattr(client, "ticker_price", unexpected_ticker)
     monkeypatch.setattr(client.symbols, "get", unexpected_metadata)
-    sell = "SELL BTCUSDT\nENTRY: 100\nTP1: 90\nSL: 105"
+    sell = channel_signal(direction="SHORT", stop="105", tp1="90", tp2="80")
     intent = engine.process_item(_item(100, 71), _store_message(repo, 71, sell))
 
     assert intent is None
@@ -1280,14 +1281,15 @@ def test_sell_signal_is_refused_before_any_exchange_or_metadata_call(cfg, repo, 
     assert "signal_stage" in rendered and "stage=parse" in rendered
     assert "signal_lock scope=process_item" in rendered
     # The rejection is recorded as a durable domain event (no legacy outbox
-    # duplicate), so the canonical signal.rejected fact is present.
+    # duplicate), so the canonical signal.rejected fact is present. Owner
+    # policy: a SHORT/SELL signal never produces a signal.received receipt.
     events = [
         row["event_type"]
         for row in engine.store.db.conn.execute(
             "SELECT event_type FROM audit_events WHERE event_class='domain' ORDER BY audit_id"
         ).fetchall()
     ]
-    assert events == ["signal.received", "signal.rejected"]
+    assert events == ["signal.rejected"]
 
 
 def test_balance_api_failure_rejects_without_submitting(cfg, repo):
@@ -1367,7 +1369,7 @@ def test_balance_preflight_counts_competing_local_intents(cfg, repo):
     )
 
     second = engine.process_item(
-        _item(100, 74), _store_message(repo, 74, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
+        _item(100, 74), _store_message(repo, 74, channel_signal(stop="90"))
     )
     # Per-symbol concurrency is not relevant here (different symbols), so
     # rejection must be due to balance insufficiency (outstanding reservation).
@@ -1397,7 +1399,7 @@ def test_balance_preflight_refetches_for_each_live_order(cfg, repo):
     engine = _engine(cfg, repo, client, mode="live")
     first = engine.process_item(_item(100, 75), _store_message(repo, 75, ALERT))
     second = engine.process_item(
-        _item(100, 76), _store_message(repo, 76, "BUY BTCUSDT ENTRY 100 SL 90 TP1 110 TP2 120")
+        _item(100, 76), _store_message(repo, 76, channel_signal(stop="90"))
     )
     assert first is not None and first["state"] == "open"
     assert second is not None and second["state"] == "open"
@@ -1876,12 +1878,12 @@ class CapturingMexc(FakeMexc):
         return super().place_order(**kwargs)
 
 
-def test_market_signal_is_converted_to_limit_entry(cfg, repo):
+def test_channel_signal_uses_limit_entry(cfg, repo):
     client = CapturingMexc(
         place_response={"orderId": "ex-mkt", "status": "NEW"},
     )
     engine = _engine(cfg, repo, client)
-    text = "MARKET BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+    text = channel_signal()
     intent = engine.process_item(_item(100, 401), _store_message(repo, 401, text))
 
     assert intent is not None
@@ -1902,8 +1904,7 @@ def test_market_signal_without_entry_is_rejected_before_exchange(cfg, repo):
     assert result is None
     assert client.place_kwargs == []
     signal = engine.store.get_signal("100:402:0")
-    assert signal is not None and signal["status"] == "rejected"
-    assert "entry" in signal["rejection_reason"].lower()
+    assert signal is not None and signal["signal_kind"] == "info"
 
 
 def test_recovered_market_intent_cannot_reach_exchange(cfg, repo):

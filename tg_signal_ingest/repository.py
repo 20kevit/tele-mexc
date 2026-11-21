@@ -134,7 +134,9 @@ class Repository:
 
     # ----------------------------------------------------------- messages
 
-    def upsert_message(self, record: StoredMessage, *, enqueue_processing: bool = True) -> UpsertResult:
+    def upsert_message(
+        self, record: StoredMessage, *, enqueue_processing: bool = True, is_edit: bool = False
+    ) -> UpsertResult:
         """Insert or update one message.
 
         ``enqueue_processing`` is disabled by historical backfill: history
@@ -152,13 +154,15 @@ class Repository:
                 (record.channel_id, record.message_id),
             ).fetchone()
             if row is None:
+                # A first-seen MessageEdited event is not a new post, even on replay.
+                version = 1 if is_edit else 0
                 conn.execute(
                     """
                     INSERT INTO messages (channel_id, message_id, datetime, edit_datetime, text, caption,
                         media_type, media_meta, grouped_id, reply_to_message_id, fwd_from_name, fwd_from_id,
                         fwd_post_message_id, raw_json, source, processing_version, deleted, deleted_at,
                         first_seen, last_updated, sender_id, sender_name, post_author, entities_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.channel_id,
@@ -176,6 +180,7 @@ class Repository:
                         record.fwd_post_message_id,
                         record.raw_json,
                         record.source,
+                        version,
                         now,
                         now,
                         record.sender_id,
@@ -185,8 +190,9 @@ class Repository:
                     ),
                 )
                 if enqueue_processing:
-                    self._enqueue_locked(conn, record.channel_id, record.message_id, "message", 0)
-                return UpsertResult(UpsertOutcome.INSERTED, 0, 0)
+                    item_type = "edit" if is_edit else "message"
+                    self._enqueue_locked(conn, record.channel_id, record.message_id, item_type, version)
+                return UpsertResult(UpsertOutcome.INSERTED, 0, version)
 
             old_version = int(row["processing_version"])
             content_fields = (

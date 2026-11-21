@@ -101,7 +101,9 @@ them to connected clients.
 
 `ProcessingEngine` claims a bounded batch, resolves the current message row,
 and invokes the handler registered for `message`/`edit`/`delete`. `serve`
-registers the trading engine for all three.
+registers the trading engine only for `message`. Edits (including a first-seen
+edit, stored at version 1) and deletes are archive-only. A queued original
+cannot trade if its current archive row is edited or marked deleted.
 
 - Success moves the item to `processed`.
 - Failure increments attempts and schedules exponential backoff

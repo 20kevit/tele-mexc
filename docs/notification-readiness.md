@@ -36,10 +36,18 @@ non-negotiable trading rules.
 | Level | Meaning | Owner A/B | Programmer |
 | --- | --- | --- | --- |
 | DEBUG | chatter, not-a-signal, news/analysis, parser diagnostics | never | only with diagnostic category enabled |
-| INFO | valid signal received/accepted, confirmed submit with orderId, open/fill, protection active, TP/SL lifecycle, trade closed | yes, subject to category/minimum | yes, subject to category/minimum |
+| INFO | valid LONG/BUY signal received/accepted, confirmed submit with orderId, open/fill, protection active, TP/SL lifecycle, trade closed | yes, subject to category/minimum | yes, subject to category/minimum |
 | WARNING | incomplete/ambiguous/rejected genuine trading signal, scheduled retry/delay, recoverable discrepancy | yes; owner-safety cases bypass; others subject to category/minimum | subject to category/minimum |
 | ERROR | definitive exchange rejection, protection failure after retries, persistent API/DB/recovery failure, serious mismatch | yes; safety-unknown cases bypass; others subject to category/minimum | subject to category/minimum |
 | CRITICAL | unprotected live trade, UNKNOWN/duplicate-risk submission, dangerous discrepancy, critical service interruption | yes; **always** | yes; **always** |
+
+Owner routing rules on top of this table:
+
+- Only a valid LONG/BUY channel signal produces the `signal.received` receipt.
+  SHORT/SELL, additional, and ordinary channel messages never produce the
+  receipt; ordinary channel messages produce no Telegram notification at all.
+- SHORT/SELL and locally rejected genuine signals keep their
+  `signal.rejected` decision notice (WARNING, owner-visible).
 
 Routing precedence for one recipient:
 

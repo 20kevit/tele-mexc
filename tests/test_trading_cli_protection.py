@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from tests.channel_template import channel_signal
 from tg_signal_ingest.normalize import message_to_record
 from tg_signal_ingest.repository import QueueItem
 from tg_signal_ingest.trading import TradingEngine
@@ -16,7 +17,7 @@ from tg_signal_ingest.trading.trade_manager import TradeManager
 
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
 LIVE_TOKEN = "I_UNDERSTAND_REAL_MONEY_AND_RISKS"
-ALERT = "BUY BTCUSDT\nENTRY: 100\nSL: 95\nTP1: 110\nTP2: 120"
+ALERT = channel_signal()
 
 
 def _item(mid: int) -> QueueItem:

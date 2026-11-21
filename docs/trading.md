@@ -164,41 +164,32 @@ enforced. The historical `trading_daily_spend` table is retained for compatibili
 
 `trading/parser.py` is the only production parser.
 
-| Kind | Meaning |
-| --- | --- |
-| `alert` | New actionable BUY/SELL signal |
-| `update` | Edited/updated actionable signal |
-| `cancel` | Cancel instruction; may cancel prior matching intents |
-| `result` | TP hit/entry filled/position closed follow-up; never executable |
-| `info` | Ordinary channel text |
-| `ambiguous` | Direction detected but required fields/format are not safe |
+Only a new channel post can produce an entry. The parser returns `signal` only
+for the ordered TOOBIT `.P(15)` template: printed signal number, date and time,
+starred LONG/SHORT, symbol, Entry, Stop Loss and TP1 through TP4. Prices are
+single `Decimal` values. LONG maps to `buy`; SHORT maps to `sell` and is refused
+before ticker or metadata queries. Optional footer fields do not affect sizing.
+All other input (including CANCEL, follow-ups and incomplete posts) is
+`additional`. In the existing database/event schema these two kinds use `alert`
+and `info`, respectively. The printed number is not the database signal ID.
 
-- LONG is treated as BUY; SHORT/SELL is retained but rejected locally before
-  ticker-price or `exchangeInfo` REST requests.
-- Futures/perpetual/margin/leverage wording is ingested but never enables
-  Futures execution. A LONG signal with a Spot-compatible symbol and complete
-  Entry/SL/TP1/TP2 fields is executed as a Spot BUY; leverage/deposit text is
-  ignored for sizing.
-- Missing/unsafe entry, symbol, or required fields fail closed.
-- A signal marked MARKET is converted to LIMIT only when it has a valid Entry
-  price; otherwise it is rejected. MARKET orders are never submitted.
-- No OCR: media without usable caption text is not actionable.
+Edits and deletes remain archived but cannot create, supersede or cancel a
+trading signal or order. Replaying a queued original whose archive row has
+since been edited does not trade the edited content.
 
 ## Risk and sizing
 
 `trading/risk.py` rejects:
 
 - emergency stop;
-- non-`alert`/`update` kinds;
+- non-`signal` kinds;
 - missing/ambiguous direction;
 - any action other than BUY;
 - missing symbol, non-positive entry/stop, inverted entry range;
 - missing fixed quote amount;
 - unsupported symbol/order type, precision, min/max notional.
 
-Order type is always LIMIT. A MARKET signal is converted to LIMIT when an Entry
-price exists; without one it fails closed. Configuration cannot re-enable
-MARKET.
+Order type is always LIMIT; the parser does not accept MARKET instructions.
 
 Quantity is `order_quote_amount / price`, then quantized **down** to the symbol
 lot step and validated against `exchangeInfo` minimum/maximum and price guards.
@@ -258,11 +249,8 @@ client_order_id = "tsi" + key[:28]
 intent_id       = "intent-" + client_order_id
 ```
 
-If a message already has an intent with a different action/symbol, the edit is
-superseded and audited; no second order is placed. A same-version duplicate
-delivery does not supersede the signal and cannot resubmit a terminal intent.
-A newer edit may supersede the old signal but still cannot create a second
-intent for the same message.
+A same-version duplicate delivery cannot resubmit a terminal intent. An edit
+never reaches intent creation and leaves the original signal status unchanged.
 
 Terminal `rejected`/`failed` intent transitions update an active
 (`parsed`/`validated`/`planned`) signal to `rejected` in the same transaction.
@@ -551,8 +539,7 @@ retry. A terminal order is never un-filled by a contradictory exchange report;
 the discrepancy is recorded.
 
 `trading reconcile` and the `live` background worker use the same path.
-Cancellation from a Telegram cancel/delete also reconciles afterward rather than
-assuming success.
+Telegram cancel/delete messages do not request exchange cancellations.
 
 ## Audit journal
 
@@ -839,8 +826,13 @@ matrix are in [notification-readiness.md](notification-readiness.md). Summary:
 
 - CRITICAL always reaches every configured recipient regardless of category or
   minimum severity.
+- Only a valid LONG/BUY channel signal produces the `signal.received` receipt
+  ("سیگنال جدید دریافت شد"). SHORT/SELL signals, additional messages, and
+  ordinary channel chatter never produce the receipt; SHORT/SELL keeps its
+  explicit `signal.rejected` decision notice.
+- Ordinary channel messages (chatter, result posts, follow-ups) are stored and
+  audited but never delivered to Telegram for any recipient.
 - Genuine rejected/ambiguous signals are WARNING and owner-visible.
-- DEBUG (chatter, not-a-signal, parser diagnostics) is programmer-only.
 - Suppressed events remain in history with their rendered text and reason.
 - Only the exact `event_id` is idempotent; distinct lifecycle events are never
   collapsed.
