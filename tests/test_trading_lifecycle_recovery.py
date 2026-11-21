@@ -166,6 +166,24 @@ def setup_trade(env, *, fill: Decimal | None = None, confirm: bool = True):
     return trade, intent
 
 
+def test_legacy_registry_suppresses_trade_manager_reconciliation(env):
+    cfg, store, engine, client, notifier, tm = env
+    trade, intent = setup_trade(env, confirm=False)
+    with store.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO legacy_ignored_intents (intent_id, reason, ignored_at) VALUES (?, ?, ?)",
+            (intent["intent_id"], "test legacy exclusion", "2026-11-21T00:00:00Z"),
+        )
+    before = (len(client.query_calls), len(client.all_orders_calls), len(client.place_calls), len(client.cancel_calls))
+    tm.recover_on_startup()
+    tm.reconcile_all_open()
+    tm.on_tick(trade["symbol"], Decimal("100"), 5001.0)
+    after = (len(client.query_calls), len(client.all_orders_calls), len(client.place_calls), len(client.cancel_calls))
+    assert after == before
+    assert all(row["trade_id"] != trade["trade_id"] for row in store.list_non_terminal_trades())
+    assert store.has_active_trade_for_symbol(trade["symbol"]) is None
+
+
 def _oco_orders(store: TradeStore, trade, kind: str = "tp1") -> list[dict]:
     orders = store.list_trade_orders(trade["trade_id"], kind=kind)
     assert orders, f"expected a {kind} OCO order"
