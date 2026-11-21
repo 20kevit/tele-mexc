@@ -968,7 +968,11 @@ periodic trade reconciliation, tick handling, and the protection-derived
 new-BUY block must ignore these records. Migration 23 clears the old global
 new-BUY block once, while preserving closed/completed history. Migration 24 records
 pre-deployment non-terminal order intents in a local ignore registry so they no
-longer enter periodic reconciliation or planned-intent recovery.
+longer enter periodic reconciliation or planned-intent recovery. Every consumer
+must honor this registry, including direct reconciliation calls, per-symbol
+admission fallbacks, open-intent counts, and local balance-reservation
+calculations. Associated trade rows should also be parked as `ignored_legacy`
+for durable operator visibility.
 
 This is a local bookkeeping boundary only: it does not query, cancel, replace,
 or amend any existing MEXC order, and it does not claim that old positions are

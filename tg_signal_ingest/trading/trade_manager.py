@@ -427,14 +427,14 @@ class TradeManager:
         if price is None or not price.is_finite() or price <= 0:
             return
         for trade in self.store.list_trades():
-            if trade["trade_state"] in TERMINAL_TRADE_STATES:
+            if self._trade_is_legacy_ignored(trade):
                 continue
             if trade["symbol"].upper() != symbol.upper():
                 continue
             key = str(trade.get("signal_id") or trade["trade_id"])
             with self._hold_trade_lock(key, "on_tick"):
                 current = self.store.get_trade(trade["trade_id"])
-                if current is None or current["trade_state"] in TERMINAL_TRADE_STATES:
+                if current is None or self._trade_is_legacy_ignored(current):
                     continue
                 self._evaluate_trade_tick(current, price, received_at)
 
@@ -3158,6 +3158,12 @@ class TradeManager:
         finally:
             self._refresh_buy_block()
 
+    def _trade_is_legacy_ignored(self, trade: dict[str, Any]) -> bool:
+        if trade.get("trade_state") in TERMINAL_TRADE_STATES:
+            return True
+        intent_id = str(trade.get("entry_intent_id") or "")
+        return bool(intent_id and self.store.is_legacy_ignored_intent(intent_id))
+
     def _reconcile_trade(self, trade_id: str) -> None:
         """Reconcile one trade and refresh the durable new-BUY block."""
 
@@ -3173,6 +3179,8 @@ class TradeManager:
         if trade is None:
             return
         state = trade["trade_state"]
+        if self._trade_is_legacy_ignored(trade):
+            return
         if state in ("stop_loss_executing", "exit_pending"):
             # Legacy Market Sell states — Market Sell path is disabled per §7.
             # Treat as unprotected: reconcile read-only, persist critical.

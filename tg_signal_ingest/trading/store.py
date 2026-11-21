@@ -155,7 +155,10 @@ class TradingStore:
             placeholders = ", ".join("?" for _ in self.CONFLICTING_TRADE_STATES)
             rows = self.db.conn.execute(
                 "SELECT * FROM trades WHERE symbol = ? AND trade_state IN "
-                f"({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+                f"({placeholders}) "
+                "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+                "WHERE legacy.intent_id = trades.entry_intent_id) "
+                "ORDER BY updated_at DESC LIMIT 1",
                 (symbol.upper(), *self.CONFLICTING_TRADE_STATES),
             ).fetchall()
         except Exception:
@@ -927,10 +930,19 @@ class TradingStore:
 
     # ------------------------------------------------------------ intents
 
+    def is_legacy_ignored_intent(self, intent_id: str) -> bool:
+        """Return whether an intent is explicitly parked from automatic work."""
+        return self.db.conn.execute(
+            "SELECT 1 FROM legacy_ignored_intents WHERE intent_id = ? LIMIT 1",
+            (intent_id,),
+        ).fetchone() is not None
+
     def count_open_intents(self) -> int:
         placeholders = ",".join("?" for _ in OPEN_INTENT_STATES)
         row = self.db.conn.execute(
-            f"SELECT COUNT(*) AS c FROM order_intents WHERE state IN ({placeholders})",
+            f"SELECT COUNT(*) AS c FROM order_intents WHERE state IN ({placeholders}) "
+            "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id)",
             OPEN_INTENT_STATES,
         ).fetchone()
         return int(row["c"])
@@ -948,16 +960,28 @@ class TradingStore:
         placeholders = ", ".join("?" for _ in OPEN_INTENT_STATES)
         rows = self.db.conn.execute(
             "SELECT * FROM order_intents WHERE symbol = ? AND state IN "
-            f"({placeholders}) ORDER BY created_at DESC LIMIT 1",
+            f"({placeholders}) "
+            "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id) "
+            "ORDER BY planned_at DESC, intent_id DESC LIMIT 1",
             (symbol.upper(), *OPEN_INTENT_STATES),
         ).fetchall()
         return dict(rows[0]) if rows else None
 
     def count_intents_by_state(self) -> dict[str, int]:
+        """Count actionable intents; parked legacy rows are reported separately."""
         return {
             str(r["state"]): int(r["c"])
-            for r in self.db.conn.execute("SELECT state, COUNT(*) AS c FROM order_intents GROUP BY state")
+            for r in self.db.conn.execute(
+                "SELECT state, COUNT(*) AS c FROM order_intents "
+                "WHERE NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+                "WHERE legacy.intent_id = order_intents.intent_id) GROUP BY state"
+            )
         }
+
+    def count_legacy_ignored_intents(self) -> int:
+        row = self.db.conn.execute("SELECT COUNT(*) AS c FROM legacy_ignored_intents").fetchone()
+        return int(row["c"])
 
     # ------------------------------------------------------- budget ledger
 
@@ -973,7 +997,10 @@ class TradingStore:
             if row is not None:
                 return
             intent = conn.execute(
-                "SELECT quote_amount, mode, state FROM order_intents WHERE intent_id = ?",
+                "SELECT quote_amount, mode, state FROM order_intents "
+                "WHERE intent_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM legacy_ignored_intents legacy "
+                "WHERE legacy.intent_id = order_intents.intent_id)",
                 (intent_id,),
             ).fetchone()
             if intent is None or intent["mode"] != "live":
@@ -1258,7 +1285,12 @@ class TradingStore:
 
     def list_intents(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.conn.execute(
-            "SELECT * FROM order_intents ORDER BY planned_at DESC, intent_id DESC LIMIT ?", (limit,)
+            "SELECT order_intents.*, CASE WHEN EXISTS ("
+            "SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id) "
+            "THEN 'ignored_legacy' ELSE order_intents.state END AS display_state "
+            "FROM order_intents ORDER BY planned_at DESC, intent_id DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1402,7 +1434,9 @@ class TradingStore:
         placeholders = ",".join("?" for _ in OPEN_INTENT_STATES)
         sql = (
             f"SELECT side, quote_amount, base_quantity FROM order_intents "
-            f"WHERE mode = 'live' AND symbol = ? AND state IN ({placeholders})"
+            f"WHERE mode = 'live' AND symbol = ? AND state IN ({placeholders}) "
+            "AND NOT EXISTS (SELECT 1 FROM legacy_ignored_intents legacy "
+            "WHERE legacy.intent_id = order_intents.intent_id)"
         )
         params: list[Any] = [symbol.upper(), *OPEN_INTENT_STATES]
         if exclude_intent_id is not None:

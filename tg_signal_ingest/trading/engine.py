@@ -2161,6 +2161,8 @@ class TradingEngine:
         intent = self.store.get_intent(intent_id)
         if intent is None:
             raise RuntimeError(f"intent {intent_id} not found")
+        if self.store.is_legacy_ignored_intent(intent_id):
+            return None
         if intent.get("mode") != "live" or self.client is None:
             return None
         with self._inflight_submission_lock:
@@ -2194,6 +2196,8 @@ class TradingEngine:
         intent = self.store.get_intent(intent_id)
         if intent is None:
             raise RuntimeError(f"intent {intent_id} not found")
+        if self.store.is_legacy_ignored_intent(intent_id):
+            return intent
         if intent.get("state") == "planned":
             return intent
         if intent.get("state") == "submitting" and not self._submission_claim_expired(intent):
